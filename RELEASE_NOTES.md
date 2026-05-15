@@ -4,6 +4,57 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.5 — Issue #13: SQLite PRAGMA ordering race fix + openclaw doc-comment line-ref bump
+
+v0.10.5 fixes [yoloshii/ClawMem#13](https://github.com/yoloshii/ClawMem/issues/13). One bug reported by @jcgau (first-time contributor):
+
+`src/store.ts:initializeDatabase()` set `PRAGMA busy_timeout = 15000` AFTER `PRAGMA journal_mode = WAL`. Because `busy_timeout` is a connection-level setting that only governs *subsequent* statements (default busy callback is NULL → `SQLITE_BUSY` returns immediately), the busy handler was not active when the first contending statement ran. When concurrent Stop-hook subprocesses (`decision-extractor`, `handoff-generator`, `feedback-loop`) opened the same SQLite file in parallel — both from OpenClaw's `agent_end` plugin-hook fan-out (`src/openclaw/engine.ts:449`) and from `before_reset` (`src/openclaw/engine.ts:576`), plus the Hermes `MemoryProvider.on_session_end` thread fan-out (`src/hermes/__init__.py:518`) — the first subprocess to acquire the journal-mode write lock succeeded and the rest returned `SQLITE_BUSY` immediately. Under the reporter's typical load (~48 heartbeat turns/day in their OpenClaw setup), two of three hooks failed per turn, silently dropping decision-extraction / handoff-generation / feedback-loop work for the losing subprocesses.
+
+Vault on disk is byte-identical to v0.10.4. No schema migration. No env-var change. No public API change. Pure `bun add -g clawmem` upgrade.
+
+### The fix — one-line ordering swap, applied to two sites
+
+`src/store.ts:initializeDatabase()` (writable init path) and `src/store.ts:createStore()` readonly branch both now set `busy_timeout` as the **first** statement on the connection, before `sqliteVec.load()`, `PRAGMA journal_mode = WAL`, and any DDL. The writable path uses 15000ms during DDL (well within the 30s Stop hook timeout); the terminal `createStore()` statement resets to operational 5000ms (or `opts.busyTimeout`) after DDL completes. The readonly branch is also hardened against the same race — public-API hardening, since no in-tree production caller currently passes `readonly: true`, but the ordering invariant should hold regardless.
+
+The docstring in `initializeDatabase()` carries the rationale durably so a future refactor can't quietly re-introduce the race:
+
+> "busy_timeout is a connection-level setting that only governs *subsequent* statements (default busy handler is NULL → SQLITE_BUSY returns immediately), so it must precede the contending PRAGMAs. 15s is well within the 30s Stop hook timeout. createStore() resets to operational value (5000ms or opts.busyTimeout) after DDL completes."
+
+### Verification
+
+The change set was validated against two turns of GPT-5.5 high-reasoning adversarial code review (cumulative ~401K tokens) under `codex exec`, session `019e2aeb-7995-74d0-b3f3-bbd32567eec2`. Turn 1 verdict was APPROVED WITH MODIFICATIONS — zero High, one Medium (soften the readonly-branch comment from "takes a brief write lock" to "can contend when switching/initializing WAL state"), one Low (mention BOTH `agent_end` AND `before_reset` parallel Stop-hook fan-outs). Both modifications applied. Turn 2 cleared verbatim "**Zero remaining findings on the Issue #13 fix. Ship as is. Ready to tag v0.10.5.**" Turn 2 also independently verified the skill-forge mirror byte-identical via `cmp -s` on all four changed files.
+
+Test coverage: 3 new tests in `tests/integration/store-concurrent-init.test.ts` (NEW) + supporting `tests/helpers/concurrent-init-worker.ts` (NEW). Two source-text assertion gates (deterministic — catch the exact regression an accidental re-swap would introduce, anchored on the function body for `initializeDatabase` and on the `// Readonly:` comment marker for the readonly branch) plus one subprocess concurrent-init test (spawns 3 `bun run` worker processes against the same on-disk DB in `mkdtempSync(tmpdir())`, 60s timeout, asserts all 3 exit 0 without `SQLITE_BUSY` or "database is locked" in stderr).
+
+The subprocess test mirrors the actual production scenario more faithfully than an in-process `Promise.all` could — `bun:sqlite` `db.exec` is synchronous, so in-process "concurrent" calls serialize on the JS event loop and do not contend on the SQLite file lock. `:memory:` stores have no file-system lock at all and cannot reproduce this bug — that's why the pre-existing `tests/integration/store.test.ts` (which uses `:memory:` exclusively) missed the regression.
+
+Local run: `bun test tests/integration/store-concurrent-init.test.ts` reports 3 pass / 0 fail (18 expect() calls, 3.01s). `bun test tests/integration/store.test.ts` reports 33 pass / 0 fail (57 expect() calls, 496ms). No regressions.
+
+### Companion housekeeping — `src/openclaw/index.ts` doc-comment line-ref bump
+
+Bundled with the v0.10.5 ship is a doc-only update to `src/openclaw/index.ts` carrying line-ref drift from the OpenClaw upstream-delta survey run on 2026-05-14 (`upstream-delta-survey` skill, main HEAD `5bb23c2f95` → `25eef1203a`, 7091 commits in that window, non-breaking for ClawMem v0.10.x). Four doc-comment occurrences updated:
+
+- `attempt.ts:2610` → `attempt.ts:2973` — `before_prompt_build` await site (twice: backtick docstring at `:41`, inline comment at `:164`)
+- `attempt.ts:3379-3402` → `attempt.ts:3870-3892` — `agent_end` fire-and-forget block (twice: backtick docstring at `:40`, inline comment at `:178`)
+
+No runtime change. Standing "doc-line-refs ride the next release" pattern from prior cycles.
+
+### What didn't change
+
+- Retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, OpenClaw plugin registration shape (`kind: memory`), and Hermes plugin contract are all unchanged from v0.10.4.
+- §14.3 contextEngine→memory migration block in `CLAUDE.md` / `AGENTS.md` preserved verbatim.
+- No public API change; no config change; no env-var change; no schema migration.
+- The terminal `PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}` at the bottom of `createStore()` is preserved — for the writable branch it resets 15000 → 5000 after DDL; for the readonly branch it's a no-op rewrite to the same value (harmless, intentional simplicity).
+
+### Cross-references
+
+- Issue: https://github.com/yoloshii/ClawMem/issues/13 (@jcgau, first-time contributor)
+- Codex review session: `019e2aeb-7995-74d0-b3f3-bbd32567eec2` (Turn 1 APPROVED WITH MODIFICATIONS, Turn 2 zero remaining findings)
+- Parallel Stop-hook fan-out sites covered by this fix: `src/openclaw/engine.ts:449` (`handleAgentEnd`), `src/openclaw/engine.ts:576` (`handleBeforeReset`), `src/hermes/__init__.py:518` (Python thread fan-out)
+- Companion 2026-05-14 OpenClaw upstream-survey driving the doc-comment line-ref bump: `~/.claude/projects/-home-khitomer-Projects/memory/openclaw-v2026.4.x-analysis.md`
+
+---
+
 ## v0.10.4 — Profile-aware `setup openclaw` + `--help` short-circuit (issue #11)
 
 v0.10.4 fixes [yoloshii/ClawMem#11](https://github.com/yoloshii/ClawMem/issues/11). Two bugs reported by @elquercarlos:

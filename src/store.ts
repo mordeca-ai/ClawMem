@@ -298,13 +298,20 @@ if (process.platform === "darwin") {
 }
 
 function initializeDatabase(db: Database): void {
+  // Set busy_timeout FIRST so subsequent PRAGMAs (journal_mode in particular,
+  // which acquires a write lock when switching or initializing WAL state) wait
+  // instead of returning SQLITE_BUSY when concurrent Stop hooks
+  // (decision-extractor, handoff-generator, feedback-loop) — and the parallel
+  // before_reset hook fan-out in src/openclaw/engine.ts — open the DB
+  // simultaneously. busy_timeout is a connection-level setting that only
+  // governs *subsequent* statements (default busy handler is NULL → SQLITE_BUSY
+  // returns immediately), so it must precede the contending PRAGMAs. 15s is
+  // well within the 30s Stop hook timeout. createStore() resets to operational
+  // value (5000ms or opts.busyTimeout) after DDL completes. Issue #13.
+  db.exec("PRAGMA busy_timeout = 15000");
   sqliteVec.load(db);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
-  // Set generous busy_timeout during DDL — concurrent Stop hooks (decision-extractor,
-  // handoff-generator, feedback-loop) all run initializeDatabase simultaneously.
-  // 15s is well within the 30s Stop hook timeout. Reset to normal after DDL completes.
-  db.exec("PRAGMA busy_timeout = 15000");
 
   // Drop legacy tables that are now managed in YAML
   db.exec(`DROP TABLE IF EXISTS path_contexts`);
@@ -1123,13 +1130,20 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
   if (!opts?.readonly) {
     initializeDatabase(db);
   } else {
-    // Readonly: load sqlite-vec extension and set WAL mode pragma only
+    // Readonly: set busy_timeout FIRST so the journal_mode PRAGMA below
+    // doesn't race when concurrent processes open the DB. PRAGMA
+    // journal_mode=WAL can contend when switching or initializing WAL
+    // state, even on readonly handles. Public-API hardening — no
+    // production caller in this repo currently passes readonly:true,
+    // but the ordering invariant should hold regardless. Issue #13.
+    db.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
     sqliteVec.load(db);
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA query_only = ON");
   }
-  // Reset busy_timeout to operational value after DDL init (which uses 15s).
-  // Default 5000ms for normal operations — callers can override via opts.
+  // For the writable branch: initializeDatabase() set 15000 during DDL —
+  // reset to operational value here. For readonly: already set inside the
+  // branch above; this assignment is a no-op rewrite to the same value.
   db.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
 
   return {
