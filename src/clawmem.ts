@@ -69,7 +69,9 @@ import {
   writeSessionFocus,
   clearSessionFocus,
   focusFilePath,
+  resolveSessionTopic,
 } from "./session-focus.ts";
+import { computeCollectionScope, type CollectionScope } from "./collection-scope.ts";
 import {
   resolveExtensionsDirNoOpenClaw,
   printSetupOpenClawHelp,
@@ -694,6 +696,31 @@ async function cmdList(args: string[]) {
   console.log(`\n${rows.length} document${rows.length !== 1 ? "s" : ""} shown.`);
 }
 
+/**
+ * IO wrapper around computeCollectionScope (src/collection-scope.ts): gathers
+ * the configured collection names, resolves the session focus topic, and dies
+ * on an unknown -c name.
+ *
+ * Session id is resolved (for focus only) from the explicit --session-id arg,
+ * then CLAUDE_SESSION_ID (Claude Code exposes this), then CLAWMEM_SESSION_ID.
+ * Any missing id / unset focus is fail-open (unscoped).
+ */
+function resolveCollectionScope(
+  flag: string | undefined,
+  sessionIdArg: string | undefined,
+): CollectionScope | undefined {
+  const knownNames = collectionsList().map(c => c.name);
+  const sid =
+    (sessionIdArg?.trim() ||
+      process.env.CLAUDE_SESSION_ID ||
+      process.env.CLAWMEM_SESSION_ID ||
+      "").trim() || undefined;
+  const focus = resolveSessionTopic(sid, process.env.CLAWMEM_SESSION_FOCUS);
+  const result = computeCollectionScope(flag, focus, knownNames);
+  if (result && "error" in result) die(result.error);
+  return result ?? undefined;
+}
+
 async function cmdSearch(args: string[]) {
   const { values, positionals } = parseArgs({
     args,
@@ -713,7 +740,12 @@ async function cmdSearch(args: string[]) {
   const limit = parseInt(values.num!, 10);
   const minScore = parseFloat(values["min-score"]!);
 
-  const results = s.searchFTS(query, limit * 2);
+  const scope = resolveCollectionScope(values.collection, undefined);
+  if (scope && !values.json) {
+    console.log(`${c.dim}[scope: ${scope.collections.join(", ")}${scope.source === "focus" ? " — session focus" : ""}]${c.reset}`);
+  }
+
+  const results = s.searchFTS(query, limit * 2, undefined, scope?.collections);
   const enriched = enrichResults(s, results, query);
   const scored = applyCompositeScoring(enriched, query)
     .filter(r => r.compositeScore >= minScore)
@@ -752,7 +784,12 @@ async function cmdVsearch(args: string[]) {
   const limit = parseInt(values.num!, 10);
   const minScore = parseFloat(values["min-score"]!);
 
-  const results = await s.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2);
+  const scope = resolveCollectionScope(values.collection, undefined);
+  if (scope && !values.json) {
+    console.log(`${c.dim}[scope: ${scope.collections.join(", ")}${scope.source === "focus" ? " — session focus" : ""}]${c.reset}`);
+  }
+
+  const results = await s.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, scope?.collections);
   const enriched = enrichResults(s, results, query);
   const scored = applyCompositeScoring(enriched, query)
     .filter(r => r.compositeScore >= minScore)
@@ -793,8 +830,14 @@ async function cmdQuery(args: string[]) {
   const limit = parseInt(values.num!, 10);
   const minScore = parseFloat(values["min-score"]!);
 
+  const scope = resolveCollectionScope(values.collection, undefined);
+  if (scope && !values.json) {
+    console.log(`${c.dim}[scope: ${scope.collections.join(", ")}${scope.source === "focus" ? " — session focus" : ""}]${c.reset}`);
+  }
+  const scopeCols = scope?.collections;
+
   // Step 1: BM25 for strong signal check
-  const ftsResults = s.searchFTS(query, 20);
+  const ftsResults = s.searchFTS(query, 20, undefined, scopeCols);
   const topScore = ftsResults[0]?.score ?? 0;
   const secondScore = ftsResults[1]?.score ?? 0;
   const strongSignal = topScore >= 0.85 && (topScore - secondScore) >= 0.15;
@@ -822,16 +865,16 @@ async function cmdQuery(args: string[]) {
 
   // Original query BM25 + vec (weight 2x)
   allRanked.push({ results: ftsResults.map(toRanked), weight: 2 });
-  const vecResults = await s.searchVec(query, DEFAULT_EMBED_MODEL, 20);
+  const vecResults = await s.searchVec(query, DEFAULT_EMBED_MODEL, 20, undefined, scopeCols);
   allRanked.push({ results: vecResults.map(toRanked), weight: 2 });
 
   // Expanded queries (weight 1x)
   for (const eq of expandedQueries) {
     if (eq.type === "lex") {
-      const r = s.searchFTS(eq.text, 20);
+      const r = s.searchFTS(eq.text, 20, undefined, scopeCols);
       allRanked.push({ results: r.map(toRanked), weight: 1 });
     } else {
-      const r = await s.searchVec(eq.text, DEFAULT_EMBED_MODEL, 20);
+      const r = await s.searchVec(eq.text, DEFAULT_EMBED_MODEL, 20, undefined, scopeCols);
       allRanked.push({ results: r.map(toRanked), weight: 1 });
     }
   }
@@ -2986,9 +3029,12 @@ ${c.bold}Indexing:${c.reset}
   clawmem status                       Show index status
 
 ${c.bold}Search:${c.reset}
-  clawmem search <query> [-n N]        BM25 keyword search
-  clawmem vsearch <query> [-n N]       Vector similarity
-  clawmem query <query> [-n N]         Hybrid + rerank (best)
+  clawmem search <query> [-n N] [-c col[,col]]   BM25 keyword search
+  clawmem vsearch <query> [-n N] [-c col[,col]]  Vector similarity
+  clawmem query <query> [-n N] [-c col[,col]]    Hybrid + rerank (best)
+    -c/--collection fences retrieval to the named collection(s). Without it,
+    a session focus (clawmem focus set <collection>) auto-scopes to that
+    collection when the focus topic names one.
 
 ${c.bold}Memory:${c.reset}
   clawmem list [-n/--limit N] [-c col]  Browse recent documents (--json for machine output)
@@ -2996,7 +3042,7 @@ ${c.bold}Memory:${c.reset}
   clawmem log [--last N]               Session history
   clawmem profile                      Show user profile
   clawmem profile rebuild              Force profile rebuild
-  clawmem focus set <topic> [--session-id ID]   Set per-session focus topic (steers context-surfacing)
+  clawmem focus set <topic> [--session-id ID]   Set per-session focus topic (steers context-surfacing; auto-scopes retrieval when topic names a collection)
   clawmem focus show [--session-id ID]          Show current focus topic
   clawmem focus clear [--session-id ID]         Clear focus topic
 
