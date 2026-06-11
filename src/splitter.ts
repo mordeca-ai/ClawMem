@@ -25,7 +25,8 @@ export interface Fragment {
 import { MAX_FRAGMENTS_PER_DOC, MAX_SPLITTER_INPUT_CHARS } from "./limits.ts";
 
 const MIN_FRAGMENT_CHARS = 50;
-const MAX_FRAGMENT_CHARS = 2000;
+export const MAX_FRAGMENT_CHARS = 2000;
+const FRAGMENT_OVERLAP_CHARS = 200;
 const MIN_DOC_CHARS_FOR_SPLIT = 200;
 
 // =============================================================================
@@ -140,12 +141,7 @@ function extractSections(lines: string[]): Fragment[] {
       if (currentHeading !== null && currentLines.length > 0) {
         const content = currentLines.join('\n').trim();
         if (content.length >= MIN_FRAGMENT_CHARS) {
-          sections.push({
-            type: 'section',
-            label: currentHeading,
-            content: maybeSplitLarge(content),
-            startLine: currentStartLine,
-          });
+          pushChunked(sections, 'section', currentHeading, content, currentStartLine);
         }
       }
 
@@ -161,12 +157,7 @@ function extractSections(lines: string[]): Fragment[] {
   if (currentHeading !== null && currentLines.length > 0) {
     const content = currentLines.join('\n').trim();
     if (content.length >= MIN_FRAGMENT_CHARS) {
-      sections.push({
-        type: 'section',
-        label: currentHeading,
-        content: maybeSplitLarge(content),
-        startLine: currentStartLine,
-      });
+      pushChunked(sections, 'section', currentHeading, content, currentStartLine);
     }
   }
 
@@ -195,12 +186,7 @@ function extractLists(lines: string[]): Fragment[] {
       if (currentList.length >= 2) {
         const content = currentList.join('\n').trim();
         if (content.length >= MIN_FRAGMENT_CHARS) {
-          lists.push({
-            type: 'list',
-            label: null,
-            content: maybeSplitLarge(content),
-            startLine: listStartLine,
-          });
+          pushChunked(lists, 'list', null, content, listStartLine);
         }
       }
       currentList = [];
@@ -211,12 +197,7 @@ function extractLists(lines: string[]): Fragment[] {
   if (currentList.length >= 2) {
     const content = currentList.join('\n').trim();
     if (content.length >= MIN_FRAGMENT_CHARS) {
-      lists.push({
-        type: 'list',
-        label: null,
-        content: maybeSplitLarge(content),
-        startLine: listStartLine,
-      });
+      pushChunked(lists, 'list', null, content, listStartLine);
     }
   }
 
@@ -246,12 +227,7 @@ function extractCodeBlocks(lines: string[]): Fragment[] {
       blockLines.push(line);
       const content = blockLines.join('\n').trim();
       if (content.length >= MIN_FRAGMENT_CHARS) {
-        blocks.push({
-          type: 'code',
-          label: blockLang,
-          content: maybeSplitLarge(content),
-          startLine: blockStartLine,
-        });
+        pushChunked(blocks, 'code', blockLang, content, blockStartLine);
       }
       inBlock = false;
       blockLines = [];
@@ -303,23 +279,75 @@ function extractFrontmatter(fm: Record<string, any>): Fragment[] {
 // =============================================================================
 
 /**
- * If content exceeds MAX_FRAGMENT_CHARS, truncate at a paragraph boundary.
+ * Split content that exceeds MAX_FRAGMENT_CHARS into multiple chunks at
+ * paragraph/line boundaries, with FRAGMENT_OVERLAP_CHARS of overlap between
+ * consecutive chunks.
+ *
+ * Previously this truncated to a single MAX_FRAGMENT_CHARS chunk, which left
+ * everything past the cap UNEMBEDDED — for large reference sections (e.g. a
+ * frame-data movelist) most of the content had no vector at all, so vector
+ * search could never surface it. Splitting keeps full coverage.
  */
-function maybeSplitLarge(content: string): string {
-  if (content.length <= MAX_FRAGMENT_CHARS) return content;
+function splitLargeContent(content: string): string[] {
+  if (content.length <= MAX_FRAGMENT_CHARS) return [content];
 
-  // Try to split at paragraph boundary
-  const paragraphBreak = content.lastIndexOf('\n\n', MAX_FRAGMENT_CHARS);
-  if (paragraphBreak > MAX_FRAGMENT_CHARS * 0.5) {
-    return content.slice(0, paragraphBreak);
+  const chunks: string[] = [];
+  let pos = 0;
+  while (pos < content.length) {
+    let end = Math.min(pos + MAX_FRAGMENT_CHARS, content.length);
+    if (end < content.length) {
+      // Prefer paragraph boundary, then line boundary, inside the window.
+      const paragraphBreak = content.lastIndexOf('\n\n', end);
+      if (paragraphBreak > pos + MAX_FRAGMENT_CHARS * 0.5) {
+        end = paragraphBreak;
+      } else {
+        const lineBreak = content.lastIndexOf('\n', end);
+        if (lineBreak > pos + MAX_FRAGMENT_CHARS * 0.5) {
+          end = lineBreak;
+        }
+      }
+    }
+    const chunk = content.slice(pos, end).trim();
+    if (chunk.length >= MIN_FRAGMENT_CHARS) chunks.push(chunk);
+    if (end >= content.length) break;
+    // Overlap so boundary-straddling facts appear whole in one chunk.
+    pos = Math.max(pos + 1, end - FRAGMENT_OVERLAP_CHARS);
   }
+  return chunks;
+}
 
-  // Fall back to line boundary
-  const lineBreak = content.lastIndexOf('\n', MAX_FRAGMENT_CHARS);
-  if (lineBreak > MAX_FRAGMENT_CHARS * 0.5) {
-    return content.slice(0, lineBreak);
+/**
+ * Push one fragment per chunk of (possibly large) content. Multi-chunk
+ * fragments get "(i/n)" suffixed labels; startLine is approximated for
+ * continuation chunks by counting newlines.
+ */
+function pushChunked(
+  out: Fragment[],
+  type: Fragment['type'],
+  label: string | null,
+  content: string,
+  startLine: number,
+): void {
+  const chunks = splitLargeContent(content);
+  for (let i = 0; i < chunks.length; i++) {
+    const chunkLabel = chunks.length > 1
+      ? `${label ?? ''}${label ? ' ' : ''}(${i + 1}/${chunks.length})`.trim()
+      : label;
+    const offset = i === 0 ? 0 : countLines(content, content.indexOf(chunks[i]!));
+    out.push({
+      type,
+      label: chunkLabel || null,
+      content: chunks[i]!,
+      startLine: startLine + offset,
+    });
   }
+}
 
-  // Hard truncate
-  return content.slice(0, MAX_FRAGMENT_CHARS);
+function countLines(text: string, until: number): number {
+  if (until <= 0) return 0;
+  let n = 0;
+  for (let i = 0; i < until && i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) n++;
+  }
+  return n;
 }
