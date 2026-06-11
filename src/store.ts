@@ -3094,11 +3094,32 @@ export function tokenizeForFTS5(query: string): string[] {
   return query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(t => t.length > 0);
 }
 
-function buildFTS5Query(query: string): string | null {
-  const terms = tokenizeForFTS5(query);
+function buildAndGroup(text: string): string | null {
+  const terms = tokenizeForFTS5(text);
   if (terms.length === 0) return null;
   if (terms.length === 1) return `"${terms[0]}"*`;
   return terms.map(t => `"${t}"*`).join(' AND ');
+}
+
+export function buildFTS5Query(query: string): string | null {
+  // Uppercase OR between terms is a user-level operator (FTS5 convention).
+  // Previously it was lowercased and AND-joined as a literal term —
+  // `cocoa OR frosting` became `"cocoa"* AND "or"* AND "frosting"*`, which
+  // only matched docs containing an or-prefixed token ("oregano" made
+  // `ancho OR butter` appear to work while `cocoa OR frosting` returned
+  // nothing). Lowercase "or" stays a plain term: natural-language queries
+  // keep their old semantics.
+  const groups = query.split(/\s+OR\s+/);
+  if (groups.length > 1) {
+    const parts: string[] = [];
+    for (const g of groups) {
+      const expr = buildAndGroup(g);
+      if (expr) parts.push(expr.includes(' AND ') ? `(${expr})` : expr);
+    }
+    if (parts.length === 0) return null;
+    return parts.join(' OR ');
+  }
+  return buildAndGroup(query);
 }
 
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): SearchResult[] {
