@@ -4,6 +4,120 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.7 — Hermes plugin: refresh session-derived state on `on_session_switch`
+
+v0.10.7 implements the `MemoryProvider.on_session_switch` hook in the Hermes plugin (`src/hermes/__init__.py`). Hermes Agent (v2026.5.16) wired this lifecycle hook to fire on `/new` (reset=True), `/resume`, `/branch`, and context compression — any mid-process `session_id` rotation that does not tear the provider down. ClawMem previously did not override it (the ABC default is a no-op), so after a switch the plugin kept using the `session_id` it cached at `initialize()`: extraction and handoff metadata carried the stale id, and the session-keyed transcript file (`{session_id}.jsonl`) kept collecting the new session's turns under the old name.
+
+The override repoints the cached `_session_id`, rebuilds `_transcript_path` for the new session, and **unconditionally** invalidates the prior session's prefetch + bootstrap caches so a recall queued under the old session cannot surface in the new one. To stay race-free with the background prefetch worker, `queue_prefetch` now snapshots the session id and transcript path under the prefetch lock at queue time (the worker uses the snapshot, never live state), and the switch bumps the prefetch generation monotonically so an in-flight worker discards its result instead of writing it into the new session. Retrieval is unaffected — the vault is path-keyed, not session-keyed — so this is metadata/transcript correctness, not a recall change.
+
+### Verification
+
+Validated across three turns of GPT-5.5 high-reasoning adversarial review under `codex exec`, session `019e46bc-0848-7540-a1ce-913000112da1`. Turn 1 (design) returned no-ship-as-written and caught two real bugs in the initial design — a reset-gated prefetch leak (stale recall crossing into `/resume` and `/branch` sessions) and an ABA race from resetting the prefetch generation to zero — and prescribed the snapshot-at-queue-time fix. Turn 2 verified the implemented design against a standalone behavioral test covering the switch / reset / compression / prefetch-race paths → verbatim "zero remaining design findings — can ship." Turn 3 re-cleared a final added assertion.
+
+### What didn't change
+
+- Retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, OpenClaw plugin registration, and the Claude Code hook path are all unchanged from v0.10.6.
+- No reindex, no schema migration, no public API change, no config or env-var change. Pure `bun add -g clawmem` upgrade.
+
+## v0.10.6 — FTS keyword-search tokenization: split separators instead of stripping them
+
+v0.10.6 fixes an internally-found bug in the BM25 keyword-search path: the query builder silently returned **zero rows for any compound / path / snake_case / dotted / hyphenated query** — exactly the config-name, hook-name, filename, and identifier searches the system is meant to serve.
+
+`src/store.ts:sanitizeFTS5Term()` removed every non-alphanumeric character from each whitespace token, which **concatenated** separator-delimited word-parts into a token that was never indexed. The FTS index (`documents_fts`, `tokenize='porter unicode61'`) does the opposite — it **splits** stored text on `_ - . / '` and all punctuation. So query and index tokenization disagreed:
+
+- `before_compaction` → `beforecompaction` → `MATCH "beforecompaction"*` → **0 rows** (the index holds `before` and `compaction` as separate tokens)
+- `src/store.ts` → `srcstorets` → **0 rows**; `q4_k_m`/`v0.8.2` → `q4km`/`v082` → **0 rows**
+
+Vector recall partially masked this in the hybrid `query` path, but pure `search` (BM25-only) and the raw file-path supplemental lookup in `context-surfacing` returned nothing. CLAUDE.md, AGENTS.md, and SKILL.md already documented "code identifiers work" — this release makes the implementation match that promise.
+
+Vault on disk is unchanged. **No reindex required** — a query-build change only, so it fixes every existing vault the moment you upgrade. No schema migration, no env-var change, no public API change. Pure `bun add -g clawmem` upgrade.
+
+### The fix — split, don't strip
+
+`sanitizeFTS5Term` is replaced by `tokenizeForFTS5`, which splits on the same boundaries the index tokenizer uses:
+
+```ts
+export function tokenizeForFTS5(query: string): string[] {
+  return query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(t => t.length > 0);
+}
+```
+
+`buildFTS5Query` keeps the existing AND-of-prefixes semantics (`"before"* AND "compaction"*`). One-character tokens are kept (needed for `q4_k_m`, `v0.8.2`, `a/b`); AND makes them a precision constraint, not noise. The split regex consumes every FTS5 syntax character, so each surviving token is alphanumeric and quoted — at least as injection-safe as the prior strip approach.
+
+### Entity FTS — exact-first candidate gathering
+
+The same `tokenizeForFTS5` is shared with the two `entities_fts` MATCH builders (`src/entity.ts`). Adversarial review surfaced that a naïve prefix query there starves short exact names: `entities_fts` applies its `LIMIT` **before** the Levenshtein / mention-count ranking, so a broad prefix (`"go"*` matching 30 `Golang*` rows, or `"c"*` for `C++`) fills the candidate pool and drops the exact row before it can be ranked. `resolveEntityCanonical` and `searchEntities` now gather **exact-token matches first**, then top up with deduped prefix matches only while under the limit (`gatherEntityFTSCandidates`). The exact row is always present for ranking; multi-char prefix recall (`clawme`* → `clawmem`) is preserved as a supplement.
+
+### Verification
+
+Validated across four turns of GPT-5.5 high-reasoning adversarial review under `codex exec`, session `019e4595-43b3-7b40-b8a0-bc684f22e2e6`. Turn 1 cleared the approach; Turn 2 confirmed the `documents_fts` fix correct + injection-safe but **caught the entity prefix-starvation regression**; Turn 3 rejected a 1-char-only band-aid (the same starvation hit short multi-char names like `Go`); Turn 4 cleared the exact-first fix verbatim "**zero remaining findings**" after re-running the repros (`C++` resolves, `Go` resolves, `clawme`→`ClawMem` recall holds).
+
+Test coverage: 8 new bug-first tests in `tests/integration/store-search.test.ts` (compound, non-adjacent AND, slash-path via the filepath column, 1-char tokens, apostrophe behavior-lock, FTS5-specials no-throw, punctuation-only → empty) + 4 entity starvation regression tests in `tests/unit/entity.test.ts` (`C++` and `Go`, each across `resolveEntityCanonical` and `searchEntities`). Five of the store tests fail on the pre-fix code; all pass after. Full suite: 1298 pass / 0 fail. `tsc --noEmit` clean for the changed files.
+
+### What didn't change
+
+- Retrieval pipeline shape, composite scoring, vault format, hook set, agent tool surface, OpenClaw plugin registration (`kind: memory`), and the Hermes plugin contract are all unchanged from v0.10.5.
+- No reindex, no schema migration, no public API change, no config or env-var change.
+- The `store ⇄ entity` import added for the shared tokenizer is runtime-safe (hoisted `function` declaration, called only at runtime).
+
+### Cross-references
+
+- Codex review session: `019e4595-43b3-7b40-b8a0-bc684f22e2e6` (4 turns; T2 caught the entity regression, T4 zero remaining findings)
+- Primary surfaces: `src/store.ts` (`tokenizeForFTS5`, `buildFTS5Query`), `src/entity.ts` (`gatherEntityFTSCandidates`, both `entities_fts` sites)
+
+---
+
+## v0.10.5 — Issue #13: SQLite PRAGMA ordering race fix + openclaw doc-comment line-ref bump
+
+v0.10.5 fixes [yoloshii/ClawMem#13](https://github.com/yoloshii/ClawMem/issues/13). One bug reported by @jcgau (first-time contributor):
+
+`src/store.ts:initializeDatabase()` set `PRAGMA busy_timeout = 15000` AFTER `PRAGMA journal_mode = WAL`. Because `busy_timeout` is a connection-level setting that only governs *subsequent* statements (default busy callback is NULL → `SQLITE_BUSY` returns immediately), the busy handler was not active when the first contending statement ran. When concurrent Stop-hook subprocesses (`decision-extractor`, `handoff-generator`, `feedback-loop`) opened the same SQLite file in parallel — both from OpenClaw's `agent_end` plugin-hook fan-out (`src/openclaw/engine.ts:449`) and from `before_reset` (`src/openclaw/engine.ts:576`), plus the Hermes `MemoryProvider.on_session_end` thread fan-out (`src/hermes/__init__.py:518`) — the first subprocess to acquire the journal-mode write lock succeeded and the rest returned `SQLITE_BUSY` immediately. Under the reporter's typical load (~48 heartbeat turns/day in their OpenClaw setup), two of three hooks failed per turn, silently dropping decision-extraction / handoff-generation / feedback-loop work for the losing subprocesses.
+
+Vault on disk is byte-identical to v0.10.4. No schema migration. No env-var change. No public API change. Pure `bun add -g clawmem` upgrade.
+
+### The fix — one-line ordering swap, applied to two sites
+
+`src/store.ts:initializeDatabase()` (writable init path) and `src/store.ts:createStore()` readonly branch both now set `busy_timeout` as the **first** statement on the connection, before `sqliteVec.load()`, `PRAGMA journal_mode = WAL`, and any DDL. The writable path uses 15000ms during DDL (well within the 30s Stop hook timeout); the terminal `createStore()` statement resets to operational 5000ms (or `opts.busyTimeout`) after DDL completes. The readonly branch is also hardened against the same race — public-API hardening, since no in-tree production caller currently passes `readonly: true`, but the ordering invariant should hold regardless.
+
+The docstring in `initializeDatabase()` carries the rationale durably so a future refactor can't quietly re-introduce the race:
+
+> "busy_timeout is a connection-level setting that only governs *subsequent* statements (default busy handler is NULL → SQLITE_BUSY returns immediately), so it must precede the contending PRAGMAs. 15s is well within the 30s Stop hook timeout. createStore() resets to operational value (5000ms or opts.busyTimeout) after DDL completes."
+
+### Verification
+
+The change set was validated against two turns of GPT-5.5 high-reasoning adversarial code review (cumulative ~401K tokens) under `codex exec`, session `019e2aeb-7995-74d0-b3f3-bbd32567eec2`. Turn 1 verdict was APPROVED WITH MODIFICATIONS — zero High, one Medium (soften the readonly-branch comment from "takes a brief write lock" to "can contend when switching/initializing WAL state"), one Low (mention BOTH `agent_end` AND `before_reset` parallel Stop-hook fan-outs). Both modifications applied. Turn 2 cleared verbatim "**Zero remaining findings on the Issue #13 fix. Ship as is. Ready to tag v0.10.5.**" Turn 2 also independently verified the skill-forge mirror byte-identical via `cmp -s` on all four changed files.
+
+Test coverage: 3 new tests in `tests/integration/store-concurrent-init.test.ts` (NEW) + supporting `tests/helpers/concurrent-init-worker.ts` (NEW). Two source-text assertion gates (deterministic — catch the exact regression an accidental re-swap would introduce, anchored on the function body for `initializeDatabase` and on the `// Readonly:` comment marker for the readonly branch) plus one subprocess concurrent-init test (spawns 3 `bun run` worker processes against the same on-disk DB in `mkdtempSync(tmpdir())`, 60s timeout, asserts all 3 exit 0 without `SQLITE_BUSY` or "database is locked" in stderr).
+
+The subprocess test mirrors the actual production scenario more faithfully than an in-process `Promise.all` could — `bun:sqlite` `db.exec` is synchronous, so in-process "concurrent" calls serialize on the JS event loop and do not contend on the SQLite file lock. `:memory:` stores have no file-system lock at all and cannot reproduce this bug — that's why the pre-existing `tests/integration/store.test.ts` (which uses `:memory:` exclusively) missed the regression.
+
+Local run: `bun test tests/integration/store-concurrent-init.test.ts` reports 3 pass / 0 fail (18 expect() calls, 3.01s). `bun test tests/integration/store.test.ts` reports 33 pass / 0 fail (57 expect() calls, 496ms). No regressions.
+
+### Companion housekeeping — `src/openclaw/index.ts` doc-comment line-ref bump
+
+Bundled with the v0.10.5 ship is a doc-only update to `src/openclaw/index.ts` carrying line-ref drift from the OpenClaw upstream-delta survey run on 2026-05-14 (`upstream-delta-survey` skill, main HEAD `5bb23c2f95` → `25eef1203a`, 7091 commits in that window, non-breaking for ClawMem v0.10.x). Four doc-comment occurrences updated:
+
+- `attempt.ts:2610` → `attempt.ts:2973` — `before_prompt_build` await site (twice: backtick docstring at `:41`, inline comment at `:164`)
+- `attempt.ts:3379-3402` → `attempt.ts:3870-3892` — `agent_end` fire-and-forget block (twice: backtick docstring at `:40`, inline comment at `:178`)
+
+No runtime change. Standing "doc-line-refs ride the next release" pattern from prior cycles.
+
+### What didn't change
+
+- Retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, OpenClaw plugin registration shape (`kind: memory`), and Hermes plugin contract are all unchanged from v0.10.4.
+- §14.3 contextEngine→memory migration block in `CLAUDE.md` / `AGENTS.md` preserved verbatim.
+- No public API change; no config change; no env-var change; no schema migration.
+- The terminal `PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}` at the bottom of `createStore()` is preserved — for the writable branch it resets 15000 → 5000 after DDL; for the readonly branch it's a no-op rewrite to the same value (harmless, intentional simplicity).
+
+### Cross-references
+
+- Issue: https://github.com/yoloshii/ClawMem/issues/13 (@jcgau, first-time contributor)
+- Codex review session: `019e2aeb-7995-74d0-b3f3-bbd32567eec2` (Turn 1 APPROVED WITH MODIFICATIONS, Turn 2 zero remaining findings)
+- Parallel Stop-hook fan-out sites covered by this fix: `src/openclaw/engine.ts:449` (`handleAgentEnd`), `src/openclaw/engine.ts:576` (`handleBeforeReset`), `src/hermes/__init__.py:518` (Python thread fan-out)
+- Companion 2026-05-14 OpenClaw upstream-survey driving the doc-comment line-ref bump: `~/.claude/projects/-home-khitomer-Projects/memory/openclaw-v2026.4.x-analysis.md`
+
+---
+
 ## v0.10.4 — Profile-aware `setup openclaw` + `--help` short-circuit (issue #11)
 
 v0.10.4 fixes [yoloshii/ClawMem#11](https://github.com/yoloshii/ClawMem/issues/11). Two bugs reported by @elquercarlos:
