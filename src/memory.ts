@@ -5,6 +5,8 @@
  * that overlays on top of QMD's raw search results.
  */
 
+import { MAX_FRAGMENT_CHARS } from "./splitter.ts";
+
 // =============================================================================
 // Content Type Half-Lives (days until score drops to 50%)
 // =============================================================================
@@ -278,7 +280,16 @@ export function applyCompositeScoring(
 
     // Length normalization: penalize verbose entries that dominate via keyword density
     // anchor=500 chars. At anchor → 1.0x, 1000 → 0.75x, 2000 → 0.57x. Never boosts short docs.
-    const lenRatio = Math.log2(Math.max((r.bodyLength || 500) / 500, 1));
+    // For VECTOR hits on a non-full fragment, the similarity was computed against a
+    // bounded fragment (≤ MAX_FRAGMENT_CHARS), not the whole document — penalizing by
+    // whole-doc length buries large reference docs (movelists, frame-data tables)
+    // behind short hub docs even when the fragment match is far stronger. Cap the
+    // effective length at the fragment bound in that case.
+    const isFragmentVecHit = r.source === "vec" && !!r.fragmentType && r.fragmentType !== "full";
+    const effectiveLength = isFragmentVecHit
+      ? Math.min(r.bodyLength || 500, MAX_FRAGMENT_CHARS)
+      : (r.bodyLength || 500);
+    const lenRatio = Math.log2(Math.max(effectiveLength / 500, 1));
     const lenFactor = 1 / (1 + 0.5 * lenRatio);
     adjusted = Math.max(adjusted * 0.3, adjusted * lenFactor);
 
