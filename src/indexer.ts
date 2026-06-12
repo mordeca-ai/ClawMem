@@ -58,7 +58,11 @@ export const EXCLUDED_DIRS = new Set([
 
 export function shouldExclude(relativePath: string): boolean {
   const segments = relativePath.split("/");
-  return segments.some(s => EXCLUDED_DIRS.has(s) || (s.startsWith(".") && s !== "."));
+  // Leading "_" = out-of-default-scope convention (master-harness ADR-0071:
+  // _superseded/, _quarantine/, _reviews/ archive dirs must never be indexed).
+  return segments.some(
+    s => EXCLUDED_DIRS.has(s) || (s.startsWith(".") && s !== ".") || s.startsWith("_")
+  );
 }
 
 // =============================================================================

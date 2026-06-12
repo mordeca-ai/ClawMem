@@ -27,6 +27,13 @@ describe("shouldExclude", () => {
     expect(shouldExclude("_PRIVATE/notes.md")).toBe(true);
   });
 
+  it("excludes underscore-prefixed dirs at any depth (ADR-0071 out-of-scope convention)", () => {
+    expect(shouldExclude("_superseded/0024-old-decision.md")).toBe(true);
+    expect(shouldExclude("synthesis/_superseded/voice-plan.md")).toBe(true);
+    expect(shouldExclude("recipes/_quarantine/bad-doc.md")).toBe(true);
+    expect(shouldExclude("_inbox/README.md")).toBe(true);
+  });
+
   it("excludes hidden directories (dot-prefixed)", () => {
     expect(shouldExclude(".hidden/file.md")).toBe(true);
     expect(shouldExclude("path/.secret/file.md")).toBe(true);
