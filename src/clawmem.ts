@@ -836,8 +836,15 @@ async function cmdQuery(args: string[]) {
   }
   const scopeCols = scope?.collections;
 
+  // Budget-aware retrieval pool (73tb.23): the per-arm pre-fusion fetch must scale with the
+  // requested `limit`, mirroring vsearch's `limit*2` oversample, so gold at vector-rank
+  // limit-1..limit*2 can enter fusion instead of being capped out at a hardcoded 20.
+  // RERANK_CAP floors small `-n` at 30 so low-k queries keep a usable candidate pool.
+  const RERANK_CAP = Math.max(limit, 30);
+  const POOL = RERANK_CAP * 2;
+
   // Step 1: BM25 for strong signal check
-  const ftsResults = s.searchFTS(query, 20, undefined, scopeCols);
+  const ftsResults = s.searchFTS(query, POOL, undefined, scopeCols);
   const topScore = ftsResults[0]?.score ?? 0;
   const secondScore = ftsResults[1]?.score ?? 0;
   const strongSignal = topScore >= 0.85 && (topScore - secondScore) >= 0.15;
@@ -865,16 +872,16 @@ async function cmdQuery(args: string[]) {
 
   // Original query BM25 + vec (weight 2x)
   allRanked.push({ results: ftsResults.map(toRanked), weight: 2 });
-  const vecResults = await s.searchVec(query, DEFAULT_EMBED_MODEL, 20, undefined, scopeCols);
+  const vecResults = await s.searchVec(query, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols);
   allRanked.push({ results: vecResults.map(toRanked), weight: 2 });
 
   // Expanded queries (weight 1x)
   for (const eq of expandedQueries) {
     if (eq.type === "lex") {
-      const r = s.searchFTS(eq.text, 20, undefined, scopeCols);
+      const r = s.searchFTS(eq.text, POOL, undefined, scopeCols);
       allRanked.push({ results: r.map(toRanked), weight: 1 });
     } else {
-      const r = await s.searchVec(eq.text, DEFAULT_EMBED_MODEL, 20, undefined, scopeCols);
+      const r = await s.searchVec(eq.text, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols);
       allRanked.push({ results: r.map(toRanked), weight: 1 });
     }
   }
@@ -886,8 +893,8 @@ async function cmdQuery(args: string[]) {
     60
   );
 
-  // Step 5: Take top 30 for reranking
-  const candidates = rrfResults.slice(0, 30);
+  // Step 5: Take top candidates for reranking (73tb.23: scale with the requested budget)
+  const candidates = rrfResults.slice(0, RERANK_CAP);
 
   // Step 6: Rerank
   let reranked: { file: string; score: number }[] = [];
