@@ -1073,14 +1073,13 @@ export class LlamaCpp implements LLM {
   }
 
   private async expandQueryRemote(query: string, includeLexical: boolean, context?: string, intent?: string): Promise<Queryable[]> {
-    const prompt = `Rewrite this search query for better retrieval. Output lines in format "type: text" where type is lex, vec, or hyde.
-- lex: keyword search terms (1-3 lines)
-- vec: semantic search queries (1-3 lines)
-- hyde: hypothetical document passage that answers the query (1 line)
-
-Query: ${query}${intent ? `\nQuery intent: ${intent}` : ""}${context ? `\nContext: ${context}` : ""}
-
-Output:`;
+    // 73tb.24: the remote expansion model (hf.co/tobil/qmd-query-expansion-1.7B-gguf) is a
+    // SPECIALIZED fine-tune trained on its own prompt format — it echoes/ignores the elaborate
+    // instruction prompt the local GBNF-grammar path uses. Send its documented trained prompt so
+    // it emits parseable lex:/vec:/hyde: lines in-domain (verified: 2.7s vs ~8s local). General
+    // substitute models were rejected (hallucinated out-of-domain expansions). The lex/vec/hyde
+    // parser + graceful passthrough fallback below are unchanged.
+    const prompt = `/no_think Expand this search query: ${query}`;
 
     const result = await this.generateRemote(prompt, 500, 0.7);
     if (!result?.text) {
