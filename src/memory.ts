@@ -6,6 +6,13 @@
  */
 
 import { MAX_FRAGMENT_CHARS } from "./splitter.ts";
+import { getUnpromotedObservationWeight } from "./config.ts";
+
+// Collections that are, by their nature, agent-generated observation streams.
+// Part of the is_agent_generated_observation provenance proxy (ADR-0112 inv.3 /
+// master-harness-4vhh) — clawmem has no `agent_generated` column, so observation
+// provenance is inferred from content_type / observation_type / collection.
+const OBSERVATION_COLLECTIONS = new Set(["episodic", "episodic-handoffs"]);
 
 // =============================================================================
 // Content Type Half-Lives (days until score drops to 50%)
@@ -234,6 +241,10 @@ export type EnrichedResult = {
   confidence: number;
   qualityScore: number;
   pinned: boolean;
+  /** Provenance: observation classifier (NULL for non-observation docs). ADR-0112 inv.3. */
+  observationType?: string | null;
+  /** Provenance: invalidation tombstone (NULL = live). ADR-0112 inv.3. */
+  invalidatedAt?: string | null;
   context: string | null;
   hash: string;
   docid: string;
@@ -284,6 +295,10 @@ export function applyCompositeScoring(
   const weights = hasRecencyIntent(query) ? RECENCY_WEIGHTS : DEFAULT_WEIGHTS;
   const now = new Date();
 
+  // ADR-0112 invariant 3 (master-harness-4vhh): read the un-promoted-observation
+  // down-weight once per scoring pass (env-driven; default 0.5). 1.0 = disabled.
+  const unpromotedObsWeight = getUnpromotedObservationWeight();
+
   const scored = results.map(r => {
     const recency = recencyScore(r.modifiedAt, r.contentType, now, r.accessCount, r.lastAccessedAt);
     const computed = confidenceScore(r.contentType, r.modifiedAt, r.accessCount, now, r.lastAccessedAt);
@@ -327,6 +342,30 @@ export function applyCompositeScoring(
     // Pin boost: +0.3 additive, capped at 1.0
     if (r.pinned) {
       adjusted = Math.min(1.0, adjusted + 0.3);
+    }
+
+    // Un-promoted-observation down-weight (ADR-0112 invariant 3, master-harness-4vhh).
+    // Closes the self-reinforcing-error entry point: an agent_generated observation
+    // that was never promoted (pinned) is a rank PENALTY, not a hard exclude — so a
+    // later-promoted observation stays discoverable, an un-promoted one is buried.
+    // Mirror of the pin boost above: promotion (pinned) is the is_promoted signal, so
+    // a pinned observation never reaches this branch and keeps its boost intact.
+    //
+    // is_agent_generated_observation := provenance proxy (no agent_generated column):
+    //   content_type = 'observation' OR observation_type IS NOT NULL
+    //   OR collection IN ('episodic','episodic-handoffs')
+    // penalize WHEN is_agent_generated_observation AND NOT pinned AND active=1
+    //   AND invalidated_at IS NULL  (active=1 holds by construction — enrichResults
+    //   only joins active rows; an invalidated observation is left alone, not buried).
+    if (unpromotedObsWeight < 1 && !r.pinned) {
+      const isAgentObservation =
+        r.contentType === "observation" ||
+        (r.observationType != null && r.observationType !== "") ||
+        OBSERVATION_COLLECTIONS.has(r.collectionName);
+      const isInvalidated = r.invalidatedAt != null && r.invalidatedAt !== "";
+      if (isAgentObservation && !isInvalidated) {
+        adjusted *= unpromotedObsWeight;
+      }
     }
 
     return { ...r, compositeScore: adjusted, recencyScore: recency };

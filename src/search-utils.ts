@@ -14,6 +14,12 @@ import type { EnrichedResult } from "./memory.ts";
 /**
  * Join search results with SAME metadata from the documents table.
  * Adds content_type, modified_at, access_count, confidence to each result.
+ *
+ * Also surfaces the provenance columns needed by the un-promoted-observation
+ * down-weight (ADR-0112 inv.3 / master-harness-4vhh): observation_type and
+ * invalidated_at. The WHERE clause already pins active = 1, so any enriched row
+ * satisfies the predicate's `active = 1` term by construction; collection is
+ * available via the spread `collectionName`.
  */
 export function enrichResults(
   store: Store,
@@ -22,8 +28,8 @@ export function enrichResults(
 ): EnrichedResult[] {
   return results.map(r => {
     const row = store.db.prepare(`
-      SELECT content_type, modified_at, access_count, confidence, domain, workstream, tags,
-             quality_score, pinned, last_accessed_at, duplicate_count, revision_count
+      SELECT content_type, observation_type, modified_at, access_count, confidence, domain, workstream, tags,
+             quality_score, pinned, last_accessed_at, duplicate_count, revision_count, invalidated_at
       FROM documents
       WHERE active = 1 AND (collection || '/' || path) = ?
       LIMIT 1
@@ -32,6 +38,8 @@ export function enrichResults(
     return {
       ...r,
       contentType: row?.content_type ?? "note",
+      observationType: row?.observation_type ?? null,
+      invalidatedAt: row?.invalidated_at ?? null,
       modifiedAt: row?.modified_at ?? r.modifiedAt,
       accessCount: row?.access_count ?? 0,
       confidence: row?.confidence ?? 0.5,
