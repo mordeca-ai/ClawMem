@@ -108,6 +108,34 @@ export function getActiveProfile(): ProfileConfig {
   return PROFILES[profileName] || PROFILES.balanced;
 }
 
+/**
+ * Ranking down-weight for un-promoted agent-generated observations.
+ *
+ * ADR-0112 invariant 3 (master-harness-4vhh): at retrieval/ranking time, an
+ * agent_generated observation that was NEVER promoted is a self-reinforcing-error
+ * entry point — the agent's own un-vetted note can rank into recall and feed the
+ * next observation. We close that entry point with a rank PENALTY, not a hard
+ * exclude: a later-promoted (pinned) observation stays fully discoverable, and an
+ * un-promoted one is merely down-ranked, not erased.
+ *
+ * The returned value is a multiplier applied to the FINAL composite score (see
+ * applyCompositeScoring in memory.ts, adjacent to the pin boost). Tunable via
+ * CLAWMEM_UNPROMOTED_OBSERVATION_WEIGHT; conservative default 0.5 (halve the
+ * score). Clamped to (0, 1]:
+ *   1.0  → feature off (no penalty)
+ *   0.5  → default (halve the score)
+ *   →0   → stronger penalty, floored just above 0 (penalty, never hard-exclude)
+ */
+export function getUnpromotedObservationWeight(): number {
+  const raw = process.env.CLAWMEM_UNPROMOTED_OBSERVATION_WEIGHT;
+  if (raw === undefined || raw === "") return 0.5;
+  const parsed = parseFloat(raw);
+  if (!Number.isFinite(parsed)) return 0.5;
+  // Clamp: never > 1 (that would invert the penalty into a boost) and never a
+  // hard 0 (a rank penalty must keep the doc discoverable, not exclude it).
+  return Math.min(1, Math.max(0.01, parsed));
+}
+
 // ---------------------------------------------------------------------------
 // Config loading
 // ---------------------------------------------------------------------------
