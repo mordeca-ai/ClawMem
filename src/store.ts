@@ -974,9 +974,13 @@ export type Store = {
 
   // Cleanup and maintenance
   deleteLLMCache: () => number;
-  deleteInactiveDocuments: () => number;
-  cleanupOrphanedContent: () => number;
-  cleanupOrphanedVectors: () => number;
+  // deleteInactiveDocuments/cleanupOrphanedContent/cleanupOrphanedVectors require an
+  // explicit scope ({ collection: string } | { all: true }) — see master-harness-t5i0.
+  // A bare call with no scope argument is a TypeScript compile error.
+  deleteInactiveDocuments: (scope: CleanupScope, opts?: CleanupOptions) => number;
+  cleanupOrphanedContent: (scope: CleanupScope, opts?: CleanupOptions) => number;
+  cleanupOrphanedVectors: (scope: CleanupScope, opts?: CleanupOptions) => number;
+  purgeCollection: (collectionName: string) => { documents: number; content: number; vectors: number };
   vacuumDatabase: () => void;
 
   // Context
@@ -1166,9 +1170,10 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Cleanup and maintenance
     deleteLLMCache: () => deleteLLMCache(db),
-    deleteInactiveDocuments: () => deleteInactiveDocuments(db),
-    cleanupOrphanedContent: () => cleanupOrphanedContent(db),
-    cleanupOrphanedVectors: () => cleanupOrphanedVectors(db),
+    deleteInactiveDocuments: (scope: CleanupScope, opts?: CleanupOptions) => deleteInactiveDocuments(db, scope, opts),
+    cleanupOrphanedContent: (scope: CleanupScope, opts?: CleanupOptions) => cleanupOrphanedContent(db, scope, opts),
+    cleanupOrphanedVectors: (scope: CleanupScope, opts?: CleanupOptions) => cleanupOrphanedVectors(db, scope, opts),
+    purgeCollection: (collectionName: string) => purgeCollection(db, collectionName),
     vacuumDatabase: () => vacuumDatabase(db),
 
     // Context
@@ -1905,31 +1910,127 @@ export function deleteLLMCache(db: Database): number {
 }
 
 /**
- * Remove inactive document records (active = 0).
+ * Mandatory scope for the DB-wide cleanup operations below (deleteInactiveDocuments,
+ * cleanupOrphanedContent, cleanupOrphanedVectors). There is deliberately no default —
+ * every call site must say explicitly whether it means one collection or the whole
+ * database. This is the hardening for master-harness-t5i0: a bare, unscoped call to
+ * deleteInactiveDocuments() previously hard-deleted 3566 pre-existing inactive
+ * document rows (and their orphaned content/vectors) when only 50 disposable
+ * smoke-test docs were meant to be purged.
+ */
+export type CleanupScope = { collection: string } | { all: true };
+
+/**
+ * Options shared by the scoped cleanup operations. `includeArchived` defaults to
+ * false: lifecycle-archived rows (active = 0, archived_at IS NOT NULL, set by
+ * `clawmem lifecycle sweep`) are restorable state, not garbage, and are spared by
+ * default even under an `{all: true}` scope. Pass `includeArchived: true` to
+ * deliberately also sweep archived rows (that is `clawmem lifecycle sweep`'s own
+ * purge-after-days path, via purgeArchivedDocuments — NOT these functions).
+ */
+export interface CleanupOptions {
+  includeArchived?: boolean;
+}
+
+function assertCleanupScope(scope: CleanupScope): void {
+  if (!scope || typeof scope !== "object") {
+    throw new Error("cleanup scope is required: { collection: string } | { all: true }");
+  }
+  if ("collection" in scope) {
+    if (typeof scope.collection !== "string" || scope.collection.trim().length === 0) {
+      throw new Error("cleanup scope collection name must be a non-empty string");
+    }
+    if (/[*?[\]]/.test(scope.collection)) {
+      throw new Error(
+        `cleanup scope collection name is ambiguous (wildcard characters not supported): "${scope.collection}"`
+      );
+    }
+  } else if (!("all" in scope) || scope.all !== true) {
+    throw new Error("cleanup scope is required: { collection: string } | { all: true }");
+  }
+}
+
+/**
+ * Remove inactive document records (active = 0), scoped to one named collection or
+ * explicitly the whole database. By default, rows with archived_at IS NOT NULL
+ * (lifecycle-archived, restorable) are spared regardless of scope; pass
+ * opts.includeArchived = true to also delete them.
  * Returns the number of inactive documents deleted.
  */
-export function deleteInactiveDocuments(db: Database): number {
-  const result = db.prepare(`DELETE FROM documents WHERE active = 0`).run();
-  return result.changes;
+export function deleteInactiveDocuments(db: Database, scope: CleanupScope, opts: CleanupOptions = {}): number {
+  assertCleanupScope(scope);
+  const archivedGuard = opts.includeArchived ? "" : " AND archived_at IS NULL";
+  // Count via SELECT before DELETE rather than trusting run().changes: SQLite's
+  // changes() counter is cumulative across trigger side effects for the *same*
+  // top-level statement, which would over-report here if a row happened to still
+  // be FTS-indexed. Counting first keeps the return value an honest row count
+  // regardless of trigger/FK internals.
+  if ("collection" in scope) {
+    const before = db.prepare(
+      `SELECT COUNT(*) as c FROM documents WHERE active = 0 AND collection = ?${archivedGuard}`
+    ).get(scope.collection) as { c: number };
+    db.prepare(`DELETE FROM documents WHERE active = 0 AND collection = ?${archivedGuard}`).run(scope.collection);
+    return before.c;
+  }
+
+  const before = db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 0${archivedGuard}`).get() as { c: number };
+  db.prepare(`DELETE FROM documents WHERE active = 0${archivedGuard}`).run();
+  return before.c;
 }
 
 /**
- * Remove orphaned content hashes that are not referenced by any active document.
+ * Remove orphaned content hashes that are not referenced by any document still
+ * considered "live" — active, or (by default) lifecycle-archived. Scoped to one
+ * named collection or explicitly the whole database. Pass opts.includeArchived =
+ * true to also drop content only referenced by archived rows (matching the
+ * legacy active-only-liveness definition).
  * Returns the number of orphaned content hashes deleted.
  */
-export function cleanupOrphanedContent(db: Database): number {
-  const result = db.prepare(`
+export function cleanupOrphanedContent(db: Database, scope: CleanupScope, opts: CleanupOptions = {}): number {
+  assertCleanupScope(scope);
+  const liveClause = opts.includeArchived ? "active = 1" : "(active = 1 OR archived_at IS NOT NULL)";
+
+  // NOTE: content.hash is the parent side of `documents.hash REFERENCES
+  // content(hash) ON DELETE CASCADE` — deleting an orphaned content row will
+  // also cascade-delete any (already-inactive, non-live) document row still
+  // pointing at it. That is intentional here (it finishes GC'ing a forgotten
+  // document whose content just got swept) but it means run().changes is not
+  // a trustworthy content-row count — it includes the cascaded document
+  // deletes too. Count via SELECT before DELETE instead.
+  if ("collection" in scope) {
+    const before = db.prepare(`
+      SELECT COUNT(*) as c FROM content
+      WHERE hash IN (SELECT DISTINCT hash FROM documents WHERE collection = ?)
+        AND hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
+    `).get(scope.collection) as { c: number };
+    db.prepare(`
+      DELETE FROM content
+      WHERE hash IN (SELECT DISTINCT hash FROM documents WHERE collection = ?)
+        AND hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
+    `).run(scope.collection);
+    return before.c;
+  }
+
+  const before = db.prepare(`
+    SELECT COUNT(*) as c FROM content
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
+  `).get() as { c: number };
+  db.prepare(`
     DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
   `).run();
-  return result.changes;
+  return before.c;
 }
 
 /**
- * Remove orphaned vector embeddings that are not referenced by any active document.
+ * Remove orphaned vector embeddings that are not referenced by any document still
+ * considered "live" (see cleanupOrphanedContent). Scoped to one named collection or
+ * explicitly the whole database.
  * Returns the number of orphaned embedding chunks deleted.
  */
-export function cleanupOrphanedVectors(db: Database): number {
+export function cleanupOrphanedVectors(db: Database, scope: CleanupScope, opts: CleanupOptions = {}): number {
+  assertCleanupScope(scope);
+
   // Check if vectors_vec table exists
   const tableExists = db.prepare(`
     SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'
@@ -1939,36 +2040,144 @@ export function cleanupOrphanedVectors(db: Database): number {
     return 0;
   }
 
+  const liveClauseAliased = opts.includeArchived ? "d.active = 1" : "(d.active = 1 OR d.archived_at IS NOT NULL)";
+  const liveClausePlain = opts.includeArchived ? "active = 1" : "(active = 1 OR archived_at IS NOT NULL)";
+  // Scope clause for statements that alias content_vectors as "cv"
+  const scopeClauseAliased = "collection" in scope
+    ? "AND cv.hash IN (SELECT DISTINCT hash FROM documents WHERE collection = ?)"
+    : "";
+  // Scope clause for the final unaliased `DELETE FROM content_vectors` statement
+  const scopeClausePlain = "collection" in scope
+    ? "AND hash IN (SELECT DISTINCT hash FROM documents WHERE collection = ?)"
+    : "";
+  const scopeParams = "collection" in scope ? [scope.collection] : [];
+
   // Count orphaned vectors first
   const countResult = db.prepare(`
     SELECT COUNT(*) as c FROM content_vectors cv
     WHERE NOT EXISTS (
-      SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+      SELECT 1 FROM documents d WHERE d.hash = cv.hash AND ${liveClauseAliased}
     )
-  `).get() as { c: number };
+    ${scopeClauseAliased}
+  `).get(...scopeParams) as { c: number };
 
   if (countResult.c === 0) {
     return 0;
   }
 
   // Delete from vectors_vec first
-  db.exec(`
+  db.prepare(`
     DELETE FROM vectors_vec WHERE hash_seq IN (
       SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
       WHERE NOT EXISTS (
-        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND ${liveClauseAliased}
       )
+      ${scopeClauseAliased}
     )
-  `);
+  `).run(...scopeParams);
 
   // Delete from content_vectors
-  db.exec(`
+  db.prepare(`
     DELETE FROM content_vectors WHERE hash NOT IN (
-      SELECT hash FROM documents WHERE active = 1
+      SELECT hash FROM documents WHERE ${liveClausePlain}
     )
-  `);
+    ${scopeClausePlain}
+  `).run(...scopeParams);
 
   return countResult.c;
+}
+
+/**
+ * Hard-delete a single named collection's documents — both active and inactive
+ * (archived or forgotten) — plus their now-orphaned content and vector rows. This
+ * is the collection-scoped purge API from master-harness-t5i0: the operation a
+ * disposable smoke-test collection teardown actually needs, without reaching for
+ * the DB-wide cleanup functions above and risking every other collection's
+ * inactive/archived rows in the same pass.
+ *
+ * Unlike deleteInactiveDocuments/cleanupOrphaned*, this is a deliberate full
+ * removal of one named collection (active rows included) — there is no
+ * archived-row carve-out, because the caller is explicitly nuking that collection
+ * in its entirety, not doing routine maintenance. Refuses an empty/missing or
+ * wildcard-bearing collection name.
+ *
+ * Returns counts of rows deleted from each table.
+ */
+export function purgeCollection(
+  db: Database,
+  collectionName: string
+): { documents: number; content: number; vectors: number } {
+  if (typeof collectionName !== "string" || collectionName.trim().length === 0) {
+    throw new Error("purgeCollection requires a non-empty collection name");
+  }
+  if (/[*?[\]]/.test(collectionName)) {
+    throw new Error(
+      `purgeCollection refuses an ambiguous collection name (wildcard characters not supported): "${collectionName}"`
+    );
+  }
+
+  const hashRows = db.prepare(
+    `SELECT DISTINCT hash FROM documents WHERE collection = ?`
+  ).all(collectionName) as { hash: string }[];
+
+  if (hashRows.length === 0) {
+    const exists = db.prepare(`SELECT 1 FROM documents WHERE collection = ? LIMIT 1`).get(collectionName);
+    if (!exists) {
+      throw new Error(`purgeCollection: no documents found for collection "${collectionName}" — nothing to purge`);
+    }
+  }
+
+  const hashes = hashRows.map(r => r.hash);
+  // Count via SELECT before DELETE: run().changes on a DELETE that touches an
+  // active (FTS-indexed) row is cumulative across the documents_fts sync
+  // trigger's internal shadow-table writes and over-reports the document
+  // count. Counting first keeps the return value an honest row count.
+  const docsBefore = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE collection = ?`).get(collectionName) as { c: number }).c;
+  db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
+
+  let contentDeleted = 0;
+  let vectorsDeleted = 0;
+
+  if (hashes.length > 0) {
+    const placeholders = hashes.map(() => "?").join(",");
+
+    const contentResult = db.prepare(`
+      DELETE FROM content
+      WHERE hash IN (${placeholders})
+        AND hash NOT IN (SELECT DISTINCT hash FROM documents)
+    `).run(...hashes);
+    contentDeleted = contentResult.changes;
+
+    const tableExists = db.prepare(`
+      SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'
+    `).get();
+    if (tableExists) {
+      const orphanHashRows = db.prepare(`
+        SELECT DISTINCT cv.hash FROM content_vectors cv
+        WHERE cv.hash IN (${placeholders})
+          AND cv.hash NOT IN (SELECT DISTINCT hash FROM documents)
+      `).all(...hashes) as { hash: string }[];
+
+      if (orphanHashRows.length > 0) {
+        const orphanHashes = orphanHashRows.map(r => r.hash);
+        const orphanPlaceholders = orphanHashes.map(() => "?").join(",");
+
+        db.prepare(`
+          DELETE FROM vectors_vec WHERE hash_seq IN (
+            SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+            WHERE cv.hash IN (${orphanPlaceholders})
+          )
+        `).run(...orphanHashes);
+
+        const vecResult = db.prepare(`
+          DELETE FROM content_vectors WHERE hash IN (${orphanPlaceholders})
+        `).run(...orphanHashes);
+        vectorsDeleted = vecResult.changes;
+      }
+    }
+  }
+
+  return { documents: docsBefore, content: contentDeleted, vectors: vectorsDeleted };
 }
 
 /**

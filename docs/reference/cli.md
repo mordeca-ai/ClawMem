@@ -15,8 +15,23 @@ clawmem doctor                  # Full health check (GPU connectivity, index int
 ```bash
 clawmem collection add <path> --name <name>   # Add a collection
 clawmem collection list                        # List all collections
-clawmem collection remove <name>               # Remove a collection
+clawmem collection remove <name>               # Forget the collection in config.yaml
+                                                # (does NOT delete indexed rows)
+clawmem collection purge <name>                # Preview a hard-delete of this collection's rows
+clawmem collection purge <name> --yes          # Hard-delete: documents (active+inactive) + orphaned content/vectors
 ```
+
+`collection remove` and `collection purge` are different operations. `remove` only
+edits `config.yaml` so the collection stops being re-scanned — existing rows in the
+SQLite index are untouched. `purge` (v0.10.8+, master-harness-t5i0) hard-deletes that
+collection's rows from the index — active and inactive alike — plus any content/vector
+rows that become orphaned as a result, without touching any other collection. It
+refuses an empty or wildcard-bearing name, and without `--yes` only prints a preview
+(active/inactive counts) — nothing is deleted. This is the operation to use for tearing
+down a disposable/scratch/smoke-test collection; **do not** reach for the DB-wide
+maintenance functions (`deleteInactiveDocuments`/`cleanupOrphaned*` in `src/store.ts`)
+for a single-collection teardown — see [Backup](#backup) below for why that's
+dangerous.
 
 ## Indexing
 
@@ -143,6 +158,67 @@ clawmem reflect [N]             # Cross-session reflection (last N days, default
 clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence documents
 ```
 
+## Backup
+
+```bash
+clawmem backup                                 # Snapshot to ~/.cache/clawmem/backups/, keep 7
+clawmem backup --dest /path/to/backups         # Custom destination directory
+clawmem backup --keep 14                       # Custom retention count
+```
+
+**v0.10.8+ (master-harness-t5i0).** Prior to this there was no backup mechanism for
+the ClawMem SQLite index at all — a scope-guard incident during unrelated testing hard
+deleted 3566 pre-existing document rows with no recovery path available, because
+nothing had ever snapshotted the DB. `clawmem backup` produces a consistent, compacted
+copy of the live index at `<dest>/index-<timestamp>.sqlite` via SQLite's `VACUUM INTO`
+(the `bun:sqlite`-native equivalent of `sqlite3 <db> ".backup <dest>"` — a single
+transactional statement, no external `sqlite3` binary required, safe to run against a
+live, in-use database). After each backup, files beyond the retention count (default
+7, oldest first) are pruned automatically.
+
+| Env var | Default | Description |
+|---|---|---|
+| `CLAWMEM_BACKUP_DIR` | `~/.cache/clawmem/backups` (or `$XDG_CACHE_HOME/clawmem/backups`) | Backup destination directory |
+
+### Scheduling
+
+`clawmem backup` does not install its own timer — run it periodically via systemd or
+cron. Example systemd user timer (daily at 03:15):
+
+```ini
+# ~/.config/systemd/user/clawmem-backup.service
+[Unit]
+Description=ClawMem index backup
+
+[Service]
+Type=oneshot
+ExecStart=%h/path/to/clawmem/bin/clawmem backup
+```
+
+```ini
+# ~/.config/systemd/user/clawmem-backup.timer
+[Unit]
+Description=Daily ClawMem index backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now clawmem-backup.timer
+```
+
+Or via cron:
+
+```cron
+15 3 * * * /path/to/clawmem/bin/clawmem backup >> ~/.cache/clawmem/backup.log 2>&1
+```
+
 ## Session focus topic (v0.9.0)
 
 Per-session topic biasing for the context-surfacing hook. Writes a focus file at `~/.cache/clawmem/sessions/<session_id>.focus` that steers query expansion, reranking, snippet extraction, and applies a post-composite-score topic boost (1.4× match, 0.75× demote, NO-OP on zero matches). Session-scoped — never writes to SQLite or mutates any lifecycle column.
@@ -190,6 +266,7 @@ The session ID is resolved from `--session-id <id>`, then `CLAUDE_SESSION_ID`, t
 | `CLAWMEM_HEAVY_LANE_SURPRISAL` | `false` | **v0.8.0.** When `true`, seed Phase 2 with k-NN anomaly-ranked doc ids from `computeSurprisalScores` instead of stale-first ordering. Degrades to stale-first on vaults without embeddings. |
 | `CLAWMEM_SESSION_FOCUS` | — | **v0.9.0 §11.4.** Debug-only override for the session focus topic. NOT session-scoped — do not use in multi-session deployments. Use `clawmem focus set <topic> --session-id <id>` instead. |
 | `CLAWMEM_FOCUS_ROOT` | `~/.cache/clawmem/sessions` | **v0.9.0 §11.4.** Override directory for per-session focus files. Primarily for hermetic testing. |
+| `CLAWMEM_BACKUP_DIR` | `~/.cache/clawmem/backups` | **v0.10.8+.** Destination directory for `clawmem backup`. See [Backup](#backup). |
 | `INDEX_PATH` | `~/.cache/clawmem/index.sqlite` | Override default vault path |
 
 The `bin/clawmem` wrapper sets endpoint defaults. Always use it instead of `bun run src/clawmem.ts` directly.

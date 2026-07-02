@@ -72,6 +72,7 @@ import {
   resolveSessionTopic,
 } from "./session-focus.ts";
 import { computeCollectionScope, type CollectionScope } from "./collection-scope.ts";
+import { createBackup } from "./backup.ts";
 import {
   resolveExtensionsDirNoOpenClaw,
   printSetupOpenClawHelp,
@@ -206,6 +207,61 @@ async function cmdCollectionRemove(args: string[]) {
     console.log(`${c.green}Removed collection '${name}'${c.reset}`);
   } else {
     die(`Collection '${name}' not found`);
+  }
+}
+
+/**
+ * Hard-delete a named collection's document/content/vector rows from the
+ * index (master-harness-t5i0). This is the scoped-purge counterpart to
+ * `collection remove` — `remove` only forgets the collection from
+ * config.yaml (stops future indexing), it does NOT touch existing rows.
+ * `purge` deletes the DB rows for exactly one named collection, active and
+ * inactive, without risking any other collection's data — the operation a
+ * disposable smoke-test / scratch collection teardown actually needs,
+ * instead of reaching for the DB-wide cleanup commands.
+ *
+ * Destructive and irreversible (no lifecycle-restore path once purged), so
+ * it requires --yes to actually execute; without it, prints a preview of
+ * what would be deleted.
+ */
+async function cmdCollectionPurge(args: string[]) {
+  const { values, positionals } = parseArgs({
+    args,
+    options: {
+      yes: { type: "boolean", default: false },
+    },
+    allowPositionals: true,
+  });
+
+  const name = positionals[0];
+  if (!name) die("Usage: clawmem collection purge <name> --yes");
+
+  const store = getStore();
+
+  const preview = store.db.prepare(`
+    SELECT
+      SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) as active,
+      SUM(CASE WHEN active = 0 THEN 1 ELSE 0 END) as inactive,
+      COUNT(*) as total
+    FROM documents WHERE collection = ?
+  `).get(name) as { active: number | null; inactive: number | null; total: number };
+
+  if (!preview.total) {
+    die(`No documents found for collection "${name}" — nothing to purge`);
+  }
+
+  if (!values.yes) {
+    console.log(`Would purge collection ${c.bold}${name}${c.reset}:`);
+    console.log(`  ${preview.active ?? 0} active, ${preview.inactive ?? 0} inactive document(s) (${preview.total} total)`);
+    console.log();
+    console.log(`${c.yellow}This is irreversible.${c.reset} Re-run with --yes to actually delete.`);
+    return;
+  }
+
+  const result = store.purgeCollection(name);
+  console.log(`${c.green}Purged collection '${name}'${c.reset}: ${result.documents} document(s), ${result.content} content row(s), ${result.vectors} vector row(s)`);
+  if (getCollection(name)) {
+    console.log(`${c.dim}Note: '${name}' is still configured in config.yaml — run 'clawmem collection remove ${name}' too if you don't want it re-indexed.${c.reset}`);
   }
 }
 
@@ -2013,6 +2069,42 @@ async function cmdReindex(args: string[]) {
 }
 
 // =============================================================================
+// Backup (master-harness-t5i0)
+// =============================================================================
+
+/**
+ * Snapshot the live index to a timestamped file via VACUUM INTO, then prune
+ * old backups down to --keep (default 7). There was previously no backup
+ * mechanism for the ClawMem SQLite index at all — see master-harness-t5i0.
+ */
+async function cmdBackup(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      dest: { type: "string" },
+      keep: { type: "string" },
+    },
+    allowPositionals: false,
+  });
+
+  const keep = values.keep !== undefined ? parseInt(values.keep, 10) : undefined;
+  if (values.keep !== undefined && (!Number.isInteger(keep) || (keep as number) < 1)) {
+    die(`--keep must be a positive integer (got "${values.keep}")`);
+  }
+
+  const store = getStore();
+  const result = createBackup(store.db, {
+    destDir: values.dest,
+    retentionCount: keep,
+  });
+
+  console.log(`${c.green}Backed up${c.reset} ${store.dbPath} -> ${result.path} (${(result.sizeBytes / 1024 / 1024).toFixed(1)} MB)`);
+  if (result.prunedFiles.length > 0) {
+    console.log(`${c.dim}Pruned ${result.prunedFiles.length} old backup(s) beyond retention${c.reset}`);
+  }
+}
+
+// =============================================================================
 // Doctor (Health Check)
 // =============================================================================
 
@@ -2441,7 +2533,8 @@ async function main() {
           case "add": await cmdCollectionAdd(subSubArgs); break;
           case "list": await cmdCollectionList(); break;
           case "remove": await cmdCollectionRemove(subSubArgs); break;
-          default: die("Usage: clawmem collection <add|list|remove>");
+          case "purge": await cmdCollectionPurge(subSubArgs); break;
+          default: die("Usage: clawmem collection <add|list|remove|purge>");
         }
         break;
       }
@@ -2495,6 +2588,9 @@ async function main() {
         break;
       case "doctor":
         await cmdDoctor();
+        break;
+      case "backup":
+        await cmdBackup(subArgs);
         break;
       case "path":
         cmdPath();
@@ -3136,7 +3232,8 @@ ${c.bold}Setup:${c.reset}
   clawmem bootstrap <path> [--name N]  One-command setup (init+add+update+embed+hooks+mcp)
   clawmem collection add <path> --name <name>
   clawmem collection list
-  clawmem collection remove <name>
+  clawmem collection remove <name>     Forget the collection in config.yaml (does NOT delete indexed rows)
+  clawmem collection purge <name> [--yes]  Hard-delete a collection's rows (active+inactive, irreversible)
   clawmem setup hooks [--remove]       Install/remove Claude Code hooks
   clawmem setup mcp [--remove]         Register/remove MCP in ~/.claude.json
   clawmem setup openclaw [--link] [--remove]   Install/remove ClawMem as OpenClaw memory plugin
@@ -3193,6 +3290,7 @@ ${c.bold}Integration:${c.reset}
   clawmem serve [--port 7438] [--host 127.0.0.1]  Start HTTP REST API server
   clawmem update-context               Regenerate all directory CLAUDE.md files
   clawmem doctor                       Full health check
+  clawmem backup [--dest <dir>] [--keep <n>]  Snapshot the index (VACUUM INTO), prune to <n> (default 7)
 
 ${c.bold}Options:${c.reset}
   -n, --num <N>        Number of results
