@@ -378,7 +378,172 @@ async function cmdMine(args: string[]) {
   }
 }
 
-async function cmdEmbed(args: string[]) {
+export type DocEmbedTask = {
+  hash: string; path: string; title: string; collection: string;
+  fragments: ReturnType<typeof splitDocument>;
+};
+
+/** Minimal shape of an embed-batch-capable LLM client, for injection in tests. */
+export type BatchedEmbedLLM = {
+  embedBatch: (texts: string[]) => Promise<(import("./llm.ts").EmbeddingResult | null)[]>;
+  lastBatchTokens: number;
+};
+
+export type BatchedEmbedOptions = {
+  /** Fragments per HTTP request. Default 50 (env: CLAWMEM_EMBED_BATCH_SIZE). */
+  batchSize?: number;
+  /** Whether to apply TPM-aware pacing between batches (real rate-limited cloud APIs only). */
+  isCloudEmbed?: boolean;
+  tpmLimit?: number;
+  tpmSafety?: number;
+};
+
+export type BatchedEmbedResult = {
+  embedded: number;
+  totalFragments: number;
+  failedFragments: number;
+  /** Number of embedBatch() HTTP calls issued — the batching win, made assertable. */
+  requestCount: number;
+};
+
+/**
+ * Embed a flat queue of fragments spanning ALL given documents, batching
+ * CLAWMEM_EMBED_BATCH_SIZE (default 50) fragments per llm.embedBatch() call —
+ * collapsing N per-fragment round trips into N/batchSize requests. Used by any
+ * HTTP remote embed endpoint (cloud API or self-hosted GPU server): both speak
+ * the OpenAI-compatible batched /v1/embeddings shape via llm.embedBatch().
+ *
+ * A null/error result for a fragment is counted as a failure and never written
+ * as a vector (62xr.5 — no silent null-vector writes); the owning document's
+ * embed_state is marked 'failed' so it gets retried on the next `clawmem embed`.
+ */
+export async function runBatchedEmbed(
+  s: Store,
+  llm: BatchedEmbedLLM,
+  docTasks: DocEmbedTask[],
+  opts: BatchedEmbedOptions = {}
+): Promise<BatchedEmbedResult> {
+  const batchSize = Math.max(1, opts.batchSize ?? 50);
+  const isCloudEmbed = !!opts.isCloudEmbed;
+  const tpmLimit = opts.tpmLimit ?? 100000;
+  const tpmSafety = opts.tpmSafety ?? 0.85;
+  const CHARS_PER_TOKEN = 4;
+  let lastBatchSentAt = 0;
+  let embedded = 0;
+  let totalFragments = 0;
+  let failedFragments = 0;
+  let requestCount = 0;
+
+  // Flatten fragments across ALL documents into one queue so batches span document
+  // boundaries — most documents have far fewer than batchSize fragments, so batching
+  // only within a document would leave most requests small. This is what actually
+  // collapses round trips ~batchSize-to-1 instead of doc-to-1.
+  type QueueItem = { docIdx: number; seq: number; text: string };
+  const queue: QueueItem[] = [];
+  for (let docIdx = 0; docIdx < docTasks.length; docIdx++) {
+    const { fragments, title } = docTasks[docIdx]!;
+    for (let seq = 0; seq < fragments.length; seq++) {
+      const frag = fragments[seq]!;
+      const label = frag.label || title;
+      queue.push({ docIdx, seq, text: formatDocForEmbedding(frag.content, label) });
+    }
+  }
+
+  const perDoc = docTasks.map(() => ({ ok: 0, fail: 0, seq0Ok: false }));
+
+  for (let qStart = 0; qStart < queue.length; qStart += batchSize) {
+    const qEnd = Math.min(qStart + batchSize, queue.length);
+    const chunk = queue.slice(qStart, qEnd);
+    const chunkTexts = chunk.map(item => item.text);
+
+    // TPM pacing only applies to real rate-limited cloud APIs — self-hosted GPU
+    // endpoints have no token quota, only compute time, so an artificial delay there
+    // would just add latency without preventing anything.
+    if (isCloudEmbed && lastBatchSentAt > 0) {
+      // Adaptive TPM-aware delay. Set CLAWMEM_EMBED_TPM_LIMIT to match your tier:
+      //   Free: 100000 (default), Paid: 2000000, Premium: 50000000
+      const estimatedTokens = chunkTexts.reduce((sum, t) => sum + Math.ceil(t.length / CHARS_PER_TOKEN), 0);
+      const safeTPM = tpmLimit * tpmSafety;
+      const requiredGapMs = Math.max(500, (estimatedTokens / safeTPM) * 60_000);
+      const elapsed = Date.now() - lastBatchSentAt;
+      const remainingMs = requiredGapMs - elapsed;
+      if (remainingMs > 0) {
+        const jittered = Math.floor(remainingMs * (0.85 + Math.random() * 0.3));
+        await new Promise(r => setTimeout(r, jittered));
+      }
+    }
+
+    lastBatchSentAt = Date.now();
+    const reqStart = Date.now();
+    requestCount++;
+    let results: (import("./llm.ts").EmbeddingResult | null)[] | null = null;
+    try {
+      results = await llm.embedBatch(chunkTexts);
+    } catch (err) {
+      console.error(`${c.yellow}Warning: batch embed failed for fragments ${qStart + 1}-${qEnd}: ${err}${c.reset}`);
+    }
+    const reqMs = Date.now() - reqStart;
+    const tokensUsed = llm.lastBatchTokens;
+
+    // Collect successful writes and commit them in a single SQLite transaction
+    // per network round trip (was: one commit per fragment / per document).
+    const writes: import("./store.ts").EmbeddingWrite[] = [];
+    const embeddedAt = new Date().toISOString();
+
+    for (let i = 0; i < chunk.length; i++) {
+      const item = chunk[i]!;
+      const doc = docTasks[item.docIdx]!;
+      const frag = doc.fragments[item.seq]!;
+      const result = results ? results[i] : null;
+      const stats = perDoc[item.docIdx]!;
+      if (result) {
+        writes.push({
+          hash: doc.hash, seq: item.seq, pos: frag.startLine,
+          embedding: new Float32Array(result.embedding), model: result.model, embeddedAt,
+          fragmentType: frag.type, fragmentLabel: frag.label ?? undefined,
+          canonicalId: canonicalDocId(doc.collection, doc.path),
+        });
+        stats.ok++;
+        totalFragments++;
+        if (item.seq === 0) stats.seq0Ok = true;
+      } else {
+        // Null/error result: never write a null vector, just count the failure —
+        // the doc's embed_state gets marked failed below so it retries (62xr.5).
+        stats.fail++;
+        failedFragments++;
+      }
+    }
+
+    if (writes.length > 0) {
+      s.ensureVecTable(writes[0]!.embedding.length);
+      s.insertEmbeddingsBatch(writes);
+    }
+
+    console.error(`  batch ${qStart + 1}-${qEnd}/${queue.length} frags (${writes.length} ok, ${chunk.length - writes.length} failed) ${reqMs}ms${tokensUsed ? ` ${tokensUsed} tok` : ""}`);
+  }
+
+  // Track embed state per document now that every batch has been processed —
+  // seq=0 (primary) must succeed for synced status, same semantics as the
+  // pre-batching per-document loop.
+  for (let docIdx = 0; docIdx < docTasks.length; docIdx++) {
+    const { hash, path } = docTasks[docIdx]!;
+    const stats = perDoc[docIdx]!;
+    if (stats.seq0Ok) {
+      s.markEmbedSynced(hash);
+    } else if (stats.ok === 0 && stats.fail > 0) {
+      s.markEmbedFailed(hash, "all fragments failed");
+    } else {
+      // seq=0 failed but some later fragments succeeded — mark failed so seq=0 gets retried
+      s.markEmbedFailed(hash, "primary fragment (seq=0) failed");
+    }
+    embedded++;
+    console.error(`  [${docIdx + 1}/${docTasks.length}] ${basename(path)}: ${stats.ok} ok, ${stats.fail} failed`);
+  }
+
+  return { embedded, totalFragments, failedFragments, requestCount };
+}
+
+export async function cmdEmbed(args: string[]) {
   const { values } = parseArgs({
     args,
     options: { force: { type: "boolean", short: "f", default: false } },
@@ -405,20 +570,26 @@ async function cmdEmbed(args: string[]) {
     return;
   }
 
-  // Count total fragments first for ETA
+  // Parse + split every document up front. This is also what gives us the
+  // fragment-count ETA, so it replaces the old separate "count total fragments" pass.
+  type DocTask = {
+    hash: string; path: string; title: string; collection: string;
+    fragments: ReturnType<typeof splitDocument>;
+  };
+  const docTasks: DocTask[] = [];
   let totalFragEstimate = 0;
-  const docFragCounts: number[] = [];
-  for (const { body, path } of hashes) {
+  for (const { hash, body, path, title: docTitle, collection } of hashes) {
+    const title = docTitle || basename(path).replace(/\.(md|txt)$/i, "");
     let frontmatter: Record<string, any> | undefined;
     try {
       const parsed = parseDocument(body, path);
       frontmatter = parsed.meta as any;
-    } catch { /* skip */ }
-    const frags = splitDocument(body, frontmatter);
-    docFragCounts.push(frags.length);
-    totalFragEstimate += frags.length;
+    } catch { /* No frontmatter or parsing error — fine, skip it */ }
+    const fragments = splitDocument(body, frontmatter);
+    docTasks.push({ hash, path, title, collection, fragments });
+    totalFragEstimate += fragments.length;
   }
-  console.log(`Embedding ${hashes.length} documents (${totalFragEstimate} fragments total)...`);
+  console.log(`Embedding ${docTasks.length} documents (${totalFragEstimate} fragments total)...`);
 
   const embedUrl = process.env.CLAWMEM_EMBED_URL;
   if (embedUrl) {
@@ -433,100 +604,43 @@ async function cmdEmbed(args: string[]) {
   let failedFragments = 0;
   const batchStart = Date.now();
 
-  // Cloud API: global batch pacing state (persists across documents)
-  // TPM is the binding constraint, not RPM. 50 frags × ~800 tokens ≈ 40K tokens/batch → max ~2.5 batches/min at 100K TPM.
+  // Any HTTP remote embed endpoint — cloud API (CLAWMEM_EMBED_API_KEY set) or a
+  // self-hosted GPU server (CLAWMEM_EMBED_URL only, e.g. yoshiee's Ollama) — supports
+  // the OpenAI-compatible batched /v1/embeddings call via llm.embedBatch(). Batching
+  // collapses N per-fragment round trips into N/BATCH_SIZE requests. For self-hosted
+  // GPU embedding, round-trip latency (not GPU compute) was the bottleneck: uo0c
+  // measured 1.06 min/doc at 7% GPU utilization with the old one-fragment-per-request path.
   const isCloudEmbed = !!process.env.CLAWMEM_EMBED_API_KEY;
-  const CLOUD_BATCH_SIZE = 50;
+  const isBatchedRemote = isCloudEmbed || !!embedUrl;
+  const BATCH_SIZE = Math.max(1, parseInt(process.env.CLAWMEM_EMBED_BATCH_SIZE || "50", 10));
+  // TPM is the binding constraint for cloud APIs, not RPM.
+  // 50 frags × ~800 tokens ≈ 40K tokens/batch → max ~2.5 batches/min at 100K TPM.
   const CLOUD_TPM_LIMIT = parseInt(process.env.CLAWMEM_EMBED_TPM_LIMIT || "100000", 10);
   const CLOUD_TPM_SAFETY = 0.85; // use 85% of limit to leave headroom for retries
-  const CHARS_PER_TOKEN = 4;
-  let lastBatchSentAt = 0; // global timestamp of last batch send
 
-  for (let docIdx = 0; docIdx < hashes.length; docIdx++) {
-    const { hash, body, path, title: docTitle, collection } = hashes[docIdx]!;
-    const title = docTitle || basename(path).replace(/\.(md|txt)$/i, "");
-    const canId = canonicalDocId(collection, path);
+  if (isBatchedRemote) {
+    const result = await runBatchedEmbed(s, llm, docTasks, {
+      batchSize: BATCH_SIZE,
+      isCloudEmbed,
+      tpmLimit: CLOUD_TPM_LIMIT,
+      tpmSafety: CLOUD_TPM_SAFETY,
+    });
+    embedded = result.embedded;
+    totalFragments = result.totalFragments;
+    failedFragments = result.failedFragments;
+  } else {
+    // True local in-process fallback (no CLAWMEM_EMBED_URL configured at all):
+    // sequential per-fragment embedding via node-llama-cpp — there's no network
+    // round trip to batch away here, so this path is unchanged from before.
+    for (let docIdx = 0; docIdx < docTasks.length; docIdx++) {
+      const { hash, path, title, collection, fragments } = docTasks[docIdx]!;
+      const canId = canonicalDocId(collection, path);
+      const docStart = Date.now();
+      let seq0Succeeded = false;
+      let docFragsOk = 0;
+      let docFragsFail = 0;
+      console.error(`  [${docIdx + 1}/${docTasks.length}] ${basename(path)} (${fragments.length} frags)`);
 
-    // Parse frontmatter for fragment splitting
-    let frontmatter: Record<string, any> | undefined;
-    try {
-      const parsed = parseDocument(body, path);
-      frontmatter = parsed.meta as any;
-    } catch {
-      // No frontmatter or parsing error — fine, skip it
-    }
-
-    const fragments = splitDocument(body, frontmatter);
-    const docStart = Date.now();
-    const prevTotalFragments = totalFragments;
-    const prevFailedFragments = failedFragments;
-    let seq0Succeeded = false;
-    console.error(`  [${docIdx + 1}/${hashes.length}] ${basename(path)} (${fragments.length} frags, ${body.length} chars)`);
-
-    if (isCloudEmbed) {
-      // Batch mode: collect all texts, send in chunks of CLOUD_BATCH_SIZE
-      const allTexts: string[] = [];
-      for (const frag of fragments) {
-        const label = frag.label || title;
-        allTexts.push(formatDocForEmbedding(frag.content, label));
-      }
-
-      for (let batchStart = 0; batchStart < allTexts.length; batchStart += CLOUD_BATCH_SIZE) {
-        // Global TPM-aware delay: compute required wait based on last batch's token count,
-        // then wait only the remaining time since lastBatchSentAt. Applies to ALL batches
-        // including first batch of each document (inter-document pacing).
-        if (lastBatchSentAt > 0) {
-          // Adaptive TPM-aware delay. Set CLAWMEM_EMBED_TPM_LIMIT to match your tier:
-          //   Free: 100000 (default), Paid: 2000000, Premium: 50000000
-          const batchEnd0 = Math.min(batchStart + CLOUD_BATCH_SIZE, allTexts.length);
-          const estimatedTokens = allTexts.slice(batchStart, batchEnd0)
-            .reduce((sum, t) => sum + Math.ceil(t.length / CHARS_PER_TOKEN), 0);
-          // Use current batch estimate (not previous batch actuals — previous batch may differ in size)
-          const batchTokens = estimatedTokens;
-          const safeTPM = CLOUD_TPM_LIMIT * CLOUD_TPM_SAFETY;
-          const requiredGapMs = Math.max(500, (batchTokens / safeTPM) * 60_000);
-          const elapsed = Date.now() - lastBatchSentAt;
-          const remainingMs = requiredGapMs - elapsed;
-          if (remainingMs > 0) {
-            const jittered = Math.floor(remainingMs * (0.85 + Math.random() * 0.3));
-            await new Promise(r => setTimeout(r, jittered));
-          }
-        }
-
-        const batchEnd = Math.min(batchStart + CLOUD_BATCH_SIZE, allTexts.length);
-        const batchTexts = allTexts.slice(batchStart, batchEnd);
-        lastBatchSentAt = Date.now();
-        const reqStart = Date.now();
-
-        try {
-          const results = await llm.embedBatch(batchTexts);
-          const reqMs = Date.now() - reqStart;
-          const tokensUsed = llm.lastBatchTokens;
-
-          for (let i = 0; i < results.length; i++) {
-            const seq = batchStart + i;
-            const frag = fragments[seq]!;
-            const result = results[i];
-            if (result) {
-              s.ensureVecTable(result.embedding.length);
-              s.insertEmbedding(
-                hash, seq, frag.startLine, new Float32Array(result.embedding),
-                result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId
-              );
-              totalFragments++;
-              if (seq === 0) seq0Succeeded = true;
-            } else {
-              failedFragments++;
-            }
-          }
-          console.error(`    batch ${batchStart + 1}-${batchEnd}/${allTexts.length} (${results.filter(r => r).length} ok) ${reqMs}ms${tokensUsed ? ` ${tokensUsed} tok` : ""}`);
-        } catch (err) {
-          failedFragments += batchTexts.length;
-          console.error(`${c.yellow}Warning: batch embed failed for ${path} frags ${batchStart + 1}-${batchEnd}: ${err}${c.reset}`);
-        }
-      }
-    } else {
-      // Local mode: embed one at a time (no rate limit concern)
       for (let seq = 0; seq < fragments.length; seq++) {
         const frag = fragments[seq]!;
         const label = frag.label || title;
@@ -543,37 +657,38 @@ async function cmdEmbed(args: string[]) {
               result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId
             );
             totalFragments++;
+            docFragsOk++;
             if (seq === 0) seq0Succeeded = true;
             if (seq === 0 || (seq + 1) % 5 === 0 || seq === fragments.length - 1) {
               console.error(`    frag ${seq + 1}/${fragments.length} (${frag.type}) ${fragMs}ms [${text.length} chars]`);
             }
           } else {
             failedFragments++;
+            docFragsFail++;
             console.error(`    frag ${seq + 1}/${fragments.length} (${frag.type}) → null result [${text.length} chars]`);
           }
         } catch (err) {
           failedFragments++;
+          docFragsFail++;
           console.error(`${c.yellow}Warning: failed to embed fragment ${seq} (${frag.type}) of ${path}: ${err}${c.reset}`);
         }
       }
-    }
 
-    // Track embed state per document — seq=0 (primary) must succeed for synced status
-    const docFragsOk = totalFragments - prevTotalFragments;
-    const docFragsFail = failedFragments - prevFailedFragments;
-    if (seq0Succeeded) {
-      s.markEmbedSynced(hash);
-    } else if (docFragsOk === 0 && docFragsFail > 0) {
-      s.markEmbedFailed(hash, "all fragments failed");
-    } else {
-      // seq=0 failed but some later fragments succeeded — mark failed so seq=0 gets retried
-      s.markEmbedFailed(hash, "primary fragment (seq=0) failed");
-    }
+      // Track embed state per document — seq=0 (primary) must succeed for synced status
+      if (seq0Succeeded) {
+        s.markEmbedSynced(hash);
+      } else if (docFragsOk === 0 && docFragsFail > 0) {
+        s.markEmbedFailed(hash, "all fragments failed");
+      } else {
+        // seq=0 failed but some later fragments succeeded — mark failed so seq=0 gets retried
+        s.markEmbedFailed(hash, "primary fragment (seq=0) failed");
+      }
 
-    embedded++;
-    const docMs = Date.now() - docStart;
-    const elapsed = ((Date.now() - batchStart) / 1000).toFixed(0);
-    console.error(`  → doc done in ${(docMs / 1000).toFixed(1)}s | ${embedded}/${hashes.length} docs, ${totalFragments} frags, ${failedFragments} fails [${elapsed}s elapsed]`);
+      embedded++;
+      const docMs = Date.now() - docStart;
+      const elapsed = ((Date.now() - batchStart) / 1000).toFixed(0);
+      console.error(`  → doc done in ${(docMs / 1000).toFixed(1)}s | ${embedded}/${docTasks.length} docs, ${totalFragments} frags, ${failedFragments} fails [${elapsed}s elapsed]`);
+    }
   }
 
   const totalSec = ((Date.now() - batchStart) / 1000).toFixed(1);
