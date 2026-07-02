@@ -1027,6 +1027,7 @@ export type Store = {
   getHashesNeedingFragments: () => { hash: string; body: string; path: string; title: string; collection: string }[];
   clearAllEmbeddings: () => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string) => void;
+  insertEmbeddingsBatch: (writes: EmbeddingWrite[]) => void;
   cleanStaleEmbeddings: () => number;
 
   // SAME: Observation metadata
@@ -1218,6 +1219,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     getHashesNeedingFragments: () => getHashesNeedingFragments(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, fragmentType, fragmentLabel, canonicalId),
+    insertEmbeddingsBatch: (writes: EmbeddingWrite[]) => insertEmbeddingsBatch(db, writes),
     cleanStaleEmbeddings: () => cleanStaleEmbeddings(db),
 
     // SAME: Observation metadata
@@ -3375,6 +3377,47 @@ export function insertEmbedding(
   db.prepare(
     `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(hash, seq, pos, model, embeddedAt, fragmentType ?? null, fragmentLabel ?? null, canonicalId ?? null);
+}
+
+export type EmbeddingWrite = {
+  hash: string;
+  seq: number;
+  pos: number;
+  embedding: Float32Array;
+  model: string;
+  embeddedAt: string;
+  fragmentType?: string;
+  fragmentLabel?: string;
+  canonicalId?: string;
+};
+
+/**
+ * Insert a batch of embeddings inside a single SQLite transaction.
+ * Same per-row semantics as insertEmbedding (delete-then-insert into the vec0
+ * virtual table, upsert into content_vectors) but committed once per batch
+ * instead of once per row — matters for remote-batched embed runs where a
+ * single HTTP round trip now produces up to CLAWMEM_EMBED_BATCH_SIZE rows.
+ */
+export function insertEmbeddingsBatch(db: Database, writes: EmbeddingWrite[]): void {
+  if (writes.length === 0) return;
+  const deleteVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
+  const insertVec = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+  const upsertContent = db.prepare(
+    `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const tx = db.transaction(() => {
+    for (const w of writes) {
+      const hashSeq = `${w.hash}_${w.seq}`;
+      // Try-catch: table may not exist yet during dimension migration (ensureVecTable drops+recreates).
+      try { deleteVec.run(hashSeq); } catch {}
+      insertVec.run(hashSeq, w.embedding);
+      upsertContent.run(
+        w.hash, w.seq, w.pos, w.model, w.embeddedAt,
+        w.fragmentType ?? null, w.fragmentLabel ?? null, w.canonicalId ?? null
+      );
+    }
+  });
+  tx();
 }
 
 // =============================================================================
