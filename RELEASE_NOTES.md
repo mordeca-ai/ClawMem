@@ -4,6 +4,45 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.8 — Collection-scoped purge, mandatory cleanup scope, index backups
+
+Hardening pass for an internal incident (master-harness-t5i0): a disposable
+smoke-test collection teardown called `store.deleteInactiveDocuments()` +
+`cleanupOrphanedContent()` + `cleanupOrphanedVectors()` expecting them to be scoped to
+that collection. They were DB-wide (`DELETE FROM documents WHERE active = 0`, no
+`WHERE collection = ?`), and hard-deleted 3566 pre-existing inactive document rows
+(plus 740 orphaned content rows) accumulated from normal file churn in the same pass
+as the 50 intended smoke docs — with no backup to recover from, because none existed.
+
+Three fixes, all in this release:
+
+1. **`clawmem collection purge <name> [--yes]`** (+ `store.purgeCollection()`) — the
+   operation that teardown actually needed: hard-deletes exactly one named
+   collection's documents (active and inactive) plus now-orphaned content/vectors,
+   without touching any other collection. Refuses an empty or wildcard-bearing name.
+   Without `--yes` it only previews (active/inactive counts) — nothing is deleted.
+2. **Mandatory scope on the DB-wide cleanups.** `deleteInactiveDocuments` /
+   `cleanupOrphanedContent` / `cleanupOrphanedVectors` (`src/store.ts`) now require an
+   explicit `scope: { collection: string } | { all: true }` argument — a bare call is
+   a TypeScript compile error and a runtime throw. Additionally, lifecycle-archived
+   rows (`archived_at IS NOT NULL` — restorable via `clawmem lifecycle restore`) are
+   spared by default under any scope, including `{ all: true }`; pass
+   `{ includeArchived: true }` to opt back into the old active-only-liveness
+   definition. There are currently no call sites for these three functions anywhere
+   in the codebase, so this is pure signature hardening ahead of future callers, not
+   a behavior change for anything shipping today.
+3. **`clawmem backup [--dest <dir>] [--keep <n>]`** (+ `src/backup.ts`) — there was no
+   snapshot mechanism for the ClawMem SQLite index at all, which is why the incident
+   above had no recovery path. `backup` snapshots the live index via `VACUUM INTO`
+   (the `bun:sqlite`-native equivalent of `sqlite3 <db> ".backup <dest>"`) to
+   `CLAWMEM_BACKUP_DIR` (default `~/.cache/clawmem/backups`), retaining the newest N
+   (default 7) and pruning older ones. Does not install its own scheduler — see
+   [docs/reference/cli.md#backup](docs/reference/cli.md#backup) for a systemd
+   timer / cron example.
+
+See [docs/reference/cli.md](docs/reference/cli.md#collection-management) and
+[#backup](docs/reference/cli.md#backup) for full usage.
+
 ## v0.10.7 — Hermes plugin: refresh session-derived state on `on_session_switch`
 
 v0.10.7 implements the `MemoryProvider.on_session_switch` hook in the Hermes plugin (`src/hermes/__init__.py`). Hermes Agent (v2026.5.16) wired this lifecycle hook to fire on `/new` (reset=True), `/resume`, `/branch`, and context compression — any mid-process `session_id` rotation that does not tear the provider down. ClawMem previously did not override it (the ABC default is a no-op), so after a switch the plugin kept using the `session_id` it cached at `initialize()`: extraction and handoff metadata carried the stale id, and the session-keyed transcript file (`{session_id}.jsonl`) kept collecting the new session's turns under the old name.
