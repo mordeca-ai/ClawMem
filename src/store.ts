@@ -67,6 +67,15 @@ const HOME = Bun.env.HOME || "/tmp";
 export const DEFAULT_EMBED_MODEL = "granite";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "tobil/qmd-query-expansion-1.7B";
+
+// 1d1fn: same class of fix as llm.ts's REMOTE_FETCH_TIMEOUT_MS — the
+// original 3e1 hang (CLAWMEM_RERANK_URL defaulting to an unreachable
+// localhost:8090) was fixed operationally (env var), but the fetch()
+// below never got an explicit deadline in code. Cap it so a hung/
+// unreachable reranker fails a batch fast instead of riding Bun's
+// unbounded connect/idle wait.
+const REMOTE_RERANK_FETCH_TIMEOUT_MS =
+  parseInt(Bun.env.CLAWMEM_REMOTE_FETCH_TIMEOUT_MS || "60000", 10);
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 
@@ -3715,6 +3724,7 @@ export async function rerank(query: string, documents: { file: string; text: str
               query: rerankQuery,
               documents: batch.map(d => d.text.slice(0, 400)),
             }),
+            signal: AbortSignal.timeout(REMOTE_RERANK_FETCH_TIMEOUT_MS),
           });
           if (resp.ok) {
             const data = await resp.json() as { results: { index: number; relevance_score: number }[] };

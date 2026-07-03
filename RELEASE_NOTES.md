@@ -4,6 +4,44 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.9 — Explicit deadline on remote embed/LLM/rerank fetches; timeout trips the circuit breaker
+
+Follow-up hardening for master-harness-62xr.5 (finance corpus embed timeout storm:
+`tools/reindex-changed` ran ~3hr and reported `0 fragments, 38 failed`). Root cause was
+two stacked bugs: yoshiee's ollama transiently hung/queued under GPU contention, and
+`src/llm.ts`'s `embedRemote()`/`embedRemoteBatch()` fetches to `/v1/embeddings` had
+**no explicit timeout/AbortSignal** — Bun's own idle-timeout behavior is neither fixed
+nor short (empirically: a raw hung TCP socket did not resolve within 300s in this
+session's probe), so each of the 38 fragments individually rode it out
+(38 x ~285s ≈ 10825s — the arithmetic IS the diagnosis) because the resulting
+DOMException was never classified as a transport failure, so the circuit breaker
+(`markRemoteEmbedDown`) never tripped.
+
+Two fixes:
+
+1. **`LlamaCppConfig.remoteFetchTimeoutMs`** (default `60_000`, env
+   `CLAWMEM_REMOTE_FETCH_TIMEOUT_MS`) — every outbound fetch to a remote
+   embed/LLM server (`embedRemote`, `embedRemoteBatch`, `generateRemote`'s
+   `/v1/chat/completions` call) now carries `AbortSignal.timeout(remoteFetchTimeoutMs)`
+   (combined with any caller-supplied signal via `AbortSignal.any`). `store.ts`'s
+   rerank fetch (`/v1/rerank`, the same class of gap the 3e1 investigation surfaced
+   but never hardened in code) picks up the same deadline via
+   `CLAWMEM_REMOTE_FETCH_TIMEOUT_MS`.
+2. **`isTransportError()` now classifies timeout DOMExceptions** (`name ===
+   "TimeoutError"`, plus the message/code variants empirically observed from Bun's
+   own connection-reset behavior) as transport failures, so
+   `markRemoteEmbedDown()`/`markRemoteLlmDown()` trip on the FIRST timeout. A hung
+   server now fails an entire batch in ~1 minute (configurable), not hours — the
+   remaining fragments short-circuit through the existing cooldown check instead of
+   each eating a full wait.
+
+New tests: `tests/unit/embed-remote-timeout.test.ts` — a raw `Bun.listen()` socket that
+accepts-and-never-responds proves (a) the embed fetch aborts at the configured
+deadline with measured wall time, (b) the breaker trips after the first timeout so
+subsequent fragments fail in <150ms with no new socket opened, (c) a healthy endpoint
+still embeds normally. Verified these assertions time out (10s bun-test budget) against
+the pre-fix code via stash-bisection on `src/llm.ts`.
+
 ## v0.10.8 — Collection-scoped purge, mandatory cleanup scope, index backups
 
 Hardening pass for an internal incident (master-harness-t5i0): a disposable

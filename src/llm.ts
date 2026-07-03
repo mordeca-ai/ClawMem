@@ -269,6 +269,19 @@ export type LlamaCppConfig = {
    * memory reclaim.
    */
   disposeModelsOnInactivity?: boolean;
+  /**
+   * Deadline (ms) for every outbound fetch() to a remote embed/LLM/rerank
+   * server (default: 60_000, Env: CLAWMEM_REMOTE_FETCH_TIMEOUT_MS).
+   *
+   * Without this, a hung remote server rides Bun's own idle-timeout behavior,
+   * which is neither fixed nor short — the 62xr.5 incident measured ~285s
+   * per hung fragment (38 fragments x ~285s = ~3hr) because the fetch had no
+   * explicit AbortSignal. AbortSignal.timeout(remoteFetchTimeoutMs) bounds
+   * every embed/generate/rerank fetch deterministically; isTransportError()
+   * classifies the resulting DOMException(name="TimeoutError") as a
+   * transport failure so the circuit breaker trips on the first timeout.
+   */
+  remoteFetchTimeoutMs?: number;
 };
 
 /**
@@ -276,6 +289,9 @@ export type LlamaCppConfig = {
  */
 // Default inactivity timeout: 2 minutes
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 2 * 60 * 1000;
+// Default deadline for outbound fetches to remote embed/LLM servers (1d1fn/62xr.5).
+const DEFAULT_REMOTE_FETCH_TIMEOUT_MS =
+  parseInt(process.env.CLAWMEM_REMOTE_FETCH_TIMEOUT_MS || "60000", 10);
 const ALLOWED_REMOTE_LLM_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 
 function normalizeRemoteLlmReasoningEffort(value?: string): string | null {
@@ -336,6 +352,14 @@ export class LlamaCpp implements LLM {
   private remoteLlmFallbackNotifiedUntil = 0;
   private static readonly REMOTE_COOLDOWN_MS = 60_000; // 60s cooldown on transport failure
 
+  // 1d1fn: explicit ceiling on remote embed/LLM/rerank fetches. Without this,
+  // a hung server (GPU contention, dropped connection with no RST) rides
+  // Bun's own idle-timeout behavior — which is neither fixed nor short
+  // across environments/versions and was observed taking ~285s/fragment in
+  // the 62xr.5 incident (38 fragments x ~285s = ~3hr). See
+  // LlamaCppConfig.remoteFetchTimeoutMs for the full rationale.
+  private remoteFetchTimeoutMs: number;
+
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
@@ -351,6 +375,7 @@ export class LlamaCpp implements LLM {
     this.remoteLlmNoThink = config.remoteLlmNoThink ?? true;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+    this.remoteFetchTimeoutMs = config.remoteFetchTimeoutMs ?? DEFAULT_REMOTE_FETCH_TIMEOUT_MS;
   }
 
   /**
@@ -728,16 +753,27 @@ export class LlamaCpp implements LLM {
    * Only transport failures should trigger the down-cache cooldown.
    */
   private isTransportError(error: unknown): boolean {
+    // 62xr.5: AbortSignal.timeout() fires a DOMException named "TimeoutError"
+    // (not "AbortError" — that name is reserved for caller-initiated abort,
+    // see isAbortError below). A hung remote server tripping our own
+    // deadline IS a transport failure — treat it exactly like ECONNREFUSED
+    // so the circuit breaker trips instead of every fragment eating the
+    // full timeout one at a time.
+    if (error instanceof DOMException && error.name === "TimeoutError") return true;
+    if ((error as any)?.name === "TimeoutError") return true;
     if (error instanceof TypeError && String(error.message).includes("fetch")) return true; // fetch network error
     const code = (error as any)?.code || (error as any)?.cause?.code;
     if (code === "ECONNREFUSED" || code === "ETIMEDOUT" || code === "ENOTFOUND" ||
         code === "EHOSTUNREACH" || code === "ENETUNREACH" || code === "ECONNRESET" ||
-        code === "UND_ERR_CONNECT_TIMEOUT") return true;
+        code === "UND_ERR_CONNECT_TIMEOUT" || code === "UND_ERR_HEADERS_TIMEOUT" ||
+        code === "UND_ERR_BODY_TIMEOUT") return true;
     const msg = String((error as any)?.message || "").toLowerCase();
     if (msg.includes("econnrefused") || msg.includes("etimedout") || msg.includes("enotfound") ||
         msg.includes("ehostunreach") || msg.includes("enetunreach") ||
         msg.includes("unable to connect") || msg.includes("connectionrefused") ||
-        msg.includes("connection refused")) return true;
+        msg.includes("connection refused") ||
+        msg.includes("the operation timed out") ||
+        msg.includes("socket connection was closed unexpectedly")) return true;
     return false;
   }
 
@@ -838,6 +874,17 @@ export class LlamaCpp implements LLM {
     return {};
   }
 
+  /**
+   * Build the AbortSignal for a remote fetch: always enforces
+   * this.remoteFetchTimeoutMs as a deadline, and additionally honors a
+   * caller-supplied signal (cancellation) if one was passed in. Use this
+   * for every outbound fetch() to a remote embed/LLM server (62xr.5).
+   */
+  private remoteFetchSignal(callerSignal?: AbortSignal): AbortSignal {
+    const timeoutSignal = AbortSignal.timeout(this.remoteFetchTimeoutMs);
+    return callerSignal ? AbortSignal.any([timeoutSignal, callerSignal]) : timeoutSignal;
+  }
+
   private getEmbedHeaders(): Record<string, string> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.remoteEmbedApiKey) {
@@ -879,6 +926,7 @@ export class LlamaCpp implements LLM {
           method: "POST",
           headers: this.getEmbedHeaders(),
           body: JSON.stringify(body),
+          signal: this.remoteFetchSignal(),
         });
         if (resp.status === 429) {
           const retryAfter = this.parseRetryAfter(resp);
@@ -925,6 +973,7 @@ export class LlamaCpp implements LLM {
           method: "POST",
           headers: this.getEmbedHeaders(),
           body: JSON.stringify(body),
+          signal: this.remoteFetchSignal(),
         });
         if (resp.status === 429) {
           const retryAfter = this.parseRetryAfter(resp);
@@ -1039,7 +1088,7 @@ export class LlamaCpp implements LLM {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal,
+        signal: this.remoteFetchSignal(signal),
       });
 
       if (!resp.ok) {
