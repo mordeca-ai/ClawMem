@@ -38,10 +38,10 @@ import {
   getConfigPath,
 } from "./collections.ts";
 import { formatSearchResults, type OutputFormat } from "./formatter.ts";
-import { indexCollection, parseDocument } from "./indexer.ts";
+import { indexCollection } from "./indexer.ts";
 import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendFusionAndRerank, type RankedResult } from "./search-utils.ts";
 import { splitDocument } from "./splitter.ts";
 import { getProfile, updateProfile, isProfileStale } from "./profile.ts";
 import { regenerateAllDirectoryContexts } from "./directory-context.ts";
@@ -439,6 +439,42 @@ export type DocEmbedTask = {
   fragments: ReturnType<typeof splitDocument>;
 };
 
+/**
+ * Build the fragment set for one document at embed time (master-harness-z7o4y).
+ *
+ * `body` is `content.doc` — the indexer stores it frontmatter-STRIPPED
+ * (parseDocument's gray-matter call strips frontmatter at INDEX time, before
+ * `insertContent`). Re-parsing this already-stripped body for frontmatter —
+ * the prior behavior, via `parseDocument(body, path)` — is a structural
+ * no-op: there is no frontmatter left to find, so title/description facts
+ * could never generate a `frontmatter`-type fragment. This is the mechanism
+ * behind ADR-0060's "zero embedding-rank effect" null (r42 falsified the
+ * title/description-shaping fix class on exactly this basis).
+ *
+ * Fix: synthesize the frontmatter object fed to `splitDocument` from data
+ * already durable on the `documents` row (title) instead of trying to
+ * recover it from the stripped body. `description`/`keywords` are NOT
+ * persisted anywhere in the schema today — `DocumentMeta` only carries
+ * title/tags/domain/workstream/content_type/review_by — so recovering those
+ * needs a schema addition (nullable `description` column) + a backfill
+ * pass; that's out of scope here (tracked as a follow-up) and does not
+ * block closing the title-embeddability gap without a schema change or a
+ * forced full re-index. Extracted (not inlined in `cmdEmbed`) so the fix is
+ * directly unit-testable without a DB/network round trip.
+ */
+export function buildDocEmbedTask(
+  hash: string,
+  body: string,
+  path: string,
+  docTitle: string | null | undefined,
+  collection: string
+): DocEmbedTask {
+  const title = docTitle || basename(path).replace(/\.(md|txt)$/i, "");
+  const frontmatter: Record<string, any> = { title };
+  const fragments = splitDocument(body, frontmatter);
+  return { hash, path, title, collection, fragments };
+}
+
 /** Minimal shape of an embed-batch-capable LLM client, for injection in tests. */
 export type BatchedEmbedLLM = {
   embedBatch: (texts: string[]) => Promise<(import("./llm.ts").EmbeddingResult | null)[]>;
@@ -628,22 +664,12 @@ export async function cmdEmbed(args: string[]) {
 
   // Parse + split every document up front. This is also what gives us the
   // fragment-count ETA, so it replaces the old separate "count total fragments" pass.
-  type DocTask = {
-    hash: string; path: string; title: string; collection: string;
-    fragments: ReturnType<typeof splitDocument>;
-  };
-  const docTasks: DocTask[] = [];
+  const docTasks: DocEmbedTask[] = [];
   let totalFragEstimate = 0;
   for (const { hash, body, path, title: docTitle, collection } of hashes) {
-    const title = docTitle || basename(path).replace(/\.(md|txt)$/i, "");
-    let frontmatter: Record<string, any> | undefined;
-    try {
-      const parsed = parseDocument(body, path);
-      frontmatter = parsed.meta as any;
-    } catch { /* No frontmatter or parsing error — fine, skip it */ }
-    const fragments = splitDocument(body, frontmatter);
-    docTasks.push({ hash, path, title, collection, fragments });
-    totalFragEstimate += fragments.length;
+    const docTask = buildDocEmbedTask(hash, body, path, docTitle, collection);
+    docTasks.push(docTask);
+    totalFragEstimate += docTask.fragments.length;
   }
   console.log(`Embedding ${docTasks.length} documents (${totalFragEstimate} fragments total)...`);
 
@@ -1076,19 +1102,9 @@ async function cmdQuery(args: string[]) {
     reranked = candidates.map(r => ({ file: r.file, score: r.score }));
   }
 
-  // Step 7: Position-aware blending
-  const rrfRankMap = new Map(candidates.map((r, i) => [r.file, i + 1]));
-  const blended = reranked.map(r => {
-    const rrfRank = rrfRankMap.get(r.file) || candidates.length;
-    let rrfWeight: number;
-    if (rrfRank <= 3) rrfWeight = 0.75;
-    else if (rrfRank <= 10) rrfWeight = 0.60;
-    else rrfWeight = 0.40;
-
-    const blendedScore = rrfWeight * (1 / rrfRank) + (1 - rrfWeight) * r.score;
-    return { file: r.file, score: blendedScore };
-  });
-  blended.sort((a, b) => b.score - a.score);
+  // Step 7: Position-aware blending — uses the candidate's actual (normalized)
+  // RRF fusion score, not a rank-index proxy (master-harness-z7o4y fusion fix).
+  const blended = blendFusionAndRerank(candidates, reranked);
 
   // Step 8: Map back to full results and apply composite scoring
   const resultMap = new Map(
