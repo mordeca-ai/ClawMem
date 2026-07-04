@@ -133,3 +133,58 @@ export function toRanked(r: SearchResult): RankedResult {
     score: r.score,
   };
 }
+
+// =============================================================================
+// Fusion + Rerank Blending (master-harness-z7o4y)
+// =============================================================================
+
+/**
+ * Blend RRF fusion evidence with cross-encoder rerank scores.
+ *
+ * Prior (buggy) shape recomputed a purely positional `1 / rrfRank` figure —
+ * "what slot did this land in, in the truncated candidate list" — and threw
+ * away the RRF score itself. RRF's whole point is that a document present
+ * near the top of MULTIPLE ranked lists (e.g. rank-1 lexical AND rank-7
+ * vector) accumulates a materially higher fused score than a document that
+ * merely occupies a similar ordinal position in a single list. The
+ * positional-only formula erased that distinction: two candidates at
+ * adjacent ranks got near-identical `1/rank` inputs regardless of how many
+ * arms actually agreed on them or how strongly. That is the textbook fusion
+ * defect master-harness-z7o4y reproduced: a dual-arm-strong document (rank-1
+ * lexical 0.522 + rank-7 vector 0.436) fused BELOW single-arm competitors —
+ * absent through k=30, surfacing only at k=40 with a fused score lower than
+ * either constituent arm.
+ *
+ * Fix: normalize each candidate's actual RRF fusion score (not its rank
+ * index) against the max RRF score in the candidate pool, and blend that
+ * against the rerank score. `candidates` MUST already be sorted descending
+ * by RRF score (both call sites pass `reciprocalRankFusion`'s output
+ * directly, which is sorted that way) — rank-tier weighting is preserved
+ * from the original design (favor the fusion signal more heavily for
+ * top-ranked candidates, lean on the reranker more for the long tail), only
+ * the *base* fusion signal changes from "1/rank" to "normalized RRF score".
+ */
+export function blendFusionAndRerank(
+  candidates: RankedResult[],
+  reranked: { file: string; score: number }[]
+): { file: string; score: number }[] {
+  const rrfRankMap = new Map(candidates.map((r, i) => [r.file, i + 1]));
+  const rrfScoreMap = new Map(candidates.map(r => [r.file, r.score]));
+  const maxRrfScore = candidates.reduce((m, r) => Math.max(m, r.score), 0);
+
+  const blended = reranked.map(r => {
+    const rrfRank = rrfRankMap.get(r.file) || candidates.length;
+    const rawRrfScore = rrfScoreMap.get(r.file) ?? 0;
+    const normalizedRrf = maxRrfScore > 0 ? rawRrfScore / maxRrfScore : 0;
+
+    let rrfWeight: number;
+    if (rrfRank <= 3) rrfWeight = 0.75;
+    else if (rrfRank <= 10) rrfWeight = 0.60;
+    else rrfWeight = 0.40;
+
+    const blendedScore = rrfWeight * normalizedRrf + (1 - rrfWeight) * r.score;
+    return { file: r.file, score: blendedScore };
+  });
+  blended.sort((a, b) => b.score - a.score);
+  return blended;
+}

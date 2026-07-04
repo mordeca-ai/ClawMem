@@ -31,7 +31,7 @@ import {
   type EnrichedResult,
   type CoActivationFn,
 } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendFusionAndRerank, type RankedResult } from "./search-utils.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
 import { listCollections } from "./collections.ts";
@@ -736,16 +736,10 @@ This is the recommended entry point for ALL memory queries.`,
       const reranked = await store.rerank(query, chunksToRerank, DEFAULT_RERANK_MODEL, intent);
 
       const candidateMap = new Map(candidates.map(c => [c.file, c]));
-      const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
-      // Blend RRF + reranker scores (position-aware)
-      const blended = reranked.map(r => {
-        const rrfRank = rrfRankMap.get(r.file) || candidates.length;
-        const rrfWeight = rrfRank <= 3 ? 0.75 : rrfRank <= 10 ? 0.60 : 0.40;
-        const blendedScore = rrfWeight * (1 / rrfRank) + (1 - rrfWeight) * r.score;
-        return { file: r.file, score: blendedScore };
-      });
-      blended.sort((a, b) => b.score - a.score);
+      // Blend RRF + reranker scores using the candidate's actual (normalized)
+      // RRF fusion score, not a rank-index proxy (master-harness-z7o4y fusion fix).
+      const blended = blendFusionAndRerank(candidates, reranked);
 
       // Map to SearchResults for composite scoring — hydrate from DB when needed
       const allSearchResults = [...store.searchFTS(query, 30)];
