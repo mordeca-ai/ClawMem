@@ -4,6 +4,57 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.10 — Fix hybrid fusion mis-weighting + frontmatter unembeddable by construction
+
+Two textbook retrieval-quality defects (master-harness-z7o4y), traced from a
+downstream falsification cycle (r42): `docs/rag/INDEX.md` scored rank-1
+lexical (BM25 0.522) AND rank-7 vector (0.436 @k20) in isolated arms, yet
+`clawmem query` (hybrid) buried it absent-through-k30, surfacing only at k=40
+with a fused score (0.291) LOWER than either constituent arm.
+
+1. **Fusion mis-weighting** (`cmdQuery` in `clawmem.ts`, duplicated in
+   `mcp.ts`'s `memory_retrieve` tool): the "position-aware blending" step
+   recomputed a purely positional `1 / rrfRank` figure and discarded the
+   actual RRF fusion score `reciprocalRankFusion()` already computed — so a
+   document present near the top of MULTIPLE ranked lists (RRF's entire
+   point) got the same blend input as a document merely occupying a similar
+   rank position in a SINGLE list. Fix: `blendFusionAndRerank()`
+   (`search-utils.ts`) normalizes each candidate's actual RRF score against
+   the candidate pool's max, preserving the existing rank-tier
+   rerank-weighting scheme — both call sites now share one implementation
+   (closes the "blast radius = every query-mode call across all harnesses"
+   duplication too).
+2. **Frontmatter unembeddable by construction** (`cmdEmbed` in
+   `clawmem.ts`): embed time re-parsed `content.doc` for frontmatter, but
+   `content.doc` is what the indexer stores AFTER stripping frontmatter
+   (`parseDocument`'s gray-matter call runs before `insertContent`) — so
+   `extractFrontmatter` never had anything to find. This explains
+   ADR-0060's "zero embedding-rank effect" null. Fix: synthesize the
+   frontmatter fed to `splitDocument` from the `documents.title` column
+   (already durable — no schema change, no forced re-index) instead of
+   re-deriving it from the stripped body. `description`/`keywords` remain
+   unrecoverable without a schema addition (`documents` has no
+   `description` column) — tracked as a follow-up.
+
+**Migration / re-embed note:** neither fix requires a schema migration.
+The fusion fix is pure retrieval-time logic — it applies to every `query`
+call immediately, no re-index needed. The frontmatter fix only affects
+fragment generation, which runs via `getHashesNeedingFragments()` — this
+selects documents *missing* a fragment (no embeddings at all, or missing
+the seq=0 primary embedding). Documents that are **already fully embedded**
+(the common case for an established index) will NOT be reselected by this
+query and therefore will NOT retroactively pick up a `title` frontmatter
+fragment from this fix alone; a targeted re-embed (clearing fragments for
+already-embedded documents, or `clawmem embed --force` for a full rebuild)
+is required to realize the effect on existing corpora. New documents, and
+any document whose content changes (triggering a hash change), pick up the
+fix automatically on their next embed pass.
+
+New tests: `tests/unit/search-utils.blend-fusion-rerank.test.ts`,
+`tests/unit/embed-frontmatter-fragments.test.ts`.
+
+---
+
 ## v0.10.9 — Explicit deadline on remote embed/LLM/rerank fetches; timeout trips the circuit breaker
 
 Follow-up hardening for master-harness-62xr.5 (finance corpus embed timeout storm:
