@@ -1285,7 +1285,7 @@ This is the recommended entry point for ALL memory queries.`,
       const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0 };
 
       for (const col of collections) {
-        const stats = await indexCollection(store, col.name, col.path, col.pattern);
+        const stats = await indexCollection(store, col.name, col.path, col.pattern, { defaultContentType: col.content_type });
         totalStats.added += stats.added;
         totalStats.updated += stats.updated;
         totalStats.unchanged += stats.unchanged;

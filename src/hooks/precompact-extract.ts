@@ -289,7 +289,7 @@ export async function precompactExtract(
       );
       if (memEntry) {
         const [colName, col] = memEntry;
-        await indexCollection(store, colName, col.path, col.pattern || "**/*.md");
+        await indexCollection(store, colName, col.path, col.pattern || "**/*.md", { defaultContentType: col.content_type });
       }
     } catch (e) {
       process.stderr.write(`precompact-extract: archive reindex failed (non-fatal): ${e}\n`);

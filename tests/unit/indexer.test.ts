@@ -219,3 +219,30 @@ describe("computeQualityScore", () => {
     expect(score).toBeGreaterThanOrEqual(0);
   });
 });
+
+// ─── per-collection default content_type (rvzn8.2) ─────────────────
+
+describe("parseDocument defaultContentType", () => {
+  it("uses the collection default for a frontmatter-less doc (kills inference)", () => {
+    // "0123-....md" infers `note` (no filename signal); the default must win.
+    const { meta } = parseDocument("# ADR 123\nBody", "0123-some-decision-topic.md", "decision");
+    expect(meta.content_type).toBe("decision");
+  });
+
+  it("explicit frontmatter content_type beats the collection default", () => {
+    const content = "---\ncontent_type: hub\n---\n# Index";
+    const { meta } = parseDocument(content, "0042-x.md", "decision");
+    expect(meta.content_type).toBe("hub");
+  });
+
+  it("falls back to inference when no default is configured (unchanged behavior)", () => {
+    const { meta } = parseDocument("# Notes", "research/topic.md");
+    expect(meta.content_type).toBe("research");
+  });
+
+  it("applies the default even when frontmatter parsing fails", () => {
+    const broken = "---\n: not: [valid yaml\n---\nbody";
+    const { meta } = parseDocument(broken, "0007-y.md", "decision");
+    expect(meta.content_type).toBe("decision");
+  });
+});

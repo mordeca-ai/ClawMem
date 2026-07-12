@@ -29,6 +29,9 @@ export interface Collection {
   pattern: string;        // Glob pattern (e.g., "**/*.md")
   context?: ContextMap;   // Optional context definitions
   update?: string;        // Optional bash command to run during qmd update
+  content_type?: string;  // Default content_type for docs WITHOUT explicit frontmatter
+                          // (kills filename inference for this collection — rvzn8.2:
+                          // frontmatter-less ADRs were inferring `note` and decaying at 60d)
 }
 
 /**
@@ -177,7 +180,8 @@ export function listCollections(): NamedCollection[] {
 export function addCollection(
   name: string,
   path: string,
-  pattern: string = "**/*.md"
+  pattern: string = "**/*.md",
+  contentType?: string
 ): void {
   const config = loadConfig();
 
@@ -185,6 +189,8 @@ export function addCollection(
     path,
     pattern,
     context: config.collections[name]?.context, // Preserve existing context
+    // Explicit arg wins; otherwise preserve an existing default (same posture as context).
+    content_type: contentType ?? config.collections[name]?.content_type,
   };
 
   saveConfig(config);

@@ -90,7 +90,7 @@ export function extractTitle(content: string, filename: string): string {
 // Frontmatter Parsing
 // =============================================================================
 
-export function parseDocument(content: string, relativePath: string): { body: string; meta: DocumentMeta } {
+export function parseDocument(content: string, relativePath: string, defaultContentType?: string): { body: string; meta: DocumentMeta } {
   // gray-matter coerces YAML values: `title: 2023-09-27` → Date, `title: true` → boolean.
   // All frontmatter fields must be runtime-checked to prevent SQLite binding errors.
   const str = (v: unknown): string | undefined =>
@@ -104,7 +104,11 @@ export function parseDocument(content: string, relativePath: string): { body: st
         tags: Array.isArray(data.tags) ? data.tags.map(String) : undefined,
         domain: str(data.domain),
         workstream: str(data.workstream),
-        content_type: (str(data.content_type) as ContentType) || inferContentType(relativePath),
+        // Precedence (rvzn8.2): explicit frontmatter > per-collection default > filename
+        // inference. A configured default KILLS inference for the collection.
+        content_type: (str(data.content_type) as ContentType)
+          || (defaultContentType as ContentType | undefined)
+          || inferContentType(relativePath),
         review_by: str(data.review_by),
       },
     };
@@ -113,7 +117,7 @@ export function parseDocument(content: string, relativePath: string): { body: st
     return {
       body: content,
       meta: {
-        content_type: inferContentType(relativePath),
+        content_type: (defaultContentType as ContentType | undefined) || inferContentType(relativePath),
       },
     };
   }
@@ -175,7 +179,7 @@ export async function indexCollection(
   collectionName: string,
   collectionPath: string,
   pattern: string = "**/*.md",
-  options?: { forceEnrich?: boolean }
+  options?: { forceEnrich?: boolean; defaultContentType?: string }
 ): Promise<IndexStats> {
   const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0 };
   const activePaths = new Set<string>();
@@ -240,7 +244,7 @@ export async function indexCollection(
         }
 
         // Content changed — update
-        const { body, meta } = parseDocument(content, relativePath);
+        const { body, meta } = parseDocument(content, relativePath, options?.defaultContentType);
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
         const docHash = hashContent(body);
 
@@ -272,7 +276,7 @@ export async function indexCollection(
           "SELECT id, hash FROM documents WHERE collection = ? AND path = ? AND active = 0"
         ).get(collectionName, relativePath) as { id: number; hash: string } | null;
 
-        const { body, meta } = parseDocument(content, relativePath);
+        const { body, meta } = parseDocument(content, relativePath, options?.defaultContentType);
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
         const docHash = hashContent(body);
         const contentType = meta.content_type || inferContentType(relativePath);

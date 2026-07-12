@@ -506,7 +506,7 @@ async function handleReindex(req: Request, _url: URL, store: Store): Promise<Res
   let totalAdded = 0, totalUpdated = 0, totalRemoved = 0;
 
   for (const coll of targetCollections) {
-    const stats = await indexCollection(store, coll.name, coll.path, coll.pattern);
+    const stats = await indexCollection(store, coll.name, coll.path, coll.pattern, { defaultContentType: coll.content_type });
     totalAdded += stats.added;
     totalUpdated += stats.updated;
     totalRemoved += stats.removed;

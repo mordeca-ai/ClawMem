@@ -40,7 +40,7 @@ import {
 import { formatSearchResults, type OutputFormat } from "./formatter.ts";
 import { indexCollection } from "./indexer.ts";
 import { detectBeadsProject } from "./beads.ts";
-import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
+import { applyCompositeScoring, hasRecencyIntent, HALF_LIVES, type EnrichedResult } from "./memory.ts";
 import { enrichResults, reciprocalRankFusion, toRanked, blendFusionAndRerank, type RankedResult } from "./search-utils.ts";
 import { splitDocument } from "./splitter.ts";
 import { getProfile, updateProfile, isProfileStale } from "./profile.ts";
@@ -156,6 +156,10 @@ async function cmdCollectionAdd(args: string[]) {
     options: {
       name: { type: "string" },
       pattern: { type: "string", default: DEFAULT_GLOB },
+      // rvzn8.2: default content_type for docs without explicit frontmatter — kills
+      // filename inference for this collection (e.g. decisions -> decision so
+      // frontmatter-less ADRs stop decaying as 60d `note`).
+      "content-type": { type: "string" },
     },
     allowPositionals: true,
   });
@@ -169,9 +173,14 @@ async function cmdCollectionAdd(args: string[]) {
   const name = values.name || basename(absPath).toLowerCase().replace(/[^a-z0-9_-]/g, "-");
   if (!isValidCollectionName(name)) die(`Invalid collection name: ${name}`);
 
-  collectionsAdd(name, absPath, values.pattern);
+  const contentType = values["content-type"];
+  if (contentType && !(contentType in HALF_LIVES)) {
+    die(`Invalid --content-type '${contentType}' (known: ${Object.keys(HALF_LIVES).join(", ")})`);
+  }
+  collectionsAdd(name, absPath, values.pattern, contentType);
   console.log(`${c.green}Added collection '${name}'${c.reset} → ${absPath}`);
   console.log(`  Pattern: ${values.pattern}`);
+  if (contentType) console.log(`  Content type (default): ${contentType}`);
   console.log();
   console.log(`Run ${c.cyan}clawmem update${c.reset} to index files`);
 }
@@ -194,6 +203,7 @@ async function cmdCollectionList() {
     console.log(`  Path:     ${col.path}`);
     console.log(`  Pattern:  ${col.pattern}`);
     console.log(`  Files:    ${count}`);
+    if (col.content_type) console.log(`  Type:     ${col.content_type} (default for frontmatter-less docs)`);
     if (col.update) console.log(`  Update:   ${col.update}`);
     console.log();
   }
@@ -291,7 +301,7 @@ async function cmdUpdate(args: string[]) {
     }
 
     console.log(`${c.cyan}Indexing ${col.name}${c.reset} (${col.path})`);
-    const stats = await indexCollection(s, col.name, col.path, col.pattern);
+    const stats = await indexCollection(s, col.name, col.path, col.pattern, { defaultContentType: col.content_type });
     console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged, ${c.red}-${stats.removed}${c.reset} removed`);
   }
 
@@ -2025,7 +2035,7 @@ async function cmdWatch() {
       console.log(`${c.dim}[${event}]${c.reset} ${col.name}/${relativePath}`);
 
       // Re-index just this collection
-      const stats = await indexCollection(s, col.name, col.path, col.pattern);
+      const stats = await indexCollection(s, col.name, col.path, col.pattern, { defaultContentType: col.content_type });
       if (stats.added > 0 || stats.updated > 0 || stats.removed > 0) {
         console.log(`  +${stats.added} ~${stats.updated} -${stats.removed}`);
       }
@@ -2079,7 +2089,7 @@ async function cmdReindex(args: string[]) {
 
   for (const col of collections) {
     console.log(`Indexing ${c.bold}${col.name}${c.reset} (${col.path})...`);
-    const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich });
+    const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich, defaultContentType: col.content_type });
     console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed`);
   }
 }
