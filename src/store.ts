@@ -3314,11 +3314,54 @@ export function tokenizeForFTS5(query: string): string[] {
   return query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(t => t.length > 0);
 }
 
+// Curated English stopword set for FTS5 AND-group relaxation
+// (master-harness-cxj0u). buildAndGroup previously ANDed every tokenized
+// term, so a natural-language question like "How does ClawMem's hybrid
+// retrieval actually work end-to-end?" required the *document* to contain
+// literal stopword tokens ("does", "how", "actually", "s"/"to" from the
+// possessive/hyphenation split) to match the lexical/BM25 arm at all —
+// on-topic docs that never spell out the question words were excluded.
+// Kept as a curated, readable set rather than an npm stopword-list dep.
+const FTS5_STOPWORDS: Set<string> = new Set([
+  // articles
+  'a', 'an', 'the',
+  // question words
+  'how', 'what', 'when', 'where', 'why', 'which', 'who', 'whom', 'whose',
+  // auxiliaries / modals / forms of "be"
+  'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'do', 'does', 'did', 'has', 'have', 'had',
+  'can', 'could', 'will', 'would', 'shall', 'should', 'may', 'might', 'must',
+  // prepositions
+  'to', 'of', 'in', 'on', 'at', 'for', 'with', 'from', 'by', 'about',
+  'into', 'over', 'under', 'through', 'between', 'during', 'against',
+  'above', 'below', 'up', 'down', 'out', 'off', 'again', 'further',
+  // conjunctions
+  'and', 'or', 'not', 'but', 'if', 'because', 'as', 'until', 'while',
+  'so', 'than', 'then',
+  // pronouns / determiners
+  'it', 'its', 'this', 'that', 'these', 'those',
+  'i', 'me', 'my', 'we', 'us', 'our', 'you', 'your',
+  'he', 'him', 'his', 'she', 'her', 'they', 'them', 'their',
+  'itself', 'himself', 'herself', 'themselves',
+  // other high-frequency filler (incl. possessive/contraction split artifacts)
+  'actually', 'really', 'just', 'also', 'very', 'there', 'here',
+  'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some',
+  'such', 'no', 'nor', 'only', 'own', 'same', 'too', 's', 't',
+]);
+
 function buildAndGroup(text: string): string | null {
   const terms = tokenizeForFTS5(text);
   if (terms.length === 0) return null;
   if (terms.length === 1) return `"${terms[0]}"*`;
-  return terms.map(t => `"${t}"*`).join(' AND ');
+  // Drop stopwords when at least one content token remains, so
+  // natural-language questions match on their content words instead of
+  // requiring literal stopword tokens in the target doc. If every token is
+  // a stopword, fall back to ANDing all of them (previous behavior) so the
+  // query still returns something rather than nothing.
+  const content = terms.filter(t => !FTS5_STOPWORDS.has(t));
+  const effective = content.length > 0 ? content : terms;
+  if (effective.length === 1) return `"${effective[0]}"*`;
+  return effective.map(t => `"${t}"*`).join(' AND ');
 }
 
 export function buildFTS5Query(query: string): string | null {
