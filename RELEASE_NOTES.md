@@ -4,6 +4,38 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.12 — FTS5 lexical search drops stopwords instead of requiring literal matches
+
+`buildFTS5Query` → `buildAndGroup` (`src/store.ts`) tokenized every query and
+ANDed every token with prefix match: `"how"* AND "does"* AND "clawmem"* AND
+"s"* AND "hybrid"* AND ...`. Natural-language questions therefore required
+the *document* to contain literal stopword tokens ("does", "how", "actually",
+"to") to match the lexical/BM25 search arm at all (master-harness-cxj0u).
+`clawmem search "How does ClawMem's hybrid retrieval actually work
+end-to-end?"` only surfaced a doc that literally quoted the question, while
+`clawmem search "clawmem hybrid retrieval"` correctly surfaced the on-topic
+hub docs — the difference was entirely the stopwords, not relevance.
+
+Fix: a curated `FTS5_STOPWORDS` set (articles, auxiliaries/modals, question
+words, pronouns, common prepositions/conjunctions). `buildAndGroup` now drops
+stopword tokens from the AND group whenever at least one content token
+remains, ANDing content tokens only. All-stopword queries (e.g. `"this or
+that"`, `"to be or not to be"`) fall back to the previous AND-all behavior so
+they still return something instead of nothing — this also preserves the
+existing "lowercase 'or' stays a plain term" regression test unchanged.
+Single-token queries are unaffected. OR-groups relax per AND-branch
+(`buildFTS5Query`'s OR-split logic is unchanged).
+
+`entity.ts`'s `gatherEntityFTSCandidates` builds OR-of-all-tokens
+expressions via `tokenizeForFTS5`, not AND-of-all-tokens — it was not
+affected by this bug and is left untouched.
+
+New tests: `tests/unit/fts5-query-builder.test.ts` (7 new cases covering
+stopword-drop, all-stopword fallback, mixed OR-group relaxation, and
+single-token shapes).
+
+---
+
 ## v0.10.10 — Fix hybrid fusion mis-weighting + frontmatter unembeddable by construction
 
 Two textbook retrieval-quality defects (master-harness-z7o4y), traced from a
