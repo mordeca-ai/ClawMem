@@ -5,7 +5,7 @@
  */
 
 import { Glob } from "bun";
-import { readFileSync, statSync } from "fs";
+import { existsSync, readFileSync, statSync } from "fs";
 import { basename, relative } from "path";
 import matter from "gray-matter";
 import { createHash } from "crypto";
@@ -183,6 +183,18 @@ export async function indexCollection(
 ): Promise<IndexStats> {
   const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0 };
   const activePaths = new Set<string>();
+
+  // A missing/pruned collection root must not hard-fail the whole run — Bun.Glob's
+  // scanSync throws ENOENT on a nonexistent cwd, and letting that escape here takes
+  // down every OTHER collection's reindex in the same `clawmem update` invocation
+  // (one stale root breaking every collection — see master-harness-x564y / l18bm).
+  // Warn loudly and skip just this collection instead.
+  if (!existsSync(collectionPath)) {
+    console.warn(
+      `[indexer] WARNING: collection "${collectionName}" root not found: ${collectionPath} — skipping (fix or remove the collection root)`
+    );
+    return stats;
+  }
 
   // Get LLM instance for A-MEM enrichment
   const llm = getDefaultLlamaCpp();

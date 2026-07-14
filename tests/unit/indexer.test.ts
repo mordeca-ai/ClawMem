@@ -1,11 +1,16 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import {
   shouldExclude,
   hashContent,
   extractTitle,
   parseDocument,
   computeQualityScore,
+  indexCollection,
 } from "../../src/indexer.ts";
+import { createStore, type Store } from "../../src/store.ts";
+import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 
 // ─── shouldExclude ──────────────────────────────────────────────────
 
@@ -244,5 +249,89 @@ describe("parseDocument defaultContentType", () => {
     const broken = "---\n: not: [valid yaml\n---\nbody";
     const { meta } = parseDocument(broken, "0007-y.md", "decision");
     expect(meta.content_type).toBe("decision");
+  });
+});
+
+// ─── indexCollection: missing collection root (master-harness-x564y) ─
+//
+// A pruned/stale collection root used to hard-fail the WHOLE `clawmem update`
+// run — Bun.Glob.scanSync throws ENOENT on a nonexistent cwd, and that error
+// escaped indexCollection uncaught, aborting the loop over every OTHER
+// configured collection too (the jioi8 incident shape; see l18bm). The fix
+// is a warn-and-skip: log a loud warning naming the collection + missing
+// path, return zeroed stats, and let the caller's loop continue to the next
+// collection.
+
+describe("indexCollection — missing collection root", () => {
+  let store: Store;
+  let warnSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    process.env.CLAWMEM_ENABLE_AMEM = "false";
+    process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+    store = createStore(":memory:");
+    warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it("warns and returns zeroed stats instead of throwing when the root doesn't exist", async () => {
+    const missingPath = join(tmpdir(), `clawmem-x564y-missing-${Date.now()}`);
+
+    const stats = await indexCollection(store, "missing-col", missingPath, "**/*.md");
+
+    expect(stats).toEqual({ added: 0, updated: 0, unchanged: 0, removed: 0 });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const [message] = warnSpy.mock.calls[0]!;
+    expect(String(message)).toContain("missing-col");
+    expect(String(message)).toContain(missingPath);
+    expect(String(message)).toContain("skipping");
+  });
+
+  it("does not touch the database for the missing collection", async () => {
+    const missingPath = join(tmpdir(), `clawmem-x564y-missing-${Date.now()}`);
+
+    await indexCollection(store, "missing-col", missingPath, "**/*.md");
+
+    const doc = store.findActiveDocument("missing-col", "anything.md");
+    expect(doc).toBeNull();
+  });
+
+  it("a sibling healthy collection still indexes when a prior collection's root is missing", async () => {
+    const missingPath = join(tmpdir(), `clawmem-x564y-missing-${Date.now()}`);
+    const healthyDir = mkdtempSync(join(tmpdir(), "clawmem-x564y-healthy-"));
+    writeFileSync(join(healthyDir, "doc.md"), "# Healthy doc\n\nStill indexes fine.");
+
+    try {
+      // Missing collection first (matches the incident shape: an earlier
+      // stale/pruned root must not prevent a LATER healthy collection from
+      // being reached in the same `clawmem update` loop).
+      const missingStats = await indexCollection(store, "missing-col", missingPath, "**/*.md");
+      const healthyStats = await indexCollection(store, "healthy-col", healthyDir, "**/*.md");
+
+      expect(missingStats).toEqual({ added: 0, updated: 0, unchanged: 0, removed: 0 });
+      expect(healthyStats.added).toBe(1);
+
+      const doc = store.findActiveDocument("healthy-col", "doc.md");
+      expect(doc).not.toBeNull();
+    } finally {
+      rmSync(healthyDir, { recursive: true, force: true });
+    }
+  });
+
+  it("healthy-only run is unchanged (no missing collection involved)", async () => {
+    const healthyDir = mkdtempSync(join(tmpdir(), "clawmem-x564y-healthy-only-"));
+    writeFileSync(join(healthyDir, "doc.md"), "# Healthy doc\n\nUnaffected by the fix.");
+
+    try {
+      const stats = await indexCollection(store, "healthy-col", healthyDir, "**/*.md");
+
+      expect(stats.added).toBe(1);
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      rmSync(healthyDir, { recursive: true, force: true });
+    }
   });
 });
