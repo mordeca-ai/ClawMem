@@ -48,6 +48,7 @@ fragments instead of short-circuiting on the "too short to split" path.
       body,
       "docs/rag/INDEX.md",
       "RAG & hybrid retrieval — how vector + lexical search, fusion, and reranking work end-to-end",
+      null,
       "docs"
     );
 
@@ -90,15 +91,48 @@ fragments instead of short-circuiting on the "too short to split" path.
 
   it("falls back to a filename-derived title when the documents row has none", () => {
     const body = "# Some doc\n\n" + "x".repeat(250);
-    const task = buildDocEmbedTask("h2", body, "docs/some-doc.md", null, "docs");
+    const task = buildDocEmbedTask("h2", body, "docs/some-doc.md", null, null, "docs");
     expect(task.title).toBe("some-doc");
     const fmFrags = task.fragments.filter(f => f.type === "frontmatter");
     expect(fmFrags.find(f => f.label === "title")?.content).toContain("some-doc");
   });
 
   it("does not choke on a short document (below the split threshold) — still returns the full fragment", () => {
-    const task = buildDocEmbedTask("h3", "short body", "docs/short.md", "Short Title", "docs");
+    const task = buildDocEmbedTask("h3", "short body", "docs/short.md", "Short Title", null, "docs");
     expect(task.fragments.length).toBeGreaterThanOrEqual(1);
     expect(task.fragments[0]!.type).toBe("full");
+  });
+
+  // master-harness-s1lli: description is now persisted (documents.description)
+  // and recovered at embed time via `docDescription`, mirroring title.
+  it("generates a frontmatter-type fragment carrying the description, when docDescription is provided", () => {
+    const body = "# Some doc\n\n" + "x".repeat(250);
+    const task = buildDocEmbedTask(
+      "h4",
+      body,
+      "docs/some-doc.md",
+      "Some Doc",
+      "A short summary of what this document covers.",
+      "docs"
+    );
+    const fmFrags = task.fragments.filter(f => f.type === "frontmatter");
+    const descFrag = fmFrags.find(f => f.label === "description");
+    expect(descFrag).toBeDefined();
+    expect(descFrag!.content).toContain("A short summary of what this document covers.");
+    // Title fragment should still be present alongside it.
+    expect(fmFrags.find(f => f.label === "title")).toBeDefined();
+  });
+
+  it("does not generate a description fragment when docDescription is null or undefined", () => {
+    const body = "# Some doc\n\n" + "x".repeat(250);
+    const taskNull = buildDocEmbedTask("h5", body, "docs/some-doc.md", "Some Doc", null, "docs");
+    const taskUndefined = buildDocEmbedTask("h6", body, "docs/some-doc.md", "Some Doc", undefined, "docs");
+
+    for (const task of [taskNull, taskUndefined]) {
+      const fmFrags = task.fragments.filter(f => f.type === "frontmatter");
+      expect(fmFrags.find(f => f.label === "description")).toBeUndefined();
+      // Title fragment is unaffected by the absence of a description.
+      expect(fmFrags.find(f => f.label === "title")).toBeDefined();
+    }
   });
 });

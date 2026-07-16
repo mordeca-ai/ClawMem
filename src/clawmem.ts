@@ -462,25 +462,29 @@ export type DocEmbedTask = {
  * title/description-shaping fix class on exactly this basis).
  *
  * Fix: synthesize the frontmatter object fed to `splitDocument` from data
- * already durable on the `documents` row (title) instead of trying to
- * recover it from the stripped body. `description`/`keywords` are NOT
- * persisted anywhere in the schema today — `DocumentMeta` only carries
- * title/tags/domain/workstream/content_type/review_by — so recovering those
- * needs a schema addition (nullable `description` column) + a backfill
- * pass; that's out of scope here (tracked as a follow-up) and does not
- * block closing the title-embeddability gap without a schema change or a
- * forced full re-index. Extracted (not inlined in `cmdEmbed`) so the fix is
- * directly unit-testable without a DB/network round trip.
+ * already durable on the `documents` row (title, description) instead of
+ * trying to recover it from the stripped body. As of master-harness-s1lli,
+ * `description` IS persisted (nullable `documents.description` column,
+ * populated by `DocumentMeta`/`parseDocument` at index time) and is passed
+ * in here as `docDescription`, so it is embeddable the same way `title` is.
+ * `keywords` remains NOT persisted anywhere in the schema — that still needs
+ * its own column + is out of scope here (tracked as a follow-up). Existing
+ * rows populate `description` on their next natural re-index (source-file
+ * touch → content-hash change); no dedicated backfill command ships with
+ * this fix. Extracted (not inlined in `cmdEmbed`) so the fix is directly
+ * unit-testable without a DB/network round trip.
  */
 export function buildDocEmbedTask(
   hash: string,
   body: string,
   path: string,
   docTitle: string | null | undefined,
+  docDescription: string | null | undefined,
   collection: string
 ): DocEmbedTask {
   const title = docTitle || basename(path).replace(/\.(md|txt)$/i, "");
   const frontmatter: Record<string, any> = { title };
+  if (docDescription) frontmatter.description = docDescription;
   const fragments = splitDocument(body, frontmatter);
   return { hash, path, title, collection, fragments };
 }
@@ -676,8 +680,8 @@ export async function cmdEmbed(args: string[]) {
   // fragment-count ETA, so it replaces the old separate "count total fragments" pass.
   const docTasks: DocEmbedTask[] = [];
   let totalFragEstimate = 0;
-  for (const { hash, body, path, title: docTitle, collection } of hashes) {
-    const docTask = buildDocEmbedTask(hash, body, path, docTitle, collection);
+  for (const { hash, body, path, title: docTitle, description: docDescription, collection } of hashes) {
+    const docTask = buildDocEmbedTask(hash, body, path, docTitle, docDescription, collection);
     docTasks.push(docTask);
     totalFragEstimate += docTask.fragments.length;
   }
