@@ -4,6 +4,49 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.13 — `description` frontmatter now persisted + embeddable (closes the z7o4y follow-up)
+
+v0.10.10 (master-harness-z7o4y) made `title` embeddable at embed time by
+recovering it from the durable `documents.title` column, since `body` (what
+`getHashesNeedingFragments()` hands the embed pipeline) is already
+frontmatter-stripped. That fix's code comment explicitly called out
+`description` as unrecoverable — it wasn't persisted anywhere in the schema
+(`DocumentMeta` only carried title/tags/domain/workstream/content_type/
+review_by) — and flagged it as a follow-up (master-harness-s1lli).
+
+Fix: thread `description` end to end, mirroring how `title` is handled:
+
+- `documents.description` — new nullable `TEXT` column, added via an
+  additive migration (`ALTER TABLE documents ADD COLUMN description TEXT`).
+  No forced re-index; existing rows have `NULL` until their next natural
+  re-index (a source-file touch that changes the content hash).
+- `parseDocument` (`indexer.ts`) now extracts `description` from frontmatter
+  into `DocumentMeta`, runtime-checked the same way `title` is (gray-matter
+  YAML coercion guard).
+- `updateDocumentMeta` / the two `INSERT INTO documents` paths (`store.ts`)
+  persist `description` alongside the other nullable meta fields.
+- `getHashesNeedingFragments` now also selects `description`, and
+  `buildDocEmbedTask` (`clawmem.ts`) takes a new `docDescription` parameter:
+  when present and non-empty, it adds a `description` key to the synthesized
+  frontmatter object fed to `splitDocument`, producing a `frontmatter`-type
+  fragment with `label: "description"` — the same mechanism that already
+  makes `title` embeddable.
+
+Scope: only `description`. `keywords` still needs its own column and is
+deferred as a separate follow-up. No dedicated backfill command ships with
+this fix — existing documents pick up `description` on their next natural
+re-index; there is no forced-reindex or backfill migration path bundled
+here.
+
+New/updated tests: `tests/unit/embed-frontmatter-fragments.test.ts` — a
+positive case (`docDescription` provided → `description`-labeled
+`frontmatter` fragment alongside `title`) and a negative case (`null`/
+`undefined` `docDescription` → no `description` fragment, `title` fragment
+unaffected). Existing 5-arg `buildDocEmbedTask` calls in that file updated to
+the new 6-arg signature (`docDescription` inserted after `docTitle`).
+
+---
+
 ## v0.10.12 — FTS5 lexical search drops stopwords instead of requiring literal matches
 
 `buildFTS5Query` → `buildAndGroup` (`src/store.ts`) tokenized every query and
