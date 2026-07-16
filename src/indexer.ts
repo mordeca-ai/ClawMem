@@ -19,6 +19,7 @@ import { getDefaultLlamaCpp } from "./llm.ts";
 
 export interface DocumentMeta {
   title?: string;
+  description?: string;
   tags?: string[];
   domain?: string;
   workstream?: string;
@@ -101,6 +102,7 @@ export function parseDocument(content: string, relativePath: string, defaultCont
       body,
       meta: {
         title: str(data.title),
+        description: str(data.description),
         tags: Array.isArray(data.tags) ? data.tags.map(String) : undefined,
         domain: str(data.domain),
         workstream: str(data.workstream),
@@ -256,6 +258,7 @@ export async function indexCollection(
         store.updateDocumentMeta(existing.id, {
           domain: meta.domain,
           workstream: meta.workstream,
+          description: meta.description,
           tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
           content_type: contentType,
           review_by: meta.review_by,
@@ -290,6 +293,7 @@ export async function indexCollection(
           store.updateDocumentMeta(inactive.id, {
             domain: meta.domain,
             workstream: meta.workstream,
+            description: meta.description,
             tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
             content_type: contentType,
             review_by: meta.review_by,
@@ -299,12 +303,13 @@ export async function indexCollection(
           enrichQueue.push({ docId: inactive.id, isNew: false });
         } else {
           // Truly new document
-          store.insertDocument(collectionName, relativePath, title, docHash, now, mtime.toISOString());
+          store.insertDocument(collectionName, relativePath, title, docHash, now, mtime.toISOString(), meta.description ?? null);
           const newDoc = store.findActiveDocument(collectionName, relativePath);
           if (newDoc) {
             store.updateDocumentMeta(newDoc.id, {
               domain: meta.domain,
               workstream: meta.workstream,
+              description: meta.description,
               tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
               content_type: contentType,
               review_by: meta.review_by,
