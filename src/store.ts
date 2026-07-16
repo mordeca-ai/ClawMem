@@ -3717,6 +3717,15 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
+  // Backend URL for this call, read ONCE up front so it can namespace the rerank cache key
+  // (master-harness d0hz / ADR-0059 cache-key pitfall). The SAME (query,file,model) reranked
+  // via the yoshiee-bge endpoint and via the OpenRouter/Cohere cloud proxy would otherwise
+  // collide on one llm_cache row and replay a stale cross-backend score. Including the URL in
+  // the key namespaces the cache per backend. `undefined` (no CLAWMEM_RERANK_URL -> local
+  // node-llama-cpp) JSON.stringify-omits, so the local-only cache key is UNCHANGED (no
+  // invalidation) — only URL-backed backends get distinct keys.
+  const rerankUrl = Bun.env.CLAWMEM_RERANK_URL;
+
   // Deduplicate identical chunk texts — same content from different files shares a single score
   const textToFiles = new Map<string, string[]>();
   const uniqueDocs: RerankDocument[] = [];
@@ -3735,7 +3744,7 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Check cache for each unique document
   for (const doc of uniqueDocs) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model });
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model, rerankUrl });
     const cached = getCachedResult(db, cacheKey);
     if (cached !== null) {
       const score = parseFloat(cached);
@@ -3749,7 +3758,7 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Rerank uncached documents (remote GPU preferred, local node-llama-cpp fallback)
   // Cap parallelism at 4 to prevent VRAM exhaustion
   if (uncachedDocs.length > 0) {
-    const rerankUrl = Bun.env.CLAWMEM_RERANK_URL;
+    // rerankUrl hoisted to function scope above (d0hz) so it namespaces the cache key.
     let scored = false;
 
     // Try remote GPU reranker first
@@ -3773,7 +3782,7 @@ export async function rerank(query: string, documents: { file: string; text: str
             const data = await resp.json() as { results: { index: number; relevance_score: number }[] };
             for (const r of data.results) {
               const doc = batch[r.index]!;
-              const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model });
+              const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model, rerankUrl });
               setCachedResult(db, cacheKey, r.relevance_score.toString());
               // Apply score to all files sharing this text
               for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, r.relevance_score);
@@ -3796,7 +3805,7 @@ export async function rerank(query: string, documents: { file: string; text: str
         const rerankResult = await llm.rerank(rerankQuery, remaining, { model });
         for (const result of rerankResult.results) {
           const doc = remaining.find(d => d.file === result.file);
-          const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: result.file, model });
+          const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: result.file, model, rerankUrl });
           setCachedResult(db, cacheKey, result.score.toString());
           // Apply score to all files sharing this text
           if (doc) {
