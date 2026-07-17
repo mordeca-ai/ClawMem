@@ -349,6 +349,7 @@ function initializeDatabase(db: Database): void {
       active INTEGER NOT NULL DEFAULT 1,
       domain TEXT,
       workstream TEXT,
+      description TEXT,
       tags TEXT,
       content_type TEXT NOT NULL DEFAULT 'note',
       review_by TEXT,
@@ -384,6 +385,9 @@ function initializeDatabase(db: Database): void {
     ["last_seen_at", "ALTER TABLE documents ADD COLUMN last_seen_at TEXT"],
     ["topic_key", "ALTER TABLE documents ADD COLUMN topic_key TEXT"],
     ["revision_count", "ALTER TABLE documents ADD COLUMN revision_count INTEGER NOT NULL DEFAULT 1"],
+    // master-harness-s1lli: persist description frontmatter so it can be
+    // recovered + embedded at embed time (mirrors the z7o4y title fix).
+    ["description", "ALTER TABLE documents ADD COLUMN description TEXT"],
   ];
   for (const [col, sql] of migrations) {
     if (!colNames.has(col)) {
@@ -1026,7 +1030,7 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; pinned: number; snoozed_until: string | null; confidence: number } | null;
   findAnyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; active: number } | null;
   reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
@@ -1037,7 +1041,7 @@ export type Store = {
 
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
-  getHashesNeedingFragments: () => { hash: string; body: string; path: string; title: string; collection: string }[];
+  getHashesNeedingFragments: () => { hash: string; body: string; path: string; title: string; collection: string; description: string | null }[];
   clearAllEmbeddings: () => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string) => void;
   insertEmbeddingsBatch: (writes: EmbeddingWrite[]) => void;
@@ -1058,7 +1062,7 @@ export type Store = {
   markUsageReferenced: (id: number) => void;
 
   // SAME: Document metadata operations
-  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }) => void;
+  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }) => void;
   incrementAccessCount: (paths: string[]) => void;
   getDocumentsByType: (contentType: string, limit?: number) => DocumentRow[];
   getStaleDocuments: (beforeDate: string) => DocumentRow[];
@@ -1219,7 +1223,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
+    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, description),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
     findAnyDocument: (collectionName: string, path: string) => findAnyDocument(db, collectionName, path),
     reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => reactivateDocument(db, documentId, title, hash, modifiedAt),
@@ -2293,14 +2297,15 @@ export function insertDocument(
   title: string,
   hash: string,
   createdAt: string,
-  modifiedAt: string
+  modifiedAt: string,
+  description?: string | null
 ): void {
   // Guard: gray-matter can coerce YAML values to Date/boolean/null — SQLite rejects these
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
-  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt);
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, description)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt, description ?? null);
 }
 
 // =============================================================================
@@ -2328,6 +2333,8 @@ export type SaveMemoryParams = {
   collection: string;
   path: string;
   title: string;
+  /** Optional short summary, persisted to documents.description (master-harness-s1lli). */
+  description?: string;
   body: string;
   contentType: string;
   confidence?: number;
@@ -2412,8 +2419,8 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
     db.prepare(`
       INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
                              content_type, confidence, quality_score, normalized_hash,
-                             duplicate_count, revision_count, last_seen_at, topic_key)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?)
+                             duplicate_count, revision_count, last_seen_at, topic_key, description)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?)
     `).run(
       params.collection,
       params.path,
@@ -2427,6 +2434,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
       normHash,
       now,
       params.topicKey ?? null,
+      params.description ?? null,
     );
   } catch (err: any) {
     // UNIQUE(collection, path) conflict — update existing row
@@ -3586,11 +3594,12 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
  * Get all unique content hashes that need fragment-level embeddings.
  * Returns hashes that have no content_vectors row with fragment_type set.
  */
-export function getHashesNeedingFragments(db: Database): { hash: string; body: string; path: string; title: string; collection: string }[] {
+export function getHashesNeedingFragments(db: Database): { hash: string; body: string; path: string; title: string; collection: string; description: string | null }[] {
   // Select docs that either have no fragments at all OR are missing the primary (seq=0) fragment.
   // The seq=0 embedding is critical — surprisal scoring, semantic graph, and health checks depend on it.
   return db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path, MIN(d.title) as title, MIN(d.collection) as collection
+    SELECT d.hash, c.doc as body, MIN(d.path) as path, MIN(d.title) as title, MIN(d.collection) as collection,
+           MIN(d.description) as description
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.fragment_type IS NOT NULL
@@ -3599,7 +3608,7 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
       AND (v.hash IS NULL OR v0.hash IS NULL)
       AND COALESCE(d.embed_attempts, 0) < 3
     GROUP BY d.hash
-  `).all() as { hash: string; body: string; path: string; title: string; collection: string }[];
+  `).all() as { hash: string; body: string; path: string; title: string; collection: string; description: string | null }[];
 }
 
 /**
@@ -4384,11 +4393,12 @@ function markUsageReferencedFn(db: Database, id: number): void {
 // SAME: Document Metadata Operations
 // =============================================================================
 
-function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }): void {
+function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }): void {
   const sets: string[] = [];
   const vals: (string | number | null)[] = [];
   if (meta.domain !== undefined) { sets.push("domain = ?"); vals.push(meta.domain); }
   if (meta.workstream !== undefined) { sets.push("workstream = ?"); vals.push(meta.workstream); }
+  if (meta.description !== undefined) { sets.push("description = ?"); vals.push(meta.description); }
   if (meta.tags !== undefined) { sets.push("tags = ?"); vals.push(meta.tags); }
   if (meta.content_type !== undefined) { sets.push("content_type = ?"); vals.push(meta.content_type); }
   if (meta.review_by !== undefined) { sets.push("review_by = ?"); vals.push(meta.review_by); }
