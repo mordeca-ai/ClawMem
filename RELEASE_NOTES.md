@@ -4,6 +4,30 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.14 — rerank `llm_cache` key namespaced by backend URL (ADR-0059 cache-key collision)
+
+The rerank cache key was `getCacheKey('rerank', {query, file, model})` with
+`model` always the hardcoded `DEFAULT_RERANK_MODEL` constant — and the
+actual backend (`CLAWMEM_RERANK_URL`) was not part of the key. A deployment
+that switches the rerank URL per-prompt (master-harness-ybtm's opt-in
+cloud-rerank fallback: yoshiee-bge ↔ cloud-Cohere proxy) therefore collided
+both backends onto one cache row, so a stale score from one backend could
+replay for the other — the exact ADR-0059 "cache-key collision" footgun
+(master-harness-d0hz).
+
+Fix: `rerank()` reads `CLAWMEM_RERANK_URL` once at the top and threads it
+into all three `getCacheKey("rerank", ...)` sites (cache read + both
+remote/local writes), namespacing `llm_cache` per backend.
+
+Compatibility: when the URL is unset (local rerank), the `undefined` value
+is omitted by `JSON.stringify`, so the local cache key is byte-identical to
+the pre-fix shape — no invalidation of the warm local cache, no re-embed,
+no schema change.
+
+Regression: `tests/unit/rerank-cache-key.test.ts` — distinct URLs produce
+distinct keys, same URL is stable, unset URL matches the pre-fix key shape,
+and remote-URL keys differ from local keys.
+
 ## v0.10.13 — `description` frontmatter now persisted + embeddable (closes the z7o4y follow-up)
 
 v0.10.10 (master-harness-z7o4y) made `title` embeddable at embed time by
