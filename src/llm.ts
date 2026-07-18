@@ -310,6 +310,33 @@ function buildRemoteChatCompletionsUrl(remoteLlmUrl: string): string {
   return `${baseUrl}${endpoint}`;
 }
 
+// 5r0rd: per-embed-model token ceilings for truncateForEmbed's token-aware
+// cap. lth's retro found the char-based cap (maxRemoteEmbedChars, calibrated
+// for EmbeddingGemma's 2048-token context) structurally can't catch
+// high-entropy content (UUIDs/paths/numeric scales) that sits UNDER the char
+// cap but tokenizes past a DIFFERENT model's token ceiling — e.g.
+// nomic-embed-text's 8192 vs EmbeddingGemma's 2048. Matched case-insensitively
+// by substring against remoteEmbedModel, same convention as
+// getCloudEmbedParams' URL matching. Unknown model → a conservative default
+// (2048, EmbeddingGemma's ceiling — the smallest of the known models here).
+// CLAWMEM_EMBED_MAX_TOKENS env override always wins when set to a positive int.
+const EMBED_MODEL_TOKEN_CEILINGS: ReadonlyArray<{ match: string; ceiling: number }> = [
+  { match: "nomic-embed-text", ceiling: 8192 },
+  { match: "embeddinggemma", ceiling: 2048 },
+  { match: "granite", ceiling: 512 },
+];
+const DEFAULT_EMBED_MODEL_TOKEN_CEILING = 2048;
+
+export function resolveEmbedModelTokenCeiling(modelName: string | null | undefined): number {
+  const envOverride = parseInt(process.env.CLAWMEM_EMBED_MAX_TOKENS || "", 10);
+  if (Number.isFinite(envOverride) && envOverride > 0) return envOverride;
+  const lower = (modelName || "").toLowerCase();
+  for (const rule of EMBED_MODEL_TOKEN_CEILINGS) {
+    if (lower.includes(rule.match)) return rule.ceiling;
+  }
+  return DEFAULT_EMBED_MODEL_TOKEN_CEILING;
+}
+
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
@@ -893,11 +920,59 @@ export class LlamaCpp implements LLM {
     return headers;
   }
 
-  private truncateForEmbed(text: string): string {
+  /**
+   * Token-aware cap seam (5r0rd): tokenize `text`, and if it exceeds
+   * `maxTokens`, slice to the first `maxTokens` tokens and detokenize back to
+   * a string (a truncate, not a chunker — only the FIRST ceiling-worth of
+   * tokens is kept). Defaults to the local generate-model tokenizer
+   * (this.tokenize/this.detokenize), which requires a real GGUF model on
+   * disk (or throws immediately when CLAWMEM_NO_LOCAL_MODELS=true — see
+   * resolveModel). Protected so a test subclass can override this ENTIRE
+   * method to stub tokenizer behavior without loading a real model — the
+   * required testability seam for exercising the token-aware path in unit
+   * tests.
+   */
+  protected async truncateToTokenCeiling(text: string, maxTokens: number): Promise<string> {
+    const tokens = await this.tokenize(text);
+    if (tokens.length <= maxTokens) return text;
+    return await this.detokenize(tokens.slice(0, maxTokens));
+  }
+
+  private async truncateForEmbed(text: string): Promise<string> {
     // Cloud providers handle their own context window limits
     if (this.isCloudEmbedding()) return text;
-    return text.length > this.maxRemoteEmbedChars
+
+    // Cheap char-based pre-slice (belt-and-suspenders) — bounds the input
+    // before tokenizing and is also the fallback below if the tokenizer is
+    // unavailable/throws.
+    const charCapped = text.length > this.maxRemoteEmbedChars
       ? text.slice(0, this.maxRemoteEmbedChars) : text;
+
+    const tokenCeiling = resolveEmbedModelTokenCeiling(this.remoteEmbedModel);
+
+    // Cheap short-circuit: a tokenizer can never produce more tokens than
+    // input characters (every token spans >= 1 character), so if the
+    // char-capped text is already at or under the token ceiling by CHAR
+    // count, it's provably at or under the ceiling by TOKEN count too — skip
+    // invoking the tokenizer entirely. This matters beyond perf: the default
+    // tokenizer seam (this.tokenize -> ensureGenerateModel) loads/downloads a
+    // real local GGUF model on first use, so touching it unconditionally for
+    // every embed call (most of which are nowhere near either limit) is both
+    // wasteful and a surprising side effect on the remote-embed-only path.
+    if (charCapped.length <= tokenCeiling) return charCapped;
+
+    try {
+      // Authoritative when available: high-entropy content (UUIDs/paths/
+      // numeric scales) can sit UNDER the char cap yet tokenize past the
+      // model's actual token ceiling (lth) — char truncation alone can never
+      // catch that; a token-aware cap is the only fix for that failure mode.
+      return await this.truncateToTokenCeiling(charCapped, tokenCeiling);
+    } catch (error) {
+      // Tokenizer unavailable or threw (e.g. CLAWMEM_NO_LOCAL_MODELS=true, no
+      // local model on disk) — never let a tokenizer failure break the embed
+      // path. The char cap above is already the safety net in that case.
+      return charCapped;
+    }
   }
 
   /** Parse Retry-After header (seconds or HTTP-date) into milliseconds to wait */
@@ -918,7 +993,7 @@ export class LlamaCpp implements LLM {
 
   private async embedRemote(text: string, extraParams: Record<string, unknown> = {}, retries = 5): Promise<EmbeddingResult | null> {
     if (this.isRemoteEmbedDown()) return null;
-    const input = this.truncateForEmbed(text);
+    const input = await this.truncateForEmbed(text);
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
         const body: Record<string, unknown> = { input, model: this.remoteEmbedModel, ...extraParams };
@@ -965,7 +1040,7 @@ export class LlamaCpp implements LLM {
 
   private async embedRemoteBatch(texts: string[], extraParams: Record<string, unknown> = {}, retries = 3): Promise<(EmbeddingResult | null)[]> {
     if (this.isRemoteEmbedDown()) return texts.map(() => null);
-    const truncated = texts.map(t => this.truncateForEmbed(t));
+    const truncated = await Promise.all(texts.map(t => this.truncateForEmbed(t)));
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
         const body: Record<string, unknown> = { input: truncated, model: this.remoteEmbedModel, ...extraParams };
