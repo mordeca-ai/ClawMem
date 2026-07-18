@@ -4,6 +4,54 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.10.15 — token-aware per-model embed cap for `truncateForEmbed` (fixes the high-entropy under-char-cap failure mode)
+
+`truncateForEmbed()` was the embed path's only size defense and it was
+**char-based only** (`CLAWMEM_EMBED_MAX_CHARS`, default 6000 — calibrated
+for EmbeddingGemma's 2048-token context, not nomic-embed-text's 8192). Per
+the lth retro (master-harness-lth), a char cap is structurally unable to
+catch failure mode (b): high-entropy content (UUIDs / file paths / numeric
+scales) that sits UNDER the char cap yet tokenizes far past the actual
+embed model's token ceiling, so truncation never fires and the primary
+(seq=0) fragment fails to embed against the model's context window.
+
+Fix (master-harness-5r0rd):
+
+- `resolveEmbedModelTokenCeiling(model)` — a per-embed-model token-ceiling
+  map (`nomic-embed-text` 8192, `embeddinggemma` 2048, `granite` 512,
+  unknown → a conservative 2048 default), matched case-insensitively by
+  substring against `remoteEmbedModel` (same convention as
+  `getCloudEmbedParams`' URL matching). `CLAWMEM_EMBED_MAX_TOKENS` env
+  override wins when set to a positive int.
+- `truncateForEmbed` is now `async` and token-aware: it char-pre-slices
+  (cheap belt-and-suspenders), then — because a tokenizer can never emit
+  more tokens than input characters — short-circuits and returns when the
+  char-capped text is already ≤ the token ceiling by char count (so the
+  common case never touches the tokenizer / never triggers a local-model
+  load). Only content that is over the ceiling by chars hits the
+  tokenize→slice→detokenize path (`truncateToTokenCeiling`, a protected,
+  test-overridable seam), truncating to the first ceiling-worth of tokens.
+- **Graceful degradation:** if the tokenizer is unavailable or throws
+  (e.g. `CLAWMEM_NO_LOCAL_MODELS=true`, no local GGUF on disk) the char cap
+  remains the safety net — a tokenizer failure never breaks the embed path.
+
+Both callers (`embedRemote`, `embedRemoteBatch`) already `async` and now
+await the truncation.
+
+Compatibility: cloud embedding (API key set) still skips truncation
+entirely. For `nomic-embed-text` the 6000-char cap is always under 8192
+tokens, so its behavior is unchanged (short-circuit path). Only models with
+a token ceiling below the char cap (EmbeddingGemma, granite) plus
+high-entropy content change behavior — and only to embed successfully where
+they previously overflowed.
+
+Regression: `tests/unit/embed-token-cap.test.ts` — AC1 high-entropy text
+under the char cap but over the token ceiling is token-truncated (stubbed
+tokenizer, no model load); AC2 per-model ceiling resolution incl. env
+override; AC3 char-cap fallback on tokenizer failure. Full suite 1419/0.
+
+---
+
 ## v0.10.14 — rerank `llm_cache` key namespaced by backend URL (ADR-0059 cache-key collision)
 
 The rerank cache key was `getCacheKey('rerank', {query, file, model})` with
