@@ -154,7 +154,7 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 ## Indexing rules
 
 - **Indexed** (per collection in `config.yaml`): `**/MEMORY.md` · `**/memory/**` · `**/docs/**` · `**/research/**` · `**/YYYY-MM-DD*` (`.md`/`.txt`).
-- **Excluded (always):** `gits/`, `scraped/`, `.git/`, `node_modules/`, `dist/`, `build/`, `vendor/`. **Never index** credential files (`.env`, `*secrets*`, `*credentials*`) or `gits/`.
+- **Excluded (always):** `gits/`, `scraped/`, `.git/`, `node_modules/`, `dist/`, `build/`, `vendor/`, plus any `.`-prefixed segment. **Never index** credential files (`.env`, `*secrets*`, `*credentials*`) or `gits/`. There is **no exclude key in `config.yaml`** — to exclude your own convention (an archive dir such as `_snapshots/` holding timestamped duplicates of live docs), add it to `EXCLUDED_DIRS` in `src/indexer.ts`, then **restart the watcher**; already-indexed docs deactivate on the next `clawmem update`. → [architecture#adding-your-own](docs/concepts/architecture.md#adding-your-own).
 - **Indexing ≠ embedding:** the watcher indexes on `.md` change but does NOT embed; the embed timer (or `clawmem embed`) keeps vectors fresh. Missing embeddings silently degrade vector recall — BM25 still works.
 
 → architecture + graph building: [docs/concepts/architecture.md](docs/concepts/architecture.md), [docs/internals/graph-traversal.md](docs/internals/graph-traversal.md).

@@ -42,6 +42,30 @@ These directories are always skipped during indexing:
 
 `_PRIVATE`, `.clawmem`, `.git`, `.obsidian`, `.logseq`, `.foam`, `.dendron`, `.trash`, `.stversions`, `node_modules`, `.cache`, `vendor`, `dist`, `build`, `gits`, `scraped`
 
+Any path segment beginning with `.` is also skipped, so dotfile directories need no entry.
+
+#### Adding your own
+
+There is no exclude key in `config.yaml` — the list is the `EXCLUDED_DIRS` set in `src/indexer.ts`, and adding to it is the supported way to exclude a directory convention ClawMem doesn't already know about:
+
+```ts
+export const EXCLUDED_DIRS = new Set([
+  "_PRIVATE",
+  "_snapshots",   // your archive convention
+  ".clawmem",
+  // ...
+]);
+```
+
+`shouldExclude()` matches **whole path segments**, not substrings, so an entry can only ever match a directory of exactly that name — a document *named* `backup-design.md` is unaffected by an entry called `backup`. The set is shared by the indexer and the file watcher, so one entry covers both reindex sweeps and live file events.
+
+Two operational notes:
+
+- **Restart the watcher** (`systemctl --user restart clawmem-watcher`) after editing the set. A running watcher holds the old list in memory and will keep indexing the directory you just excluded.
+- **Already-indexed documents retire on the next `clawmem update`** — the indexer deactivates stored paths that no longer match. No manual deletion is needed, and the documents remain in the database as `active=0` rather than being destroyed.
+
+The common case is an archive or versioned-copy directory holding timestamped duplicates of live documents (`_snapshots/<ts>/report.md` beside a live `report.md`). Indexing those yields several stale near-identical copies of the same document, and retrieval can surface a superseded revision as though it were current — a quiet correctness problem rather than a noisy one, since nothing errors.
+
 ## Documents
 
 Each indexed file becomes a document with:
