@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.28.0**.
+Guide for upgrading between released versions. Current: **v0.29.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -59,6 +59,42 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.29.0: contradiction judge — a behavior change to check
+
+Schema changes (`judge_runs`, `judge_events`) auto-apply on first open; no re-embed or
+reindex. **One behavior change needs a decision from you:**
+
+**Contradiction analysis is now judge-gated.** It runs ONLY when `CLAWMEM_JUDGE_*` is
+configured, because the stock expansion model cannot meet the judge contract
+([details](inference-services.md#contradiction-judge)). Check which case you are in:
+
+- **Stock install** (wrapper defaults, or `CLAWMEM_LLM_URL` at the stock 1.7B): nothing to
+  do. No verdict ever applied on the stock model — you lose nothing and gain a skipped LLM
+  call per Stop hook. Configure a judge when you want contradiction analysis.
+- **Custom global LLM** (you pointed `CLAWMEM_LLM_URL`/`CLAWMEM_LLM_MODEL` at a larger or
+  cloud model): contradiction verdicts **may have been genuinely applying** through the
+  global endpoint, and after this upgrade they stop until you opt in. To keep the behavior,
+  configure the judge explicitly — e.g. the same endpoint, task-scoped:
+
+  ```bash
+  export CLAWMEM_JUDGE_URL="$CLAWMEM_LLM_URL"
+  export CLAWMEM_JUDGE_MODEL="your-model-id"        # required — no default on this lane
+  export CLAWMEM_JUDGE_API_KEY="$CLAWMEM_LLM_API_KEY"   # if the endpoint needs one
+  ```
+
+  ClawMem never adopts the global endpoint as a judge automatically — the judge vars are
+  also your data-egress consent (the judge receives new decisions + retrieved snippets).
+  `clawmem doctor` warns when it detects a custom global LLM with no judge configured (it
+  cannot detect a custom model served at the stock localhost endpoint — this notice is the
+  authoritative one).
+
+Also in this release: `CLAWMEM_CONTRADICTION_POLICY=supersede` now **requires a configured
+judge** — without one it is loudly constrained to the non-deactivating `link` policy and
+`clawmem doctor` reports it inactive. Run `clawmem doctor` after upgrading: it smoke-tests
+whatever judge you configure and reports the audit tables.
+
+---
+
 ## v0.28.0: hook write-path contracts
 
 No migration, no re-embed, no config change. Drop-in.
@@ -74,7 +110,8 @@ Totals count only edges whose both endpoints are active, matching what the build
 **Contradiction detection starts having an effect.** The hook always classified, but two contract
 defects discarded every verdict before it could mutate anything — it will now lower the confidence of documents a
 session's facts contradict (`-0.25`, floored at `0.2`). That is a ranking signal only; nothing
-leaves retrieval. The terminal step that *does* remove a document from retrieval — invalidation —
+leaves retrieval. (Superseded in v0.29.0: contradiction analysis now runs only when a judge is
+configured via `CLAWMEM_JUDGE_*` — see the v0.29.0 section above.) The terminal step that *does* remove a document from retrieval — invalidation —
 is **off by default** behind `CLAWMEM_CONTRADICTION_INVALIDATE` and logs `WOULD invalidate`
 instead of writing. Nothing to do on upgrade. Before arming it, calibrate against your own vault:
 [contradiction invalidation](contradiction-invalidation.md).
@@ -568,7 +605,7 @@ None of these auto-enable. They are new capabilities gated behind environment va
 | Surprisal selector | v0.8.0 | `CLAWMEM_HEAVY_LANE_SURPRISAL=true`. Seeds Phase 2 with k-NN anomaly-ranked doc ids; falls back to stale-first (`surprisal-fallback-stale` metric) on vaults without embeddings. |
 | Post-import conversation synthesis | v0.7.2 | `clawmem mine <dir> --synthesize` flag. One-shot, not persistent. Runs a two-pass LLM pipeline over freshly imported conversation docs to extract structured decision / preference / milestone / problem facts with cross-fact relations. |
 | Consolidation worker | v0.7.1 | `CLAWMEM_ENABLE_CONSOLIDATION=true` (flag exists pre-v0.7.1). v0.7.1 attaches the new safety gates (Ext 1/2/3) to the existing Phase 2/3 path — enabling the flag picks up the gates automatically. |
-| Contradiction policy | v0.7.1 | `CLAWMEM_CONTRADICTION_POLICY=link` (default, keep both rows + insert `contradicts` edge) or `supersede` (mark old row `status='inactive'`). |
+| Contradiction policy | v0.7.1 (judge-gated v0.29.0) | `CLAWMEM_CONTRADICTION_POLICY=link` (default, keep both rows + set the old row's `invalidated_by` backlink) or `supersede` (mark old row `status='inactive'`; requires a configured judge since v0.29.0). |
 | Merge guard dry-run | v0.7.1 | `CLAWMEM_MERGE_GUARD_DRY_RUN=true` logs merge-safety rejections without enforcing — useful for calibration on older vaults before flipping the gate on. Leave `false` (default) to enforce. |
 
 Full environment variable reference: [`docs/reference/cli.md`](../reference/cli.md).

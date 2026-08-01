@@ -77,7 +77,10 @@ import {
 import { readHookInput, writeHookOutput, makeEmptyOutput, type HookOutput } from "./hooks.ts";
 import { contextSurfacing } from "./hooks/context-surfacing.ts";
 import { sessionBootstrap } from "./hooks/session-bootstrap.ts";
-import { decisionExtractor } from "./hooks/decision-extractor.ts";
+import { decisionExtractor, unwrapContradictionArray, admitContradictionEntries } from "./hooks/decision-extractor.ts";
+import { resolveJudge, buildContradictionPrompt, extractJudgeJson, JUDGE_VERDICT_SCHEMA } from "./judge.ts";
+import { evaluateMergeContradiction, isActionableContradiction, resolveContradictionPolicy } from "./merge-guards.ts";
+import { judgeAuditCounts } from "./judge-audit.ts";
 import { handoffGenerator } from "./hooks/handoff-generator.ts";
 import { feedbackLoop } from "./hooks/feedback-loop.ts";
 import { stalenessCheck } from "./hooks/staleness-check.ts";
@@ -1506,6 +1509,16 @@ async function cmdHook(args: string[]) {
   const hookName = args[0];
   if (!hookName) die("Usage: clawmem hook <name>");
 
+  // v0.29.0 judge recursion guard: a claude-cli judge spawn sets this marker in the
+  // child env. A nested session's ClawMem hooks must no-op BEFORE stdin is read or
+  // the store is opened — otherwise a judge call inside a Stop hook could recurse
+  // into another judge spawn. Central here so EVERY hook is covered.
+  if (process.env.CLAWMEM_JUDGE_SPAWN === "1") {
+    console.error(`[clawmem] hook ${hookName} skipped: running inside a judge spawn (CLAWMEM_JUDGE_SPAWN=1)`);
+    writeHookOutput(makeEmptyOutput(hookName));
+    return;
+  }
+
   const input = await readHookInput();
   // Open the store capped from the START for the context-surfacing hook (not just after open via the
   // PRAGMA below) so a contended init cannot wait the full 5000ms default before it is narrowed. Other
@@ -2755,6 +2768,121 @@ async function cmdDoctor() {
     } else {
       console.log(`${c.yellow}!${c.reset} Sampled vectors: could not run (${(err as Error).message})`);
     }
+  }
+
+  // 10. Contradiction judge (v0.29.0). A SMOKE TEST, never capability
+  // certification: three fixture scenarios through the configured judge, zero
+  // store involvement. Runs ONLY when a judge is configured — the default lane
+  // is never probed (no reliable non-downloading cache detector exists, and the
+  // stock model's verdict is established and documented).
+  try {
+    const resolution = resolveJudge();
+    const configuredPolicy = resolveContradictionPolicy();
+    if (resolution.status === "unconfigured") {
+      console.log(
+        `${c.yellow}!${c.reset} Contradiction judge: not configured — contradiction analysis is ` +
+        `DISABLED (the stock expansion model cannot meet the judge contract). ` +
+        `Set CLAWMEM_JUDGE_* to enable: docs/guides/inference-services.md`,
+      );
+      // Migration warning (§J1): a capable GLOBAL LLM may have produced real verdicts
+      // before v0.29.0 decoupled the judge from CLAWMEM_LLM_*. Provenance-aware — the
+      // wrapper marks its own stock default; a custom model served AT the stock
+      // endpoint is undetectable, so upgrading.md remains the authoritative notice.
+      const urlSource = process.env.CLAWMEM_LLM_URL_SOURCE;
+      const llmUrl = process.env.CLAWMEM_LLM_URL;
+      const llmModel = process.env.CLAWMEM_LLM_MODEL?.trim();
+      const userSuppliedUrl = !!llmUrl && urlSource !== "default" && llmUrl !== "http://localhost:8089";
+      const nonStockModel = !!llmModel && llmModel !== "qwen3";
+      if (userSuppliedUrl || nonStockModel) {
+        console.log(
+          `${c.yellow}!${c.reset} Migration: a custom global LLM is configured ` +
+          `(${userSuppliedUrl ? llmUrl : `model=${llmModel}`}) but no judge is. If it was doing ` +
+          `real contradiction analysis before v0.29.0, set CLAWMEM_JUDGE_* to keep it — the ` +
+          `judge no longer rides the global vars (docs/guides/upgrading.md).`,
+        );
+      }
+      if (configuredPolicy === "supersede") {
+        console.log(
+          `${c.yellow}!${c.reset} CLAWMEM_CONTRADICTION_POLICY=supersede is configured but ` +
+          `presently INACTIVE (no judge) — merge contradictions are constrained to ` +
+          `non-deactivating 'link'.`,
+        );
+      }
+    } else if (resolution.status === "invalid") {
+      console.log(`${c.red}✗${c.reset} Contradiction judge: misconfigured — ${resolution.error}`);
+      issues++;
+    } else {
+      const judge = resolution.judge;
+      const d = judge.descriptor;
+      const scenarioA = {
+        newFacts: ["Decided: the ingestion worker now writes directly to Postgres; the Redis queue layer is removed entirely."],
+        existing: ["Decided: all ingestion must go through the Redis queue; workers never write directly to Postgres."],
+      };
+      const scenarioB = {
+        newFacts: ["Decided: bump the frontend to Tailwind v4 in the next sprint."],
+        existing: ["Observation: the nightly backup cron runs at 03:00 and rotates 7 snapshots."],
+      };
+      const runPair = async (sc: { newFacts: string[]; existing: string[] }) => {
+        const prompt = buildContradictionPrompt({ newFacts: sc.newFacts, existingSnippets: sc.existing, minConfidence: 0.7 });
+        const res = await judge.judge({ system: prompt.system, user: prompt.user, schema: JUDGE_VERDICT_SCHEMA });
+        if (!res.ok) return { ok: false as const, detail: `${res.reason}: ${res.detail}` };
+        if (res.truncated) return { ok: false as const, detail: "response truncated" };
+        const parsed = unwrapContradictionArray(extractJudgeJson(res.text));
+        if (!Array.isArray(parsed)) return { ok: false as const, detail: "response is not a JSON array" };
+        const batch = admitContradictionEntries(parsed, sc.existing.length, sc.newFacts.length);
+        return { ok: true as const, parsed, batch };
+      };
+
+      const a = await runPair(scenarioA);
+      // A CLEAN response is required — one raw entry, one admitted, zero
+      // rejected/duplicate/inconsistent. A right answer wrapped in schema junk
+      // or repeats is not a passing judge (code-review t1 finding 5).
+      const aPass = a.ok && a.parsed.length === 1 && a.batch.accepted.length === 1 &&
+        a.batch.rejected === 0 && a.batch.duplicates === 0 && a.batch.inconsistent === 0 &&
+        a.batch.accepted[0].relation === "contradiction" &&
+        a.batch.accepted[0].new_idx === 0 && a.batch.accepted[0].old_idx === 0 &&
+        a.batch.accepted[0].confidence >= 0.7;
+      const b = await runPair(scenarioB);
+      // ANY verdict on unrelated facts — even a low-confidence `same` — is fabrication.
+      const bPass = b.ok && b.parsed.length === 0;
+      const cEval = await evaluateMergeContradiction(resolution, scenarioA.existing[0]!, scenarioA.newFacts[0]!);
+      const cRun = cEval.kind === "decided" ? cEval.runs[cEval.runs.length - 1] : undefined;
+      const cPass = cEval.kind === "decided" && cEval.result.source === "llm" &&
+        isActionableContradiction(cEval.result) &&
+        (cRun?.entriesAdmitted ?? 0) === 1 && (cRun?.entriesRejected ?? 1) === 0 &&
+        (cRun?.entriesDuplicate ?? 1) === 0 && (cRun?.entriesInconsistent ?? 1) === 0;
+
+      if (aPass && bPass && cPass) {
+        console.log(
+          `${c.green}✓${c.reset} Contradiction judge: ${d.lane}/${d.model} passed the smoke test ` +
+          `(designed contradiction detected, unrelated control clean, merge contract actionable). ` +
+          `${c.dim}Smoke test only — not capability certification.${c.reset}`,
+        );
+      } else {
+        const parts = [
+          aPass ? null : `scenario A (designed contradiction): ${a.ok ? 'no valid (0,0,"contradiction") verdict at ≥ 0.7' : a.detail}`,
+          bPass ? null : `scenario B (unrelated control): ${b.ok ? "fabricated a verdict on unrelated facts" : b.detail}`,
+          cPass ? null : `scenario C (merge single-pair): not actionable via the judge`,
+        ].filter(Boolean);
+        console.log(
+          `${c.red}✗${c.reset} Contradiction judge: ${d.lane}/${d.model} FAILED the smoke test — ` +
+          `${parts.join("; ")}. Rejects stay fail-closed, but this judge is not fit to rely on. ` +
+          `See docs/guides/inference-services.md.`,
+        );
+        issues++;
+      }
+      if (configuredPolicy === "supersede") {
+        console.log(`${c.dim}   supersede policy: ACTIVE (judge configured)${c.reset}`);
+      }
+    }
+    // Durable audit rows — the evidence calibration reads.
+    try {
+      const s = getStore();
+      const counts = judgeAuditCounts(s.db);
+      console.log(`${c.dim}   judge audit: ${counts.runs} run(s), ${counts.events} event(s)${counts.oldestTs ? `, oldest ${counts.oldestTs}` : ""}${c.reset}`);
+    } catch { /* audit tables absent on pre-0.29.0 vaults — non-fatal */ }
+  } catch (err) {
+    console.log(`${c.yellow}!${c.reset} Contradiction judge: could not probe (${(err as Error).message})`);
   }
 
   console.log();

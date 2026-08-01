@@ -1,22 +1,48 @@
-import { describe, it, expect, afterEach } from "bun:test";
+import { describe, it, expect, afterEach, beforeEach } from "bun:test";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
-  checkContradiction,
+  evaluateMergeContradiction,
+  persistMergeEvaluation,
+  resolveEffectiveContradictionPolicy,
   CONTRADICTION_MIN_CONFIDENCE,
   heuristicContradictionCheck,
   isActionableContradiction,
-  llmContradictionCheck,
   resolveContradictionPolicy,
 } from "../../src/merge-guards.ts";
-import { createMockLLM } from "../helpers/mock-llm.ts";
+import type { JudgeResolution, JudgeResult, JudgeRequest } from "../../src/judge.ts";
+import { createStore, type Store } from "../../src/store.ts";
 
 /**
  * Unit tests for Ext 2 — Contradiction-aware merge gate
- * (THOTH_EXTRACTION_PLAN.md Extraction 2).
+ * (THOTH_EXTRACTION_PLAN.md Extraction 2; judge-gated since v0.29.0).
  *
- * The module is fully unit-testable: the heuristic is deterministic,
- * the LLM path uses the shared `createMockLLM` helper, and the
- * orchestrator is just LLM → heuristic fallback.
+ * The judge lane is stubbed at the JudgeResolution seam. The load-bearing
+ * v0.29.0 properties: the legacy object contract is DEAD (an object response is
+ * a parse reject, not a verdict), confidence-defaulting is GONE (a missing
+ * confidence is an invalid entry, never 0.5), judge failure falls back to an
+ * AUDITED heuristic pair, and `aborted` is terminal.
  */
+
+const readyResolution = (fn: (req: JudgeRequest) => Promise<JudgeResult>): JudgeResolution => ({
+  status: "ready",
+  judge: {
+    descriptor: {
+      lane: "openai",
+      model: "stub-judge",
+      endpoint: "http://stub:1",
+      supportsSystemRole: true,
+      supportsJsonSchema: false,
+      noThink: false,
+      mayDownload: false,
+    },
+    judge: fn,
+  },
+});
+
+const okText = (text: string) => async (): Promise<JudgeResult> =>
+  ({ ok: true, text, model: "stub-judge", truncated: false });
 
 // ─── heuristicContradictionCheck ───────────────────────────────────────
 
@@ -106,185 +132,165 @@ describe("heuristicContradictionCheck", () => {
   });
 });
 
-// ─── llmContradictionCheck ─────────────────────────────────────────────
+// ─── evaluateMergeContradiction (judge-gated, §J5d/§J7 matrix) ─────────
 
-describe("llmContradictionCheck", () => {
-  it("returns structured result on valid JSON", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockResolvedValueOnce({
-      text: '{"contradictory": true, "confidence": 0.92, "reason": "opposite outcomes"}',
-      model: "mock-llm",
-      done: true,
-    });
+describe("evaluateMergeContradiction", () => {
+  it("a valid single-pair contradiction verdict decides, source='llm'", async () => {
+    const resolution = readyResolution(okText(
+      '[{"new_idx":0,"old_idx":0,"relation":"contradiction","confidence":0.92,"reasoning":"opposite outcomes"}]'
+    ));
+    const ev = await evaluateMergeContradiction(resolution, "Deploy succeeded", "Deploy failed");
+    expect(ev.kind).toBe("decided");
+    if (ev.kind !== "decided") return;
+    expect(ev.result.source).toBe("llm");
+    expect(ev.result.contradictory).toBe(true);
+    expect(ev.result.confidence).toBe(0.92);
+    expect(ev.runs).toHaveLength(1);
+    expect(ev.runs[0]!.outcome).toBe("ok");
+    expect(ev.events.some(e => e.eventType === "verdict" && e.relation === "contradiction")).toBe(true);
+  });
 
-    const result = await llmContradictionCheck(
-      llm,
-      "Deploy succeeded",
-      "Deploy failed"
+  it("an empty array is a decisive 'no relationship' — not contradictory", async () => {
+    const ev = await evaluateMergeContradiction(readyResolution(okText("[]")), "a", "b");
+    if (ev.kind !== "decided") throw new Error("expected decided");
+    expect(ev.result.contradictory).toBe(false);
+    expect(ev.result.source).toBe("llm");
+  });
+
+  it("REGRESSION: the legacy object contract is DEAD — an object response falls back to the audited heuristic", async () => {
+    // Pre-0.29.0 this parsed and its missing confidence defaulted to the
+    // actionable 0.5 — the fail-open the redesign kills.
+    const ev = await evaluateMergeContradiction(
+      readyResolution(okText('{"contradictory": true, "confidence": 0.9, "reason": "legacy"}')),
+      "The team shipped the feature",
+      "The team shipped the feature",
     );
-
-    expect(result).not.toBeNull();
-    expect(result!.contradictory).toBe(true);
-    expect(result!.confidence).toBe(0.92);
-    expect(result!.reason).toBe("opposite outcomes");
-    expect(result!.source).toBe("llm");
+    if (ev.kind !== "decided") throw new Error("expected decided");
+    expect(ev.result.source).toBe("heuristic");
+    expect(ev.result.contradictory).toBe(false); // no heuristic signal on identical text
+    expect(ev.runs).toHaveLength(2);
+    expect(ev.runs[0]!.outcome).toBe("parse_reject");
+    expect(ev.runs[1]!.lane).toBe("heuristic");
   });
 
-  it("returns null when LLM returns null (cooldown)", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockResolvedValueOnce(null);
-
-    const result = await llmContradictionCheck(llm, "a", "b");
-    expect(result).toBeNull();
+  it("REGRESSION: a missing confidence is a SEMANTIC REJECT — audited heuristic decides, never a 0.5 default", async () => {
+    // A non-empty response with zero admitted entries must NOT read as a decisive
+    // "no relationship" — that recreated the parseable-response-bypasses-heuristic
+    // fail-open for semantic admission errors (code-review t1 finding 3).
+    const ev = await evaluateMergeContradiction(
+      readyResolution(okText('[{"new_idx":0,"old_idx":0,"relation":"contradiction","reasoning":"no conf"}]')),
+      "The deploy succeeded", "The deploy did not succeed",
+    );
+    if (ev.kind !== "decided") throw new Error("expected decided");
+    expect(ev.result.source).toBe("heuristic");
+    expect(ev.result.contradictory).toBe(true); // negation asymmetry decides, audited
+    expect(ev.runs).toHaveLength(2);
+    expect(ev.runs[0]!.outcome).toBe("parse_reject");
+    expect(ev.runs[0]!.entriesRejected).toBe(1);
+    expect(ev.runs[1]!.lane).toBe("heuristic");
   });
 
-  it("returns null when LLM throws", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockRejectedValueOnce(new Error("network failure"));
-
-    const result = await llmContradictionCheck(llm, "a", "b");
-    expect(result).toBeNull();
+  it("judge unavailable → failed provider run + linked audited heuristic run; heuristic decides", async () => {
+    const resolution = readyResolution(async () => ({ ok: false, reason: "unavailable", detail: "down" }));
+    const ev = await evaluateMergeContradiction(resolution, "The deploy succeeded", "The deploy did not succeed");
+    if (ev.kind !== "decided") throw new Error("expected decided");
+    expect(ev.result.source).toBe("heuristic");
+    expect(ev.result.contradictory).toBe(true); // negation asymmetry
+    expect(ev.runs).toHaveLength(2);
+    expect(ev.runs[0]!.outcome).toBe("unavailable");
+    expect(ev.runs[1]!.lane).toBe("heuristic");
   });
 
-  it("returns null on malformed JSON output", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockResolvedValueOnce({
-      text: "I am not JSON at all, this is plain prose.",
-      model: "mock-llm",
-      done: true,
-    });
-
-    const result = await llmContradictionCheck(llm, "a", "b");
-    expect(result).toBeNull();
+  it("truncated responses fall back — never partially parsed", async () => {
+    const resolution = readyResolution(async () => ({ ok: true, text: '[{"new_idx":0,', model: "stub", truncated: true }));
+    const ev = await evaluateMergeContradiction(resolution, "Version 2 shipped", "Version 5 shipped");
+    if (ev.kind !== "decided") throw new Error("expected decided");
+    expect(ev.runs[0]!.outcome).toBe("truncated");
+    expect(ev.result.source).toBe("heuristic");
+    expect(ev.result.contradictory).toBe(true); // number mismatch
   });
 
-  it("returns null when 'contradictory' field is missing", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockResolvedValueOnce({
-      text: '{"confidence": 0.8, "reason": "missing contradictory field"}',
-      model: "mock-llm",
-      done: true,
-    });
-
-    const result = await llmContradictionCheck(llm, "a", "b");
-    expect(result).toBeNull();
+  it("aborted is TERMINAL: no heuristic, no decision", async () => {
+    const resolution = readyResolution(async () => ({ ok: false, reason: "aborted", detail: "caller cancelled" }));
+    const ev = await evaluateMergeContradiction(resolution, "The deploy succeeded", "The deploy did not succeed");
+    expect(ev.kind).toBe("aborted");
+    if (ev.kind !== "aborted") return;
+    expect(ev.runs).toHaveLength(1);
+    expect(ev.runs[0]!.outcome).toBe("aborted");
   });
 
-  it("clamps confidence into [0, 1]", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockResolvedValueOnce({
-      text: '{"contradictory": true, "confidence": 1.7, "reason": "over"}',
-      model: "mock-llm",
-      done: true,
-    });
-    const result = await llmContradictionCheck(llm, "a", "b");
-    expect(result!.confidence).toBe(1.0);
-
-    llm.generate.mockResolvedValueOnce({
-      text: '{"contradictory": true, "confidence": -0.3, "reason": "under"}',
-      model: "mock-llm",
-      done: true,
-    });
-    const result2 = await llmContradictionCheck(llm, "a", "b");
-    expect(result2!.confidence).toBe(0);
-  });
-
-  it("falls back to 0.5 confidence when field is missing/invalid", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockResolvedValueOnce({
-      text: '{"contradictory": false}',
-      model: "mock-llm",
-      done: true,
-    });
-    const result = await llmContradictionCheck(llm, "a", "b");
-    expect(result!.confidence).toBe(0.5);
-  });
-
-  it("passes the context string into the prompt", async () => {
-    const llm = createMockLLM();
-    let capturedPrompt = "";
-    llm.generate.mockImplementationOnce(async (prompt: string) => {
-      capturedPrompt = prompt;
-      return {
-        text: '{"contradictory": false, "confidence": 0.1}',
-        model: "mock-llm",
-        done: true,
-      };
-    });
-
-    await llmContradictionCheck(llm, "a", "b", "test collection: foo");
-    expect(capturedPrompt).toContain("test collection: foo");
+  it("unconfigured → heuristic-only single run", async () => {
+    const ev = await evaluateMergeContradiction({ status: "unconfigured" }, "a", "b not a");
+    if (ev.kind !== "decided") throw new Error("expected decided");
+    expect(ev.result.source).toBe("heuristic");
+    expect(ev.runs).toHaveLength(1);
+    expect(ev.runs[0]!.lane).toBe("heuristic");
   });
 });
 
-// ─── checkContradiction (orchestrator) ─────────────────────────────────
+// ─── persistMergeEvaluation (pair linkage) ─────────────────────────────
 
-describe("checkContradiction", () => {
-  it("returns LLM result when LLM path succeeds", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockResolvedValueOnce({
-      text: '{"contradictory": true, "confidence": 0.88}',
-      model: "mock-llm",
-      done: true,
-    });
+describe("persistMergeEvaluation", () => {
+  let store: Store;
+  let dir: string;
 
-    const result = await checkContradiction(llm, "a", "b");
-    expect(result.source).toBe("llm");
-    expect(result.contradictory).toBe(true);
-    expect(result.confidence).toBe(0.88);
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "merge-guards-"));
+    store = createStore(join(dir, "vault.sqlite"));
   });
 
-  it("falls back to heuristic when LLM returns null", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockResolvedValueOnce(null);
-
-    // Heuristic should fire on the negation asymmetry
-    const result = await checkContradiction(
-      llm,
-      "The deploy succeeded",
-      "The deploy did not succeed"
-    );
-    expect(result.source).toBe("heuristic");
-    expect(result.contradictory).toBe(true);
+  afterEach(() => {
+    try { (store as any).close?.(); } catch { /* best-effort */ }
+    rmSync(dir, { recursive: true, force: true });
   });
 
-  it("falls back to heuristic when LLM throws", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockRejectedValueOnce(new Error("timeout"));
+  it("a provider-failure→heuristic pair links via fallback_from_run_id; events bind to the DECIDING run", async () => {
+    const resolution = readyResolution(async () => ({ ok: false, reason: "timeout", detail: "slow" }));
+    const ev = await evaluateMergeContradiction(resolution, "The deploy succeeded", "The deploy did not succeed");
+    if (ev.kind !== "decided") throw new Error("expected decided");
 
-    const result = await checkContradiction(
-      llm,
-      "Version 2 shipped",
-      "Version 5 shipped"
-    );
-    expect(result.source).toBe("heuristic");
-    expect(result.contradictory).toBe(true); // number mismatch
+    const decidingRunId = persistMergeEvaluation(store.db, "merge-phase2", null, ev);
+
+    const rows = store.db.prepare(
+      `SELECT id, lane, outcome, fallback_from_run_id FROM judge_runs ORDER BY id`
+    ).all() as { id: number; lane: string; outcome: string; fallback_from_run_id: number | null }[];
+    expect(rows).toHaveLength(2);
+    expect(rows[0]!.outcome).toBe("timeout");
+    expect(rows[0]!.fallback_from_run_id).toBeNull();
+    expect(rows[1]!.lane).toBe("heuristic");
+    expect(rows[1]!.fallback_from_run_id).toBe(rows[0]!.id);
+    expect(decidingRunId).toBe(rows[1]!.id);
+
+    const ev0 = store.db.prepare(`SELECT run_id FROM judge_events`).get() as { run_id: number };
+    expect(ev0.run_id).toBe(decidingRunId);
+  });
+});
+
+// ─── resolveEffectiveContradictionPolicy (§J1 blocked supersede) ───────
+
+describe("resolveEffectiveContradictionPolicy", () => {
+  afterEach(() => {
+    delete process.env.CLAWMEM_CONTRADICTION_POLICY;
   });
 
-  it("falls back to heuristic with null when LLM null + no heuristic signal", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockResolvedValueOnce(null);
-
-    const result = await checkContradiction(
-      llm,
-      "The team shipped the feature",
-      "The team shipped the feature"
-    );
-    expect(result.source).toBe("heuristic");
-    expect(result.contradictory).toBe(false);
+  it("configured supersede WITHOUT a judge is constrained to link, flagged blocked", () => {
+    process.env.CLAWMEM_CONTRADICTION_POLICY = "supersede";
+    const r = resolveEffectiveContradictionPolicy(false);
+    expect(r.policy).toBe("link");
+    expect(r.supersedeBlocked).toBe(true);
   });
 
-  it("never throws — LLM exception + heuristic always resolves", async () => {
-    const llm = createMockLLM();
-    llm.generate.mockRejectedValueOnce(new Error("boom"));
+  it("configured supersede WITH a judge stays supersede", () => {
+    process.env.CLAWMEM_CONTRADICTION_POLICY = "supersede";
+    const r = resolveEffectiveContradictionPolicy(true);
+    expect(r.policy).toBe("supersede");
+    expect(r.supersedeBlocked).toBe(false);
+  });
 
-    let threw = false;
-    try {
-      await checkContradiction(llm, "x", "y");
-    } catch {
-      threw = true;
-    }
-    expect(threw).toBe(false);
+  it("link is never blocked", () => {
+    const r = resolveEffectiveContradictionPolicy(false);
+    expect(r.policy).toBe("link");
+    expect(r.supersedeBlocked).toBe(false);
   });
 });
 
@@ -356,5 +362,51 @@ describe("resolveContradictionPolicy", () => {
   it("falls back to 'link' on invalid value", () => {
     process.env.CLAWMEM_CONTRADICTION_POLICY = "merge-everything";
     expect(resolveContradictionPolicy()).toBe("link");
+  });
+});
+
+// ─── t3 regression pins ────────────────────────────────────────────────
+
+describe("dirty-batch authorization + provider-event binding (code-review t3)", () => {
+  it("REGRESSION: one VALID verdict wrapped in junk cannot decide — audited heuristic takes over", async () => {
+    // Pre-fix, the valid (0,0) entry decided with source:"llm" and could
+    // authorize supersede despite the rejected junk beside it.
+    const dirty = '[{"new_idx":0,"old_idx":0,"relation":"contradiction","confidence":0.95,"reasoning":"real"},' +
+                  '{"new_idx":0,"old_idx":9,"relation":"contradiction","confidence":0.9,"reasoning":"oob"}]';
+    const ev = await evaluateMergeContradiction(
+      readyResolution(okText(dirty)),
+      "The team shipped the feature", "The team shipped the feature",
+    );
+    if (ev.kind !== "decided") throw new Error("expected decided");
+    expect(ev.result.source).toBe("heuristic");
+    expect(ev.runs[0]!.outcome).toBe("parse_reject");
+    expect(ev.runs[0]!.entriesAdmitted).toBe(1);
+    expect(ev.runs[0]!.entriesRejected).toBe(1);
+    // The discarded-but-valid proposal AND the reject are provider-bound evidence.
+    const pe = ev.providerEvents ?? [];
+    expect(pe.some(e => e.eventType === "verdict" && e.relation === "contradiction" && e.confidence === 0.95)).toBe(true);
+    expect(pe.some(e => e.eventType === "reject" && e.reasonCode === "index_oob")).toBe(true);
+  });
+
+  it("persistMergeEvaluation binds providerEvents to the PROVIDER run, verdict events to the deciding run", async () => {
+    const dir2 = mkdtempSync(join(tmpdir(), "merge-guards-pe-"));
+    const store2 = createStore(join(dir2, "vault.sqlite"));
+    try {
+      const dirty = '[{"new_idx":0,"old_idx":0,"relation":"contradiction","confidence":0.95,"reasoning":"real"},' +
+                    '{"new_idx":0,"old_idx":9,"relation":"contradiction","confidence":0.9,"reasoning":"oob"}]';
+      const ev = await evaluateMergeContradiction(readyResolution(okText(dirty)), "a", "b");
+      if (ev.kind !== "decided") throw new Error("expected decided");
+      const decidingId = persistMergeEvaluation(store2.db, "merge-phase2", null, ev);
+      const rows = store2.db.prepare(
+        `SELECT run_id, event_type, reason_code FROM judge_events ORDER BY id`,
+      ).all() as { run_id: number; event_type: string; reason_code: string | null }[];
+      const providerRunId = (store2.db.prepare(`SELECT MIN(id) AS id FROM judge_runs`).get() as { id: number }).id;
+      expect(providerRunId).not.toBe(decidingId);
+      expect(rows.filter(r => r.run_id === providerRunId).length).toBeGreaterThanOrEqual(2);
+      expect(rows.filter(r => r.run_id === decidingId && r.event_type === "verdict").length).toBe(1);
+    } finally {
+      try { (store2 as any).close?.(); } catch { /* best-effort */ }
+      rmSync(dir2, { recursive: true, force: true });
+    }
   });
 });

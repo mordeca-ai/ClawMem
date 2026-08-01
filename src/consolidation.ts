@@ -20,11 +20,18 @@ import { hashContent } from "./indexer.ts";
 import { passesMergeSafety } from "./text-similarity.ts";
 import { withWorkerLease } from "./worker-lease.ts";
 import {
-  checkContradiction,
+  evaluateMergeContradiction,
+  persistMergeEvaluation,
+  persistMergeEvaluationBestEffort,
+  resolveEffectiveContradictionPolicy,
   isActionableContradiction,
-  resolveContradictionPolicy,
+  CONTRADICTION_MIN_CONFIDENCE,
+  type ContradictionPolicy,
   type ContradictionResult,
 } from "./merge-guards.ts";
+import { resolveJudge } from "./judge.ts";
+import { pruneJudgeRuns } from "./judge-audit.ts";
+import { insertJudgeEvent } from "./judge-audit.ts";
 import {
   validateDeductiveDraft,
   type DeductiveDraft,
@@ -380,6 +387,12 @@ export async function runConsolidationTick(
     return { acquired: lease.acquired };
   } finally {
     isRunning = false;
+    // Judge-audit retention (§J7, t3 finding 1): the light lane also creates
+    // Phase-2/Phase-3 judge rows — prune here so light-lane-only deployments
+    // honor the cap. Pair-aware, best-effort.
+    try {
+      pruneJudgeRuns(store.db);
+    } catch { /* retention is best-effort */ }
   }
 }
 
@@ -604,35 +617,90 @@ Return ONLY the JSON array. /no_think`;
       opts.guarded === true,
     );
     if (existing) {
-      // Ext 2: contradiction gate. Before merging into an existing
-      // consolidation, check whether the new observation contradicts
-      // the existing one. On actionable contradiction we do NOT merge;
-      // instead we insert the new row as a separate consolidation and
-      // apply the configured policy (link or supersede).
-      const contradiction = await checkContradiction(
-        llm,
+      // Ext 2 (judge-gated, v0.29.0): before merging into an existing consolidation,
+      // check whether the new observation contradicts the existing one — through the
+      // configured judge per the §J7 failure matrix (judge failure falls back to an
+      // AUDITED heuristic pair; `aborted` defers the candidate). Every completed
+      // evaluation commits its run/events atomically WITH the chosen mutation.
+      const resolution = resolveJudge();
+      const evaluation = await evaluateMergeContradiction(
+        resolution,
         existing.observation,
         pattern.observation,
-        `collection: ${cluster.collection}`
+        CONTRADICTION_MIN_CONFIDENCE,
       );
+      if (evaluation.kind === "aborted") {
+        persistMergeEvaluationBestEffort(store.db, "merge-phase2", null, evaluation);
+        console.warn(
+          `[consolidation] contradiction evaluation aborted — merge decision deferred ` +
+          `for existing #${existing.id} in ${cluster.collection}`,
+        );
+        continue;
+      }
 
-      if (isActionableContradiction(contradiction)) {
-        applyContradictoryConsolidation(
-          store,
-          existing,
-          pattern.observation,
-          sourceDocIds,
-          cluster.collection,
-          contradiction
+      // Authorization keys on the classifier that actually DECIDED, not on judge
+      // configuration: a configured judge that failed over to the heuristic must
+      // never authorize destructive supersede (code-review t1 finding 1).
+      const effective = resolveEffectiveContradictionPolicy(evaluation.result.source === "llm");
+      if (isActionableContradiction(evaluation.result)) {
+        // On actionable contradiction we do NOT merge; instead we insert the new row
+        // as a separate consolidation and apply the EFFECTIVE policy (link, or
+        // supersede when a judge authorizes it — §J1 blocked-supersede loudness).
+        let appliedNewId = 0;
+        store.db.transaction(() => {
+          const runId = persistMergeEvaluation(store.db, "merge-phase2", null, evaluation);
+          const { newId } = applyContradictoryConsolidationCore(
+            store,
+            existing,
+            pattern.observation,
+            sourceDocIds,
+            cluster.collection,
+            effective.policy,
+          );
+          appliedNewId = newId;
+          insertJudgeEvent(store.db, {
+            runId,
+            eventType: "verdict",
+            newRef: `cons:${newId}`,
+            oldRef: `cons:${existing.id}`,
+            relation: "contradiction",
+            confidence: evaluation.result.confidence,
+            action: effective.policy === "supersede" ? "merge_supersede" : "merge_link",
+          });
+          if (effective.supersedeBlocked) {
+            insertJudgeEvent(store.db, {
+              runId,
+              eventType: "verdict",
+              newRef: `cons:${newId}`,
+              oldRef: `cons:${existing.id}`,
+              action: "merge_supersede_blocked",
+            });
+          }
+        })();
+        console.log(
+          `[consolidation] contradiction detected (policy=${effective.policy} ` +
+            `source=${evaluation.result.source} confidence=${evaluation.result.confidence.toFixed(2)}): ` +
+            `existing #${existing.id} + new #${appliedNewId} — reason="${evaluation.result.reason ?? ""}"`,
         );
       } else {
-        const { mergedIds } = mergeIntoExistingConsolidation(
-          store,
-          existing,
-          sourceDocIds,
-          pattern.observation
-        );
-        console.log(`[consolidation] Updated observation #${existing.id}: proof_count=${mergedIds.length}`);
+        // Ordinary merge — still an audit-coupled mutation (§J7: the previously bare
+        // UPDATE gains a transaction wrapping run + events + UPDATE).
+        store.db.transaction(() => {
+          const runId = persistMergeEvaluation(store.db, "merge-phase2", null, evaluation);
+          const { mergedIds } = mergeIntoExistingConsolidation(
+            store,
+            existing,
+            sourceDocIds,
+            pattern.observation
+          );
+          insertJudgeEvent(store.db, {
+            runId,
+            eventType: "verdict",
+            oldRef: `cons:${existing.id}`,
+            action: "merge_allowed",
+          });
+          console.log(`[consolidation] Updated observation #${existing.id}: proof_count=${mergedIds.length}`);
+        })();
       }
     } else {
       // Insert new consolidated observation
@@ -666,7 +734,9 @@ Return ONLY the JSON array. /no_think`;
  * failure on the UPDATE side rolls back the new row, preventing a
  * dangling active consolidation with no backlink.
  *
- * Policy is resolved via `CLAWMEM_CONTRADICTION_POLICY=link|supersede`.
+ * v0.29.0 (§J1/C21): the EFFECTIVE policy arrives as a parameter — this
+ * mutation code never reads `CLAWMEM_CONTRADICTION_POLICY` itself. Resolve it
+ * upstream via `resolveEffectiveContradictionPolicy(judgeReady)`.
  *
  * Returns the new consolidation's id and the policy used.
  */
@@ -676,12 +746,39 @@ export function applyContradictoryConsolidation(
   newObservation: string,
   newSourceDocIds: number[],
   collection: string,
-  contradiction: ContradictionResult
+  contradiction: ContradictionResult,
+  policy: ContradictionPolicy,
 ): { newId: number; policy: "link" | "supersede" } {
-  const policy = resolveContradictionPolicy();
+  const tx = store.db.transaction(() =>
+    applyContradictoryConsolidationCore(store, existing, newObservation, newSourceDocIds, collection, policy)
+  );
+  const applied = tx();
 
+  console.log(
+    `[consolidation] contradiction detected (policy=${policy} source=${contradiction.source} ` +
+      `confidence=${contradiction.confidence.toFixed(2)}): ` +
+      `existing #${existing.id} + new #${applied.newId} — reason="${contradiction.reason ?? ""}"`
+  );
+
+  return applied;
+}
+
+/**
+ * Transaction-free core of `applyContradictoryConsolidation` — the Phase-2 call
+ * site wraps it in ITS OWN transaction together with the evaluation's audit
+ * rows and action events (§J7), so the audit and the mutation commit or roll
+ * back as one.
+ */
+export function applyContradictoryConsolidationCore(
+  store: Store,
+  existing: { id: number; observation: string; source_doc_ids: string },
+  newObservation: string,
+  newSourceDocIds: number[],
+  collection: string,
+  policy: ContradictionPolicy,
+): { newId: number; policy: "link" | "supersede" } {
   let newId = 0;
-  const tx = store.db.transaction(() => {
+  {
     // Insert the new consolidation as a separate active row
     const insertResult = store.db
       .prepare(
@@ -722,14 +819,7 @@ export function applyContradictoryConsolidation(
         )
         .run(newId, existing.id);
     }
-  });
-  tx();
-
-  console.log(
-    `[consolidation] contradiction detected (policy=${policy} source=${contradiction.source} ` +
-      `confidence=${contradiction.confidence.toFixed(2)}): ` +
-      `existing #${existing.id} + new #${newId} — reason="${contradiction.reason ?? ""}"`
-  );
+  }
 
   return { newId, policy };
 }
@@ -1199,32 +1289,79 @@ Return ONLY the JSON array. /no_think`;
       return union > 0 && intersection / union > 0.5;
     });
 
-    const contradictoryDuplicates: { id: number; confidence: number; reason?: string }[] = [];
+    // §J7 two-step contract (v0.29.0): each candidate's classification audit
+    // COMMITS FIRST as a standalone precondition; only then may the verdict
+    // influence the skip/create decision. Audit-write failure (or a terminal
+    // `aborted`) disables the gate for this deduction and the pure-similarity
+    // dedup rule — the pre-gate default — applies instead.
+    const resolution = resolveJudge();
+    const contradictoryDuplicates: { id: number; confidence: number; reason?: string; runId: number }[] = [];
     let hasNonContradictoryDuplicate = false;
+    let nonContradictoryRunId: number | null = null;
+    let gateUnavailable = false;
     for (const candidate of jaccardDuplicates) {
-      const contradiction = await checkContradiction(
-        llm,
+      const evaluation = await evaluateMergeContradiction(
+        resolution,
         candidate.title,
         deduction.conclusion,
-        "deductive synthesis phase"
+        CONTRADICTION_MIN_CONFIDENCE,
       );
-      if (isActionableContradiction(contradiction)) {
+      if (evaluation.kind === "aborted") {
+        persistMergeEvaluationBestEffort(store.db, "merge-phase3", null, evaluation);
+        gateUnavailable = true;
+        break;
+      }
+      let runId: number;
+      try {
+        runId = store.db.transaction(() =>
+          persistMergeEvaluation(store.db, "merge-phase3", null, evaluation)
+        )();
+      } catch (e) {
+        console.error(
+          `[deductive] classification audit failed — contradiction gate disabled for this ` +
+          `deduction, pure-similarity dedup applies: ${e instanceof Error ? e.message : String(e)}`,
+        );
+        gateUnavailable = true;
+        break;
+      }
+      if (isActionableContradiction(evaluation.result)) {
         contradictoryDuplicates.push({
           id: candidate.id,
-          confidence: contradiction.confidence,
-          reason: contradiction.reason,
+          confidence: evaluation.result.confidence,
+          reason: evaluation.result.reason,
+          runId,
         });
       } else {
         hasNonContradictoryDuplicate = true;
+        nonContradictoryRunId = runId;
         // Don't break — keep scanning to give operator full log coverage,
         // but we already know we'll skip.
       }
+    }
+
+    if (gateUnavailable) {
+      // Pure-similarity fallback (the pre-gate default, C27): any Jaccard match ⇒
+      // skip the new deduction, with NO judge or heuristic influence. The loop only
+      // runs when jaccardDuplicates is non-empty, so this always skips.
+      stats.dedupSkipped++;
+      continue;
     }
 
     // Skip rule: if ANY non-contradictory duplicate exists, the new
     // deduction is redundant regardless of any contradictions.
     if (hasNonContradictoryDuplicate) {
       stats.dedupSkipped++;
+      // The skip decision mutates nothing — record it on the committed
+      // precondition run, best-effort (§J7: dedup_skip lives in the precondition).
+      if (nonContradictoryRunId != null) {
+        try {
+          insertJudgeEvent(store.db, {
+            runId: nonContradictoryRunId,
+            eventType: "verdict",
+            action: "dedup_skip",
+          });
+        } catch { /* best-effort — no mutation to couple */ }
+      }
       continue;
     }
     // Otherwise we either have no matches (fall through to insert as new)
@@ -1302,17 +1439,38 @@ Return ONLY the JSON array. /no_think`;
           );
           for (const contra of contradictoryDuplicates) {
             try {
-              relStmt.run(
-                doc.id,
-                contra.id,
-                contra.confidence,
-                JSON.stringify({ reason: contra.reason ?? "" })
-              );
+              // §J7: the contradicts-edge insert and its audit event commit or roll
+              // back together, referencing the candidate's committed precondition
+              // run — replacing the old swallowed-failure path for THIS decision.
+              store.db.transaction(() => {
+                relStmt.run(
+                  doc.id,
+                  contra.id,
+                  contra.confidence,
+                  JSON.stringify({ reason: contra.reason ?? "" })
+                );
+                insertJudgeEvent(store.db, {
+                  runId: contra.runId,
+                  eventType: "verdict",
+                  newRef: `doc:${doc.id}`,
+                  oldRef: `doc:${contra.id}`,
+                  relation: "contradiction",
+                  confidence: contra.confidence,
+                  action: "contradicts_edge",
+                });
+              })();
               console.log(
                 `[deductive] contradiction linked: new #${doc.id} contradicts existing #${contra.id} ` +
                   `(confidence=${contra.confidence.toFixed(2)})`
               );
-            } catch { /* non-fatal — the deduction itself still landed */ }
+            } catch (e) {
+              // The edge AND its event rolled back together — the deduction itself
+              // still landed. Loud, not swallowed (§J7).
+              console.error(
+                `[deductive] contradicts-edge write failed (edge + audit event rolled back) ` +
+                  `for new #${doc.id} vs existing #${contra.id}: ${e instanceof Error ? e.message : String(e)}`,
+              );
+            }
           }
         }
 

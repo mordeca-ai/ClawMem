@@ -118,9 +118,11 @@ The Stop-event hooks (`decision-extractor`, `handoff-generator`, `feedback-loop`
 
 ## What the Stop hooks write
 
-`decision-extractor` does more than persist observations: it classifies each session's new facts
-against the memories they resemble, and a `contradiction` verdict lowers the older document's
-confidence by 0.25 (floored at 0.2). That is a ranking signal — the document stays retrievable.
+`decision-extractor` does more than persist observations: when a contradiction **judge** is
+configured (`CLAWMEM_JUDGE_*`, v0.29.0 — disabled otherwise), it classifies each session's new
+facts against the memories they resemble, and a `contradiction` verdict lowers the older
+document's confidence by 0.25 (floored at 0.2). That is a ranking signal — the document stays
+retrievable.
 
 When erosion reaches the floor the hook can additionally set `invalidated_at`, which removes the
 document from FTS and vector retrieval outright. **That step is off by default** — it logs

@@ -130,6 +130,24 @@ export type GenerateOptions = {
 };
 
 /**
+ * Judge-only chat request/result (v0.29.0). Consumed by generateJudgeChat — the
+ * judge factory's openai lane. Deliberately NOT part of GenerateOptions: the
+ * legacy generate() wire shape must stay byte-identical for existing consumers.
+ */
+export type JudgeChatRequest = {
+  system: string;
+  user: string;
+  /** JSON schema for a response_format json_schema constraint; omitted → prompt-only. */
+  schema?: Record<string, unknown>;
+  maxTokens: number;
+  temperature?: number;
+};
+
+export type JudgeChatResult =
+  | { ok: true; text: string; model: string; truncated: boolean }
+  | { ok: false; reason: "unavailable" | "http" | "timeout" | "aborted"; detail: string };
+
+/**
  * Options for reranking
  */
 export type RerankOptions = {
@@ -352,6 +370,14 @@ export type LlamaCppConfig = {
    */
   remoteLlmNoThink?: boolean;
   /**
+   * When true, generate() never falls back to in-process node-llama-cpp — a remote
+   * failure quietly returns null instead. Set by the v0.29.0 judge factory so a
+   * judge-scoped instance can never auto-download or run the stock local model.
+   * Per-instance and quiet by design, distinct from the global
+   * CLAWMEM_NO_LOCAL_MODELS download block.
+   */
+  noLocalFallback?: boolean;
+  /**
    * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
    *
    * Per node-llama-cpp lifecycle guidance, we prefer keeping models loaded and only disposing
@@ -412,6 +438,7 @@ export class LlamaCpp implements LLM {
   private remoteLlmModel: string;
   private remoteLlmReasoningEffort: string | null;
   private remoteLlmNoThink: boolean;
+  private noLocalFallback: boolean;
 
   // Ensure we don't load the same model concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
@@ -449,6 +476,7 @@ export class LlamaCpp implements LLM {
     this.remoteLlmModel = normalizedRemoteLlmModel || "qwen3";
     this.remoteLlmReasoningEffort = normalizeRemoteLlmReasoningEffort(config.remoteLlmReasoningEffort);
     this.remoteLlmNoThink = config.remoteLlmNoThink ?? true;
+    this.noLocalFallback = config.noLocalFallback ?? false;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
@@ -1123,6 +1151,10 @@ export class LlamaCpp implements LLM {
       // Transport failure set cooldown — fall through to local
     }
 
+    // Judge-scoped instances never run local inference (v0.29.0) — quiet null,
+    // typed diagnostics live at the judge layer.
+    if (this.noLocalFallback) return null;
+
     // Remote is in cooldown or was never configured — try local fallback
     if (this.remoteLlmUrl && this.isRemoteLlmDown()) {
       if (process.env.CLAWMEM_NO_LOCAL_MODELS === "true") return null;
@@ -1189,10 +1221,12 @@ export class LlamaCpp implements LLM {
     try {
       const body: Record<string, unknown> = {
         model: this.remoteLlmModel,
-        // Idempotent: six prompts already end with a literal `/no_think` (consolidation x2,
-        // decision-extractor, entity, intent, merge-guards) because the LOCAL fallback receives
-        // the prompt directly and needs it inline. Appending unconditionally sent those a
-        // doubled suffix. Do not strip the prompt-local ones instead — the local path needs them.
+        // Idempotent: several prompts already end with a literal `/no_think` (as of v0.29.0:
+        // consolidation x2, entity, intent, deductive-guardrails — decision-extractor and
+        // merge-guards moved to the judge module, which owns the token for judge traffic)
+        // because the LOCAL fallback receives the prompt directly and needs it inline.
+        // Appending unconditionally sent those a doubled suffix. Do not strip the
+        // prompt-local ones instead — the local path needs them.
         messages: [{ role: "user", content: this.applyNoThinkSuffix(prompt) }],
         max_tokens: maxTokens,
         temperature,
@@ -1234,6 +1268,66 @@ export class LlamaCpp implements LLM {
         console.error("[generate] Remote LLM error:", error);
       }
       return null;
+    }
+  }
+
+  /**
+   * Judge-only chat request (v0.29.0). A SEPARATE body builder from generateRemote:
+   * system+user role split and optional response_format json_schema. The legacy
+   * generateRemote body (one user message + scalars) stays byte-identical for every
+   * existing generate() consumer — guarded by a snapshot test. Reuses this instance's
+   * transport (URL normalization, Bearer headers, down-cache) only.
+   */
+  async generateJudgeChat(req: JudgeChatRequest, opts: { signal?: AbortSignal } = {}): Promise<JudgeChatResult> {
+    if (!this.remoteLlmUrl) {
+      return { ok: false, reason: "unavailable", detail: "no remote LLM URL configured on this instance" };
+    }
+    if (this.isRemoteLlmDown()) {
+      return { ok: false, reason: "unavailable", detail: "remote LLM in failure cooldown" };
+    }
+    const body: Record<string, unknown> = {
+      model: this.remoteLlmModel,
+      messages: [
+        { role: "system", content: req.system },
+        { role: "user", content: this.remoteLlmNoThink ? this.applyNoThinkSuffix(req.user) : req.user },
+      ],
+      max_tokens: req.maxTokens,
+    };
+    if (req.temperature !== undefined) body.temperature = req.temperature;
+    if (this.remoteLlmReasoningEffort) body.reasoning_effort = this.remoteLlmReasoningEffort;
+    if (req.schema) {
+      body.response_format = { type: "json_schema", json_schema: { name: "judge_verdicts", schema: req.schema } };
+    }
+    try {
+      const resp = await fetch(buildRemoteChatCompletionsUrl(this.remoteLlmUrl), {
+        method: "POST",
+        headers: this.getLlmHeaders(),
+        body: JSON.stringify(body),
+        signal: opts.signal,
+      });
+      if (!resp.ok) {
+        return { ok: false, reason: "http", detail: `HTTP ${resp.status}: ${resp.statusText}` };
+      }
+      const data = await resp.json() as {
+        choices: { message: { content: string }; finish_reason?: string }[];
+        model?: string;
+      };
+      const choice = data.choices?.[0];
+      return {
+        ok: true,
+        text: choice?.message?.content || "",
+        model: data.model || this.remoteLlmUrl,
+        truncated: choice?.finish_reason === "length",
+      };
+    } catch (error) {
+      if (this.isAbortError(error)) {
+        const timedOut =
+          (error as { name?: string })?.name === "TimeoutError" ||
+          ((opts.signal?.reason as { name?: string } | undefined)?.name === "TimeoutError");
+        return { ok: false, reason: timedOut ? "timeout" : "aborted", detail: String(error) };
+      }
+      if (this.isTransportError(error)) this.markRemoteLlmDown();
+      return { ok: false, reason: "unavailable", detail: String(error) };
     }
   }
 

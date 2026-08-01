@@ -22,6 +22,7 @@
  */
 
 import type { Store } from "./store.ts";
+import { pruneJudgeRuns } from "./judge-audit.ts";
 import type { LlamaCpp } from "./llm.ts";
 import {
   consolidateObservations,
@@ -505,6 +506,13 @@ export async function runHeavyMaintenanceTick(
     });
     results.push(loadMaintenanceRun(store, skippedId));
   }
+
+  // Judge-audit retention (§J7, code-review t2 finding 4): a consumer-neutral
+  // prune point — merge-only deployments (no decision-extractor traffic) still
+  // honor the 90-day/10k root cap. Pair-aware; best-effort.
+  try {
+    pruneJudgeRuns(store.db);
+  } catch { /* retention is best-effort */ }
 
   return results;
 }

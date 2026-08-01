@@ -1050,6 +1050,57 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
       expires_at TEXT NOT NULL
     )
   `);
+
+  // v0.29.0: durable contradiction-judge audit. One judge_runs row per evaluation
+  // (a provider-failure→heuristic fallback is TWO rows linked by fallback_from_run_id,
+  // pruned as a unit via the self-FK cascade); judge_events carries per-verdict /
+  // per-reject / per-error facts. Interactive hosts do not persist hook stderr, so
+  // these rows are the only durable evidence erosion calibration can read.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS judge_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL DEFAULT (datetime('now')),
+      session_id TEXT,
+      consumer TEXT NOT NULL,
+      lane TEXT NOT NULL,
+      model TEXT,
+      endpoint TEXT,
+      prompt_version TEXT,
+      new_fact_count INTEGER NOT NULL DEFAULT 0,
+      candidate_count INTEGER NOT NULL DEFAULT 0,
+      response_sha256 TEXT,
+      outcome TEXT NOT NULL,
+      fallback_from_run_id INTEGER REFERENCES judge_runs(id) ON DELETE CASCADE,
+      entries_admitted INTEGER NOT NULL DEFAULT 0,
+      entries_rejected INTEGER NOT NULL DEFAULT 0,
+      entries_duplicate INTEGER NOT NULL DEFAULT 0,
+      entries_inconsistent INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_runs_consumer_ts ON judge_runs(consumer, ts DESC)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_runs_fallback ON judge_runs(fallback_from_run_id)`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS judge_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL REFERENCES judge_runs(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL,
+      new_idx INTEGER,
+      old_idx INTEGER,
+      new_ref TEXT,
+      old_ref TEXT,
+      relation TEXT,
+      confidence REAL,
+      reasoning_head TEXT,
+      reason_code TEXT,
+      action TEXT,
+      evidence_head TEXT,
+      score_before REAL,
+      score_after REAL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_events_run ON judge_events(run_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_events_action ON judge_events(action)`);
 }
 
 

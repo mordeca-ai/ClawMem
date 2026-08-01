@@ -22,7 +22,22 @@ import { updateDirectoryContext } from "../directory-context.ts";
 import { loadConfig } from "../collections.ts";
 import { getDefaultLlamaCpp } from "../llm.ts";
 import type { ObservationWithDoc } from "../amem.ts";
-import { extractJsonFromLLM } from "../amem.ts";
+import {
+  resolveJudge,
+  buildContradictionPrompt,
+  extractJudgeJson,
+  JUDGE_VERDICT_SCHEMA,
+  JUDGE_PROMPT_VERSION,
+} from "../judge.ts";
+import {
+  insertJudgeRun,
+  insertJudgeEvent,
+  insertJudgeRunBestEffort,
+  pruneJudgeRuns,
+  type JudgeEventInput,
+  type JudgeLane,
+  type JudgeReasonCode,
+} from "../judge-audit.ts";
 import { DEFAULT_EMBED_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, parseVirtualPath, type SearchResult } from "../store.ts";
 import { ensureEntityCanonical, resolveEntityTypeExact } from "../entity.ts";
 import { isSchemaPlaceholder, CONTRADICTION_RESIDUE } from "../schema-placeholder.ts";
@@ -267,6 +282,16 @@ export type ContradictionBatch = {
   duplicates: number;
   /** Pairs dropped whole because the classifier gave more than one answer for them. */
   inconsistent: number;
+  /**
+   * v0.29.0: the rejected entries WITH their verdicts, observationally — admission
+   * semantics are unchanged (`rejected === rejectedEntries.length`). Feeds the
+   * durable audit's per-reject events; without it a reject was a bare count.
+   */
+  rejectedEntries: { entry: unknown; reason: Exclude<ContradictionEntryVerdict, "ok"> }[];
+  /** One sample entry per collapsed-duplicate pair, with the repeat count (observational). */
+  duplicateEntries: { entry: unknown; repeats: number }[];
+  /** One sample entry per inconsistently-answered pair, with the distinct-answer count (observational). */
+  inconsistentEntries: { entry: unknown; answers: number }[];
 };
 
 /**
@@ -303,10 +328,13 @@ export function admitContradictionEntries(
   // reported one duplicate while `[0.8, 0.9, 0.9]` reported none, for the same multiset.
   const groups = new Map<string, { first: any; signatures: string[] }>();
   let rejected = 0;
+  const rejectedEntries: { entry: unknown; reason: Exclude<ContradictionEntryVerdict, "ok"> }[] = [];
 
   for (const rel of parsed) {
-    if (validateContradictionEntry(rel, candidateCount, newFactCount) !== "ok") {
+    const verdict = validateContradictionEntry(rel, candidateCount, newFactCount);
+    if (verdict !== "ok") {
       rejected++;
+      rejectedEntries.push({ entry: rel, reason: verdict });
       continue;
     }
 
@@ -325,18 +353,22 @@ export function admitContradictionEntries(
   const accepted: any[] = [];
   let duplicates = 0;
   let inconsistent = 0;
+  const duplicateEntries: { entry: unknown; repeats: number }[] = [];
+  const inconsistentEntries: { entry: unknown; answers: number }[] = [];
 
   for (const { first, signatures } of groups.values()) {
     const distinct = new Set(signatures);
     if (distinct.size > 1) {
       inconsistent++;               // the classifier answered this pair more than one way
+      inconsistentEntries.push({ entry: first, answers: distinct.size });
     } else {
       accepted.push(first);         // insertion order — deterministic for a given input
       duplicates += signatures.length - 1;
+      if (signatures.length > 1) duplicateEntries.push({ entry: first, repeats: signatures.length });
     }
   }
 
-  return { accepted, rejected, duplicates, inconsistent };
+  return { accepted, rejected, duplicates, inconsistent, rejectedEntries, duplicateEntries, inconsistentEntries };
 }
 
 /**
@@ -384,11 +416,22 @@ export type ContradictionOutcomes = {
   invalidationErrors: number;
 };
 
-function isInvalidationEligible(store: Store, docId: number): boolean {
+/**
+ * v0.29.0: the eligibility answer split into its real causes — the boolean form
+ * conflated wrong-content-type with already-invalidated (`invalidated_at IS NULL`
+ * in the predicate), which made the audit unable to say WHICH kind of ineligible
+ * a floor-reaching document was. `floorIneligible` still counts all of them;
+ * only the audit event distinguishes.
+ */
+type InvalidationEligibility = "eligible" | "ineligible-type" | "already-invalidated" | "row-missing";
+
+function invalidationEligibility(store: Store, docId: number): InvalidationEligibility {
   const row = store.db
-    .prepare(`SELECT content_type FROM documents WHERE id = ? AND invalidated_at IS NULL`)
-    .get(docId) as { content_type: string | null } | undefined;
-  return row?.content_type === INVALIDATION_ELIGIBLE_CONTENT_TYPE;
+    .prepare(`SELECT content_type, invalidated_at FROM documents WHERE id = ?`)
+    .get(docId) as { content_type: string | null; invalidated_at: string | null } | undefined;
+  if (!row) return "row-missing";
+  if (row.invalidated_at != null) return "already-invalidated";
+  return row.content_type === INVALIDATION_ELIGIBLE_CONTENT_TYPE ? "eligible" : "ineligible-type";
 }
 
 /**
@@ -404,6 +447,12 @@ export function applyContradictionOutcomes(
   newFacts: string[],
   /** Source document of each entry in `newFacts`, positionally aligned. Null = unattributable. */
   newFactDocIds: ReadonlyArray<number | null>,
+  /**
+   * v0.29.0 audit sink. When present (production: inside the run's transaction),
+   * every applied/blocked/errored outcome emits a durable event. Absent in
+   * seam-level tests that assert mutation behavior only.
+   */
+  emit?: (ev: Omit<JudgeEventInput, "runId">) => void,
 ): ContradictionOutcomes {
   const out: ContradictionOutcomes = {
     contradictions: 0,
@@ -417,7 +466,20 @@ export function applyContradictionOutcomes(
   };
 
   for (const rel of accepted) {
-    if (rel.confidence < 0.7) continue;
+    if (rel.confidence < 0.7) {
+      // Below the mutation threshold: the verdict is recorded (calibration wants to
+      // see near-misses) but nothing is written.
+      emit?.({
+        eventType: "verdict",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasoningHead: rel.reasoning,
+        action: "classified_only",
+      });
+      continue;
+    }
     const oldDoc = candidates[rel.old_idx];
     if (!oldDoc) continue;
 
@@ -430,11 +492,29 @@ export function applyContradictionOutcomes(
     const virtual = parseVirtualPath(oldDoc.filepath);
     if (!virtual) {
       out.unparseableTarget++;
+      emit?.({
+        eventType: "reject",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasonCode: "target_unparseable",
+        evidenceHead: oldDoc.filepath,
+      });
       continue;
     }
     const existingDoc = store.findActiveDocument(virtual.collectionName, virtual.path);
     if (!existingDoc) {
       out.missingTarget++;
+      emit?.({
+        eventType: "reject",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasonCode: "target_missing",
+        evidenceHead: oldDoc.filepath,
+      });
       continue;
     }
 
@@ -446,6 +526,19 @@ export function applyContradictionOutcomes(
         confidence: newConfidence,
       });
       out.contradictions++;
+      emit?.({
+        eventType: "verdict",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        newRef: newFactDocIds[rel.new_idx] != null ? `doc:${newFactDocIds[rel.new_idx]}` : null,
+        oldRef: `doc:${existingDoc.id}`,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasoningHead: rel.reasoning,
+        action: "eroded",
+        scoreBefore: currentConfidence,
+        scoreAfter: newConfidence,
+      });
       console.error(
         `[decision-extractor] CONTRADICTION: "${newFacts[rel.new_idx]}" vs "${oldDoc.displayPath}" (conf: ${rel.confidence})`
       );
@@ -464,12 +557,39 @@ export function applyContradictionOutcomes(
       // precision can be adjudicated against real traffic first. Set
       // CLAWMEM_CONTRADICTION_INVALIDATE=true to arm it.
       if (newConfidence <= 0.2) {
-        if (!isInvalidationEligible(store, existingDoc.id)) {
+        const eligibility = invalidationEligibility(store, existingDoc.id);
+        if (eligibility !== "eligible") {
           out.floorIneligible++;
+          emit?.({
+            eventType: "verdict",
+            newIdx: rel.new_idx,
+            oldIdx: rel.old_idx,
+            oldRef: `doc:${existingDoc.id}`,
+            relation: rel.relation,
+            confidence: rel.confidence,
+            action: "floor_reached",
+            reasonCode:
+              eligibility === "already-invalidated" ? "already_invalidated"
+              : eligibility === "row-missing" ? "target_missing"
+              : "ineligible_type",
+            scoreBefore: currentConfidence,
+            scoreAfter: newConfidence,
+          });
           continue;
         }
         if (process.env.CLAWMEM_CONTRADICTION_INVALIDATE !== "true") {
           out.shadowInvalidations++;
+          emit?.({
+            eventType: "verdict",
+            newIdx: rel.new_idx,
+            oldIdx: rel.old_idx,
+            oldRef: `doc:${existingDoc.id}`,
+            relation: rel.relation,
+            confidence: rel.confidence,
+            action: "would_invalidate",
+            scoreBefore: currentConfidence,
+            scoreAfter: newConfidence,
+          });
           console.warn(
             `[decision-extractor] contradiction: WOULD invalidate "${oldDoc.displayPath}" ` +
             `(confidence ${currentConfidence} -> ${newConfidence}) — shadow mode, nothing ` +
@@ -478,7 +598,7 @@ export function applyContradictionOutcomes(
           continue;
         }
         try {
-          // The content_type predicate is redundant against isInvalidationEligible above and
+          // The content_type predicate is redundant against invalidationEligibility above and
           // kept deliberately: it makes a lost race a zero-row no-op rather than a wrong write.
           const res = store.db.prepare(`
             UPDATE documents
@@ -490,8 +610,29 @@ export function applyContradictionOutcomes(
           // A swallowed result is how the original defect stayed invisible for four months.
           if (res.changes === 0) out.invalidationNoOp++;
           else out.invalidated++;
+          emit?.({
+            eventType: "verdict",
+            newIdx: rel.new_idx,
+            oldIdx: rel.old_idx,
+            oldRef: `doc:${existingDoc.id}`,
+            relation: rel.relation,
+            confidence: rel.confidence,
+            action: res.changes === 0 ? "write_noop" : "invalidated",
+            scoreBefore: currentConfidence,
+            scoreAfter: newConfidence,
+          });
         } catch (e) {
           out.invalidationErrors++;
+          emit?.({
+            eventType: "error",
+            newIdx: rel.new_idx,
+            oldIdx: rel.old_idx,
+            oldRef: `doc:${existingDoc.id}`,
+            relation: rel.relation,
+            confidence: rel.confidence,
+            reasonCode: "write_error",
+            evidenceHead: e instanceof Error ? e.message : String(e),
+          });
           console.warn(
             `[decision-extractor] contradiction: invalidation FAILED for ` +
             `"${oldDoc.displayPath}": ${e instanceof Error ? e.message : String(e)}`,
@@ -502,8 +643,34 @@ export function applyContradictionOutcomes(
     } else if (rel.relation === "update") {
       // Lower old doc confidence by 0.15 (floor 0.3)
       const currentConfidence = existingDoc.confidence ?? 0.5;
+      const newConfidence = Math.max(0.3, currentConfidence - 0.15);
       store.updateDocumentMeta(existingDoc.id, {
-        confidence: Math.max(0.3, currentConfidence - 0.15),
+        confidence: newConfidence,
+      });
+      emit?.({
+        eventType: "verdict",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        newRef: newFactDocIds[rel.new_idx] != null ? `doc:${newFactDocIds[rel.new_idx]}` : null,
+        oldRef: `doc:${existingDoc.id}`,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasoningHead: rel.reasoning,
+        action: "eroded",
+        scoreBefore: currentConfidence,
+        scoreAfter: newConfidence,
+      });
+    } else if (rel.relation === "same") {
+      // No mutation for `same` — but the classification is still a calibration fact.
+      emit?.({
+        eventType: "verdict",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        oldRef: `doc:${existingDoc.id}`,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasoningHead: rel.reasoning,
+        action: "classified_only",
       });
     }
   }
@@ -535,12 +702,39 @@ const EMPTY_OUTCOMES = (): ContradictionOutcomes => ({
  * the seam a regression test drives; `detectContradictions` adds only the LLM call and the
  * operator-facing reporting around it.
  */
+/** Judge identity + response identity for the durable audit (§J7). */
+export type ContradictionAuditContext = {
+  sessionId: string | null;
+  lane: JudgeLane;
+  model: string | null;
+  endpoint: string | null;
+  promptVersion: string;
+  responseSha256: string;
+};
+
+/** Admission verdicts → audit reason codes — mirrors, never invents (§J7). */
+const REJECT_REASON_CODE: Record<Exclude<ContradictionEntryVerdict, "ok">, JudgeReasonCode> = {
+  "invalid-relation": "invalid_relation",
+  "invalid-reasoning": "invalid_reasoning",
+  "placeholder-reasoning": "placeholder_reasoning",
+  "invalid-confidence": "invalid_confidence",
+  "index-out-of-range": "index_oob",
+};
+
 export function applyContradictionResponse(
   store: Store,
   rawJson: unknown,
   candidates: SearchResult[],
   newFacts: string[],
   newFactDocIds: ReadonlyArray<number | null>,
+  /**
+   * v0.29.0: when present (production), the run row, per-verdict/per-reject events,
+   * and every mutation commit in ONE transaction — an audit-insert failure rolls the
+   * mutations back (fail-closed: an unauditable erosion is this feature's original
+   * defect). A thrown transaction propagates to the caller, which records the
+   * post-rollback `write_error` run. Seam-level tests may omit it.
+   */
+  audit?: ContradictionAuditContext,
 ): ContradictionResponseResult {
   const parsed = unwrapContradictionArray(rawJson);
   const parsedCategory = parsed === null ? "unparseable" : Array.isArray(parsed) ? "array" : typeof parsed;
@@ -550,9 +744,49 @@ export function applyContradictionResponse(
       outcomes: EMPTY_OUTCOMES(), rejected: 0, duplicates: 0, inconsistent: 0,
     };
   }
-  const { accepted, rejected, duplicates, inconsistent } =
+  const { accepted, rejected, duplicates, inconsistent, rejectedEntries, duplicateEntries, inconsistentEntries } =
     admitContradictionEntries(parsed, candidates.length, newFacts.length);
-  const outcomes = applyContradictionOutcomes(store, accepted, candidates, newFacts, newFactDocIds);
+
+  const applyAll = (): ContradictionOutcomes => {
+    let emit: ((ev: Omit<JudgeEventInput, "runId">) => void) | undefined;
+    if (audit) {
+      const runId = insertJudgeRun(store.db, {
+        sessionId: audit.sessionId,
+        consumer: "decision-extractor",
+        lane: audit.lane,
+        model: audit.model,
+        endpoint: audit.endpoint,
+        promptVersion: audit.promptVersion,
+        responseSha256: audit.responseSha256,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        outcome: "ok",
+        entriesAdmitted: accepted.length,
+        entriesRejected: rejected,
+        entriesDuplicate: duplicates,
+        entriesInconsistent: inconsistent,
+      });
+      emit = ev => { insertJudgeEvent(store.db, { runId, ...ev }); };
+      for (const { entry, reason } of rejectedEntries) {
+        emit({
+          eventType: "reject",
+          reasonCode: REJECT_REASON_CODE[reason],
+          evidenceHead: JSON.stringify(entry),
+        });
+      }
+      // Collapsed duplicates and inconsistently-answered pairs are audit facts too —
+      // counts alone could not say WHICH pair was collapsed or dropped (t1 finding 7).
+      for (const { entry, repeats } of duplicateEntries) {
+        emit({ eventType: "reject", reasonCode: "duplicate", evidenceHead: JSON.stringify({ repeats, entry }) });
+      }
+      for (const { entry, answers } of inconsistentEntries) {
+        emit({ eventType: "reject", reasonCode: "inconsistent", evidenceHead: JSON.stringify({ answers, entry }) });
+      }
+    }
+    return applyContradictionOutcomes(store, accepted, candidates, newFacts, newFactDocIds, emit);
+  };
+
+  const outcomes = audit ? store.db.transaction(applyAll)() : applyAll();
   return { parseFailed: false, parsedCategory, outcomes, rejected, duplicates, inconsistent };
 }
 
@@ -566,8 +800,6 @@ async function detectContradictions(
   if (decisions.length === 0) return 0;
 
   let contradictionCount = 0;
-  const llm = await getDefaultLlamaCpp();
-  if (!llm) return 0;
 
   // Batch all new decision facts, carrying each fact's source document alongside it so
   // `invalidated_by` names the document that actually contradicted, not whichever row a
@@ -583,6 +815,37 @@ async function detectContradictions(
     }
   }
   if (newFacts.length === 0) return 0;
+
+  // §J1 (v0.29.0): contradiction analysis runs ONLY on a configured judge. The stock
+  // expansion model cannot meet the judge contract (probe-verified: non-array output,
+  // placeholder echo, fabricated relations), and dormancy could not be inferred across
+  // the prompt reshape — so unconfigured means DISABLED: an audited no-op with one loud
+  // line, never a silent attempt on the default model.
+  const resolution = resolveJudge();
+  if (resolution.status !== "ready") {
+    insertJudgeRunBestEffort(store.db, {
+      sessionId,
+      consumer: "decision-extractor",
+      lane: "none",
+      promptVersion: JUDGE_PROMPT_VERSION,
+      newFactCount: newFacts.length,
+      outcome: resolution.status === "unconfigured" ? "no_judge_configured" : "config",
+    });
+    if (resolution.status === "invalid") {
+      console.error(
+        `[decision-extractor] contradiction judge misconfigured: ${resolution.error} — ` +
+        `no contradiction was evaluated.`,
+      );
+    } else {
+      console.error(
+        `[decision-extractor] contradiction analysis disabled: no judge configured. ` +
+        `The stock expansion model cannot meet the judge contract; set CLAWMEM_JUDGE_* ` +
+        `(docs/guides/inference-services.md) to enable. No contradiction was evaluated.`,
+      );
+    }
+    return 0;
+  }
+  const judge = resolution.judge;
 
   // Vector search for existing decisions on overlapping topics
   const queryText = newFacts.join(". ");
@@ -603,34 +866,92 @@ async function detectContradictions(
 
   if (candidates.length === 0) return 0;
 
-  // Build classification prompt
-  const existingFacts = candidates
-    .map((c, i) => `[OLD-${i}] ${c.displayPath}\n${extractSnippet(c.body || "", queryText, 300).snippet}`)
-    .join("\n\n");
-
-  const prompt = `You are analyzing decisions for contradictions.
-
-NEW DECISIONS (this session):
-${newFacts.map((f, i) => `[NEW-${i}] ${f}`).join("\n")}
-
-EXISTING DECISIONS (prior sessions):
-${existingFacts}
-
-For each NEW decision, check against EXISTING decisions. Classify each relationship:
-- "same": Identical decision, no action needed
-- "update": New decision supersedes/refines old one
-- "contradiction": New decision directly conflicts with old one
-
-Return JSON array:
-[{"new_idx": 0, "old_idx": 0, "relation": "update|contradiction|same", "confidence": 0.0-1.0, "reasoning": "..."}]
-
-Only include pairs with confidence >= 0.7. Return [] if no relationships found. /no_think`;
+  // §J5 (v0.29.0): reshaped prompt via the judge module — role-separated instructions,
+  // JSON-encoded data inside CSPRNG nonce fencing, a VALID example row, and the 0.7
+  // erosion threshold stated once. Snippets stay positionally aligned with `candidates`
+  // so old_idx addresses the same document; paths stay OUT of the payload (less egress,
+  // less injection surface).
+  const existingSnippets = candidates.map(c => extractSnippet(c.body || "", queryText, 300).snippet);
+  const prompt = buildContradictionPrompt({ newFacts, existingSnippets, minConfidence: 0.7 });
 
   try {
-    const result = await llm.generate(prompt, { temperature: 0.3, maxTokens: 400 });
-    if (!result) return 0;
-    const applied = applyContradictionResponse(
-      store, extractJsonFromLLM(result.text), candidates, newFacts, newFactDocIds);
+    const result = await judge.judge({ system: prompt.system, user: prompt.user, schema: JUDGE_VERDICT_SCHEMA });
+    if (!result.ok) {
+      // Typed judge failure — audited standalone (nothing mutated), loud, fail-closed.
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: judge.descriptor.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: prompt.promptVersion,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        outcome: result.reason,
+      });
+      console.warn(
+        `[decision-extractor] contradiction judge ${result.reason} ` +
+        `(lane=${judge.descriptor.lane} model=${judge.descriptor.model}): ${result.detail} — ` +
+        `no contradiction was evaluated.`,
+      );
+      return 0;
+    }
+    if (result.truncated) {
+      // §J5b: provider-reported truncation is a typed reject BEFORE extraction — the
+      // repaired-partial-batch class must stay dead.
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: result.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: prompt.promptVersion,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        responseSha256: hashContent(result.text),
+        outcome: "truncated",
+      });
+      console.warn(
+        `[decision-extractor] contradiction judge response TRUNCATED ` +
+        `(len=${result.text.length} model=${JSON.stringify(result.model)}) — rejected before ` +
+        `extraction; no contradiction was evaluated.`,
+      );
+      return 0;
+    }
+
+    const audit: ContradictionAuditContext = {
+      sessionId,
+      lane: judge.descriptor.lane,
+      model: result.model,
+      endpoint: judge.descriptor.endpoint,
+      promptVersion: prompt.promptVersion,
+      responseSha256: hashContent(result.text),
+    };
+    let applied: ContradictionResponseResult;
+    try {
+      applied = applyContradictionResponse(
+        store, extractJudgeJson(result.text), candidates, newFacts, newFactDocIds, audit);
+    } catch (e) {
+      // §J7: the run+events+mutations transaction rolled back — nothing mutated. The
+      // in-txn run row died with the transaction; record a standalone write_error run.
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: result.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: prompt.promptVersion,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        responseSha256: audit.responseSha256,
+        outcome: "write_error",
+      });
+      console.error(
+        `[decision-extractor] contradiction apply FAILED — transaction rolled back, ` +
+        `no mutation applied: ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return 0;
+    }
 
     if (applied.parseFailed) {
       // A silent `return 0` here is indistinguishable from "no contradictions found",
@@ -641,6 +962,18 @@ Only include pairs with confidence >= 0.7. Return [] if no relationships found. 
       // be a content-exposure path in ordinary operation. Emit shape + identity only;
       // raw text is opt-in via CLAWMEM_DEBUG_LLM_RAW and still truncated.
       const category = applied.parsedCategory;
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: result.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: prompt.promptVersion,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        responseSha256: hashContent(result.text),
+        outcome: "parse_reject",
+      });
       console.warn(
         `[decision-extractor] contradiction parse gate REJECTED the model response ` +
         `(expected JSON array, got ${category}; len=${result.text.length} ` +
@@ -740,13 +1073,23 @@ export async function decisionExtractor(
   store: Store,
   input: HookInput
 ): Promise<HookOutput> {
+  const sessionId = input.sessionId || `session-${Date.now()}`;
+
+  // Judge-audit retention (§J7, code-review t3 finding 1 / t4 finding 1): prune as the
+  // handler's FIRST act — before transcript validation, so literally every invocation,
+  // early returns included, honors the 90-day/10k root cap. Pair-aware, best-effort,
+  // never this session's rows.
+  try {
+    pruneJudgeRuns(store.db, { excludeSessionId: sessionId });
+  } catch { /* retention is best-effort */ }
+
   const transcriptPath = validateTranscriptPath(input.transcriptPath);
   if (!transcriptPath) return makeEmptyOutput("decision-extractor");
 
   const messages = readTranscript(transcriptPath, 200);
   if (messages.length === 0) return makeEmptyOutput("decision-extractor");
 
-  const sessionId = input.sessionId || `session-${Date.now()}`;
+
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
   const timestamp = now.toISOString();

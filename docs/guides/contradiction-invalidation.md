@@ -1,11 +1,13 @@
 # Contradiction invalidation — calibrating before you arm it
 
 The `decision-extractor` Stop hook classifies each session's new facts against the memories they
-resemble. When it labels a pair a **contradiction**, two things can happen to the older document:
+resemble — since v0.29.0, only through a configured **judge** (`CLAWMEM_JUDGE_*`; with no judge,
+no contradiction analysis runs at all — see [§3](#3-the-judge-model)). When the judge labels a
+pair a **contradiction**, two things can happen to the older document:
 
 | Stage | Effect | Reversible | Default |
 |---|---|---|---|
-| **Confidence erosion** | `confidence -= 0.25`, floored at `0.2` | Yes — one `UPDATE` restores it | **Live** |
+| **Confidence erosion** | `confidence -= 0.25`, floored at `0.2` | Yes — one `UPDATE` restores it | **Live** (when a judge is configured) |
 | **Invalidation** | `invalidated_at` is set, removing the document from FTS *and* vector retrieval | Yes by SQL, but nothing tells you it happened | **Shadowed** (opt-in) |
 
 Confidence is a ranking signal — 25% of the default composite score, 15% under `query`, 20% under
@@ -134,14 +136,22 @@ first thing you look at.
 Covered above. If the eligible count is zero — a vault indexed from files with no Stop-hook
 history — arming changes nothing at all.
 
-### 3. The classifier model
+### 3. The judge model
 
-Precision is a property of whatever `CLAWMEM_LLM_URL` / `CLAWMEM_LLM_MODEL` is serving, not of
-ClawMem. Smaller local models tend to echo the prompt skeleton back as output, and the schema
-guards catch that shape rather than judging whether the classification is *correct*. Two vaults
-running identical code against different endpoints will not have the same false-positive rate.
+Since v0.29.0, contradiction classification runs ONLY through the configured judge
+(`CLAWMEM_JUDGE_*` — see [inference services](inference-services.md#contradiction-judge)),
+never through the global `CLAWMEM_LLM_URL` / `CLAWMEM_LLM_MODEL` expansion model. With no
+judge configured there is nothing to calibrate: the hook writes an audited
+`no_judge_configured` run and mutates nothing.
 
-If you change the model, the calibration you did under the old one no longer holds.
+Precision is a property of the judge you configure, not of ClawMem. Smaller local models tend
+to echo the prompt skeleton back as output, and the schema guards catch that shape rather than
+judging whether the classification is *correct*. Two vaults running identical code against
+different judges will not have the same false-positive rate.
+
+If you change the judge model, the calibration you did under the old one no longer holds —
+`judge_runs.model` and `prompt_version` are recorded on every run precisely so you can scope
+calibration queries to one judge.
 
 ### 4. What your corpus is made of
 
@@ -188,13 +198,23 @@ stderr:
 plus per-session summaries for suppressed invalidations, floor-reached-but-ineligible documents,
 and unresolvable targets.
 
-**Where that output lands depends on your host, and one host cannot currently show it:**
+**Since v0.29.0 the stderr lines are convenience output, not the calibration record.** Every
+judge evaluation writes durable rows to `judge_runs` / `judge_events` in the vault database —
+inside the same transaction as the mutation it audits — so **calibration is audit-based on
+every host**, including hosts that discard hook stderr:
 
-| Host | Shadow output reachable? |
-|---|---|
-| **Claude Code** | **Yes.** Hook stderr is stored in the session transcript. `grep -r 'WOULD invalidate' ~/.claude/projects/<encoded-project-path>/` |
-| **systemd** | **Not applicable.** No shipped unit runs this hook — `clawmem-watcher.service` runs `clawmem watch`, which is the indexer, not the Stop hook. Nothing will appear in its journal. |
-| **OpenClaw** | **No.** The plugin captures hook stderr but only surfaces it when the hook exits non-zero, and a successful shadow run exits zero — so the `WOULD invalidate` lines are discarded. **Shadow calibration is not possible under OpenClaw, and this flag should not be armed there.** Running the calibration under Claude Code against the same vault is *not* an equivalent substitute: exposure depends on prompts, session traffic and candidate selection, all of which differ by host. |
+```sql
+-- every would-be invalidation, with scores and the judge that produced it
+SELECT r.ts, r.model, e.old_ref, e.confidence, e.score_before, e.score_after
+FROM judge_events e JOIN judge_runs r ON r.id = e.run_id
+WHERE e.action = 'would_invalidate' ORDER BY r.ts DESC;
+```
+
+| Host | Shadow stderr visible? | Audit rows available? |
+|---|---|---|
+| **Claude Code** | Yes — hook stderr is stored in the session transcript. | **Yes.** |
+| **systemd** | Not applicable — no shipped unit runs this hook. | **Yes** (the consolidation worker's merge-gate rows land here too). |
+| **OpenClaw** | No — the plugin surfaces hook stderr only on a non-zero exit. | **Yes.** *(Pre-0.29.0 versions of this guide said shadow calibration was impossible under OpenClaw; the durable audit reverses that — query the rows above instead of grepping stderr.)* |
 
 Erosion runs during this period regardless of host, so the *effect* accumulates in the vault and
 can be watched directly:
@@ -229,7 +249,8 @@ and missing targets, floor-reached-but-ineligible, shadow suppressions, writes, 
 write failures, and collapsed or inconsistent duplicates. There is deliberately **no per-relation
 counter** — they will not tell you how many `same` or `update` verdicts came back, so do not infer
 classifier activity from their absence either. Attributing confidence changes to this hook with
-certainty would need event telemetry or a durable erosion audit; neither exists today.
+certainty uses the durable audit (v0.29.0): `judge_events` rows carry per-verdict relations,
+scores before/after, and namespaced targets — query those rather than inferring from stderr.
 
 ### Step 3 — adjudicate
 

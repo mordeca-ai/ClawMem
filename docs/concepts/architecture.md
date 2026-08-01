@@ -124,10 +124,10 @@ When the worker finds a candidate existing observation to merge a new pattern in
 
 ### Phase 2 — contradiction-aware merge gate
 
-After the name-aware gate passes, the worker checks whether the new observation contradicts the existing one. A deterministic heuristic runs first (negation asymmetry, number/date mismatch), then an LLM check confirms. If the final confidence exceeds `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` (default `0.5`), the merge is blocked and one of two policies applies (controlled by `CLAWMEM_CONTRADICTION_POLICY`):
+After the name-aware gate passes, the worker checks whether the new observation contradicts the existing one. Since v0.29.0 the check runs through the configured **contradiction judge** (`CLAWMEM_JUDGE_*`, the same strict relation-array contract as the decision-extractor hook); with no judge configured, only the deterministic heuristic runs (negation asymmetry, number/date mismatch) and outcomes are constrained to the non-deactivating `link` policy. Mutation-authorizing evaluations commit durable `judge_runs`/`judge_events` audit rows in the same transaction as the resulting mutation; non-mutating outcomes write standalone rows. If the final confidence meets `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` (default `0.5`), the merge is blocked and one of two policies applies (configured via `CLAWMEM_CONTRADICTION_POLICY`):
 
-- `link` (default) — insert a new `consolidated_observations` row and create a `contradicts` edge in `memory_relations` between the two rows. Both remain active and queryable.
-- `supersede` — insert the new row and mark the old row `status='inactive'` with `invalidated_at`/`superseded_by` set. The old row is filtered from retrieval but preserved for audit.
+- `link` (default) — insert a new `consolidated_observations` row and set the old row's `invalidated_by` column as a **backlink** to the new row. Both remain active and queryable. *(Phase 2 does not insert `memory_relations` edges — `contradicts` edges come from Phase 3 deductive synthesis.)*
+- `supersede` — insert the new row and mark the old row `status='inactive'` with `invalidated_at`/`superseded_by` set. The old row is filtered from retrieval but preserved for audit. **Requires a configured judge**: without one, a configured `supersede` is loudly constrained to `link` (`clawmem doctor` reports the policy as inactive).
 
 Phase 3 deductive synthesis applies the same `contradicts` link for any draft that matches a prior deductive observation with conflicting content.
 

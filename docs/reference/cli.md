@@ -7,7 +7,7 @@ Complete command reference for the ClawMem memory engine. Always use the `bin/cl
 ```bash
 clawmem init                    # Initialize vault (creates SQLite DB)
 clawmem status                  # Quick index status
-clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation)
+clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set)
 ```
 
 ## Collection management
@@ -193,6 +193,7 @@ The session ID is resolved from `--session-id <id>`, then `CLAUDE_SESSION_ID`, t
 | `CLAWMEM_LLM_MODEL` | `qwen3` | Model name sent to the configured LLM endpoint |
 | `CLAWMEM_LLM_REASONING_EFFORT` | — | Optional top-level `reasoning_effort` field for Chat Completions endpoints that support it (for example OpenAI reasoning models). Leave unset for llama-server/vLLM unless explicitly supported. |
 | `CLAWMEM_LLM_NO_THINK` | `true` | Append `/no_think` to remote prompts; set `false` for standard OpenAI models and other endpoints that reject or treat it as literal prompt text |
+| `CLAWMEM_JUDGE_URL` / `_PROVIDER` / `_MODEL` / `_API_KEY` / `_NO_THINK` / `_STRUCTURED` | (none) | **v0.29.0.** The contradiction **judge** — task-scoped endpoint for contradiction classification (decision-extractor hook + merge-time gate), independent of the global `CLAWMEM_LLM_*` vars. Unset ⇒ contradiction analysis is disabled (audited no-op). Full table + lane semantics: [inference services](../guides/inference-services.md#contradiction-judge). |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server |
 | `CLAWMEM_RERANK_API_KEY` | — | Bearer token for an authenticated remote reranker endpoint |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block node-llama-cpp auto-downloads |
