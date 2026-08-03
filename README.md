@@ -605,8 +605,10 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | `session_log` | USE THIS for "last time", "yesterday", "what happened", "what did we do". Returns session history with handoffs and file changes. DO NOT use `query()` for cross-session questions — this tool has session-specific data that search cannot find. |
 | `profile` | Current static + dynamic user profile |
 | `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary |
-| `lifecycle_sweep` | Run lifecycle policies: archive stale docs past retention threshold, optionally purge old archives. Defaults to dry_run (preview only) |
+| `lifecycle_sweep` | Run lifecycle policies: archive stale docs past retention threshold. Archives only — never deletes. Defaults to dry_run (preview only) |
 | `lifecycle_restore` | Restore documents that were auto-archived by lifecycle policies. Filter by query, collection, or restore all |
+
+**ClawMem never physically deletes a document row (v0.30.0).** Forget and archive deactivate; `lifecycle_restore` reverses archival; `purge_after_days` is inert. Through v0.29.0 a configured retention window permanently deleted archived rows from a non-dry-run sweep and from the SessionStart hook, without reporting it — see [upgrading](docs/guides/upgrading.md#v0300-clawmem-no-longer-deletes-document-rows).
 
 ### Compact Mode
 

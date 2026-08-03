@@ -155,6 +155,20 @@ clawmem reflect [N]             # Cross-session reflection (last N days, default
 clawmem consolidate [--dry-run] # Find and archive duplicate low-confidence documents
 ```
 
+## Lifecycle & retention
+
+```bash
+clawmem lifecycle status                    # Lifecycle stats + active policy
+clawmem lifecycle sweep [--dry-run]         # Archive stale docs per policy (reversible)
+clawmem lifecycle search <query>            # Search archived docs (FTS, no restore)
+clawmem lifecycle restore --query <term> | --collection <name> | --all
+```
+
+`sweep` archives only; `restore` reverses it. **ClawMem physically deletes no document row
+on any path** (v0.30.0) — `purge_after_days` is inert, and a sweep that sees it configured
+says so. To reclaim disk space, act on the SQLite file out-of-band; that is deliberately
+outside ClawMem's mutation contract.
+
 ## Offline eval harness
 
 ```bash

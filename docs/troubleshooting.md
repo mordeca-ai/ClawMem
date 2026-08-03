@@ -298,6 +298,13 @@ builders operate on — so archiving documents legitimately lowers the total.
 - The restore deliberately leaves `confidence` alone — the document returns at whatever erosion left it (usually `0.2`), retrievable but ranking low. Raise it separately if you judge the erosion itself was wrong: `UPDATE documents SET confidence=0.8 WHERE id=<id>;`.
 - If contradiction invalidation is the cause and you want it off, remove `CLAWMEM_CONTRADICTION_INVALIDATE` from wherever the hook's environment is configured (a shell `unset` will not affect a value set in your hook config or plugin host); a bulk restore scoped `WHERE invalidated_at IS NOT NULL AND content_type='observation'` covers exactly what that path can have written. Full procedure: [contradiction invalidation](guides/contradiction-invalidation.md).
 
+**A memory is gone from the vault entirely — not merely absent from search (pre-v0.30.0 only)**
+- Check this first, because the entry above will mislead you: if the row was *deleted* rather than invalidated, the `invalidated_at` query returns nothing and there is no document to restore. Confirm which case you are in: `sqlite3 ~/.cache/clawmem/index.sqlite "SELECT id, active, archived_at FROM documents WHERE path LIKE '%<filename>%';"` — no row at all means deletion, not invalidation.
+- **Cause, on v0.29.0 and earlier:** a configured `lifecycle.purge_after_days` permanently deleted every archived document past that window. It fired from a non-dry-run `lifecycle_sweep` (MCP) and from the `staleness-check` SessionStart hook, and neither reported it — the MCP dry-run preview listed only what would be *archived*, and the hook discarded the count inside a catch. If `purge_after_days` was null (the default), this never happened to you.
+- **Fixed in v0.30.0: ClawMem physically deletes no document row on any code path**, and `purge_after_days` is inert. Retention is archival, reversed by `lifecycle_restore`. Upgrading stops any ongoing loss.
+- **Already-deleted rows are unrecoverable from the vault** — the row, not just its retrieval flag, is gone. Recover from a backup of `index.sqlite` if you keep one, or re-index the source files: for file-backed collections the markdown on disk was never touched, so `clawmem update --embed` re-indexes it. Only vault-native content with no file behind it (mined conversations, synthesized facts, `_clawmem` observations) is genuinely lost.
+- Verify your current exposure: `grep -A6 '^lifecycle:' ~/.config/clawmem/config.yaml`. On v0.30.0+ a sweep that sees `purge_after_days` set says so explicitly and deletes nothing.
+
 ## OpenClaw
 
 **`clawmem setup openclaw` installs into the wrong profile / ignores `OPENCLAW_STATE_DIR` (ClawMem v0.10.0–v0.10.3)**

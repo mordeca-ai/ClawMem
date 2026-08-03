@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.29.0**.
+Guide for upgrading between released versions. Current: **v0.30.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -56,6 +56,38 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.30.0: ClawMem no longer deletes document rows
+
+No schema change, no re-embed, no reindex. **Check whether you set `purge_after_days`:**
+
+```bash
+grep -A6 '^lifecycle:' ~/.config/clawmem/config.yaml | grep purge_after_days
+```
+
+- **`purge_after_days: null` (the default) — nothing changes.** No deletion was happening.
+- **`purge_after_days: <number>` — deletion stops.** Until now, a non-dry-run
+  `lifecycle_sweep` *and* every SessionStart with the `staleness-check` hook installed
+  permanently deleted every archived row past that window. The MCP preview never listed or
+  counted those rows (it reported only what would be *archived*), and the hook path reported
+  nothing at all. **Anything already deleted is gone**; this release stops the ongoing loss.
+  The value is now inert — archival continues and stays reversible via `lifecycle_restore`.
+
+There is no replacement command. Physical deletion is the one ClawMem mutation with no
+restore path, and no in-process or CLI credential can tell an operator apart from the coding
+agent ClawMem serves — an env var or a confirmation flag is satisfiable by the agent itself.
+So the capability is not offered rather than gated. If you need to reclaim space, operate on
+the SQLite file directly, out-of-band; that is explicitly outside ClawMem's mutation
+contract. A supported retention design (reversible quarantine with a protected window) is
+planned.
+
+**Also fixed:** `archiveDocuments` / `restoreArchivedDocuments` returned SQLite's `changes`
+count, which includes the `documents_fts` trigger writes — archiving 3 documents reported
+16. Every "archived N" / "restored N" figure ClawMem printed was inflated. The mutations
+were always correct; only the counts were wrong. If you parse that output, the numbers will
+now be smaller and accurate.
 
 ---
 

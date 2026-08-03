@@ -82,6 +82,20 @@ A second, longer-interval consolidation lane with DB-backed exclusivity, stale-f
 | `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` | `0.5` | Minimum confidence before the gate blocks a merge. Below this, the merge proceeds. The judge prompt states this same threshold — it never overrides your configured value. |
 | `CLAWMEM_JUDGE_URL` / `_PROVIDER` / `_MODEL` / `_API_KEY` / `_NO_THINK` / `_STRUCTURED` | (none) | **v0.29.0.** The contradiction **judge** — a task-scoped endpoint for contradiction classification (decision-extractor hook + merge-time gate), independent of the global `CLAWMEM_LLM_*` expansion vars. Unset ⇒ contradiction analysis is disabled (audited no-op). Full table + lane semantics: [inference services](../guides/inference-services.md#contradiction-judge). |
 
+## Retention (v0.30.0: ClawMem no longer deletes rows)
+
+`lifecycle.purge_after_days` in `config.yaml` is **inert as of v0.30.0** and is retained only
+so existing configs keep loading. Only a positive finite number is accepted; anything else
+(including a negative value, which previously produced a *future* cutoff that deleted every
+archived row) is read as unset.
+
+Retention is archival, which `lifecycle_restore` reverses. ClawMem physically deletes no
+document row on any code path — MCP, hook, or CLI. Deletion is the one mutation with no
+restore, and no in-process or CLI credential can distinguish an operator from the coding
+agent the package serves, so the capability is not offered rather than gated. Reclaiming
+disk space is an out-of-band operator action on the SQLite file, explicitly outside
+ClawMem's mutation contract.
+
 ## REST API & Hermes plugin
 
 | Variable | Default | Effect |

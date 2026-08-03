@@ -131,7 +131,15 @@ export function loadConfig(): CollectionConfig {
       config.lifecycle = {
         archive_after_days: typeof lc.archive_after_days === "number" ? lc.archive_after_days : 90,
         type_overrides: typeof lc.type_overrides === "object" && lc.type_overrides !== null ? lc.type_overrides : {},
-        purge_after_days: typeof lc.purge_after_days === "number" ? lc.purge_after_days : null,
+        // INERT since v0.30.0 (see src/config.ts for the same guard) — only a positive
+        // finite value is accepted; a negative or infinite one previously yielded a future
+        // cutoff that deleted every archived row.
+        purge_after_days:
+          typeof lc.purge_after_days === "number" &&
+          Number.isFinite(lc.purge_after_days) &&
+          lc.purge_after_days > 0
+            ? lc.purge_after_days
+            : null,
         exempt_collections: Array.isArray(lc.exempt_collections) ? lc.exempt_collections : [],
         dry_run: lc.dry_run !== false,
       };

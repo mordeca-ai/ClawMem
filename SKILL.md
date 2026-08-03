@@ -98,7 +98,7 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `build_graphs` | Temporal backbone + semantic graph after bulk ingestion. NOT after every reindex. Reports `N new edge(s), M total` — `0 new` on a rebuild is correct, not an empty graph. |
 | `timeline` | Temporal neighborhood around a doc. Progressive disclosure: search → timeline → get. |
 | `memory_evolution_status` | How a doc's A-MEM metadata evolved over time. |
-| `lifecycle_status` / `lifecycle_sweep` / `lifecycle_restore` | Lifecycle stats / archive stale (dry-run default) / restore auto-archived. |
+| `lifecycle_status` / `lifecycle_sweep` / `lifecycle_restore` | Lifecycle stats / archive stale (dry-run default, archives only — ClawMem never deletes rows) / restore auto-archived. |
 | `index_stats` / `status` / `reindex` | Doc counts + embedding coverage / quick health / force re-index (does NOT embed). |
 | `beads_sync` / `vault_sync` / `list_vaults` | Beads issues from Dolt / index a dir into a named vault / list vaults. |
 
@@ -215,6 +215,7 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 - **`memory_pin`** (lifecycle retention + priority among relevance-equivalent results; +0.3 boost on composite surfaces, exact-tie precedence on raw routes) — PROACTIVELY when: user says "remember this"/"important"; an architecture/critical decision was just made; a user preference/constraint should persist across sessions. Do NOT pin routine/session-specific items.
 - **`memory_snooze`** — PROACTIVELY when a memory keeps surfacing but isn't relevant now, user says "not now"/"later", or content is time-boxed.
 - **`memory_forget`** — only when genuinely wrong or permanently obsolete. Prefer snooze for temporary suppression.
+- **ClawMem never physically deletes a document row (v0.30.0).** Every lifecycle operation above is reversible: pin/snooze are metadata, forget and archive deactivate, contradiction handling only erodes confidence. Retention archives — `lifecycle_restore` brings it back — and `purge_after_days` is inert. Through v0.29.0 it permanently deleted archived rows from a non-dry-run sweep and from the SessionStart hook, unreported.
 - **Contradiction auto-resolution (judge-gated, v0.29.0):** runs ONLY when a judge is configured via `CLAWMEM_JUDGE_*` — disabled (audited no-op) otherwise. With a judge: when `decision-extractor` detects a new decision contradicting an old one, the old one's confidence is lowered automatically (−0.25, floor 0.2). It stays retrievable; only its ranking drops. Removing it from retrieval outright (`invalidated_at`) is a separate, **opt-in** step behind `CLAWMEM_CONTRADICTION_INVALIDATE`, and applies **only to `content_type='observation'`** — a superseded decision is eroded, never retired, so do NOT tell a user that contradiction handling will retire a prior decision. Unarmed it logs `WOULD invalidate` and writes nothing. Do NOT suggest arming it without the vault-specific calibration in [`docs/guides/contradiction-invalidation.md`](docs/guides/contradiction-invalidation.md).
 
 ---

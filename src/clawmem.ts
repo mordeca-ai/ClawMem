@@ -3381,12 +3381,16 @@ async function cmdLifecycle(args: string[]) {
         return;
       }
 
+      // Archival only. ClawMem no longer physically deletes document rows from any code
+      // path — see the retention note in src/store.ts. `purge_after_days` is inert.
       const archived = store.archiveDocuments(candidates.map(c => c.id));
-      let purged = 0;
+      console.log(`Lifecycle sweep: archived ${archived} document(s). Nothing was deleted.`);
       if (policy.purge_after_days) {
-        purged = store.purgeArchivedDocuments(policy.purge_after_days);
+        console.log(
+          `  Note: purge_after_days=${policy.purge_after_days} is set but INERT — ClawMem no ` +
+          `longer deletes rows. Archived docs stay restorable (clawmem lifecycle restore).`
+        );
       }
-      console.log(`Lifecycle sweep: archived ${archived}, purged ${purged}`);
       break;
     }
 

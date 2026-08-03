@@ -35,7 +35,6 @@ import {
   getCollection,
   listCollections as collectionsListCollections,
   addCollection as collectionsAddCollection,
-  removeCollection as collectionsRemoveCollection,
   renameCollection as collectionsRenameCollection,
   setGlobalContext,
   loadConfig as collectionsLoadConfig,
@@ -1392,7 +1391,6 @@ export type Store = {
 
   // Cleanup and maintenance
   deleteLLMCache: () => number;
-  deleteInactiveDocuments: () => number;
   cleanupOrphanedContent: () => number;
   vacuumDatabase: () => void;
 
@@ -1536,7 +1534,6 @@ export type Store = {
   archiveDocuments: (ids: number[]) => number;
   getArchiveCandidates: (policy: import("./collections.ts").LifecyclePolicy) => { id: number; collection: string; path: string; title: string; modified_at: string; last_accessed_at: string | null; content_type: string }[];
   restoreArchivedDocuments: (filter: { ids?: number[]; collection?: string; sinceDate?: string }) => number;
-  purgeArchivedDocuments: (olderThanDays: number) => number;
   getLifecycleStats: () => { active: number; archived: number; forgotten: number; pinned: number; snoozed: number; neverAccessed: number; oldestAccess: string | null };
   searchArchived: (query: string, limit?: number) => { id: number; collection: string; path: string; title: string; archived_at: string; score: number }[];
 };
@@ -1593,7 +1590,6 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Cleanup and maintenance
     deleteLLMCache: () => deleteLLMCache(db),
-    deleteInactiveDocuments: () => deleteInactiveDocuments(db),
     cleanupOrphanedContent: () => cleanupOrphanedContent(db),
     vacuumDatabase: () => vacuumDatabase(db),
 
@@ -2082,17 +2078,25 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       if (ids.length === 0) return 0;
       const now = new Date().toISOString();
       const placeholders = ids.map(() => "?").join(",");
-      const result = db.prepare(`
-        UPDATE documents SET active = 0, archived_at = ?
-        WHERE id IN (${placeholders}) AND active = 1
-      `).run(now, ...ids);
-      return result.changes;
+      // `result.changes` is NOT the number of documents archived: the `documents_fts`
+      // triggers fire on this UPDATE and their shadow-table writes inflate the count
+      // (3 documents reported as 16). Count the matching rows explicitly, in the same
+      // transaction, so the number returned is the outcome rather than a side-effect total.
+      return db.transaction(() => {
+        const row = db.prepare(`
+          SELECT COUNT(*) AS n FROM documents WHERE id IN (${placeholders}) AND active = 1
+        `).get(...ids) as { n: number } | undefined;
+        db.prepare(`
+          UPDATE documents SET active = 0, archived_at = ?
+          WHERE id IN (${placeholders}) AND active = 1
+        `).run(now, ...ids);
+        return row?.n ?? 0;
+      })();
     },
 
     // Lifecycle management
     getArchiveCandidates: (policy) => getArchiveCandidatesFn(db, policy),
     restoreArchivedDocuments: (filter) => restoreArchivedDocumentsFn(db, filter),
-    purgeArchivedDocuments: (olderThanDays) => purgeArchivedDocumentsFn(db, olderThanDays),
     getLifecycleStats: () => getLifecycleStatsFn(db),
     searchArchived: (query, limit?) => searchArchivedFn(db, query, limit),
   };
@@ -2399,23 +2403,29 @@ export function deleteLLMCache(db: Database): number {
   return result.changes;
 }
 
-/**
- * Remove inactive document records (active = 0).
- * Returns the number of inactive documents deleted.
- */
-export function deleteInactiveDocuments(db: Database): number {
-  const result = db.prepare(`DELETE FROM documents WHERE active = 0`).run();
-  return result.changes;
-}
+// NOTE: `deleteInactiveDocuments` was removed in v0.30.0. It ran
+// `DELETE FROM documents WHERE active = 0` — strictly broader than the retention purge,
+// since it destroyed every inactive row (archived AND forgotten) with no age restriction
+// and no authorization. It had no callers, but sat on the public `Store` interface, so any
+// holder of a store could invoke it. Deactivation must stay reversible; see the retention
+// note on the removed purge helper below.
 
 /**
- * Remove orphaned content hashes that are not referenced by any active document.
- * Returns the number of orphaned content hashes deleted.
+ * Remove content rows that no document references at all.
+ *
+ * The predicate must consider EVERY document, not just active ones. `documents.hash` is
+ * `ON DELETE CASCADE` on `content(hash)`, so deleting content still referenced by an
+ * archived or forgotten document destroys that document row too — a hard delete reached
+ * indirectly, which is exactly what the retention rule forbids. Scoping to `active = 1`
+ * did that: one archived document plus a cleanup call left zero documents.
+ *
+ * With the predicate below no cascade is possible, because nothing references the rows it
+ * removes. Returns the number of orphaned content rows deleted.
  */
 export function cleanupOrphanedContent(db: Database): number {
   const result = db.prepare(`
     DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents)
   `).run();
   return result.changes;
 }
@@ -3381,27 +3391,13 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
 }
 
 /**
- * Remove a collection and clean up its documents.
- * Uses collections.ts to remove from YAML config and cleans up database.
+ * NOTE: the store-level `removeCollection` was removed in v0.30.0. It ran
+ * `DELETE FROM documents WHERE collection = ?` — an unauthorized hard delete of an entire
+ * collection's documents. It had no callers: `clawmem collection remove` goes through
+ * `collections.ts`'s `removeCollection`, which edits the YAML config only and leaves the
+ * indexed rows to deactivate on the next update. That is the reversible path and remains
+ * the only one. Do not reintroduce a row-destroying variant here.
  */
-export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
-  // Delete documents from database
-  const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
-
-  // Clean up orphaned content hashes
-  const cleanupResult = db.prepare(`
-    DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
-  `).run();
-
-  // Remove from YAML config (returns true if found and removed)
-  collectionsRemoveCollection(collectionName);
-
-  return {
-    deletedDocs: docResult.changes,
-    cleanedHashes: cleanupResult.changes
-  };
-}
 
 /**
  * Rename a collection.
@@ -5705,34 +5701,47 @@ function restoreArchivedDocumentsFn(
   db: Database,
   filter: { ids?: number[]; collection?: string; sinceDate?: string }
 ): number {
-  let sql = "UPDATE documents SET active = 1, archived_at = NULL WHERE active = 0 AND archived_at IS NOT NULL";
+  let where = "WHERE active = 0 AND archived_at IS NOT NULL";
   const params: any[] = [];
 
   if (filter.ids?.length) {
     const placeholders = filter.ids.map(() => "?").join(",");
-    sql += ` AND id IN (${placeholders})`;
+    where += ` AND id IN (${placeholders})`;
     params.push(...filter.ids);
   }
   if (filter.collection) {
-    sql += " AND collection = ?";
+    where += " AND collection = ?";
     params.push(filter.collection);
   }
   if (filter.sinceDate) {
-    sql += " AND archived_at >= ?";
+    where += " AND archived_at >= ?";
     params.push(filter.sinceDate);
   }
 
-  return db.prepare(sql).run(...params).changes;
+  // Same trigger-inflation problem as archiveDocuments: `.changes` counts the
+  // `documents_fts` shadow writes too. Count the matching rows explicitly instead.
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT COUNT(*) AS n FROM documents ${where}`)
+      .get(...params) as { n: number } | undefined;
+    db.prepare(`UPDATE documents SET active = 1, archived_at = NULL ${where}`).run(...params);
+    return row?.n ?? 0;
+  })();
 }
 
-function purgeArchivedDocumentsFn(db: Database, olderThanDays: number): number {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - olderThanDays);
-  const result = db.prepare(`
-    DELETE FROM documents WHERE active = 0 AND archived_at IS NOT NULL AND archived_at <= ?
-  `).run(cutoff.toISOString());
-  return result.changes;
-}
+// NOTE: `purgeArchivedDocumentsFn` was removed in v0.30.0. It ran
+// `DELETE FROM documents WHERE active = 0 AND archived_at <= ?` — the only operation in
+// ClawMem that destroyed a row rather than deactivating it, and therefore the only one
+// with no restore path. It was reachable from an agent-invoked MCP tool, from an
+// unattended SessionStart hook, and from the CLI.
+//
+// ClawMem no longer physically deletes document rows from ANY code path. Retention is
+// archival, which `restoreArchivedDocuments` reverses. Reclaiming disk space is an
+// out-of-band operator action on the SQLite file, explicitly outside ClawMem's mutation
+// contract — deliberately NOT an affordance this package offers, because any in-process
+// or CLI credential is equally available to the coding agent the package serves.
+//
+// A supported retention design (reversible quarantine with a protected window) is tracked
+// separately. Do not reintroduce a hard delete here without it.
 
 function getLifecycleStatsFn(db: Database): {
   active: number; archived: number; forgotten: number;

@@ -140,7 +140,7 @@ do not break.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/lifecycle/status` | Active/archived/pinned/snoozed counts |
-| POST | `/lifecycle/sweep` | Archive stale docs (dry_run default) |
+| POST | `/lifecycle/sweep` | Archive stale docs (dry_run default). Archives only — never deletes |
 | POST | `/lifecycle/restore` | Restore archived docs |
 
 ### Document mutations

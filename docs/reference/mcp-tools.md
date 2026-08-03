@@ -230,12 +230,17 @@ Document lifecycle statistics: active, archived, forgotten, pinned, snoozed coun
 
 ### lifecycle_sweep
 
-Archive stale documents based on lifecycle policy.
+Archive stale documents based on lifecycle policy. **Archives only — never deletes.**
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `dry_run` | boolean | true | Preview only (no action) |
 | `vault` | string | — | Named vault |
+
+Archival is reversible via `lifecycle_restore`. Through v0.29.0 a non-dry-run sweep also
+permanently deleted every archived row past `purge_after_days` — a set the preview never
+listed or counted. As of v0.30.0 ClawMem does not physically delete document rows on any
+path, and `purge_after_days` is inert.
 
 ### lifecycle_restore
 

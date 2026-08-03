@@ -4,6 +4,44 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.30.0 — ClawMem stops deleting rows
+
+ClawMem's governing rule for agent-mediated memory mutation is that nothing an agent does should be unrecoverable. Every mutation surface honored that except one: `purgeArchivedDocuments` physically `DELETE`d rows. This release removes physical deletion from the package entirely rather than gating it, because a gate cannot work here — see below.
+
+### Why removal rather than an administrator gate
+
+The obvious fix is to keep purge and require administrator authority for it. That fix does not hold, and the reasoning is worth stating because it generalizes: **ClawMem's primary consumer is a coding agent with shell access.** Any credential expressible in-process or on the command line — an env var, a confirmation flag, an interactive prompt — is equally available to that agent, which can type an opt-in env var and a `--purge` flag as readily as a human can. A gate like that only relabels the operation; it does not remove it from agent authority. (No such flag or variable exists in this release — that design was built, reviewed, and rejected for this reason.) A longer confirmation boundary also satisfies neither "immutable prior revision" nor "supported restore": once the row is gone there is nothing left to restore.
+
+So the capability is not offered. Reclaiming disk space is an out-of-band operator action on the SQLite file, explicitly outside ClawMem's mutation contract. A supported retention design — reversible quarantine with a protected window — is planned separately.
+
+### What was removed (`src/store.ts`)
+
+- **`purgeArchivedDocuments`** — ran `DELETE FROM documents WHERE active = 0 AND archived_at <= ?`. Reachable from three call sites, below.
+- **`deleteInactiveDocuments`** — ran `DELETE FROM documents WHERE active = 0`: strictly broader, destroying every inactive row (archived *and* forgotten) with no age bound and no authorization. It had no callers but sat on the public `Store` interface.
+- **the store-level `removeCollection`** — ran `DELETE FROM documents WHERE collection = ?`, an unauthorized hard delete of an entire collection. Also callerless; `clawmem collection remove` goes through `collections.ts` (YAML config only), which remains the reversible path.
+
+No code path now issues a `DELETE` against `documents`.
+
+### The three purge call sites, and the one that mattered most
+
+- **`lifecycle_sweep` (MCP)** — a non-dry-run sweep archived, then deleted every archived row past `purge_after_days`. That set was **never previewed**: the dry-run branch reported `Would archive N document(s)` and said nothing about deletion, and the deleted population was different from the previewed candidates entirely. The preview was not weakly binding — it was silent.
+- **`staleness-check` (SessionStart hook)** — the worst host of the three: unattended, no model and no operator in the loop, the purge count discarded, all of it inside a `catch {}` documented as "lifecycle errors never block the hook", so a failed delete was silent too. Auto-**archival** here is unchanged and remains reversible.
+- **`clawmem lifecycle sweep` (CLI)** — archives only, and says so when it sees `purge_after_days` set.
+
+### Count reporting was wrong (`src/store.ts`)
+
+`archiveDocuments` and `restoreArchivedDocuments` returned SQLite's `changes`, which counts the `documents_fts` trigger writes as well — archiving 3 documents reported **16**. Every "archived N" / "restored N" ClawMem has printed was inflated. Both now count the affected documents explicitly inside the same transaction. The mutations were always correct; only the reported numbers were wrong. Found by writing the first behavioral test of this path.
+
+### Behavior changes to expect
+
+- `purge_after_days` is **inert**. It is still parsed so existing configs load, but only a positive finite value is accepted — a negative value previously produced a *future* cutoff that deleted every archived row, including ones archived moments earlier.
+- `lifecycle_sweep` reports `archived N document(s). Nothing was deleted.` The tool description no longer advertises purge.
+- Archive/restore counts are now accurate, and smaller than before.
+
+Test coverage: `tests/unit/no-hard-delete.test.ts` — the invariant that no path destroys a row, the real SessionStart hook exercised end to end, and the count regression. There was previously **no test of the purge path at all**, which is part of why this survived.
+
+---
+
 ## v0.29.0 — the contradiction judge: opt-in model override, judge-gated analysis, durable audit
 
 v0.28.0 repaired the contradiction write path; this release faces the model behind it. A live contract probe at the production seam showed the prescribed stock expansion model cannot meet the judge contract at all — it returns an object where the contract requires an array, echoes the schema's enum text back as a value, and fabricates confident relations between unrelated facts, deterministically. The same weak model sat in a *fail-open* position at the merge-time gate, where a parseable answer bypassed the deterministic heuristic and a missing confidence defaulted to exactly the actionable threshold. This release routes every contradiction decision through an explicitly configured **judge**, disables the analysis when none is configured, fixes the fail-open surfaces, and makes every evaluation durably auditable.
