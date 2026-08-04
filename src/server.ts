@@ -486,7 +486,7 @@ async function handleForget(_req: Request, url: URL, store: Store): Promise<Resp
   ).get(resolved.hash) as { id: number; collection: string; path: string } | undefined;
   if (!doc) return jsonError(`Document not found: ${docid}`, 404);
 
-  store.deactivateDocument(doc.collection, doc.path);
+  store.deactivateDocument(doc.collection, doc.path, "forget");
   return jsonResponse({ docid, forgotten: true });
 }
 

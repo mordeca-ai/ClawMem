@@ -205,13 +205,29 @@ function expandBraces(pattern: string): string[] {
   return match[1]!.split(",").map(s => s.trim());
 }
 
+/**
+ * Collections that are never reconciled against a filesystem root (§55.6 D5).
+ *
+ * `_clawmem` holds DB-created memory — observations, handoffs, deductions — which has no file
+ * behind it. Reconciling it against any root deactivates every row and nothing brings them back.
+ * §55.1 required reserving it for one tool; enforcing it in the reconciler covers every present
+ * and future caller instead.
+ */
+export const RESERVED_COLLECTIONS = new Set(["_clawmem"]);
+
 export async function indexCollection(
   store: Store,
   collectionName: string,
   collectionPath: string,
   pattern: string = "**/*.md",
-  options?: { forceEnrich?: boolean }
+  options?: { forceEnrich?: boolean; force?: boolean }
 ): Promise<IndexStats> {
+  if (RESERVED_COLLECTIONS.has(collectionName)) {
+    throw new Error(
+      `Collection '${collectionName}' is database-created memory and has no filesystem source; ` +
+      `it cannot be reconciled against a root.`,
+    );
+  }
   const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0 };
   const activePaths = new Set<string>();
 
@@ -265,7 +281,12 @@ export async function indexCollection(
           "SELECT content_hash, authored_at FROM documents WHERE id = ?"
         ).get(existing.id) as { content_hash: string | null; authored_at: string | null } | null;
 
-        if (existingRow?.content_hash === contentHash) {
+        // §55.6 D7: `--force` re-parses and rewrites every file by bypassing this
+        // content-hash short-circuit. It replaces a blanket `UPDATE documents SET active = 0`
+        // that deactivated EVERY row in the vault — including `_clawmem` rows, which have no
+        // filesystem source and so were never reconstructed, with no `archived_at` and
+        // therefore no supported restore.
+        if (existingRow?.content_hash === contentHash && !options?.force) {
           stats.unchanged++;
           // §51.1 D5: unchanged-row adoption — a NULL row whose frontmatter
           // already declares authored_at adopts it metadata-only (no modified_at
@@ -348,10 +369,24 @@ export async function indexCollection(
 
         stats.updated++;
       } else {
-        // Check for inactive (previously removed) doc at same path — reactivate instead of inserting
-        const inactive = store.db.prepare(
-          "SELECT id, hash FROM documents WHERE collection = ? AND path = ? AND active = 0"
-        ).get(collectionName, relativePath) as { id: number; hash: string } | null;
+        // Check for an inactive doc at the same path — reactivate instead of inserting.
+        // §55.6 D9: ONLY a row this reconciler deactivated for absence may come back. A row
+        // deactivated by `memory_forget` or by lifecycle archival is a memory decision, and
+        // reactivating it silently undid that decision — measured: a forget on a file-backed
+        // document survived only until the next `.md` change in its collection.
+        // NULL = legacy pre-migration row, treated as 'absent' so it is not stranded.
+        const inactiveRow = store.db.prepare(
+          "SELECT id, hash, deactivated_reason FROM documents WHERE collection = ? AND path = ? AND active = 0"
+        ).get(collectionName, relativePath) as { id: number; hash: string; deactivated_reason: string | null } | null;
+
+        // Forgotten / archived: leave it alone. Skipping the file — rather than falling through
+        // to the insert branch — is load-bearing: inserting would create a SECOND row at the
+        // same (collection, path) and resurrect the content under a new id, which is the same
+        // bug wearing a different shape.
+        if (inactiveRow && inactiveRow.deactivated_reason !== null && inactiveRow.deactivated_reason !== "absent") {
+          continue;
+        }
+        const inactive = inactiveRow;
 
         const { body, meta } = parseDocument(content, relativePath);
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
@@ -361,8 +396,8 @@ export async function indexCollection(
         store.insertContent(docHash, body, now);
 
         if (inactive) {
-          // Reactivate existing row
-          store.db.prepare("UPDATE documents SET active = 1, hash = ?, title = ?, modified_at = ?, content_hash = ? WHERE id = ?")
+          // Reactivate existing row. §55.6 D9: clear the provenance on the way back.
+          store.db.prepare("UPDATE documents SET active = 1, hash = ?, title = ?, modified_at = ?, content_hash = ?, deactivated_reason = NULL WHERE id = ?")
             .run(docHash, title, mtime.toISOString(), contentHash, inactive.id);
           store.updateDocumentMeta(inactive.id, {
             domain: meta.domain,
@@ -403,7 +438,8 @@ export async function indexCollection(
     const storedPaths = store.getActiveDocumentPaths(collectionName);
     for (const storedPath of storedPaths) {
       if (!activePaths.has(storedPath)) {
-        store.deactivateDocument(collectionName, storedPath);
+        // §55.6 D9: record WHY. Only 'absent' is reversible by a later reconciliation.
+        store.deactivateDocument(collectionName, storedPath, "absent");
         stats.removed++;
       }
     }

@@ -1166,7 +1166,7 @@ This is the recommended entry point for ALL memory queries.`,
         };
       }
 
-      s.deactivateDocument(collection, path);
+      s.deactivateDocument(collection, path, "forget");
 
       s.insertUsage({
         sessionId: "mcp-forget",

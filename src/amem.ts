@@ -558,20 +558,40 @@ Return ONLY valid JSON in this exact format:
 }
 
 /**
+ * A note carrying no information. Blank entries do not count: the parser preserves
+ * whitespace-only strings inside the arrays, so `{keywords: [" "], tags: [], context: " "}`
+ * would otherwise be written over NULL and permanently mask the row from backfill.
+ * A note with ONE real keyword, tag, or context is information and is kept.
+ */
+function isEmptyNote(note: MemoryNote): boolean {
+  const hasText = (xs: string[]) => xs.some(x => typeof x === "string" && x.trim().length > 0);
+  return !hasText(note.keywords) && !hasText(note.tags) && !note.context.trim();
+}
+
+/**
  * Store memory note in the documents table.
  * Updates amem_keywords, amem_tags, and amem_context columns.
  *
- * @param store - Store instance
- * @param docId - Document numeric ID
- * @param note - Memory note to store
+ * §55.6 D8.2 — FAIL-CLOSED. An empty note is never written, whatever the row currently holds:
+ *
+ *  - Over a learned note, the empty write destroyed it. `constructMemoryNote` fails OPEN to an
+ *    empty note when inference is unavailable, and this write used to be unconditional, so a
+ *    transient outage during a routine reindex blanked A-MEM on every document it touched
+ *    (measured: `["LEARNED"]` -> `[]` on a reactivation with an identical body).
+ *  - Over a NULL row it was worse in a quieter way: it makes a FAILURE indistinguishable from
+ *    completed enrichment, and `backfillAmem`'s `amem_keywords IS NULL` predicate then never
+ *    retries it. NULL is the retryable state and must survive a failed attempt.
+ *
+ * @returns whether the note was actually written — so callers cannot report success after a no-op.
  */
 export function storeMemoryNote(
   store: Store,
   docId: number,
   note: MemoryNote
-): void {
+): boolean {
+  if (isEmptyNote(note)) return false;
   try {
-    store.db.prepare(`
+    const result = store.db.prepare(`
       UPDATE documents
       SET amem_keywords = ?,
           amem_tags = ?,
@@ -583,8 +603,12 @@ export function storeMemoryNote(
       note.context,
       docId
     );
+    // `.changes` is inflated by the documents_fts triggers and is NOT a row count — but zero
+    // is still unambiguous: no row matched, so nothing landed.
+    return result.changes > 0;
   } catch (err) {
     console.log(`[amem] Error storing memory note for docId ${docId}:`, err);
+    return false;
   }
 }
 
@@ -1062,13 +1086,23 @@ export async function postIndexEnrich(
 
     console.log(`[amem] Starting enrichment for docId ${docId} (isNew=${isNew})`);
 
-    // Step 1: Construct and store memory note (always)
+    // Step 1: Construct and store memory note (always attempted)
     const note = await constructMemoryNote(store, llm, docId);
-    storeMemoryNote(store, docId, note);
+    // §55.6 D8.2: report what actually happened. An empty note is refused, and saying
+    // "Completed note refresh" after a refused write is how a silent inference outage used to
+    // read as success in the logs.
+    const noteStored = storeMemoryNote(store, docId, note);
+    if (!noteStored) {
+      console.log(`[amem] No note stored for docId ${docId} (enrichment produced nothing — existing note, if any, left intact)`);
+    }
 
     // For updated documents, stop here to avoid churn
     if (!isNew) {
-      console.log(`[amem] Completed note refresh for docId ${docId}`);
+      console.log(
+        noteStored
+          ? `[amem] Completed note refresh for docId ${docId}`
+          : `[amem] Note refresh for docId ${docId} made no change`,
+      );
       return;
     }
 

@@ -446,10 +446,86 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
     ["topic_key", "ALTER TABLE documents ADD COLUMN topic_key TEXT"],
     ["revision_count", "ALTER TABLE documents ADD COLUMN revision_count INTEGER NOT NULL DEFAULT 1"],
     ["authored_at", "ALTER TABLE documents ADD COLUMN authored_at TEXT"],
+    // §55.6 D9: WHY a row was deactivated. `active` is written by three unrelated owners —
+    // absence reconciliation, forget, and archival — and the indexer used to reactivate all
+    // three indiscriminately, so a forget on a file-backed document was silently undone by
+    // the next reindex. NULL = legacy row (pre-migration), treated as 'absent'.
+    ["deactivated_reason", "ALTER TABLE documents ADD COLUMN deactivated_reason TEXT"],
   ];
   for (const [col, sql] of migrations) {
     if (!colNames.has(col)) {
       try { db.exec(sql); } catch { /* column may already exist */ }
+    }
+  }
+
+  // The loop above swallows every ALTER error, so a real failure (SQLITE_BUSY, disk) is
+  // indistinguishable from "already there" — and the follow-up query would then raise
+  // `no such column`, which the handler below treats as benign. Check explicitly instead,
+  // or a genuinely failed migration ships as silence.
+  const hasDeactivationReason = (
+    db.prepare("PRAGMA table_info(documents)").all() as { name: string }[]
+  ).some(c => c.name === "deactivated_reason");
+  if (!hasDeactivationReason) {
+    console.warn(
+      `[clawmem] could not add the deactivated_reason column on this open. Forget and archival ` +
+      `remain reversible by indexing until it succeeds; it is retried on the next open.`,
+    );
+  }
+
+  // §55.6 D9 migration. Both halves are read-guarded so an already-migrated DB takes NO
+  // write lock here (same reason as the last_accessed_at backfill below).
+  try {
+    if (!hasDeactivationReason) throw new Error("deactivated_reason column absent");
+    // (a) Backfill provenance for rows archival already marked. Legacy rows deactivated by
+    //     forget are indistinguishable from absence at this point, so they stay NULL and keep
+    //     today's reactivate-on-return behaviour rather than being stranded — from here
+    //     forward, forget is durable.
+    const needsReasonBackfill = db.prepare(
+      `SELECT 1 FROM documents WHERE active = 0 AND archived_at IS NOT NULL AND deactivated_reason IS NULL LIMIT 1`
+    ).get();
+    if (needsReasonBackfill) {
+      db.exec(`UPDATE documents SET deactivated_reason = 'archive' WHERE active = 0 AND archived_at IS NOT NULL AND deactivated_reason IS NULL`);
+    }
+    // (b) REPAIR, not merely prevent: released versions could reactivate an archived row while
+    //     leaving archived_at set — an internally inconsistent state with no legitimate meaning.
+    //     Restore those to a consistent archived state and report, since silently re-archiving
+    //     rows a user may have been reading would be its own surprise.
+    //
+    //     Count and update run in ONE transaction: two processes opening the store concurrently
+    //     would otherwise both read the same count while only one performed the repair, and the
+    //     loser would report a repair it did not make.
+    const repaired = db.transaction(() => {
+      const row = db.prepare(
+        `SELECT COUNT(*) AS n FROM documents WHERE active = 1 AND archived_at IS NOT NULL`
+      ).get() as { n: number } | undefined;
+      const n = row?.n ?? 0;
+      if (n > 0) {
+        db.prepare(`UPDATE documents SET active = 0, deactivated_reason = 'archive' WHERE active = 1 AND archived_at IS NOT NULL`).run();
+      }
+      return n;
+    })();
+    if (repaired > 0) {
+      console.warn(
+        `[clawmem] repaired ${repaired} archived document(s) that a previous reindex had ` +
+        `reactivated while still marked archived. Use lifecycle_restore to bring any of them back.`,
+      );
+    }
+  } catch (err) {
+    // Do NOT fail open silently. A read-only handle or a pre-migration schema is expected and
+    // benign; anything else (SQLITE_BUSY, a genuine SQL fault) means this process is running
+    // WITHOUT the migration, and the user needs to know rather than discovering it as behaviour.
+    const msg = err instanceof Error ? err.message : String(err);
+    // A missing column is NOT benign here — it is already reported above with its own message,
+    // so absorbing it a second time would double-report; anything else that is not a read-only
+    // handle or a pre-migration table is a real failure the user must see.
+    const alreadyReported = /deactivated_reason column absent/.test(msg);
+    const benign = alreadyReported || /readonly|read-only|no such table/i.test(msg);
+    if (!benign) {
+      console.warn(
+        `[clawmem] deactivation-provenance migration did not run on this open (${msg}). ` +
+        `Forget/archive may still be reversible by indexing until it succeeds; it is retried on ` +
+        `the next open.`,
+      );
     }
   }
 
@@ -1432,10 +1508,10 @@ export type Store = {
   insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; pinned: number; snoozed_until: string | null; confidence: number } | null;
   findAnyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; active: number } | null;
-  reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
+  reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => boolean;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
-  deactivateDocument: (collectionName: string, path: string) => void;
+  deactivateDocument: (collectionName: string, path: string, reason: DeactivationReason) => void;
   getActiveDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
@@ -1490,7 +1566,7 @@ export type Store = {
 
   // A-MEM: Self-Evolving Memory
   constructMemoryNote: (llm: any, docId: number) => Promise<any>;
-  storeMemoryNote: (docId: number, note: any) => void;
+  storeMemoryNote: (docId: number, note: any) => boolean;
   generateMemoryLinks: (llm: any, docId: number, kNeighbors?: number) => Promise<number>;
   evolveMemories: (llm: any, memoryId: number, triggeredBy: number) => Promise<boolean>;
   postIndexEnrich: (llm: any, docId: number, isNew: boolean) => Promise<void>;
@@ -1634,7 +1710,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => reactivateDocument(db, documentId, title, hash, modifiedAt),
     updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
     updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
-    deactivateDocument: (collectionName: string, path: string) => deactivateDocument(db, collectionName, path),
+    deactivateDocument: (collectionName: string, path: string, reason: DeactivationReason) => deactivateDocument(db, collectionName, path, reason),
     getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
 
     // Vector/embedding operations
@@ -2087,7 +2163,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
           SELECT COUNT(*) AS n FROM documents WHERE id IN (${placeholders}) AND active = 1
         `).get(...ids) as { n: number } | undefined;
         db.prepare(`
-          UPDATE documents SET active = 0, archived_at = ?
+          UPDATE documents SET active = 0, archived_at = ?, deactivated_reason = 'archive'
           WHERE id IN (${placeholders}) AND active = 1
         `).run(now, ...ids);
         return row?.n ?? 0;
@@ -2908,12 +2984,22 @@ export function reactivateDocument(
   title: string,
   hash: string,
   modifiedAt: string
-): void {
+): boolean {
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
   // The reset_embed_on_hash_change trigger resets embed_state/attempts/error iff the
   // hash actually changes, so re-adding unchanged content preserves its valid vectors.
-  db.prepare(`UPDATE documents SET active = 1, title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(safeTitle, hash, modifiedAt, documentId);
+  //
+  // §55.6 D9: every successful active=1 writer clears the deactivation provenance — but this
+  // generic reactivator must not overrule a lifecycle decision. `updateProfile` calls it on any
+  // inactive profile row during a routine `clawmem update` (src/profile.ts), so without the
+  // predicate a forgotten profile came back on the next index — and an archived one came back
+  // still carrying `archived_at`, recreating the exact inconsistent state the migration repairs.
+  // Restoring an archived document is `restoreArchivedDocuments`' job, not this function's.
+  const result = db.prepare(
+    `UPDATE documents SET active = 1, title = ?, hash = ?, modified_at = ?, deactivated_reason = NULL
+     WHERE id = ? AND (deactivated_reason IS NULL OR deactivated_reason = 'absent')`,
+  ).run(safeTitle, hash, modifiedAt, documentId);
+  return result.changes > 0;
 }
 
 /**
@@ -2948,11 +3034,26 @@ export function updateDocument(
 }
 
 /**
- * Deactivate a document (mark as inactive but don't delete).
+ * Why a document was deactivated (§55.6 D9). Only `'absent'` is reversible by the indexer;
+ * `'forget'` and `'archive'` are lifecycle decisions it must never undo.
  */
-export function deactivateDocument(db: Database, collectionName: string, path: string): void {
-  db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = ? AND active = 1`)
-    .run(collectionName, path);
+export type DeactivationReason = "absent" | "forget" | "archive";
+
+/**
+ * Deactivate a document (mark as inactive but don't delete).
+ *
+ * `reason` is required because this one function serves two unrelated owners — the indexer's
+ * absence loop and the MCP/REST forget path — and the indexer's reactivate branch keys on it.
+ * Defaulting it would silently re-open the bug it exists to close.
+ */
+export function deactivateDocument(
+  db: Database,
+  collectionName: string,
+  path: string,
+  reason: DeactivationReason,
+): void {
+  db.prepare(`UPDATE documents SET active = 0, deactivated_reason = ? WHERE collection = ? AND path = ? AND active = 1`)
+    .run(reason, collectionName, path);
 }
 
 /**
@@ -5723,7 +5824,7 @@ function restoreArchivedDocumentsFn(
   return db.transaction(() => {
     const row = db.prepare(`SELECT COUNT(*) AS n FROM documents ${where}`)
       .get(...params) as { n: number } | undefined;
-    db.prepare(`UPDATE documents SET active = 1, archived_at = NULL ${where}`).run(...params);
+    db.prepare(`UPDATE documents SET active = 1, archived_at = NULL, deactivated_reason = NULL ${where}`).run(...params);
     return row?.n ?? 0;
   })();
 }

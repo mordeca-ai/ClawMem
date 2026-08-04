@@ -33,7 +33,9 @@ clawmem mine <dir> -c convos --backfill-dates  # v0.27.0: derive authored_at for
                                                # source transcripts — dry-run report by default
 clawmem mine <dir> -c convos --backfill-dates --apply     # Execute the backfill (metadata-only: modified_at,
                                                # stored confidence, and embeddings are never touched)
-clawmem reindex                                # Force re-scan all collections
+clawmem reindex                                # Re-scan all collections
+clawmem reindex --force                        # Re-read every file, bypassing the content-hash skip
+clawmem reindex --enrich                       # Full A-MEM pipeline on all documents
 clawmem embed                   # Embed all un-embedded fragments (geometry-canary preflight runs first)
 clawmem embed --force           # Re-embed everything (clears existing vectors; aborts BEFORE clearing if the canary preflight fails)
 clawmem embed --force --force-geometry        # v0.21.0: proceed despite a failed/unavailable canary — vault is tainted until a verified rebuild

@@ -4,6 +4,73 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.31.0 — forget stays forgotten
+
+Three defects on the indexing boundary, all of which destroyed or reversed memory silently. Each
+was found by observing the database rather than by reading call sites, and each is fixed by making
+the affected write refuse rather than by adding a confirmation step.
+
+### `memory_forget` was undone by the next reindex
+
+Forgetting a document that has a file behind it did not stick. The indexer reactivated **any**
+inactive row it found at a path present on disk, without asking why that row was inactive — and
+`active` is written by three unrelated owners: absence reconciliation, `memory_forget`, and
+lifecycle archival. On a machine running `clawmem watch`, a forget therefore survived only until
+the next `.md` change anywhere in that collection. Archived documents came back too, still carrying
+`archived_at`, leaving them simultaneously active and archived.
+
+Documents now record **why** they were deactivated (`deactivated_reason`), and only what was
+deactivated for absence can be revived automatically. A forgotten or archived document stays that
+way, and its file is skipped rather than re-inserted — re-inserting would have left the row
+forgotten while making its content live again under a new id. The generic reactivation helper
+enforces the same rule, so automatic profile regeneration during `clawmem update` no longer revives
+a forgotten profile either. Restoring an archived document remains `lifecycle_restore`'s job.
+
+**Migration** (automatic, on first open): existing archived rows are backfilled as `'archive'`, and
+any row a previous version left in the inconsistent active-and-archived state is restored to
+archived, with a count reported on stderr. Use `lifecycle_restore` to bring any of those back.
+Legacy rows deactivated by forget before this release are indistinguishable from absence and remain
+reactivatable once; from this release forward, forget is durable.
+
+### `clawmem reindex --force` orphaned every database-created memory
+
+`--force` began with a blanket `UPDATE documents SET active = 0` across the entire vault, then
+rebuilt only the *configured* collections. Observations, handoffs, and deductions live in
+`_clawmem` and have no file behind them, so nothing ever brought them back. The deactivation set no
+`archived_at`, which meant `lifecycle_restore` could not see them either — they were invisible to
+the only supported restore path.
+
+`--force` now does what its name implies: it re-reads and rewrites every file, bypassing the
+content-hash short-circuit that normally skips unchanged documents. It no longer deactivates
+anything up front; documents still absent from disk are deactivated by the ordinary reconciliation
+pass, one collection at a time, exactly as they are without the flag. Separately, `_clawmem` is now refused by the indexer outright — database-created
+memory has no filesystem source and cannot be reconciled against one, by any caller.
+
+### A failed enrichment blanked learned A-MEM notes
+
+`constructMemoryNote` fails open to an empty note when the inference endpoint is unavailable, and
+the note was then stored unconditionally. A transient outage during a routine reindex therefore
+blanked `amem_keywords`, `amem_tags`, and `amem_context` on every document it touched. Writing an
+empty note over a *never-enriched* row was quieter but no better: it made a failure
+indistinguishable from completed enrichment, so backfill never retried that document.
+
+An empty note is now never written, whatever the row holds — including a note whose entries are
+only whitespace, which carries no information but would still have masked the row from backfill.
+The store reports whether the note actually landed, and both callers honour that: the enrichment
+log distinguishes a refused write from a completed one, and the consolidation backfill skips the
+link pass and leaves the document eligible for a later retry. `NULL` is preserved as the retryable
+"not enriched yet" state.
+
+### Upgrading
+
+No action required. The migration runs on open, is idempotent, and performs its count and repair
+in one transaction so concurrent opens cannot double-report. If it cannot run — a locked database,
+for instance — it says so on stderr and is retried on the next open rather than failing silently.
+If it reports repaired documents, those were archived rows a previous version had incorrectly
+reactivated.
+
+---
+
 ## v0.30.0 — ClawMem stops deleting rows
 
 ClawMem's governing rule for agent-mediated memory mutation is that nothing an agent does should be unrecoverable. Every mutation surface honored that except one: `purgeArchivedDocuments` physically `DELETE`d rows. This release removes physical deletion from the package entirely rather than gating it, because a gate cannot work here — see below.

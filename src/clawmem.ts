@@ -64,7 +64,7 @@ import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
 import { enrichResults, reciprocalRankFusion, toRanked, hasStrongFtsSignal, ftsBypassEnabled, type RankedResult } from "./search-utils.ts";
 import { splitDocument } from "./splitter.ts";
-import { getProfile, updateProfile, isProfileStale } from "./profile.ts";
+import { getProfile, updateProfile, isProfileStale, type ProfileUpdateOutcome } from "./profile.ts";
 import { regenerateAllDirectoryContexts } from "./directory-context.ts";
 import {
   startConsolidationWorker,
@@ -272,8 +272,9 @@ async function cmdUpdate(args: string[]) {
 
   // Auto-rebuild profile if stale
   if (isProfileStale(s)) {
-    updateProfile(s);
-    console.log(`${c.dim}Profile auto-rebuilt (stale)${c.reset}`);
+    // §55.6 D9: a forgotten or archived profile is deliberately left alone — say so rather
+    // than reporting a rebuild that did not happen.
+    console.log(`${c.dim}${profileOutcomeMessage(updateProfile(s), true)}${c.reset}`);
   }
 }
 
@@ -2464,6 +2465,25 @@ async function cmdWatch() {
 // Reindex
 // =============================================================================
 
+/**
+ * Truthful one-liner for a profile rebuild outcome (§55.6 D9).
+ *
+ * A FORGOTTEN profile deliberately gets no "restore it first" advice: `lifecycle_restore` only
+ * reverses archival, so pointing a user at it would prescribe a capability that does not exist.
+ */
+function profileOutcomeMessage(outcome: ProfileUpdateOutcome, auto: boolean): string {
+  switch (outcome) {
+    case "rebuilt":
+      return auto ? "Profile auto-rebuilt (stale)" : "Profile rebuilt";
+    case "held-archive":
+      return "Profile not rebuilt — it is archived. Restore it (lifecycle_restore), then rebuild.";
+    case "held-forget":
+      return "Profile not rebuilt — it was forgotten, and ClawMem will not rebuild over a forgotten document. There is no supported restore for a forgotten document yet.";
+    case "failed":
+      return "Profile not rebuilt — the write failed.";
+  }
+}
+
 async function cmdReindex(args: string[]) {
   const force = args.includes("--force") || args.includes("-f");
   const enrich = args.includes("--enrich");
@@ -2476,9 +2496,12 @@ async function cmdReindex(args: string[]) {
   const s = getStore();
 
   if (force) {
-    // Delete all documents and re-scan
-    s.db.exec("UPDATE documents SET active = 0");
-    console.log(`${c.yellow}Force reindex: deactivated all documents${c.reset}`);
+    // §55.6 D7: `--force` re-parses and rewrites every file (see the `force` option threaded
+    // into indexCollection below). It NO LONGER blanket-deactivates the vault first — that
+    // `UPDATE documents SET active = 0` hit every collection, including `_clawmem`, whose
+    // database-created rows have no filesystem source and so were never reconstructed. It set
+    // no `archived_at`, so `lifecycle_restore` could not see them either.
+    console.log(`${c.yellow}Force reindex: re-reading every file (content-hash check bypassed)${c.reset}`);
   }
 
   if (enrich) {
@@ -2487,7 +2510,7 @@ async function cmdReindex(args: string[]) {
 
   for (const col of collections) {
     console.log(`Indexing ${c.bold}${col.name}${c.reset} (${col.path})...`);
-    const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich });
+    const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich, force });
     console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed`);
   }
 }
@@ -3073,8 +3096,9 @@ async function cmdProfile(args: string[]) {
   const s = getStore();
 
   if (args[0] === "rebuild") {
-    updateProfile(s);
-    console.log(`${c.green}Profile rebuilt${c.reset}`);
+    const outcome = updateProfile(s);
+    const colour = outcome === "rebuilt" ? c.green : c.yellow;
+    console.log(`${colour}${profileOutcomeMessage(outcome, false)}${c.reset}`);
     return;
   }
 
