@@ -54,7 +54,7 @@ clawmem doctor                              # full health check (clawmem status 
 | `postcompact-inject` | SessionStart (compact) | re-injects authoritative state after compaction → `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | surfaces curator actions; nudges when the report is stale |
 | `precompact-extract` | PreCompact | extracts decisions / file paths / open questions before compaction |
-| `decision-extractor` | Stop | LLM → observations + causal links + contradiction detection + SPO triples |
+| `decision-extractor` | Stop | LLM → observations + contradiction detection + SPO triples (+ the causal witness writer when `CLAWMEM_CAUSAL_WRITER` is `shadow`/`on` — default `off`) |
 | `handoff-generator` | Stop | LLM session summary → handoffs |
 | `feedback-loop` | Stop | tracks referenced notes → confidence boosts, co-activations, utility signals |
 
@@ -86,7 +86,7 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
     Decomposes into 2-4 typed clauses (bm25/vector/graph), runs them in parallel, merges via RRF.
 2.  Progressive disclosure -> multi_get("path1,path2") for full content of top hits
 3.  Spot checks         -> search(query) (BM25, 0 GPU)  or  vsearch(query) (vector, 1 GPU)
-4.  Chain tracing       -> find_causal_links(docid, direction="both", depth=5)
+4.  Causal edges        -> find_causal_links(docid, direction="both", depth=5)
 5.  Entity facts        -> kg_query(entity)  (SPO triples; NOT causal "why" — that's intent_search)
 6.  Temporal context    -> timeline(docid, before=5, after=5)
 ```
@@ -101,7 +101,7 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `vsearch` | Vector semantic — conceptual/fuzzy when vocabulary unknown. ~100ms, 1 GPU. |
 | `get` / `multi_get` | Single doc by path/`#docid` / multiple by glob or comma-list. |
 | `find_similar` | "what else relates to X" — k-NN vector neighbors beyond keyword overlap. |
-| `find_causal_links` | Trace decision chains ("what led to X") over observation docs. |
+| `find_causal_links` | Evidence-preserving causal edge traversal ("what led to X"): directed edge records with fact-pair witnesses + reasoning. Multi-hop CHAIN quality is experimental — depth > 1 is per-edge evidence, not a verified chain. |
 | `kg_query` | Entity SPO triples with temporal validity. Entity facts, NOT causal "why". |
 | `session_log` | "last time" / "yesterday" / "what did we do". Do NOT use `query` for cross-session. |
 | `profile` | User profile (static facts + dynamic context). |

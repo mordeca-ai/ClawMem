@@ -14,7 +14,7 @@ import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { createStore, buildTemporalBackbone, searchFTS, type Store } from "../../src/store.ts";
-import { inferCausalLinks } from "../../src/amem.ts";
+import { runCausalStep } from "../../src/causal-writer.ts";
 import {
   validateContradictionEntry,
   admitContradictionEntries,
@@ -70,52 +70,80 @@ function withStore(): void {
   });
 }
 
+// The anti-parrot / range guards carried over from the retired first-witness-only
+// writer into the s342 causal step; each test asserts the guard against
+// `runCausalStep` in `on` mode. New endpoints are verified against the PERSISTED
+// observation lane + `documents.facts`, so the fixture persists exactly the
+// facts each test hands in.
+function mkObsDoc(path: string, facts: string[]): { docId: number; facts: string[] } {
+  const docId = mkDoc(path);
+  (store as any).db.prepare(`UPDATE documents SET observation_type = 'discovery', facts = ? WHERE id = ?`)
+    .run(JSON.stringify(facts), docId);
+  return { docId, facts };
+}
+
+const causalStep = (llm: any, observations: Array<{ docId: number; facts: string[] }>) =>
+  runCausalStep(store as any, llm, {
+    sessionId: "guards-test",
+    mode: "on",
+    newObservations: observations,
+    deadlineAt: Date.now() + 25_000,
+  });
+
+const sightingRows = () =>
+  (store as any).db.prepare(
+    `SELECT source_id, target_id, confidence, run_key FROM causal_witness_sightings ORDER BY id`,
+  ).all() as Array<{ source_id: number; target_id: number; confidence: number; run_key: string }>;
+
 describe("anti-parrot guard — causal inference", () => {
   withStore();
   test("rejects the prompt-skeleton residue the deployed model actually returns", async () => {
-    const a = mkDoc("observations/a.md");
-    const b = mkDoc("observations/b.md");
+    const a = mkObsDoc("observations/a.md", ["fact one"]);
+    const b = mkObsDoc("observations/b.md", ["fact two"]);
 
-    const written = await inferCausalLinks(store as any, stubLlm([
+    const result = await causalStep(stubLlm([
       { source_fact_idx: 0, target_fact_idx: 1, confidence: 0.85,
         reasoning: "Brief explanation of causal relationship" },
-    ]), [{ docId: a, facts: ["fact one"] }, { docId: b, facts: ["fact two"] }]);
+    ]), [a, b]);
 
-    expect(written).toBe(0);
+    expect(result.admittedCount).toBe(0);
+    expect(result.edgesWritten).toBe(0);
     expect(causalRows()).toHaveLength(0);
   });
 
   test("rejects that residue with trailing punctuation — exact-string matching missed it", async () => {
-    const a = mkDoc("observations/a.md");
-    const b = mkDoc("observations/b.md");
+    const a = mkObsDoc("observations/a.md", ["fact one"]);
+    const b = mkObsDoc("observations/b.md", ["fact two"]);
 
-    const written = await inferCausalLinks(store as any, stubLlm([
+    const result = await causalStep(stubLlm([
       { source_fact_idx: 0, target_fact_idx: 1, confidence: 0.9,
         reasoning: "Brief explanation of causal relationship." },
-    ]), [{ docId: a, facts: ["fact one"] }, { docId: b, facts: ["fact two"] }]);
+    ]), [a, b]);
 
-    expect(written).toBe(0);
+    expect(result.admittedCount).toBe(0);
     expect(causalRows()).toHaveLength(0);
   });
 
   test("non-finite confidence never reaches the writer, by either route", async () => {
-    const a = mkDoc("observations/a.md");
-    const b = mkDoc("observations/b.md");
+    const a = mkObsDoc("observations/a.md", ["deploy"]);
+    const b = mkObsDoc("observations/b.md", ["outage"]);
 
     // Two distinct routes, both of which must end in zero rows:
-    //   - over the wire, `1e309` serializes to JSON `null`, so the parse closure's
-    //     `typeof confidence === "number"` test rejects it and retries exhaust;
+    //   - over the wire, `1e309` serializes to JSON `null`, so the strict
+    //     single-shot parse rejects the WHOLE response (`parse_fail` — there is
+    //     no corrective retry by design);
     //   - injected directly (as an in-process caller or a non-JSON transport could),
-    //     Infinity IS typeof "number" and clears `>= 0.6`, previously inserting a row
-    //     whose weight column landed as NULL. The range check covers that route.
-    const viaJson = await inferCausalLinks(store as any, stubLlm([
+    //     Infinity IS typeof "number" and clears the threshold; the
+    //     `invalid_confidence` admission filter covers that route.
+    const viaJson = await causalStep(stubLlm([
       { source_fact_idx: 0, target_fact_idx: 1, confidence: 1e309,
         reasoning: "the deploy caused the outage" },
-    ]), [{ docId: a, facts: ["deploy"] }, { docId: b, facts: ["outage"] }]);
-    expect(viaJson).toBe(0);
+    ]), [a, b]);
+    expect(viaJson.outcome).toBe("parse_fail");
+    expect(viaJson.edgesWritten).toBe(0);
 
     // Raw-text route: `JSON.parse` turns the literal `1e309` into Infinity, which reaches
-    // the loop as a genuine number and is stopped only by the range check.
+    // admission as a genuine number and is stopped only by the range filter.
     const rawLlm: any = {
       generate: async () => ({
         text: '[{"source_fact_idx":0,"target_fact_idx":1,"confidence":1e309,'
@@ -124,64 +152,62 @@ describe("anti-parrot guard — causal inference", () => {
         done: true,
       }),
     };
-    const viaRaw = await inferCausalLinks(store as any, rawLlm,
-      [{ docId: a, facts: ["deploy"] }, { docId: b, facts: ["outage"] }]);
-    expect(viaRaw).toBe(0);
+    const viaRaw = await causalStep(rawLlm, [a, b]);
+    expect(viaRaw.admittedCount).toBe(0);
 
     expect(causalRows()).toHaveLength(0);
   });
 
   test("rejects confidence above the unit interval", async () => {
-    const a = mkDoc("observations/a.md");
-    const b = mkDoc("observations/b.md");
+    const a = mkObsDoc("observations/a.md", ["deploy"]);
+    const b = mkObsDoc("observations/b.md", ["outage"]);
 
-    const written = await inferCausalLinks(store as any, stubLlm([
+    const result = await causalStep(stubLlm([
       { source_fact_idx: 0, target_fact_idx: 1, confidence: 42,
         reasoning: "the deploy caused the outage" },
-    ]), [{ docId: a, facts: ["deploy"] }, { docId: b, facts: ["outage"] }]);
+    ]), [a, b]);
 
-    expect(written).toBe(0);
+    expect(result.admittedCount).toBe(0);
     expect(causalRows()).toHaveLength(0);
   });
 
   test("accepts genuine reasoning across two documents", async () => {
-    const a = mkDoc("observations/a.md");
-    const b = mkDoc("observations/b.md");
+    const a = mkObsDoc("observations/a.md", ["deploy wrote an invalid nginx config"]);
+    const b = mkObsDoc("observations/b.md", ["nginx returned 502"]);
 
-    const written = await inferCausalLinks(store as any, stubLlm([
+    const result = await causalStep(stubLlm([
       { source_fact_idx: 0, target_fact_idx: 1, confidence: 0.85,
         reasoning: "The invalid nginx config caused the 502 responses" },
-    ]), [
-      { docId: a, facts: ["deploy wrote an invalid nginx config"] },
-      { docId: b, facts: ["nginx returned 502"] },
-    ]);
+    ]), [a, b]);
 
-    expect(written).toBe(1);
+    expect(result.edgesWritten).toBe(1);
     const rows = causalRows();
     expect(rows).toHaveLength(1);
     expect(rows[0]!.weight).toBe(0.85);
+    expect(sightingRows()).toHaveLength(1);
   });
 
-  test("the returned count reflects rows written, not candidates attempted", async () => {
-    const a = mkDoc("observations/a.md");
-    const b = mkDoc("observations/b.md");
+  test("separate-run recurrence APPENDS a sighting; the edge and its weight stay coherent", async () => {
+    const a = mkObsDoc("observations/a.md", ["a migration dropped the users index"]);
+    const b = mkObsDoc("observations/b.md", ["login queries began doing full table scans"]);
     // Causally coherent facts, so a future evidence-alignment validator does not have to
-    // break this counter test to become correct.
+    // break this test to become correct.
     const llm = stubLlm([
       { source_fact_idx: 0, target_fact_idx: 1, confidence: 0.9,
         reasoning: "The migration dropped the index, so login queries began table scans" },
     ]);
-    const args: any = [
-      { docId: a, facts: ["a migration dropped the users index"] },
-      { docId: b, facts: ["login queries began doing full table scans"] },
-    ];
+    const args = [a, b];
 
-    expect(await inferCausalLinks(store as any, llm, args)).toBe(1);
-    // Identical edge again: INSERT OR IGNORE suppresses it on the composite PK, so a
-    // candidate is attempted but no row is written. Counting attempts here is what let a
-    // total failure of this path report success for four months.
-    expect(await inferCausalLinks(store as any, llm, args)).toBe(0);
+    expect((await causalStep(llm, args)).edgesWritten).toBe(1);
+    // Identical tuple in a LATER run: distinct run_key → the sighting APPENDS
+    // (Q9 as ruled — recurrence is evidence, not a duplicate), while the edge
+    // row stays single and its weight is re-derived from stored sightings.
+    expect((await causalStep(llm, args)).edgesWritten).toBe(1);
     expect(causalRows()).toHaveLength(1);
+    expect(causalRows()[0]!.weight).toBe(0.9);
+    const sightings = sightingRows();
+    expect(sightings).toHaveLength(2);
+    expect(sightings[0]!.run_key).not.toBe(sightings[1]!.run_key);
   });
 });
 

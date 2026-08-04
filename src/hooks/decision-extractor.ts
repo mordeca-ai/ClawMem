@@ -23,6 +23,14 @@ import { loadConfig } from "../collections.ts";
 import { getDefaultLlamaCpp } from "../llm.ts";
 import type { ObservationWithDoc } from "../amem.ts";
 import {
+  resolveCausalWriterMode,
+  resolveStopBudgetMs,
+  runCausalStep,
+  pruneCausalRuns,
+  PERSIST_RESERVE_MS,
+  CAUSAL_MIN_BUDGET_MS,
+} from "../causal-writer.ts";
+import {
   resolveJudge,
   buildContradictionPrompt,
   extractJudgeJson,
@@ -88,6 +96,11 @@ export async function checkMergePolicy(
   contentType: string,
   body: string,
   collection: string,
+  /** s342 D2: absolute deadline (already net of the persistence reserve) that
+   *  bounds the dedup embedding. Past it, dedup degrades to a plain insert —
+   *  saveMemory's hash dedup still applies — rather than starting a model call
+   *  outside the Stop budget. */
+  deadlineMs?: number,
 ): Promise<{ action: 'insert' | 'skip' | 'merge'; existingId?: number }> {
   const policy = getMergePolicy(contentType);
 
@@ -98,9 +111,12 @@ export async function checkMergePolicy(
   if (recentDocs.length === 0) return { action: 'insert' };
 
   if (policy === 'dedup_check') {
+    if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+      return { action: 'insert' };
+    }
     // Vector similarity check against recent entries
     try {
-      const results = await store.searchVec(body.slice(0, 500), DEFAULT_EMBED_MODEL, 3);
+      const results = await store.searchVec(body.slice(0, 500), DEFAULT_EMBED_MODEL, 3, undefined, undefined, undefined, deadlineMs);
       const sameType = results.filter(r =>
         r.collectionName === collection &&
         r.score >= DEDUP_SIMILARITY_THRESHOLD
@@ -795,6 +811,10 @@ async function detectContradictions(
   newObservations: Observation[],
   sessionId: string,
   docIdByObservation?: ReadonlyMap<Observation, number>,
+  /** s342 D2: the Stop handler's whole-handler deadline. When present, the
+   *  judge call is skipped below the remaining-budget floor (audited as
+   *  `skipped_budget`) and an in-flight call is bounded by the remainder. */
+  deadlineAt?: number,
 ): Promise<number> {
   const decisions = newObservations.filter(o => o.type === "decision");
   if (decisions.length === 0) return 0;
@@ -847,11 +867,38 @@ async function detectContradictions(
   }
   const judge = resolution.judge;
 
-  // Vector search for existing decisions on overlapping topics
+  // s342 D2: the floor gates the WHOLE contradiction phase — including the
+  // candidate-retrieval embedding below, which is itself a model call — so a
+  // near-exhausted budget never starts ANY of it.
+  if (deadlineAt !== undefined) {
+    const remaining = deadlineAt - Date.now() - PERSIST_RESERVE_MS;
+    if (remaining < CAUSAL_MIN_BUDGET_MS) {
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: judge.descriptor.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: JUDGE_PROMPT_VERSION,
+        newFactCount: newFacts.length,
+        outcome: "skipped_budget",
+      });
+      console.warn(
+        `[decision-extractor] contradiction phase skipped: ${remaining}ms of the ` +
+        `Stop budget remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor — ` +
+        `no contradiction was evaluated.`,
+      );
+      return 0;
+    }
+  }
+
+  // Vector search for existing decisions on overlapping topics — the embedding
+  // is bounded by the whole-handler deadline minus the persistence reserve.
+  const searchDeadline = deadlineAt !== undefined ? deadlineAt - PERSIST_RESERVE_MS : undefined;
   const queryText = newFacts.join(". ");
   let existingDocs: SearchResult[];
   try {
-    existingDocs = await store.searchVec(queryText, DEFAULT_EMBED_MODEL, 5);
+    existingDocs = await store.searchVec(queryText, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, searchDeadline);
   } catch (e) {
     warnOnceOnVectorModelMismatch(e);
     existingDocs = store.searchFTS(queryText, 5);
@@ -874,8 +921,38 @@ async function detectContradictions(
   const existingSnippets = candidates.map(c => extractSnippet(c.body || "", queryText, 300).snippet);
   const prompt = buildContradictionPrompt({ newFacts, existingSnippets, minConfidence: 0.7 });
 
+  // s342 D2: the judge shares the whole-handler deadline — never START a call
+  // near budget exhaustion, and bound an in-flight one by the remainder.
+  let judgeSignal: AbortSignal | undefined;
+  if (deadlineAt !== undefined) {
+    const remaining = deadlineAt - Date.now() - PERSIST_RESERVE_MS;
+    if (remaining < CAUSAL_MIN_BUDGET_MS) {
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: judge.descriptor.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: prompt.promptVersion,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        outcome: "skipped_budget",
+      });
+      console.warn(
+        `[decision-extractor] contradiction judge skipped: ${remaining}ms of the ` +
+        `Stop budget remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor — ` +
+        `no contradiction was evaluated.`,
+      );
+      return 0;
+    }
+    judgeSignal = AbortSignal.timeout(remaining);
+  }
+
   try {
-    const result = await judge.judge({ system: prompt.system, user: prompt.user, schema: JUDGE_VERDICT_SCHEMA });
+    const result = await judge.judge(
+      { system: prompt.system, user: prompt.user, schema: JUDGE_VERDICT_SCHEMA },
+      judgeSignal ? { signal: judgeSignal } : {},
+    );
     if (!result.ok) {
       // Typed judge failure — audited standalone (nothing mutated), loud, fail-closed.
       insertJudgeRunBestEffort(store.db, {
@@ -1079,23 +1156,81 @@ export async function decisionExtractor(
   // handler's FIRST act — before transcript validation, so literally every invocation,
   // early returns included, honors the 90-day/10k root cap. Pair-aware, best-effort,
   // never this session's rows.
+  // s342 D2: the whole-handler deadline starts at handler ENTRY — captured
+  // BEFORE the retention passes below, which take the same database locks as
+  // everything else and must count against the budget, not precede it.
+  // CLAWMEM_STOP_BUDGET_MS bounds EVERY model-bearing phase — observation
+  // extraction, the contradiction judge, and the causal step — with
+  // PERSIST_RESERVE_MS held back for persistence/output so the host never
+  // kills mid-write. Operating requirement (docs/reference/configuration.md):
+  // the installed host hook timeout must exceed this budget plus safety.
+  const stopBudget = resolveStopBudgetMs();
+  const deadlineAt = Date.now() + stopBudget.budgetMs;
+  if (stopBudget.invalid) {
+    console.error(`[decision-extractor] ${stopBudget.invalid}`);
+  }
+
+  // s342 D5: ONE causal invocation record per Stop invocation in shadow/on —
+  // cardinality includes the early returns below, so the step is a named
+  // closure invoked on EVERY handler exit path. Default OFF; `shadow` audits
+  // without writing; `on` writes. Config anomalies audit durably on the run.
+  const phaseSkipNotes: string[] = [];
+  const runCausalInvocation = async (newObs: ObservationWithDoc[]): Promise<void> => {
+    const causalMode = resolveCausalWriterMode();
+    if (causalMode === "off") return;
+    try {
+      const llm = getDefaultLlamaCpp();
+      await runCausalStep(store, llm, {
+        sessionId,
+        mode: causalMode,
+        newObservations: newObs,
+        deadlineAt,
+        invalidConfigNotes: stopBudget.invalid ? [stopBudget.invalid] : [],
+        phaseSkipNotes,
+      });
+    } catch (err) {
+      console.log(`[decision-extractor] Error in causal inference:`, err);
+    }
+  };
+
   try {
     pruneJudgeRuns(store.db, { excludeSessionId: sessionId });
   } catch { /* retention is best-effort */ }
+  try {
+    pruneCausalRuns(store.db, { excludeSessionId: sessionId });
+  } catch { /* retention is best-effort */ }
 
   const transcriptPath = validateTranscriptPath(input.transcriptPath);
-  if (!transcriptPath) return makeEmptyOutput("decision-extractor");
+  if (!transcriptPath) {
+    await runCausalInvocation([]);
+    return makeEmptyOutput("decision-extractor");
+  }
 
   const messages = readTranscript(transcriptPath, 200);
-  if (messages.length === 0) return makeEmptyOutput("decision-extractor");
+  if (messages.length === 0) {
+    await runCausalInvocation([]);
+    return makeEmptyOutput("decision-extractor");
+  }
 
 
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
   const timestamp = now.toISOString();
 
-  // Try observer first for structured observations
-  const observations = await extractObservations(messages);
+  // Try observer first for structured observations. s342 D2: extraction has
+  // the SAME pre-call floor as the judge and the causal step — near budget
+  // exhaustion it is skipped outright, never started with a degenerate timeout.
+  const extractionRemaining = deadlineAt - Date.now() - PERSIST_RESERVE_MS;
+  let observations: Observation[] = [];
+  if (extractionRemaining < CAUSAL_MIN_BUDGET_MS) {
+    const note =
+      `observation extraction skipped: ${extractionRemaining}ms of the Stop budget ` +
+      `remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor`;
+    phaseSkipNotes.push(note);
+    console.warn(`[decision-extractor] ${note}.`);
+  } else {
+    observations = await extractObservations(messages, { timeoutMs: extractionRemaining });
+  }
   const observedDecisions = observations.filter(o => o.type === "decision");
 
   // Persist ALL observations unconditionally (C2 fix: not gated on decisions existing)
@@ -1114,18 +1249,6 @@ export async function decisionExtractor(
       }
     }
 
-    // Infer causal links from observations with facts
-    if (observationsWithDocs.length > 0) {
-      try {
-        const llm = await getDefaultLlamaCpp();
-        if (llm) {
-          await store.inferCausalLinks(llm, observationsWithDocs);
-        }
-      } catch (err) {
-        console.log(`[decision-extractor] Error in causal inference:`, err);
-      }
-    }
-
     // Extract SPO triples from observation-emitted <triples> blocks (Fix A).
     // The regex-based extractTripleFromFact is gone — the observer LLM now emits
     // structured triples alongside facts, parsed and validated in parseObservationXml.
@@ -1133,6 +1256,11 @@ export async function decisionExtractor(
     // real source_doc_id provenance from the persisted observation document (Fix F).
     insertObservationTriples(store, observations, observationsWithDocs);
   }
+
+  // s342: the bounded one-hop causal step (C4′) for this invocation —
+  // observation-document nodes, append-only fact-pair witness evidence on the
+  // edge. Replaces the retired first-witness-only writer.
+  await runCausalInvocation(observationsWithDocs);
 
   // Extract decisions (observer-first, regex fallback)
   let decisionBody: string;
@@ -1146,7 +1274,7 @@ export async function decisionExtractor(
 
     // Detect contradictions with existing decisions
     try {
-      const contradictions = await detectContradictions(store, observedDecisions, sessionId, docIdByObservation);
+      const contradictions = await detectContradictions(store, observedDecisions, sessionId, docIdByObservation, deadlineAt);
       if (contradictions > 0) {
         console.error(`[decision-extractor] Found ${contradictions} contradiction(s) with prior decisions`);
       }
@@ -1173,8 +1301,9 @@ export async function decisionExtractor(
 
   const decisionPath = `decisions/${dateStr}-${sessionId.slice(0, 8)}.md`;
 
-  // Check existing merge policy first (vector-based dedup for decisions)
-  const mergeResult = await checkMergePolicy(store, "decision", decisionBody, "_clawmem");
+  // Check existing merge policy first (vector-based dedup for decisions),
+  // bounded by the whole-handler deadline minus the persistence reserve.
+  const mergeResult = await checkMergePolicy(store, "decision", decisionBody, "_clawmem", deadlineAt - PERSIST_RESERVE_MS);
 
   if (mergeResult.action === 'skip') {
     process.stderr.write(`[decision-extractor] Skipped near-duplicate decision (vector dedup)\n`);
@@ -1221,8 +1350,9 @@ export async function decisionExtractor(
       const antiSemanticPayload = antipatterns.map(a => a.text).join("\n");
       const antiPath = `antipatterns/${dateStr}-${sessionId.slice(0, 8)}.md`;
 
-      // Check existing merge policy first (merge_recent for antipatterns)
-      const antiMerge = await checkMergePolicy(store, "antipattern", antiBody, "_clawmem");
+      // Check existing merge policy first (merge_recent for antipatterns),
+      // under the same whole-handler deadline bound.
+      const antiMerge = await checkMergePolicy(store, "antipattern", antiBody, "_clawmem", deadlineAt - PERSIST_RESERVE_MS);
 
       if (antiMerge.action === 'skip') {
         // Near-duplicate — skip

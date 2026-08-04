@@ -4,6 +4,98 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.33.0 — the causal writer returns, evidence-first
+
+v0.32.0 rebuilt causal *reading* and noted that restoring causal *inference* was a separate,
+future piece of work. This is that piece. A new causal witness writer runs inside the
+`decision-extractor` Stop hook — off by default, shadow-first — and the causal graph it builds
+is evidence-preserving end to end: documents are the nodes, and every edge carries the specific
+fact pair that justified it.
+
+### The causal witness writer
+
+When enabled (`CLAWMEM_CAUSAL_WRITER=shadow|on`), each Stop-hook invocation considers this
+session's new observation documents against a small temporal window of recent ones
+(`CLAWMEM_CAUSAL_WINDOW`, default 5, effective-time ordered) and makes ONE strict single-shot
+model call proposing causal pairs. Admission is unforgiving: every proposed pair must cite fact
+ordinals that exist in the *persisted* documents (caller arrays are never trusted), must include
+at least one endpoint from this invocation (history is never re-inferred), and self-pairs,
+duplicates, out-of-range ordinals, and sub-threshold confidences are each rejected with their own
+audit event. What survives is written append-only as **fact-pair witness sightings** — repeat
+observations of the same causal claim accumulate instead of being dropped — and the edge weight
+is derived (`MAX` of witness confidences) in the same transaction. Placeholder reasoning is
+rejected, so every edge a reader sees can show *why* it exists.
+
+Every invocation in shadow/on mode writes a durable run record (`causal_runs` /
+`causal_run_events`) — including early exits, skipped phases, and invalid configuration — with
+retention mirroring the judge audit (90 days / 10k runs; sightings survive pruning). Inspect it
+with the new `clawmem causal-audit` CLI. Shadow mode runs the full pipeline and audits everything
+while writing zero graph state: run it for a while and read the audit before arming `on`.
+
+### Pre-cut edges: preflight, resolve, restore
+
+Causal edges written by the pre-v0.30 writer carry old-format metadata. The reader materializes
+the valid ones lazily on first touch; edges whose metadata cannot yield a valid witness make the
+writer fail closed rather than guess. `clawmem migrate causal-witnesses --preflight` reports a
+census and emits a binding manifest; `--resolve-unmaterializable keep-weight|retire-edge` acts
+only on explicitly selected edges whose full row image still matches the manifest fingerprint;
+retirement is archive-style and reversible (`--restore-edge`, fail-closed: a restore never
+overwrites an occupied key). CLI audit rows are born terminal-pessimistic — a crash mid-operation
+can leave an honest `cli_error`, never a stranded `in_progress` or a fabricated success.
+
+### The Stop hook now runs to a deadline
+
+`CLAWMEM_STOP_BUDGET_MS` (default 25000) is a whole-handler deadline captured at entry. Every
+model-bearing phase — observation extraction, contradiction candidate retrieval *including its
+embedding call*, the contradiction judge, dedup embeddings, and the causal step — checks
+remaining budget before starting and is skipped (audited, loudly logged) rather than started
+unbounded. Previously a slow inference server could push the hook past the host's timeout, losing
+the entire extraction; now the hook degrades phase by phase and always reaches persistence.
+
+### Security: document-id lookups are structurally validated
+
+Found by this release's boundary tests: docid resolution used its input in a SQL `LIKE` pattern
+without escaping, so the wildcards `_` and `%` matched **arbitrary documents** through every
+docid surface — including the destructive REST `/documents/{docid}/forget`, where a single `_`
+deactivated whichever document the pattern happened to match first. Docids are now validated
+against `^[0-9a-fA-F]{6,64}$` (after `#` strip) before any query; wildcards, non-hex, and
+undersized prefixes return not-found everywhere. Oversized docids no longer throw. If you expose
+the REST API beyond localhost, upgrade for this alone.
+
+### `find_causal_links` returns evidence, not just links
+
+The tool (MCP + REST `/causal-links`) now returns directed **edge records**: invariant
+source/target, traversal provenance (predecessor, depth, direction), and up to 3 fact-pair
+witnesses per edge with reasoning, confidence, and sighting counts — projected in SQL, capped by
+a byte ceiling (64 KiB) that drops whole edges from the tail rather than truncating mid-record.
+Traversal is level-synchronous and returns the globally strongest 50 edges under a total order,
+not the first 50 found. Depth > 1 remains per-edge evidence, not a verified chain.
+
+### Migration
+
+Automatic on first open, additive only: four new tables (`causal_runs`, `causal_run_events`,
+`causal_witness_sightings`, `retired_causal_edges`) with their indexes. No data backfill, no
+manual step. The writer defaults to `off`, so nothing changes in write behavior until you arm it
+— and before setting `on`, run the preflight (above).
+
+### Verification
+
+Cross-model adversarial pass (codex / GPT-5.x), both gates in one pinned session: the design was
+reviewed to zero remaining findings across seven turns (13→9→9→8→3→2→0), then the implementation
+against that contract across seven more (13→5→4→6→3→1→0). Production-boundary tests drive the
+real CLI subprocesses (conflict, whole-run lock, rejected finalization), the real MCP handlers,
+and the real REST server (docid injection attempts, byte-ceiling overflow, destructive-route
+validation). Full suite at clearance: 1977 tests, 0 failures.
+
+### What didn't change
+
+The v0.32.0 reader pipeline (shared causal retrieval, observation lane, one-hop traversal) is
+untouched. `includeInternal` semantics are unchanged. With `CLAWMEM_CAUSAL_WRITER=off` (the
+default) the Stop hook makes no causal model call and writes no causal rows — the only new
+default-on behaviors are the budget deadline and the docid validation.
+
+---
+
 ## v0.32.0 — causal answers reach their reasoning
 
 Three defects found while reviewing the causal layer's foundations: the recommended causal
@@ -71,6 +163,15 @@ inference itself is a separate, future piece of work. Direct `intent_search` rem
 design; REST remains unfiltered in every mode; `includeInternal` semantics are unchanged;
 `confidence` does not move on repeat sightings; hooks issue no new queries.
 
+### Upgrading
+
+No manual migration step — the provenance backfill runs on first open, idempotent and
+read-guarded. The v0.31.0 mixed-version caution applies unchanged: when long-lived writers run
+concurrently, restart daemons and reconnect open agent sessions together, so no old-code process
+keeps writing after the vault has migrated. A stale writer inserts facts without evidence rows —
+repaired by a later open's backfill — and keeps dropping repeat sightings outright, which is not
+recoverable: the evidence row is simply never written.
+
 ---
 
 ## v0.31.0 — forget stays forgotten
@@ -132,11 +233,20 @@ link pass and leaves the document eligible for a later retry. `NULL` is preserve
 
 ### Upgrading
 
-No action required. The migration runs on open, is idempotent, and performs its count and repair
-in one transaction so concurrent opens cannot double-report. If it cannot run — a locked database,
-for instance — it says so on stderr and is retried on the next open rather than failing silently.
-If it reports repaired documents, those were archived rows a previous version had incorrectly
-reactivated.
+No manual migration step. The migration runs on open, is idempotent, and performs its count and
+repair in one transaction so concurrent opens cannot double-report. If it cannot run — a locked
+database, for instance — it says so on stderr and is retried on the next open rather than failing
+silently. If it reports repaired documents, those were archived rows a previous version had
+incorrectly reactivated.
+
+One operational requirement when long-lived writers run concurrently — the watcher,
+`clawmem serve`, or an MCP server in an agent session that stays open across the upgrade:
+restart them together (daemons restarted; open sessions reconnected via `/mcp` or closed), so no
+old-code process keeps writing after the first new-code open has migrated the vault. An old-code
+writer records no deactivation reason, and the new indexer deliberately treats reason-less
+deactivation as legacy absence — a forget issued through a stale session can be reactivated by
+the next re-index, which is this release's bug reintroduced by the stale process. A
+single-session setup with no daemons needs nothing.
 
 ---
 

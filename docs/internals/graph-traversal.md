@@ -85,14 +85,19 @@ from output.
 
 ## When to run find_causal_links
 
-Use after `intent_search` to walk the full causal chain from a specific document:
+Use after `intent_search` to read the causal edges around a specific document —
+directed edge records with fact-pair witness evidence:
 
 ```
 # 1. Find the anchor
 intent_search("why did we switch to PostgreSQL")
 # → top result: decisions/2026-02-15-db-migration.md (#a1b2c3)
 
-# 2. Trace the chain
+# 2. Read the surrounding causal edges
 find_causal_links(docid="#a1b2c3", direction="both", depth=5)
-# → shows what caused this decision and what it caused
+# → directed edge records (sourceDocId → targetDocId) with witnesses + reasoning
 ```
+
+Each record is evidence for ONE edge. Multi-hop chain quality is experimental:
+`depth > 1` results are per-edge evidence along a traversal, not a verified
+end-to-end chain.

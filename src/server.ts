@@ -17,6 +17,7 @@ import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./
 import { applyMMRDiversity } from "./mmr.ts";
 import { listCollections } from "./collections.ts";
 import { runCausalRetrieval, hasCausalSignal, hasTimelineSignal } from "./causal-retrieval.ts";
+import { capCausalWire } from "./causal-reader.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import {
   DEFAULT_EMBED_MODEL,
@@ -325,20 +326,39 @@ function handleProfile(_req: Request, _url: URL, store: Store): Response {
 function handleCausalLinks(_req: Request, url: URL, store: Store): Response {
   const docid = url.pathname.split("/").pop();
   if (!docid) return jsonError("docid is required");
+  // s342 D4: every exit is byte-bounded — the caller-controlled docid is
+  // display-bounded before ANY echo (error bodies included).
+  const docidEcho = docid.slice(0, 256);
 
   const resolved = store.findDocumentByDocid(docid);
-  if (!resolved) return jsonError(`Document not found: ${docid}`, 404);
+  if (!resolved) return jsonError(`Document not found: ${docidEcho}`, 404);
 
+  // s342: anchor eligibility — the reader enforces the same predicate on every
+  // recursive expansion; an invalidated anchor resolves to nothing here.
   const doc = store.db.prepare(
-    "SELECT id FROM documents WHERE hash = ? AND active = 1 LIMIT 1"
+    "SELECT id FROM documents WHERE hash = ? AND active = 1 AND invalidated_at IS NULL LIMIT 1"
   ).get(resolved.hash) as { id: number } | undefined;
-  if (!doc) return jsonError(`Document not found: ${docid}`, 404);
+  if (!doc) return jsonError(`Document not found: ${docidEcho}`, 404);
 
-  const direction = (queryParam(url, "direction", "both") as "causes" | "caused_by" | "both") || "both";
+  // Validate against the enum — never echo caller-controlled junk into the body.
+  const rawDirection = queryParam(url, "direction", "both") ?? "both";
+  if (rawDirection !== "causes" && rawDirection !== "caused_by" && rawDirection !== "both") {
+    return jsonError("direction must be causes | caused_by | both");
+  }
+  const direction = rawDirection as "causes" | "caused_by" | "both";
   const depth = queryInt(url, "depth", 5);
 
-  const links = store.findCausalLinks(doc.id, direction, depth);
-  return jsonResponse({ docid, direction, depth, count: links.length, links });
+  // Evidence-preserving directed edge records; the COMPLETE body is capped at
+  // CAUSAL_READER_MAX_BYTES with whole-edge truncation in the reader's
+  // deterministic total order, and the overflow envelope backstops the ceiling
+  // unconditionally.
+  const { edges, truncated } = store.findCausalLinks(doc.id, direction, depth);
+  const body = capCausalWire(edges, truncated, (kept, isTruncated) => ({
+    docid: docidEcho, direction, depth, count: kept.length, truncated: isTruncated, links: kept,
+  }), () => ({
+    docid: docidEcho, direction, depth, count: 0, truncated: true, overflow: true, links: [],
+  }));
+  return jsonResponse(body);
 }
 
 // --- Similar Documents ---

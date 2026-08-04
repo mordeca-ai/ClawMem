@@ -53,9 +53,8 @@ import {
   generateMemoryLinks,
   evolveMemories,
   postIndexEnrich,
-  inferCausalLinks,
-  type ObservationWithDoc,
 } from "./amem.ts";
+import { parseLegacyEdgeWitness } from "./causal-reader.ts";
 import {
   enrichDocumentEntities,
   searchEntities,
@@ -878,6 +877,124 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   // MPFP composite index for efficient neighbor loading (GPT 5.4 recommendation)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_mpfp ON memory_relations(source_id, relation_type, weight DESC, target_id)`);
 
+  // s342 causal writer (C4′): per-invocation audit runs. run_key is UNIQUE NOT
+  // NULL so a key collision fails loudly BEFORE inference results are written.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS causal_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_key TEXT NOT NULL UNIQUE,
+      session_id TEXT,
+      source TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      model TEXT,
+      prompt_version TEXT,
+      prompt_sha256 TEXT,
+      response_sha256 TEXT,
+      outcome TEXT NOT NULL,
+      new_doc_count INTEGER NOT NULL DEFAULT 0,
+      window_doc_count INTEGER NOT NULL DEFAULT 0,
+      candidate_count INTEGER NOT NULL DEFAULT 0,
+      admitted_count INTEGER NOT NULL DEFAULT 0,
+      edges_written INTEGER NOT NULL DEFAULT 0,
+      edges_refused INTEGER NOT NULL DEFAULT 0,
+      edges_errored INTEGER NOT NULL DEFAULT 0,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      duration_ms INTEGER
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_causal_runs_ts ON causal_runs(started_at DESC, id DESC)`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS causal_run_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL REFERENCES causal_runs(id) ON DELETE CASCADE,
+      scope TEXT NOT NULL CHECK (scope IN ('document','pair','write')),
+      event_type TEXT NOT NULL,
+      source_doc_id INTEGER,
+      target_doc_id INTEGER,
+      source_fact_ordinal INTEGER,
+      target_fact_ordinal INTEGER,
+      confidence REAL,
+      detail TEXT,
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_causal_run_events_run ON causal_run_events(run_id, id)`);
+
+  // s342: append-only fact-pair witness sightings on causal edges. Identity is
+  // the ORDINAL pair (facts are display snapshots); a live row must carry
+  // visible evidence + full attribution; legacy rows (ordinals = -1) keep their
+  // explicitly different compatibility contract. Witnesses are dependent
+  // evidence of the edge — the composite FK cascades with it, never a second
+  // lifecycle identity. Audit retention deletes runs only: run_id detaches via
+  // SET NULL while denormalized model/prompt/run_key attribution survives.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS causal_witness_sightings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_id INTEGER NOT NULL,
+      target_id INTEGER NOT NULL,
+      relation_type TEXT NOT NULL DEFAULT 'causal' CHECK (relation_type = 'causal'),
+      source_fact_ordinal INTEGER NOT NULL,
+      target_fact_ordinal INTEGER NOT NULL,
+      source_fact TEXT,
+      target_fact TEXT,
+      reasoning TEXT NOT NULL DEFAULT '',
+      confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+      model_identity TEXT NOT NULL DEFAULT '',
+      prompt_version TEXT NOT NULL DEFAULT '',
+      run_key TEXT NOT NULL,
+      run_id INTEGER REFERENCES causal_runs(id) ON DELETE SET NULL,
+      legacy INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      CHECK ((legacy = 0 AND source_fact_ordinal >= 0 AND target_fact_ordinal >= 0)
+          OR (legacy = 1 AND source_fact_ordinal = -1 AND target_fact_ordinal = -1)),
+      CHECK (legacy = 1 OR (length(COALESCE(source_fact,'')) > 0
+                        AND length(COALESCE(target_fact,'')) > 0
+                        AND length(reasoning) > 0
+                        AND length(model_identity) > 0
+                        AND length(prompt_version) > 0
+                        AND length(run_key) > 0)),
+      FOREIGN KEY (source_id, target_id, relation_type)
+        REFERENCES memory_relations(source_id, target_id, relation_type) ON DELETE CASCADE
+    )
+  `);
+  // ONE live sighting per (edge, ordinal pair, invocation); recurrence across
+  // runs APPENDS under its own run_key. Plain columns — a valid targeted
+  // ON CONFLICT target for the partial-index upsert.
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_cws_live ON causal_witness_sightings
+    (source_id, target_id, source_fact_ordinal, target_fact_ordinal, run_key)
+    WHERE legacy = 0`);
+  // EXACTLY ONE legacy row per physical edge — repeated materialization throws.
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_cws_one_legacy ON causal_witness_sightings
+    (source_id, target_id) WHERE legacy = 1`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cws_edge ON causal_witness_sightings
+    (source_id, target_id, confidence DESC, created_at DESC, id DESC)`);
+
+  // s342: NON-PRUNED archive for operator-retired causal edges — the supported,
+  // reversible restoration path (`clawmem migrate causal-witnesses --restore-edge`).
+  // Full row image, no FKs: the archive must survive everything, including audit
+  // retention. An archive table (vs a retired_at column) keeps every existing
+  // graph reader predicate unchanged.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS retired_causal_edges (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_id INTEGER NOT NULL,
+      target_id INTEGER NOT NULL,
+      relation_type TEXT NOT NULL,
+      weight REAL,
+      metadata TEXT,
+      created_at TEXT,
+      contradict_confidence REAL,
+      retired_at TEXT NOT NULL,
+      retired_run_key TEXT NOT NULL,
+      operator_note TEXT,
+      fingerprint TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_retired_causal_edge ON retired_causal_edges
+    (source_id, target_id, relation_type)`);
+
   // A-MEM: Memory evolution tracking
   db.exec(`
     CREATE TABLE IF NOT EXISTS memory_evolution (
@@ -1605,8 +1722,7 @@ export type Store = {
   generateMemoryLinks: (llm: any, docId: number, kNeighbors?: number) => Promise<number>;
   evolveMemories: (llm: any, memoryId: number, triggeredBy: number) => Promise<boolean>;
   postIndexEnrich: (llm: any, docId: number, isNew: boolean) => Promise<void>;
-  inferCausalLinks: (llm: any, observations: ObservationWithDoc[]) => Promise<number>;
-  findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => CausalLink[];
+  findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => CausalEdgesResult;
   getEvolutionTimeline: (docId: number, limit?: number) => EvolutionEntry[];
 
   // Entity resolution + co-occurrence
@@ -1876,7 +1992,6 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     generateMemoryLinks: (llm: any, docId: number, kNeighbors?: number) => generateMemoryLinks({ db, dbPath: resolvedPath } as Store, llm, docId, kNeighbors),
     evolveMemories: (llm: any, memoryId: number, triggeredBy: number) => evolveMemories({ db, dbPath: resolvedPath } as Store, llm, memoryId, triggeredBy),
     postIndexEnrich: (llm: any, docId: number, isNew: boolean) => postIndexEnrich({ db, dbPath: resolvedPath } as Store, llm, docId, isNew),
-    inferCausalLinks: (llm: any, observations: ObservationWithDoc[]) => inferCausalLinks({ db, dbPath: resolvedPath } as Store, llm, observations),
     findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => findCausalLinks(db, docId, direction, maxDepth),
     getEvolutionTimeline: (docId: number, limit?: number) => getEvolutionTimeline(db, docId, limit),
 
@@ -3340,7 +3455,14 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
   // Normalize: remove leading # if present
   const shortHash = docid.startsWith('#') ? docid.slice(1) : docid;
 
-  if (shortHash.length < 1) return null;
+  // Structural validation BEFORE the value reaches LIKE: a docid is a hex
+  // prefix of a sha256 hash, 6–64 chars (the documented short-docid contract).
+  // Anything else returns not-found — this closes real holes on EVERY docid
+  // surface (destructive REST forget included): `_`/`%` are LIKE wildcards
+  // that matched arbitrary documents, a 1-char prefix is ambiguity-by-design,
+  // and an unbounded value made SQLite's LIKE throw ("pattern too complex")
+  // instead of answering.
+  if (!/^[0-9a-fA-F]{6,64}$/.test(shortHash)) return null;
 
   // Look up documents where hash starts with the short hash
   const doc = db.prepare(`
@@ -5662,110 +5784,340 @@ export async function buildSemanticGraph(
 // A-MEM: Causal Graph Traversal
 // =============================================================================
 
-export type CausalLink = {
+/** One projected fact-pair witness on a causal edge (s342). Legacy witnesses
+ *  (ordinals = -1) carry pre-cut evidence whose fact ordinals are unknowable. */
+export type CausalWitness = {
+  sourceFactOrdinal: number;
+  targetFactOrdinal: number;
+  sourceFact: string | null;
+  targetFact: string | null;
+  reasoning: string;
+  confidence: number;
+  /** created_at of the max-confidence sighting for this ordinal pair. */
+  strongestAt: string;
+  /** most recent sighting created_at for this ordinal pair — distinct from strongestAt. */
+  lastSeenAt: string;
+  legacy: boolean;
+};
+
+/** Directed causal edge record: invariant physical edge identity
+ *  (sourceDocId → targetDocId) with traversal provenance kept SEPARATE
+ *  (predecessorDocId/depth/direction) — consumers never invert fields. */
+export type CausalEdgeRecord = {
+  sourceDocId: number;
+  targetDocId: number;
+  /** The far endpoint this hop reached (== targetDocId outbound, sourceDocId inbound). */
   docId: number;
   title: string;
   filepath: string;
+  predecessorDocId: number;
   depth: number;
+  direction: 'causes' | 'caused_by';
   weight: number;
-  reasoning: string | null;
+  /** Distinct ordinal-pair witnesses on this edge (witnesses lists the top 3). */
+  evidenceCount: number;
+  witnesses: CausalWitness[];
+  /** true when witnesses were synthesized in-memory from pre-cut edge metadata. */
+  legacy: boolean;
 };
 
+export type CausalEdgesResult = { edges: CausalEdgeRecord[]; truncated: boolean };
+
+/** Combined budget across BOTH directions; the reader fetches budget+1 per
+ *  direction as an overflow probe so `truncated` is truthful. */
+export const CAUSAL_READER_MAX_EDGES = 50;
+export const CAUSAL_READER_MAX_WITNESSES = 3;
+
+type RawEdge = {
+  sourceDocId: number;
+  targetDocId: number;
+  docId: number;
+  title: string;
+  filepath: string;
+  predecessorDocId: number;
+  depth: number;
+  direction: 'causes' | 'caused_by';
+  weight: number;
+  metadata: string | null;
+  edgeCreatedAt: string | null;
+};
+
+/** Deterministic total order for results AND truncation:
+ *  (depth, weight DESC, sourceDocId, targetDocId, direction). */
+function compareCausalEdges(a: RawEdge, b: RawEdge): number {
+  return a.depth - b.depth
+    || b.weight - a.weight
+    || a.sourceDocId - b.sourceDocId
+    || a.targetDocId - b.targetDocId
+    || a.direction.localeCompare(b.direction);
+}
+
+/** Iterative bounded traversal, level-synchronous across BOTH directions so the
+ *  retained set is the globally-first `probeLimit` edges under the reader's
+ *  total order — (depth, weight DESC, sourceDocId, targetDocId, direction) —
+ *  never an ID-arrival-order sample of one direction. Per level, each
+ *  direction's SQL contributes its top `remaining` edges by weight (sufficient:
+ *  the global top-R at one depth needs at most R from either direction), the
+ *  level competes as one pool, and only KEPT edges extend the next frontier —
+ *  a dropped edge never sponsors deeper traversal it wouldn't explain.
+ *
+ *  Eligibility (`active = 1 AND invalidated_at IS NULL`) is enforced on EVERY
+ *  expansion, so an invalidated document stops traversal through it — never
+ *  just hidden from output. Each node expands at most once per direction
+ *  (cycle-safe); distinct edges all surface, so diamond paths keep every real
+ *  edge. Titles are display-bounded so base responses stay under the wire
+ *  ceiling by construction. */
+function collectCausalEdges(
+  db: Database,
+  anchorId: number,
+  dirs: Array<'causes' | 'caused_by'>,
+  maxDepth: number,
+  probeLimit: number,
+): RawEdge[] {
+  const edges: RawEdge[] = [];
+  const seen = new Set<string>();
+  const state = dirs.map(dir => ({
+    dir,
+    frontier: [anchorId] as number[],
+    expanded: new Set<number>([anchorId]),
+  }));
+
+  for (let depth = 1; depth <= maxDepth && edges.length < probeLimit; depth++) {
+    const remaining = probeLimit - edges.length;
+    const level: RawEdge[] = [];
+    for (const st of state) {
+      if (st.frontier.length === 0) continue;
+      const outbound = st.dir === 'causes';
+      const nearCol = outbound ? 'source_id' : 'target_id';
+      const farCol = outbound ? 'target_id' : 'source_id';
+      const placeholders = st.frontier.map(() => '?').join(',');
+      const rows = db.prepare(
+        `SELECT mr.source_id, mr.target_id, mr.weight, mr.metadata,
+                mr.created_at AS edge_created_at,
+                d.title, d.collection || '/' || d.path AS filepath
+         FROM memory_relations mr
+         JOIN documents d ON d.id = mr.${farCol}
+         WHERE mr.${nearCol} IN (${placeholders})
+           AND mr.relation_type = 'causal'
+           AND d.active = 1 AND d.invalidated_at IS NULL
+         ORDER BY COALESCE(mr.weight, 1.0) DESC, mr.source_id, mr.target_id
+         LIMIT ?`,
+      ).all(...st.frontier, remaining) as Array<{
+        source_id: number; target_id: number; weight: number | null;
+        metadata: string | null; edge_created_at: string | null;
+        title: string; filepath: string;
+      }>;
+      for (const row of rows) {
+        const far = outbound ? row.target_id : row.source_id;
+        const near = outbound ? row.source_id : row.target_id;
+        level.push({
+          sourceDocId: row.source_id,
+          targetDocId: row.target_id,
+          docId: far,
+          title: row.title.slice(0, 300),
+          filepath: row.filepath,
+          predecessorDocId: near,
+          depth,
+          direction: st.dir,
+          weight: row.weight ?? 1.0,
+          metadata: row.metadata,
+          edgeCreatedAt: row.edge_created_at,
+        });
+      }
+    }
+
+    // One pool per level: both directions compete under the total order.
+    level.sort(compareCausalEdges);
+    const kept: RawEdge[] = [];
+    for (const e of level) {
+      if (edges.length + kept.length >= probeLimit) break;
+      const key = `${e.sourceDocId}:${e.targetDocId}:${e.direction}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      kept.push(e);
+    }
+    edges.push(...kept);
+
+    let anyFrontier = false;
+    for (const st of state) {
+      const next: number[] = [];
+      for (const e of kept) {
+        if (e.direction !== st.dir) continue;
+        if (!st.expanded.has(e.docId)) {
+          st.expanded.add(e.docId);
+          next.push(e.docId);
+        }
+      }
+      next.sort((a, b) => a - b);
+      st.frontier = next;
+      if (next.length > 0) anyFrontier = true;
+    }
+    if (!anyFrontier) break;
+  }
+  return edges;
+}
+
+type ProjectedWitnessRow = {
+  source_id: number; target_id: number;
+  source_fact_ordinal: number; target_fact_ordinal: number;
+  source_fact: string | null; target_fact: string | null;
+  reasoning: string; confidence: number; legacy: number;
+  created_at: string; last_seen_at: string;
+  pair_rank: number; evidence_count: number;
+};
+
+/** SQL-side witness projection: per ordinal pair the max-confidence sighting
+ *  wins (tie → latest created_at, then highest id), pairs rank by projected
+ *  confidence, and only the top CAUSAL_READER_MAX_WITNESSES rows per edge —
+ *  plus an honest per-edge evidence_count — cross into JS. Sightings are
+ *  append-only forever (recurrence appends by design), so the reader must
+ *  never hydrate an edge's complete history into memory. */
+function projectedWitnessSql(edgeTupleCount: number): string {
+  const valueTuples = Array.from({ length: edgeTupleCount }, () => '(?, ?)').join(',');
+  return `
+    WITH pair_proj AS (
+      SELECT source_id, target_id, source_fact_ordinal, target_fact_ordinal,
+             source_fact, target_fact, reasoning, confidence, legacy, created_at,
+             ROW_NUMBER() OVER (
+               PARTITION BY source_id, target_id, source_fact_ordinal, target_fact_ordinal
+               ORDER BY confidence DESC, created_at DESC, id DESC) AS rn,
+             MAX(created_at) OVER (
+               PARTITION BY source_id, target_id, source_fact_ordinal, target_fact_ordinal) AS last_seen_at
+      FROM causal_witness_sightings
+      WHERE (source_id, target_id) IN (VALUES ${valueTuples})
+    ),
+    ranked AS (
+      SELECT *,
+             ROW_NUMBER() OVER (
+               PARTITION BY source_id, target_id
+               ORDER BY confidence DESC, source_fact_ordinal, target_fact_ordinal) AS pair_rank,
+             COUNT(*) OVER (PARTITION BY source_id, target_id) AS evidence_count
+      FROM pair_proj WHERE rn = 1
+    )
+    SELECT source_id, target_id, source_fact_ordinal, target_fact_ordinal,
+           source_fact, target_fact, reasoning, confidence, legacy, created_at,
+           last_seen_at, pair_rank, evidence_count
+    FROM ranked WHERE pair_rank <= ${CAUSAL_READER_MAX_WITNESSES}`;
+}
+
+/** Lazy read-through for untouched pre-cut edges: synthesize one legacy display
+ *  witness — via the SAME validity rule the writer and census apply
+ *  (`parseLegacyEdgeWitness`), so no surface calls an edge valid that another
+ *  refuses. Never written; invalid evidence yields NO witness. */
+function synthesizeLegacyWitness(edge: RawEdge): CausalWitness | null {
+  const parsed = parseLegacyEdgeWitness({ weight: edge.weight, metadata: edge.metadata });
+  if (!parsed) return null;
+  return {
+    sourceFactOrdinal: -1,
+    targetFactOrdinal: -1,
+    sourceFact: parsed.sourceFact,
+    targetFact: parsed.targetFact,
+    reasoning: parsed.reasoning,
+    confidence: parsed.confidence,
+    strongestAt: edge.edgeCreatedAt ?? '',
+    lastSeenAt: edge.edgeCreatedAt ?? '',
+    legacy: true,
+  };
+}
+
+/**
+ * s342 causal reader: evidence-preserving directed edge traversal.
+ *
+ * Returns directed edge records — invariant sourceDocId/targetDocId with
+ * traversal predecessor/depth/direction separate — each carrying up to
+ * CAUSAL_READER_MAX_WITNESSES projected fact-pair witnesses. One combined
+ * CAUSAL_READER_MAX_EDGES budget spans both directions, with an overflow probe
+ * for a truthful `truncated` flag. Multi-hop CHAIN quality is explicitly
+ * experimental (canon fence): depth > 1 records are per-edge evidence, never a
+ * verified chain.
+ */
 export function findCausalLinks(
   db: Database,
   docId: number,
   direction: 'causes' | 'caused_by' | 'both' = 'both',
   maxDepth: number = 5
-): CausalLink[] {
+): CausalEdgesResult {
   if (maxDepth < 1) maxDepth = 1;
   if (maxDepth > 10) maxDepth = 10;
 
-  let query: string;
+  // Anchor eligibility: an inactive or invalidated anchor yields nothing.
+  const anchor = db.prepare(
+    `SELECT 1 FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL`,
+  ).get(docId);
+  if (!anchor) return { edges: [], truncated: false };
 
-  if (direction === 'causes') {
-    // Outbound: documents this one causes
-    query = `
-      WITH RECURSIVE causal_chain(doc_id, depth, path) AS (
-        -- Base case: immediate causal links outbound
-        SELECT target_id, 1, json_array(?)
-        FROM memory_relations
-        WHERE source_id = ? AND relation_type = 'causal'
+  const probeLimit = CAUSAL_READER_MAX_EDGES + 1;
+  const dirs: Array<'causes' | 'caused_by'> =
+    direction === 'both' ? ['causes', 'caused_by'] : [direction];
 
-        UNION ALL
+  const collected = collectCausalEdges(db, docId, dirs, maxDepth, probeLimit);
+  collected.sort(compareCausalEdges);
+  const truncated = collected.length > CAUSAL_READER_MAX_EDGES;
+  const kept = truncated ? collected.slice(0, CAUSAL_READER_MAX_EDGES) : collected;
 
-        -- Recursive case: follow the chain
-        SELECT mr.target_id, cc.depth + 1, json_insert(cc.path, '$[#]', cc.doc_id)
-        FROM memory_relations mr
-        JOIN causal_chain cc ON mr.source_id = cc.doc_id
-        WHERE cc.depth < ?
-          AND mr.relation_type = 'causal'
-          AND mr.target_id NOT IN (SELECT value FROM json_each(cc.path))
-      )
-      SELECT DISTINCT
-        cc.doc_id as docId,
-        d.title,
-        d.collection || '/' || d.path as filepath,
-        cc.depth,
-        COALESCE(mr.weight, 1.0) as weight,
-        json_extract(mr.metadata, '$.reasoning') as reasoning
-      FROM causal_chain cc
-      JOIN documents d ON d.id = cc.doc_id
-      LEFT JOIN memory_relations mr ON (mr.source_id = ? AND mr.target_id = cc.doc_id AND mr.relation_type = 'causal')
-      WHERE d.active = 1
-      ORDER BY cc.depth, weight DESC
-    `;
-    return db.prepare(query).all(docId, docId, maxDepth, docId) as CausalLink[];
-  } else if (direction === 'caused_by') {
-    // Inbound: documents that cause this one
-    query = `
-      WITH RECURSIVE causal_chain(doc_id, depth, path) AS (
-        -- Base case: immediate causal links inbound
-        SELECT source_id, 1, json_array(?)
-        FROM memory_relations
-        WHERE target_id = ? AND relation_type = 'causal'
-
-        UNION ALL
-
-        -- Recursive case: follow the chain
-        SELECT mr.source_id, cc.depth + 1, json_insert(cc.path, '$[#]', cc.doc_id)
-        FROM memory_relations mr
-        JOIN causal_chain cc ON mr.target_id = cc.doc_id
-        WHERE cc.depth < ?
-          AND mr.relation_type = 'causal'
-          AND mr.source_id NOT IN (SELECT value FROM json_each(cc.path))
-      )
-      SELECT DISTINCT
-        cc.doc_id as docId,
-        d.title,
-        d.collection || '/' || d.path as filepath,
-        cc.depth,
-        COALESCE(mr.weight, 1.0) as weight,
-        json_extract(mr.metadata, '$.reasoning') as reasoning
-      FROM causal_chain cc
-      JOIN documents d ON d.id = cc.doc_id
-      LEFT JOIN memory_relations mr ON (mr.target_id = ? AND mr.source_id = cc.doc_id AND mr.relation_type = 'causal')
-      WHERE d.active = 1
-      ORDER BY cc.depth, weight DESC
-    `;
-    return db.prepare(query).all(docId, docId, maxDepth, docId) as CausalLink[];
-  } else {
-    // Both directions
-    const outbound = findCausalLinks(db, docId, 'causes', maxDepth);
-    const inbound = findCausalLinks(db, docId, 'caused_by', maxDepth);
-
-    // Merge and deduplicate
-    const seen = new Set<number>();
-    const merged: CausalLink[] = [];
-
-    for (const link of [...outbound, ...inbound]) {
-      if (!seen.has(link.docId)) {
-        seen.add(link.docId);
-        merged.push(link);
-      }
+  // Witness hydration: ONE query over the retained edge set, projected in SQL —
+  // at most CAUSAL_READER_MAX_WITNESSES rows per edge reach JS regardless of
+  // how many sightings history has accumulated.
+  const witnessesByEdge = new Map<string, ProjectedWitnessRow[]>();
+  const distinctEdges = [...new Map(kept.map(e => [`${e.sourceDocId}:${e.targetDocId}`, e])).values()];
+  if (distinctEdges.length > 0) {
+    const params = distinctEdges.flatMap(e => [e.sourceDocId, e.targetDocId]);
+    const rows = db.prepare(projectedWitnessSql(distinctEdges.length)).all(...params) as ProjectedWitnessRow[];
+    for (const row of rows) {
+      const key = `${row.source_id}:${row.target_id}`;
+      const list = witnessesByEdge.get(key) ?? [];
+      list.push(row);
+      witnessesByEdge.set(key, list);
     }
-
-    return merged.sort((a, b) => a.depth - b.depth || b.weight - a.weight);
   }
+
+  const edges: CausalEdgeRecord[] = kept.map(edge => {
+    const projected = witnessesByEdge.get(`${edge.sourceDocId}:${edge.targetDocId}`);
+    if (projected && projected.length > 0) {
+      projected.sort((a, b) => a.pair_rank - b.pair_rank);
+      return {
+        sourceDocId: edge.sourceDocId,
+        targetDocId: edge.targetDocId,
+        docId: edge.docId,
+        title: edge.title,
+        filepath: edge.filepath,
+        predecessorDocId: edge.predecessorDocId,
+        depth: edge.depth,
+        direction: edge.direction,
+        weight: edge.weight,
+        evidenceCount: projected[0]!.evidence_count,
+        witnesses: projected.map(w => ({
+          sourceFactOrdinal: w.source_fact_ordinal,
+          targetFactOrdinal: w.target_fact_ordinal,
+          sourceFact: w.source_fact,
+          targetFact: w.target_fact,
+          reasoning: w.reasoning,
+          confidence: w.confidence,
+          strongestAt: w.created_at,
+          lastSeenAt: w.last_seen_at,
+          legacy: w.legacy === 1,
+        })),
+        legacy: false,
+      };
+    }
+    const synthesized = synthesizeLegacyWitness(edge);
+    return {
+      sourceDocId: edge.sourceDocId,
+      targetDocId: edge.targetDocId,
+      docId: edge.docId,
+      title: edge.title,
+      filepath: edge.filepath,
+      predecessorDocId: edge.predecessorDocId,
+      depth: edge.depth,
+      direction: edge.direction,
+      weight: edge.weight,
+      evidenceCount: synthesized ? 1 : 0,
+      witnesses: synthesized ? [synthesized] : [],
+      legacy: true,
+    };
+  });
+
+  return { edges, truncated };
 }
 
 // =============================================================================

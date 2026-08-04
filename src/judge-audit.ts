@@ -27,6 +27,7 @@ export type JudgeRunOutcome =
   | "timeout"
   | "http"
   | "aborted"
+  | "skipped_budget"
   | "write_error";
 
 export type JudgeEventType = "verdict" | "reject" | "error";

@@ -144,7 +144,22 @@ k-NN vector neighbors of a reference document.
 
 ### find_causal_links
 
-Trace causal decision chains from a document.
+Evidence-preserving directed causal edge traversal from a document. Each result is
+an edge record with invariant `sourceDocId`/`targetDocId` (the physical edge) plus
+separate traversal provenance (`predecessorDocId`, `depth`, `direction`), carrying
+up to 3 fact-pair witnesses (`sourceFactOrdinal`/`targetFactOrdinal`, fact
+snapshots, reasoning, confidence, `strongestAt`/`lastSeenAt`) and an honest
+`evidenceCount`. Pre-cut edges without stored witnesses surface one synthesized
+`legacy` display witness from edge metadata when it is valid.
+
+**Multi-hop CHAIN quality is experimental**: records at `depth > 1` are per-edge
+evidence along a traversal, not a verified causal chain.
+
+Bounds: one combined 50-edge budget across both directions with a truthful
+`truncated` flag, and the complete serialized result (text and structured copies
+together) is capped at 64 KiB — truncation drops whole edges from both
+representations symmetrically in the deterministic order
+(depth, weight DESC, sourceDocId, targetDocId, direction).
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|

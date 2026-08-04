@@ -20,6 +20,12 @@ This installs hooks into `~/.claude/settings.json`:
 | `handoff-generator` | Stop | 30s | Summarize session for continuity |
 | `feedback-loop` | Stop | 30s | Track referenced notes, boost confidence |
 
+`decision-extractor` runs its model-bearing phases under an internal whole-handler
+budget, `CLAWMEM_STOP_BUDGET_MS` (default 25000 ms), so it finishes and persists
+before the host's 30s Stop timeout kills it. If you raise the budget, raise the
+installed hook `timeout` too — the host timeout must always exceed the budget
+plus a safety margin ([configuration](../reference/configuration.md)).
+
 ## Manual install (full reference)
 
 If you prefer to configure hooks manually instead of running `setup hooks`, add this to `~/.claude/settings.json`. Replace `/path/to/clawmem` with your actual install path (e.g. `~/.bun/bin/clawmem` or `~/clawmem/bin/clawmem`):

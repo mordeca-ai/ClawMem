@@ -23,9 +23,10 @@ import {
   rethrowIfFatalVectorError,
   type Store,
   type SearchResult,
-  type CausalLink,
+  type CausalEdgeRecord,
   type EvolutionEntry,
 } from "./store.ts";
+import { capCausalWire } from "./causal-reader.ts";
 import {
   applyCompositeScoring,
   hasRecencyIntent,
@@ -1857,9 +1858,9 @@ This is the recommended entry point for ALL memory queries.`,
     "find_causal_links",
     {
       title: "Find Causal Links",
-      description: "USE THIS to trace decision chains: 'what led to X', 'trace how we got from A to B'. Follow up intent_search with this tool on a top result to walk the full causal chain. Returns depth-annotated links with reasoning.",
+      description: "USE THIS to trace causal evidence: 'what led to X', 'what did X cause'. Returns directed causal edge records — invariant sourceDocId/targetDocId plus separate traversal depth/direction — each carrying up to 3 fact-pair witnesses with reasoning. Evidence-preserving edge traversal; multi-hop CHAIN quality is experimental (depth > 1 records are per-edge evidence, not a verified chain).",
       inputSchema: {
-        docid: z.string().describe("Document ID (e.g., '#123' or path)"),
+        docid: z.string().describe("Document ID (e.g., '#a1b2c3' — a 6-64 char hex hash prefix)"),
         direction: z.enum(['causes', 'caused_by', 'both']).optional().default('both').describe("Direction: 'causes' (outbound), 'caused_by' (inbound), or 'both'"),
         depth: z.number().optional().default(5).describe("Maximum traversal depth (1-10)"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
@@ -1867,67 +1868,93 @@ This is the recommended entry point for ALL memory queries.`,
     },
     async ({ docid, direction, depth, vault }) => {
       const store = getStore(vault);
+      // s342 D4: EVERY exit of this tool — errors included — is byte-bounded.
+      // The caller-controlled docid is display-bounded before it is echoed.
+      const docidEcho = docid.slice(0, 256);
       // Resolve docid to document
       const resolved = store.findDocumentByDocid(docid);
       if (!resolved) {
         return {
-          content: [{ type: "text", text: `Document not found: ${docid}` }],
+          content: [{ type: "text", text: `Document not found: ${docidEcho}` }],
         };
       }
 
-      // Get the numeric docId
+      // Get the numeric docId. s342: anchor eligibility — the reader enforces
+      // `active = 1 AND invalidated_at IS NULL` on the anchor and on every
+      // recursive expansion, so an invalidated anchor resolves to nothing here.
       const doc = store.db.prepare(`
         SELECT id, title, collection, path
         FROM documents
-        WHERE hash = ? AND active = 1
+        WHERE hash = ? AND active = 1 AND invalidated_at IS NULL
         LIMIT 1
       `).get(resolved.hash) as { id: number; title: string; collection: string; path: string } | undefined;
 
       if (!doc) {
         return {
-          content: [{ type: "text", text: `Document not found: ${docid}` }],
+          content: [{ type: "text", text: `Document not found: ${docidEcho}` }],
         };
       }
 
-      // Find causal links
-      const links = store.findCausalLinks(doc.id, direction, depth);
+      // Evidence-preserving directed edge traversal (s342 reader)
+      const { edges, truncated } = store.findCausalLinks(doc.id, direction, depth);
 
-      if (links.length === 0) {
-        return {
-          content: [{ type: "text", text: `No causal links found for "${doc.title}" (${direction})` }],
-          structuredContent: { source: doc, links: [] },
-        };
-      }
-
-      // Format summary
-      const directionLabel = direction === 'causes' ? 'causes' : direction === 'caused_by' ? 'is caused by' : 'is causally related to';
-      const lines = [`"${doc.title}" ${directionLabel} ${links.length} document(s):\n`];
-
-      for (const link of links) {
-        const confidence = Math.round(link.weight * 100);
-        const reasoning = link.reasoning ? ` - ${link.reasoning}` : '';
-        lines.push(`[Depth ${link.depth}] ${confidence}% ${link.title} (${link.filepath})${reasoning}`);
-      }
-
-      return {
-        content: [{ type: "text", text: lines.join('\n') }],
+      // EVERY result shape — including zero edges — goes through the wire cap:
+      // both representations are built from ONE retained edge set and capped
+      // together as the complete serialized result (CAUSAL_READER_MAX_BYTES).
+      // Base fields are display-bounded so the empty response always fits, and
+      // the overflow envelope backstops the ceiling unconditionally.
+      const anchorTitle = doc.title.slice(0, 300);
+      const anchorPath = `${doc.collection}/${doc.path}`.slice(0, 600);
+      type CausalToolResult = {
+        content: Array<{ type: "text"; text: string }>;
         structuredContent: {
-          source: {
-            id: doc.id,
-            title: doc.title,
-            filepath: `${doc.collection}/${doc.path}`,
-          },
-          direction,
-          links: links.map(l => ({
-            id: l.docId,
-            title: l.title,
-            filepath: l.filepath,
-            depth: l.depth,
-            confidence: Math.round(l.weight * 100),
-            reasoning: l.reasoning,
-          })),
-        },
+          source?: { id: number; title: string; filepath: string };
+          direction: typeof direction;
+          links: CausalEdgeRecord[];
+          truncated: boolean;
+          overflow?: boolean;
+        };
       };
+      return capCausalWire<CausalToolResult>(edges, truncated, (kept: CausalEdgeRecord[], isTruncated: boolean) => {
+        const lines = kept.length === 0
+          ? [
+              isTruncated
+                ? `Causal edges exist for "${anchorTitle}" (${direction}) but none fit the response ceiling.`
+                : `No causal links found for "${anchorTitle}" (${direction})`,
+            ]
+          : [
+              `"${anchorTitle}" has ${kept.length} causal edge(s) (${direction})` +
+              `${isTruncated ? ' [truncated]' : ''}:\n`,
+            ];
+        for (const edge of kept) {
+          const pct = Math.round(edge.weight * 100);
+          const arrow = edge.direction === 'causes' ? '→' : '←';
+          lines.push(
+            `[depth ${edge.depth}] ${arrow} ${pct}% ${edge.title} (${edge.filepath}) ` +
+            `— edge ${edge.sourceDocId}→${edge.targetDocId}, ${edge.evidenceCount} witness(es)` +
+            `${edge.legacy ? ' [legacy]' : ''}`,
+          );
+          for (const w of edge.witnesses) {
+            lines.push(`    · [${w.sourceFactOrdinal}→${w.targetFactOrdinal}] ${Math.round(w.confidence * 100)}% ${w.reasoning}`);
+          }
+        }
+        return {
+          content: [{ type: "text", text: lines.join('\n') }],
+          structuredContent: {
+            source: {
+              id: doc.id,
+              title: anchorTitle,
+              filepath: anchorPath,
+            },
+            direction,
+            links: kept,
+            truncated: isTruncated,
+          },
+        };
+      }, () => ({
+        content: [{ type: "text", text: "Causal response exceeds the reader byte ceiling even with zero edges — refine the request." }],
+        structuredContent: { direction, links: [], truncated: true, overflow: true },
+      }));
     }
   );
 
@@ -2020,7 +2047,7 @@ This is the recommended entry point for ALL memory queries.`,
       title: "Memory Evolution Status",
       description: "Get the evolution timeline for a memory document, showing how its keywords and context have changed over time based on new evidence.",
       inputSchema: {
-        docid: z.string().describe("Document ID (e.g., '#123' or path)"),
+        docid: z.string().describe("Document ID (e.g., '#a1b2c3' — a 6-64 char hex hash prefix)"),
         limit: z.number().optional().default(10).describe("Maximum number of evolution entries to return (1-100)"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
@@ -2125,7 +2152,7 @@ This is the recommended entry point for ALL memory queries.`,
       title: "Document Timeline",
       description: "Show the temporal neighborhood around a document — what was created/modified before and after it. Token-efficient progressive disclosure: search → timeline (context) → get (full content). Use after finding a document via search to understand what happened around it.",
       inputSchema: {
-        docid: z.string().describe("Document ID (e.g., '#123' or short hash)"),
+        docid: z.string().describe("Document ID (e.g., '#a1b2c3' — a 6-64 char hex hash prefix)"),
         before: z.number().optional().default(5).describe("Number of documents to show before the focus (1-20)"),
         after: z.number().optional().default(5).describe("Number of documents to show after the focus (1-20)"),
         same_collection: z.boolean().optional().default(false).describe("Constrain to same collection (like session scoping)"),

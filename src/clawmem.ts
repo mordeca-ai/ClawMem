@@ -4,7 +4,7 @@
  */
 
 import { parseArgs } from "util";
-import { existsSync, mkdirSync, readFileSync, statSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { resolve as pathResolve, basename, relative as pathRelative } from "path";
 import { createHash } from "crypto";
 import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
@@ -3326,6 +3326,12 @@ async function main() {
       case "diary":
         await cmdDiary(subArgs);
         break;
+      case "migrate":
+        await cmdMigrate(subArgs);
+        break;
+      case "causal-audit":
+        await cmdCausalAudit(subArgs);
+        break;
       case "help":
       case "--help":
       case "-h":
@@ -3337,6 +3343,282 @@ async function main() {
     }
   } finally {
     closeStore();
+  }
+}
+
+// =============================================================================
+// migrate causal-witnesses — s342 legacy-evidence resolution (operator CLI)
+// =============================================================================
+
+function parseEdgeArg(raw: string): { sourceId: number; targetId: number } {
+  const m = raw.match(/^(\d+):(\d+)$/);
+  if (!m) die(`--edge expects <sourceDocId>:<targetDocId> (got "${raw}")`);
+  return { sourceId: Number(m[1]), targetId: Number(m[2]) };
+}
+
+/**
+ * `clawmem migrate causal-witnesses` — the operator surface for causal edges the
+ * writer refuses to touch (zero sightings + metadata that cannot yield a valid
+ * witness). Preflight is REQUIRED (or every unresolved edge resolved) before
+ * setting CLAWMEM_CAUSAL_WRITER=on. Application is explicit-selection only —
+ * bulk "resolve all qualifying" does not exist — and is bound to the preview by
+ * a version-tagged full-row fingerprint rechecked under the write lock.
+ */
+async function cmdMigrate(args: string[]) {
+  const sub = args[0];
+  if (sub !== "causal-witnesses") {
+    die("Usage: clawmem migrate causal-witnesses --preflight [--out <manifest.json>]\n" +
+        "       clawmem migrate causal-witnesses --resolve-unmaterializable keep-weight|retire-edge \\\n" +
+        "           --manifest <file> --edge <src>:<tgt> [--edge ...] [--note <text>] [--apply]\n" +
+        "       clawmem migrate causal-witnesses --restore-edge <src>:<tgt> [--apply]");
+  }
+  const rest = args.slice(1);
+  const {
+    causalWitnessCensus, buildResolutionManifest, applyResolution, restoreRetiredEdge,
+    insertCausalRun, finalizeCliCausalRun, CAUSAL_FINGERPRINT_VERSION,
+  } = await import("./causal-writer.ts");
+  const { randomUUID } = await import("node:crypto");
+
+  const flagValue = (name: string): string | null => {
+    const i = rest.indexOf(name);
+    if (i === -1) return null;
+    const v = rest[i + 1];
+    if (!v || v.startsWith("--")) die(`${name} requires a value`);
+    return v;
+  };
+  const edgeArgs: { sourceId: number; targetId: number }[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--edge") {
+      const v = rest[i + 1];
+      if (!v) die("--edge requires a value");
+      edgeArgs.push(parseEdgeArg(v));
+    }
+  }
+  const apply = rest.includes("--apply");
+  const s = getStore();
+
+  // --- restore-edge -----------------------------------------------------------
+  const restoreRaw = flagValue("--restore-edge");
+  if (restoreRaw) {
+    const edge = parseEdgeArg(restoreRaw);
+    const archived = s.db.prepare(
+      `SELECT weight, metadata, created_at, retired_at, operator_note FROM retired_causal_edges
+       WHERE source_id = ? AND target_id = ? AND relation_type = 'causal'`,
+    ).get(edge.sourceId, edge.targetId) as { weight: number | null; retired_at: string; operator_note: string | null } | undefined;
+    if (!archived) {
+      die(`No archived causal edge ${edge.sourceId}→${edge.targetId} in retired_causal_edges.`);
+    }
+    if (!apply) {
+      console.log(`${c.cyan}Would restore${c.reset} edge ${edge.sourceId}→${edge.targetId} ` +
+        `(weight ${archived.weight}, retired ${archived.retired_at}` +
+        `${archived.operator_note ? `, note: ${archived.operator_note}` : ""}). Re-run with --apply.`);
+      return;
+    }
+    const startedAtMs = Date.now();
+    const runKey = randomUUID();
+    // Pessimistic terminal outcome: the row is BORN cli_error and only a
+    // successful finalization flips it to cli_ok — a writer lock that kills
+    // both the operation and the finalization leaves an honest cli_error,
+    // never a stranded in_progress row.
+    const runId = insertCausalRun(s.db, { runKey, source: "cli_migrate", mode: "cli", outcome: "cli_error" });
+    let outcome: ReturnType<typeof restoreRetiredEdge>;
+    try {
+      outcome = restoreRetiredEdge(s.db, edge, { runKey, runId });
+    } catch (err) {
+      finalizeCliCausalRun(s.db, runId, "cli_error", startedAtMs);
+      throw err;
+    }
+    finalizeCliCausalRun(s.db, runId, outcome.status === "restored" ? "cli_ok" : "cli_error", startedAtMs);
+    if (outcome.status === "restored") {
+      console.log(`${c.green}Restored${c.reset} causal edge ${edge.sourceId}→${edge.targetId} from the archive.`);
+    } else if (outcome.status === "not_archived") {
+      die(`Edge ${edge.sourceId}→${edge.targetId} vanished from the archive before apply.`);
+    } else {
+      // Fail-closed: a key or foreign-key CONSTRAINT refused the plain INSERT —
+      // an active edge may occupy the composite key, or an endpoint document is
+      // missing. Either way nothing was replaced and the archive row is untouched.
+      die(`Restore REFUSED (fail-closed): ${outcome.reason}\n` +
+          `A key/FK constraint refused ${edge.sourceId}→${edge.targetId} (occupied key or missing endpoint); ` +
+          `the archive row is untouched.`);
+    }
+    return;
+  }
+
+  // --- preflight --------------------------------------------------------------
+  if (rest.includes("--preflight")) {
+    const entries = causalWitnessCensus(s.db);
+    const unresolved = entries.filter(e => !e.materializable);
+    const materializable = entries.filter(e => e.materializable);
+    console.log(`Causal witness census (observation-lane edges with zero sightings):`);
+    console.log(`  ${materializable.length} edge(s) with valid old-writer metadata — will materialize lazily on first live touch; no action needed.`);
+    console.log(`  ${unresolved.length} UNRESOLVED edge(s) — metadata cannot yield a valid witness; the writer fails closed on these until resolved:`);
+    for (const e of unresolved) {
+      const metaHead = (e.row.metadata ?? "<null>").slice(0, 80);
+      console.log(`    ${c.yellow}${e.row.source_id}→${e.row.target_id}${c.reset} weight=${e.row.weight} metadata=${JSON.stringify(metaHead)}`);
+    }
+    const outPath = flagValue("--out");
+    if (outPath) {
+      const manifest = buildResolutionManifest(entries);
+      writeFileSync(outPath, JSON.stringify(manifest, null, 2));
+      console.log(`\nManifest (${manifest.edges.length} edge(s), fingerprint ${CAUSAL_FINGERPRINT_VERSION}) written to ${outPath}.`);
+      console.log(`Resolve with: clawmem migrate causal-witnesses --resolve-unmaterializable keep-weight|retire-edge --manifest ${outPath} --edge <src>:<tgt> --apply`);
+    } else if (unresolved.length > 0) {
+      console.log(`\nRe-run with --out <manifest.json> to emit the binding manifest required by --apply.`);
+    }
+    if (unresolved.length === 0) {
+      console.log(`${c.green}Preflight clean${c.reset} — safe to set CLAWMEM_CAUSAL_WRITER=on.`);
+    }
+    return;
+  }
+
+  // --- resolve-unmaterializable ----------------------------------------------
+  const action = flagValue("--resolve-unmaterializable");
+  if (!action) {
+    die("Nothing to do: pass --preflight, --resolve-unmaterializable, or --restore-edge.");
+  }
+  if (action !== "keep-weight" && action !== "retire-edge") {
+    die(`--resolve-unmaterializable must be keep-weight or retire-edge (got "${action}")`);
+  }
+  // Bulk resolution is refused for unprovable-origin metadata: application acts
+  // only on edges EXPLICITLY SELECTED from the preview, never on "all qualifying".
+  if (edgeArgs.length === 0) {
+    die("Explicit selection required: pass one --edge <src>:<tgt> per edge from the preflight preview. Bulk resolution is not supported.");
+  }
+  const manifestPath = flagValue("--manifest");
+  if (!manifestPath) {
+    die("--manifest <file> (from --preflight --out) is required — application is bound to the previewed row images.");
+  }
+  let manifest: { version: string; edges: Array<{ sourceId: number; targetId: number; fingerprint: string; materializable: boolean }> };
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+  } catch (err) {
+    die(`Cannot read manifest ${manifestPath}: ${err}`);
+  }
+  const note = flagValue("--note");
+
+  if (!apply) {
+    for (const edge of edgeArgs) {
+      const entry = manifest.edges.find(e => e.sourceId === edge.sourceId && e.targetId === edge.targetId);
+      if (!entry) {
+        console.log(`${c.red}NOT IN MANIFEST${c.reset} ${edge.sourceId}→${edge.targetId} — regenerate the preflight preview.`);
+      } else if (entry.materializable) {
+        console.log(`${c.red}WOULD REFUSE${c.reset} ${edge.sourceId}→${edge.targetId}: materializable (valid old-writer metadata) — resolves itself lazily; no action needed.`);
+      } else {
+        console.log(`${c.cyan}Would ${action}${c.reset} ${edge.sourceId}→${edge.targetId} (fingerprint ${entry.fingerprint.slice(0, 12)}…).`);
+      }
+    }
+    console.log(`Re-run with --apply to execute.`);
+    return;
+  }
+
+  const startedAtMs = Date.now();
+  const runKey = randomUUID();
+  // Pessimistic terminal outcome (same discipline as restore): born cli_error,
+  // flipped to cli_ok only by successful finalization — failure representation
+  // never depends on a second successful write.
+  const runId = insertCausalRun(s.db, { runKey, source: "cli_migrate", mode: "cli", outcome: "cli_error" });
+  let failures = 0;
+  try {
+    for (const edge of edgeArgs) {
+      const entry = manifest.edges.find(e => e.sourceId === edge.sourceId && e.targetId === edge.targetId);
+      if (!entry) {
+        console.log(`${c.red}REFUSED${c.reset} ${edge.sourceId}→${edge.targetId}: not in the manifest — regenerate the preflight preview.`);
+        failures++;
+        continue;
+      }
+      // Resolution acts on UNRESOLVED edges only — an edge whose old-writer
+      // metadata is valid materializes lazily and must never be retired here.
+      if (entry.materializable) {
+        console.log(`${c.red}REFUSED${c.reset} ${edge.sourceId}→${edge.targetId}: materializable (valid old-writer metadata) — no resolution needed.`);
+        failures++;
+        continue;
+      }
+      const outcome = applyResolution(
+        s.db,
+        { sourceId: edge.sourceId, targetId: edge.targetId, fingerprint: entry.fingerprint, manifestVersion: manifest.version },
+        action,
+        { runKey, runId, operatorNote: note },
+      );
+      if (outcome.status === "resolved") {
+        console.log(`${c.green}${action === "keep-weight" ? "Materialized" : "Retired"}${c.reset} ${edge.sourceId}→${edge.targetId}.`);
+      } else if (outcome.status === "stale") {
+        console.log(`${c.yellow}STALE${c.reset} ${edge.sourceId}→${edge.targetId}: ${outcome.reason} — row untouched; re-run --preflight.`);
+        failures++;
+      } else {
+        console.log(`${c.red}REFUSED${c.reset} ${edge.sourceId}→${edge.targetId}: ${outcome.reason}`);
+        failures++;
+      }
+    }
+  } catch (err) {
+    finalizeCliCausalRun(s.db, runId, "cli_error", startedAtMs);
+    throw err;
+  }
+  finalizeCliCausalRun(s.db, runId, failures > 0 ? "cli_error" : "cli_ok", startedAtMs);
+  if (failures > 0) {
+    process.exitCode = 1;
+  }
+}
+
+/**
+ * `clawmem causal-audit` — the D5 operator inspection surface over
+ * `causal_runs` / `causal_run_events` (shadow-mode calibration and general
+ * writer forensics). Read-only.
+ */
+async function cmdCausalAudit(args: string[]) {
+  const s = getStore();
+  const json = args.includes("--json");
+  const runKeyIdx = args.indexOf("--run");
+  const runKey = runKeyIdx !== -1 ? args[runKeyIdx + 1] : null;
+  const limitIdx = args.indexOf("--limit");
+  const limit = limitIdx !== -1 ? Math.max(1, Math.min(200, Number(args[limitIdx + 1]) || 20)) : 20;
+
+  if (runKey) {
+    const run = s.db.prepare(`SELECT * FROM causal_runs WHERE run_key = ?`).get(runKey) as Record<string, unknown> | null;
+    if (!run) die(`No causal run with run_key ${runKey}.`);
+    const events = s.db.prepare(
+      `SELECT scope, event_type, source_doc_id, target_doc_id, source_fact_ordinal,
+              target_fact_ordinal, confidence, detail, created_at
+       FROM causal_run_events WHERE run_id = ? ORDER BY id`,
+    ).all(run.id as number) as Record<string, unknown>[];
+    if (json) {
+      console.log(JSON.stringify({ run, events }, null, 2));
+      return;
+    }
+    console.log(`${c.bold}Run ${runKey}${c.reset} (${run.source}/${run.mode}) outcome=${c.cyan}${run.outcome}${c.reset}`);
+    console.log(`  started=${run.started_at} finished=${run.finished_at ?? "—"} duration=${run.duration_ms ?? "—"}ms model=${run.model ?? "—"}`);
+    console.log(`  new=${run.new_doc_count} window=${run.window_doc_count} candidates=${run.candidate_count} admitted=${run.admitted_count}`);
+    console.log(`  edges: written=${run.edges_written} refused=${run.edges_refused} errored=${run.edges_errored}`);
+    console.log(`  ${events.length} event(s):`);
+    for (const ev of events) {
+      const pair = ev.source_doc_id != null ? ` ${ev.source_doc_id}→${ev.target_doc_id ?? "?"}` : "";
+      const ords = ev.source_fact_ordinal != null ? ` [${ev.source_fact_ordinal}→${ev.target_fact_ordinal}]` : "";
+      const conf = ev.confidence != null ? ` conf=${ev.confidence}` : "";
+      const detail = ev.detail ? ` — ${String(ev.detail).slice(0, 80)}` : "";
+      console.log(`    ${String(ev.scope).padEnd(8)} ${c.cyan}${ev.event_type}${c.reset}${pair}${ords}${conf}${detail}`);
+    }
+    return;
+  }
+
+  const runs = s.db.prepare(
+    `SELECT run_key, session_id, source, mode, outcome, candidate_count, admitted_count,
+            edges_written, edges_refused, edges_errored, started_at, duration_ms
+     FROM causal_runs ORDER BY started_at DESC, id DESC LIMIT ?`,
+  ).all(limit) as Record<string, unknown>[];
+  if (json) {
+    console.log(JSON.stringify(runs, null, 2));
+    return;
+  }
+  if (runs.length === 0) {
+    console.log("No causal runs recorded. The writer audits runs when CLAWMEM_CAUSAL_WRITER is shadow or on.");
+    return;
+  }
+  console.log(`${c.bold}Recent causal runs${c.reset} (${runs.length}; --run <run_key> for events):`);
+  for (const r of runs) {
+    console.log(
+      `  ${r.started_at}  ${String(r.mode).padEnd(6)} ${c.cyan}${String(r.outcome).padEnd(14)}${c.reset} ` +
+      `cand=${r.candidate_count} adm=${r.admitted_count} w/r/e=${r.edges_written}/${r.edges_refused}/${r.edges_errored} ` +
+      `${r.duration_ms ?? "—"}ms  ${c.dim}${r.run_key}${c.reset}`,
+    );
   }
 }
 
@@ -3994,6 +4276,15 @@ ${c.bold}Integration:${c.reset}
   clawmem update-context               Regenerate all directory CLAUDE.md files
   clawmem doctor                       Full health check
   clawmem rerank-health [--json]       Probe reranker discrimination (exit 1 if degenerate)
+  clawmem migrate causal-witnesses --preflight [--out <manifest.json>]
+                                       Census unresolved pre-cut causal edges (run before CLAWMEM_CAUSAL_WRITER=on)
+  clawmem migrate causal-witnesses --resolve-unmaterializable keep-weight|retire-edge
+      --manifest <file> --edge <src>:<tgt> [--note <text>] [--apply]
+                                       Resolve an explicitly selected unresolved edge (manifest-bound)
+  clawmem migrate causal-witnesses --restore-edge <src>:<tgt> [--apply]
+                                       Restore a retired causal edge from the archive (fail-closed)
+  clawmem causal-audit [--limit N] [--run <run_key>] [--json]
+                                       Inspect causal writer runs/events (shadow calibration)
 
 ${c.bold}Options:${c.reset}
   -n, --num <N>        Number of results

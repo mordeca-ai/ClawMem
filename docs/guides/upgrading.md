@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.30.0**.
+Guide for upgrading between released versions. Current: **v0.33.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -17,7 +17,7 @@ cd ~/clawmem && git pull
 systemctl --user restart clawmem-watcher.service  # if installed as a user unit
 ```
 
-Hooks (spawned fresh per Claude Code invocation) and the MCP stdio server (respawned per Claude Code session) pick up new code automatically on their next invocation — no restart required for those. Only persistent daemons like `clawmem watch`, `clawmem serve`, and the systemd embed/watcher/curator units need to be restarted.
+Hooks (spawned fresh per Claude Code invocation) pick up new code automatically on their next invocation. The MCP stdio server is respawned per agent session — a **new** session gets the new code, but a session already open when you upgrade keeps its old-code server alive until you reconnect (`/mcp` in Claude Code) or close it. For most releases that stale server is harmless — it just lacks the new features. **For releases that migrate the vault and change write semantics (v0.31.0, v0.32.0), it is not** — see the mixed-version caution in the v0.31.0 section below. The safe order on those upgrades: stop persistent daemons (`clawmem watch`, `clawmem serve`, the systemd embed/watcher/curator units) → upgrade → reconnect or restart every open agent session → start the daemons again.
 
 ### What auto-applies on first open
 
@@ -59,12 +59,54 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.33.0: the causal witness writer + Stop-hook deadline + docid validation
+
+**Migration is automatic** on first open and additive only: four new tables (`causal_runs`,
+`causal_run_events`, `causal_witness_sightings`, `retired_causal_edges`) plus indexes. No data
+backfill, no manual step.
+
+**Mixed-version exposure is lower than v0.31/v0.32** — the schema additions are ignored by old
+code and the causal writer defaults to `off`, so a stale process cannot corrupt the new state.
+What a stale process DOES keep until restarted: the unescaped-docid lookup (the `_`/`%` wildcard
+vulnerability, reachable through REST `/documents/{docid}/forget`) and the unbounded Stop-hook
+phases. Restart daemons and reconnect open agent sessions to retire both.
+
+**Before arming the writer** (`CLAWMEM_CAUSAL_WRITER=on`): run
+`clawmem migrate causal-witnesses --preflight`. Edges from the pre-v0.30 writer whose metadata
+cannot yield a valid witness make the new writer fail closed on those candidates; resolve them
+(`--resolve-unmaterializable keep-weight|retire-edge`, manifest-bound, explicitly selected edges
+only — retirement is reversible via `--restore-edge`) or accept the per-candidate refusals.
+Recommended order: `shadow` first, read `clawmem causal-audit` for a few sessions, then `on`.
+
+**Behavior to check after upgrading:**
+
+- Docids are structurally validated everywhere (`^[0-9a-fA-F]{6,64}$` after `#` strip): `_`, `%`,
+  non-hex, and prefixes shorter than 6 now return not-found on every docid surface, MCP and REST.
+  Anything that relied on wildcard matching was relying on the vulnerability.
+- The `decision-extractor` Stop hook now runs to a whole-handler deadline
+  (`CLAWMEM_STOP_BUDGET_MS`, default 25000): under a slow inference server, phases are skipped
+  (audited + logged) instead of overrunning the host hook timeout. Ensure the installed host hook
+  timeout exceeds the budget plus margin (default 25s sits under Claude Code's 30s).
+- `find_causal_links` (MCP + REST) returns the new directed edge-record shape with fact-pair
+  witnesses, capped at a 64 KiB response ceiling that drops whole edges from the tail. Consumers
+  parsing the old shape need updating.
+- With the writer `off` (default), no causal model call and no causal rows — the audit surfaces
+  stay empty until you arm `shadow`/`on`.
+
+---
+
 ## v0.32.0: the shared causal pipeline + knowledge-graph evidence
 
 **Migration is automatic** on first open: a new `entity_triple_provenance` table records one row
 per unique evidence source per knowledge-graph fact, backfilled from every existing triple's
 inline evidence (a triple with no inline evidence gets a single `unattributed` row). The backfill
 is idempotent and read-guarded — steady-state opens perform no writes.
+
+**Upgrading with concurrent writers:** the [v0.31.0 mixed-version caution](#v0310-forget-and-archive-survive-re-indexing)
+applies here too. An old-code process still writing after the vault has migrated inserts
+knowledge-graph facts without evidence rows — repaired by a later open's backfill — and keeps
+dropping repeat sightings outright, which is not recoverable: the evidence row is simply never
+written. Restart daemons and reconnect open agent sessions together.
 
 **Behavior to check after upgrading:**
 
@@ -91,6 +133,17 @@ is idempotent and read-guarded — steady-state opens perform no writes.
 each row was deactivated (`absent` / `forget` / `archive`); existing archived rows are backfilled
 as `'archive'`, and any row a previous version left simultaneously active-and-archived is
 repaired to archived (count reported on stderr — use `lifecycle_restore` to bring any back).
+
+**Mixed-version caution — restart every writer together.** Once any new-code process has opened
+(and therefore migrated) the vault, a still-running old-code process must not keep writing. An
+old-code writer deactivates documents without recording a reason, and the new indexer
+deliberately treats reason-less deactivation as legacy absence — so a `memory_forget` issued
+through a stale session can be reactivated by the next re-index: the exact bug this release
+fixes, reintroduced by the stale process. Exposure requires concurrent long-lived writers — the
+watcher, `clawmem serve`, or an MCP server in an agent session that stays open across the
+upgrade; a single-session setup with no daemons needs nothing beyond the quick path. The
+discipline is one line: restart the daemons and reconnect (`/mcp`) or restart every open agent
+session as part of the upgrade, so no pre-upgrade process keeps writing afterward.
 
 **Behavior to check after upgrading:**
 
