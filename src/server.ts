@@ -12,11 +12,11 @@
 
 import type { Server } from "bun";
 import type { Store, SearchResult, TimelineResult } from "./store.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, attachRrfScores } from "./search-utils.ts";
+import { enrichResults } from "./search-utils.ts";
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { listCollections } from "./collections.ts";
-import { classifyIntent, type IntentType } from "./intent.ts";
+import { runCausalRetrieval, hasCausalSignal, hasTimelineSignal } from "./causal-retrieval.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import {
   DEFAULT_EMBED_MODEL,
@@ -586,8 +586,10 @@ async function handleBuildGraphs(req: Request, _url: URL, store: Store): Promise
 
 function classifyRetrievalMode(query: string): "keyword" | "semantic" | "causal" | "timeline" | "hybrid" {
   const q = query.toLowerCase();
-  if (/\b(last session|yesterday|prior session|previous session|last time we|handoff|what happened last|what did we do)\b/i.test(q)) return "timeline";
-  if (/\b(why did|why was|what caused|what led to|reason for|decided to|decision about|trade.?off|chose to)\b/i.test(q) || /^why\b/i.test(q)) return "causal";
+  // Shared signal source with the MCP classifier (causal-retrieval.ts). The REST copy used to
+  // recognize neither "why were" nor "because we", so those queries never routed causal here.
+  if (hasTimelineSignal(q)) return "timeline";
+  if (hasCausalSignal(q)) return "causal";
   if (q.length < 50 && (/[A-Z][A-Z0-9_]{2,}/.test(query) || /[\w-]+\.\w{2,4}\b/.test(q.trim()))) return "keyword";
   if (/\b(how does|explain|concept|overview|understand|what is the purpose)\b/i.test(q)) return "semantic";
   return "hybrid";
@@ -626,17 +628,18 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
   }
 
   if (mode === "causal") {
-    // Intent-aware RRF: boost vector for causal queries
+    // Shared intent-aware causal pipeline (v0.32.0). REST's shipped posture is preserved as an
+    // EXPLICIT allowAll policy — nothing is internally filtered here, matching every other REST
+    // mode. The graph stages (adaptive traversal, MPFP, causal one-hop, rerank) are NEW REST
+    // capability, documented in docs/reference/rest-api.md; entity expansion stays off — its
+    // only home is direct intent_search. A REST-wide visibility option is a later slice.
     const llm = getDefaultLlamaCpp();
-    const intent = await classifyIntent(query, llm, store.db);
-    const bm25 = store.searchFTS(query, limit * 2, undefined, collections);
-    let vec: SearchResult[] = [];
-    try {
-      vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch (e) { rethrowIfFatalVectorError(e); /* vector unavailable */ }
-    const weights = intent.intent === "WHEN" ? [1.5, 1.0] : [1.0, 1.5];
-    const fused = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], weights);
-    results = attachRrfScores(fused, [...bm25, ...vec]);
+    const causal = await runCausalRetrieval(store, llm, query, {
+      stages: { traversal: true, mpfp: true, entityExpansion: false, rerank: true, causalOneHop: true },
+      baseEligibility: { allowCollections: collections },
+      whyObservationLane: false,
+    });
+    results = causal.results;
   } else if (mode === "keyword") {
     results = store.searchFTS(query, limit * 2, undefined, collections);
   } else if (mode === "semantic") {

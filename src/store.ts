@@ -984,6 +984,41 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_predicate ON entity_triples(predicate)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_valid ON entity_triples(valid_from, valid_to)`);
 
+  // Per-source evidence for SPO triples (v0.32.0). One row per distinct
+  // (triple, source_doc, source_fact) — the base row's inline source_doc_id/source_fact stay
+  // frozen as the first sighting. Uniqueness is null-normalized: a plain UNIQUE treats NULLs as
+  // distinct, which would let unattributed evidence duplicate unboundedly.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entity_triple_provenance (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      triple_id INTEGER NOT NULL REFERENCES entity_triples(id),
+      source_doc_id INTEGER REFERENCES documents(id),
+      source_fact TEXT,
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_etp_evidence ON entity_triple_provenance
+    (triple_id, COALESCE(source_doc_id, -1), COALESCE(source_fact, ''))`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_etp_triple_recent ON entity_triple_provenance
+    (triple_id, created_at DESC, id DESC)`);
+  // Idempotent backfill, READ-GUARDED (v0.16.0 discipline: a writable open on a healthy DB
+  // must not wait on busy_timeout) — the INSERT runs only when at least one triple still lacks
+  // a provenance row, so steady-state opens perform zero writes here. EVERY legacy triple gets
+  // a row: one whose inline evidence is entirely NULL gets a single unattributed row (the
+  // null-normalized unique index caps it at one), so evidenceCount is honest for legacy facts.
+  const needsEvidenceBackfill = db.prepare(`
+    SELECT 1 FROM entity_triples t
+    WHERE NOT EXISTS (SELECT 1 FROM entity_triple_provenance p WHERE p.triple_id = t.id)
+    LIMIT 1
+  `).get();
+  if (needsEvidenceBackfill) {
+    db.exec(`
+      INSERT OR IGNORE INTO entity_triple_provenance (triple_id, source_doc_id, source_fact, created_at)
+      SELECT id, source_doc_id, source_fact, COALESCE(created_at, datetime('now'))
+      FROM entity_triples
+    `);
+  }
+
   // Entity FTS5 for fuzzy name lookup
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(entity_id, name, entity_type)`);
 
@@ -1485,7 +1520,7 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[]) => SearchResult[];
+  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => Promise<SearchResult[]>;
   searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => Promise<VecSearchDetailedResult>;
 
@@ -1582,7 +1617,7 @@ export type Store = {
   // SPO knowledge graph
   addTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, options?: { validFrom?: string; validTo?: string; confidence?: number; sourceDocId?: number; sourceFact?: string }) => number;
   invalidateTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, endedDate?: string) => number;
-  queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both" }) => { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean }[];
+  queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both"; includeProvenance?: boolean; provenanceLimit?: number }) => { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean; evidenceCount?: number; sources?: { docId: number | null; collection: string | null; path: string | null; fact: string | null; at: string }[] }[];
   getTripleStats: () => { totalTriples: number; currentFacts: number; expiredFacts: number; predicateTypes: string[] };
 
   // Recall tracking
@@ -1684,7 +1719,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[]) => searchFTS(db, query, limit, collectionId, collections, dateRange, excludeCollections),
+    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => searchFTS(db, query, limit, collectionId, collections, dateRange, excludeCollections, opts),
     searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadlineMs),
     searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => searchVecDetailed(db, query, model, limit, opts),
 
@@ -1858,21 +1893,39 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         ? "object_entity_id = ? AND object_literal IS NULL"
         : "object_entity_id IS NULL AND object_literal = ?";
       const objParam = objectEntityId ?? objectLiteral;
-      const existing = db.prepare(
-        `SELECT id FROM entity_triples WHERE subject_entity_id = ? AND predicate = ? AND ${objClause} AND valid_to IS NULL`
-      ).get(subjectEntityId, pred, objParam) as { id: number } | null;
-      if (existing) return existing.id;
+      // Evidence rides in the same transaction as the base row — a triple must never exist
+      // without a provenance row. An entirely-unattributed sighting still writes its
+      // null-normalized row (the unique index collapses repeats to one), so evidenceCount
+      // stays honest rather than under-reporting unattributed corroboration as zero.
+      const insertEvidence = (tripleId: number) => {
+        db.prepare(`
+          INSERT OR IGNORE INTO entity_triple_provenance (triple_id, source_doc_id, source_fact, created_at)
+          VALUES (?, ?, ?, ?)
+        `).run(tripleId, options?.sourceDocId ?? null, options?.sourceFact ?? null, now);
+      };
+      const txn = db.transaction(() => {
+        const existing = db.prepare(
+          `SELECT id FROM entity_triples WHERE subject_entity_id = ? AND predicate = ? AND ${objClause} AND valid_to IS NULL`
+        ).get(subjectEntityId, pred, objParam) as { id: number } | null;
+        if (existing) {
+          insertEvidence(existing.id);
+          return existing.id;
+        }
 
-      const result = db.prepare(`
-        INSERT INTO entity_triples (subject_entity_id, predicate, object_entity_id, object_literal, valid_from, valid_to, confidence, source_doc_id, source_fact, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        subjectEntityId, pred, objectEntityId, objectLiteral,
-        options?.validFrom ?? null, options?.validTo ?? null,
-        options?.confidence ?? 1.0, options?.sourceDocId ?? null,
-        options?.sourceFact ?? null, now
-      );
-      return Number(result.lastInsertRowid);
+        const result = db.prepare(`
+          INSERT INTO entity_triples (subject_entity_id, predicate, object_entity_id, object_literal, valid_from, valid_to, confidence, source_doc_id, source_fact, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          subjectEntityId, pred, objectEntityId, objectLiteral,
+          options?.validFrom ?? null, options?.validTo ?? null,
+          options?.confidence ?? 1.0, options?.sourceDocId ?? null,
+          options?.sourceFact ?? null, now
+        );
+        const tripleId = Number(result.lastInsertRowid);
+        insertEvidence(tripleId);
+        return tripleId;
+      });
+      return txn.immediate() as number;
     },
 
     invalidateTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, endedDate?: string) => {
@@ -1888,10 +1941,10 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       return result.changes;
     },
 
-    queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both" }) => {
+    queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both"; includeProvenance?: boolean; provenanceLimit?: number }) => {
       const direction = options?.direction ?? "both";
       const asOf = options?.asOf;
-      const results: { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean }[] = [];
+      const results: { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean; evidenceCount?: number; sources?: { docId: number | null; collection: string | null; path: string | null; fact: string | null; at: string }[] }[] = [];
 
       if (direction === "outgoing" || direction === "both") {
         let query = `SELECT t.id, t.predicate, t.object_entity_id, t.object_literal, t.valid_from, t.valid_to, t.confidence,
@@ -1924,6 +1977,39 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         }
         for (const row of db.prepare(query).all(...params) as any[]) {
           results.push({ id: row.id, direction: "incoming", subject: row.sub_name, predicate: row.predicate, object: row.obj_name, validFrom: row.valid_from, validTo: row.valid_to, confidence: row.confidence, current: row.valid_to === null });
+        }
+      }
+
+      // Provenance is OPT-IN: the context-surfacing hook calls this per detected prompt entity
+      // and discards evidence fields — the default path must not pay these two queries.
+      if (options?.includeProvenance && results.length > 0) {
+        const provLimit = Math.max(1, options.provenanceLimit ?? 5);
+        const tripleIds = [...new Set(results.map(r => r.id))];
+        const ph = tripleIds.map(() => "?").join(",");
+        const counts = new Map<number, number>();
+        for (const row of db.prepare(
+          `SELECT triple_id, COUNT(*) AS n FROM entity_triple_provenance WHERE triple_id IN (${ph}) GROUP BY triple_id`
+        ).all(...tripleIds) as { triple_id: number; n: number }[]) {
+          counts.set(row.triple_id, row.n);
+        }
+        const sourcesByTriple = new Map<number, { docId: number | null; collection: string | null; path: string | null; fact: string | null; at: string }[]>();
+        for (const row of db.prepare(`
+          SELECT triple_id, source_doc_id, source_fact, created_at, collection, path FROM (
+            SELECT p.triple_id, p.source_doc_id, p.source_fact, p.created_at,
+                   d.collection AS collection, d.path AS path,
+                   ROW_NUMBER() OVER (PARTITION BY p.triple_id ORDER BY p.created_at DESC, p.id DESC) AS rn
+            FROM entity_triple_provenance p
+            LEFT JOIN documents d ON d.id = p.source_doc_id
+            WHERE p.triple_id IN (${ph})
+          ) WHERE rn <= ? ORDER BY triple_id, rn
+        `).all(...tripleIds, provLimit) as { triple_id: number; source_doc_id: number | null; source_fact: string | null; created_at: string; collection: string | null; path: string | null }[]) {
+          const list = sourcesByTriple.get(row.triple_id) ?? [];
+          list.push({ docId: row.source_doc_id, collection: row.collection, path: row.path, fact: row.source_fact, at: row.created_at });
+          sourcesByTriple.set(row.triple_id, list);
+        }
+        for (const r of results) {
+          r.evidenceCount = counts.get(r.id) ?? 0;
+          r.sources = sourcesByTriple.get(r.id) ?? [];
         }
       }
 
@@ -3706,7 +3792,7 @@ export function ftsScoreFromBm25(bm25Score: number): number {
   return m / (1 + m);
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[]): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -3750,6 +3836,14 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     const exPlaceholders = excludeCollections.map(() => '?').join(',');
     sql += ` AND d.collection NOT IN (${exPlaceholders})`;
     params.push(...excludeCollections);
+  }
+
+  // WHY observation lane (v0.32.0): the structural predicate is applied IN the candidate
+  // selection, so `limit` is satisfied with eligible observation documents by construction —
+  // a post-filter over a fixed overfetch could be starved by higher-ranked non-observation
+  // internal artifacts.
+  if (opts?.observationsOnly) {
+    sql += ` AND d.path LIKE 'observations/%' AND d.observation_type IS NOT NULL`;
   }
 
   // bm25 lower is better; sort ascending.
@@ -3975,6 +4069,10 @@ export interface VecSearchDetailedOpts {
   deadlineMs?: number;
   /** Override the hard MATCH-depth cap (default 4096). Primarily for tests. */
   escalationCap?: number;
+  /** WHY observation lane (v0.32.0): restrict candidates to `_clawmem` observation documents
+   * (path 'observations/%' + observation_type set) inside the hydration SQL, so the escalation
+   * loop fills `limit` with eligible observations by construction. */
+  observationsOnly?: boolean;
 }
 
 export interface VecSearchDetailedResult {
@@ -4036,6 +4134,9 @@ function hydrateVecResultsClassified(
     // §51.1: content-time predicate — authorship when known, filing time otherwise.
     docSql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
     params.push(opts.dateRange.start, opts.dateRange.end);
+  }
+  if (opts.observationsOnly) {
+    docSql += ` AND d.path LIKE 'observations/%' AND d.observation_type IS NOT NULL`;
   }
 
   const docRows = db.prepare(docSql).all(...params) as {
@@ -4112,14 +4213,18 @@ export function searchVecDetailedWithVector(
   let raw: { hash_seq: string; distance: number }[] = [];
   let classified: ReturnType<typeof hydrateVecResultsClassified> = { results: [], allowedDocs: 0, excludedDocsSeen: 0 };
 
-  // Escalation loop (exclusion-enabled callers only): grow MATCH depth x3 until `limit`
-  // allowed DOCUMENTS (post-dedup) hydrate, the effective cap is hit, or the deadline passes.
-  // Without exclusion this runs exactly once at limit*3 — today's semantics.
+  // Escalation loop (filtering callers only): grow MATCH depth x3 until `limit` allowed
+  // DOCUMENTS (post-dedup) hydrate, the effective cap is hit, or the deadline passes.
+  // `observationsOnly` filters in the hydration SQL exactly like a collection exclusion does,
+  // so it engages the same escalation — otherwise nearer non-observation internals could
+  // starve the observation lane out of its first limit*3 raw candidates. Without any
+  // filtering this runs exactly once at limit*3 — today's semantics.
+  const filteringActive = exclude.size > 0 || !!opts.observationsOnly;
   for (;;) {
     raw = matchStmt.all(queryVec.embedding, k) as { hash_seq: string; distance: number }[];
     classified = hydrateVecResultsClassified(db, raw, limit, opts, exclude);
     const done =
-      exclude.size === 0 ||
+      !filteringActive ||
       classified.allowedDocs >= limit ||
       k >= effectiveCap ||
       raw.length < k || // MATCH returned fewer than requested: table exhausted below k
@@ -4135,7 +4240,7 @@ export function searchVecDetailedWithVector(
   let degradedReason: VecSearchDetailedResult["degradedReason"];
   const underfilled = classified.allowedDocs < limit;
   const hardCapPreventedExhaustion = tableRows > hardCap && k >= hardCap;
-  if (exclude.size > 0 && underfilled && hardCapPreventedExhaustion) {
+  if (filteringActive && underfilled && hardCapPreventedExhaustion) {
     degraded = true;
     degradedReason = classified.excludedDocsSeen >= (limit - classified.allowedDocs)
       ? "excluded-dominant"

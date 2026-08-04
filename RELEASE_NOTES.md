@@ -4,6 +4,75 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.32.0 — causal answers reach their reasoning
+
+Three defects found while reviewing the causal layer's foundations: the recommended causal
+retrieval route could not reach the documents causal edges actually connect; the four causal
+surfaces had drifted into four different pipelines; and the SPO knowledge graph wrote evidence it
+never showed while silently dropping repeat sightings.
+
+### One causal pipeline behind every causal surface
+
+`memory_retrieve`'s causal mode, `intent_search`, `query_plan`'s graph clauses, and REST
+`/retrieve`'s causal mode were four independent implementations of "intent-classified retrieval
+plus graph expansion", each missing different stages — the documented claim that causal queries
+route to `intent_search`'s pipeline was true of none of them. They now share one implementation
+and differ only in declared stages and visibility policy, so parity holds by construction. REST's
+causal route gains graph traversal (it was anchor-only RRF), and the REST classifier now
+recognizes the same causal phrasings as MCP — "why were" and "because we" never routed causal
+over REST before. `intent_search` keeps its documented unfiltered contract verbatim, and its
+`enable_graph_traversal: false` now disables every graph stage, including the new one-hop step.
+
+### WHY queries reach observation documents — and can walk a causal edge backward
+
+The default-filtered routes excluded the `_clawmem` collection categorically, and every causal
+edge endpoint lives there — so causal graph structure was reachable by nobody through the
+recommended default route. Independently, neither traversal engine could follow a causal edge
+backward (inbound edges were restricted to semantic/entity), so "why did B happen?" anchored at B
+could never reach cause A.
+
+WHY-classified queries on the filtered routes now anchor into `_clawmem` **observation documents
+specifically** — never handoffs or deductions — and follow causal edges one bounded hop in both
+directions (at most 3 per anchor, 10 total), with each hit labeled `cause` or `effect` relative
+to its anchor. Candidate eligibility (active, non-invalidated, inside any effective-time window,
+collection policy) is now enforced inside every anchor, traversal, and MPFP query — previously an
+inactive or invalidated document could still consume beam slots and steer expansion even though it
+was hidden from output. Entity co-occurrence expansion cannot honor row-level eligibility (its
+aggregates carry no source-document provenance) and is therefore confined to direct
+`intent_search`, its only shipped home, with the limitation documented.
+
+### The knowledge graph shows its evidence
+
+`entity_triples` recorded `source_doc_id` and `source_fact` on first sighting, but no query
+surfaced either — and a repeat sighting of a known fact was dropped entirely, so corroboration
+accumulated nowhere. A new `entity_triple_provenance` table now accumulates unique evidence
+sources per fact, written in the same transaction as the fact itself. `kg_query` reports
+`evidenceCount` plus up to 5 most-recent sources per fact (evidence with no source document
+renders as `unattributed`). Provenance in `queryEntityTriples` is opt-in, so the prompt-hook path
+pays nothing new.
+
+**Migration** (automatic, on first open): one evidence row is backfilled per existing triple that
+carries inline evidence. The backfill is idempotent and read-guarded — steady-state opens perform
+no writes.
+
+### Verification
+
+Cross-model adversarial pass (codex / GPT-5.x): the remediation design was reviewed to zero
+remaining findings across five turns before implementation, and the implementation reviewed to
+zero remaining findings against it. Production-boundary tests drive the real MCP handlers and the
+real REST server: backward one-hop retrieval, decision-typed observation endpoints, lane
+exclusions for handoffs/deductions, breadth caps, the graph master switch, REST classifier parity,
+evidence dedup/ordering/atomicity, and migration idempotence across reopen.
+
+### What didn't change
+
+The causal *writer* — batching, edge schema, per-edge witnesses — is untouched; restoring causal
+inference itself is a separate, future piece of work. Direct `intent_search` remains unfiltered by
+design; REST remains unfiltered in every mode; `includeInternal` semantics are unchanged;
+`confidence` does not move on repeat sightings; hooks issue no new queries.
+
+---
+
 ## v0.31.0 — forget stays forgotten
 
 Three defects on the indexing boundary, all of which destroyed or reversed memory silently. Each

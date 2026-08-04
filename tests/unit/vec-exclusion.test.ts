@@ -168,7 +168,7 @@ describe("traversal-level exclusion (design (b).3)", () => {
 
     // With exclusion the internal node neither appears NOR consumes the beam slot —
     // the user neighbor is discovered (beam parity with a vault where internals don't exist).
-    const withExcl = adaptiveTraversal(store.db, [{ hash: anchor, score: 1 }], { ...OPTS, beamWidth: 1, excludeCollections: ["_clawmem"] });
+    const withExcl = adaptiveTraversal(store.db, [{ hash: anchor, score: 1 }], { ...OPTS, beamWidth: 1, eligibility: { excludeCollections: ["_clawmem"] } });
     expect(withExcl.some(n => n.docId === id(internalN))).toBe(false);
     expect(withExcl.some(n => n.docId === id(userN))).toBe(true);
   });

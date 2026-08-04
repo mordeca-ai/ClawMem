@@ -59,6 +59,51 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.32.0: the shared causal pipeline + knowledge-graph evidence
+
+**Migration is automatic** on first open: a new `entity_triple_provenance` table records one row
+per unique evidence source per knowledge-graph fact, backfilled from every existing triple's
+inline evidence (a triple with no inline evidence gets a single `unattributed` row). The backfill
+is idempotent and read-guarded — steady-state opens perform no writes.
+
+**Behavior to check after upgrading:**
+
+- `memory_retrieve`'s causal mode, `intent_search`, `query_plan`'s graph clauses, and REST
+  `/retrieve`'s causal mode now run ONE shared pipeline. WHY-classified queries on the
+  default-filtered routes reach `_clawmem` **observation documents** (never handoffs/deductions)
+  and follow causal edges one bounded hop in both directions — internal observation paths
+  appearing in causal results is the feature, not a leak. `includeInternal` semantics are
+  unchanged.
+- `intent_search(enable_graph_traversal: false)` now disables the one-hop step too, along with
+  adaptive traversal, MPFP, and entity expansion.
+- REST `/retrieve` causal gains graph traversal (it was anchor-only RRF). The REST classifier now
+  recognizes the same causal phrasings as MCP ("why were", "because we").
+- `kg_query` facts now carry `evidenceCount` + up to 5 `sources`; text output appends
+  `[evidence ×N; sources: …]`.
+- Inactive, invalidated, or out-of-time-window documents no longer consume graph-traversal
+  budget on any causal surface.
+
+---
+
+## v0.31.0: forget and archive survive re-indexing
+
+**Migration is automatic** on first open: a new `documents.deactivated_reason` column records why
+each row was deactivated (`absent` / `forget` / `archive`); existing archived rows are backfilled
+as `'archive'`, and any row a previous version left simultaneously active-and-archived is
+repaired to archived (count reported on stderr — use `lifecycle_restore` to bring any back).
+
+**Behavior to check after upgrading:**
+
+- `memory_forget` on a file-backed document now STICKS across `clawmem update` / the watcher —
+  do not re-run forget after indexing. Only absence-deactivated rows reactivate automatically.
+- `clawmem reindex --force` no longer blanket-deactivates the vault up front; it re-reads and
+  rewrites every file, bypassing the content-hash short-circuit. `_clawmem` is refused by the
+  filesystem indexer outright (database-created memory has no filesystem source).
+- A failed A-MEM enrichment no longer blanks learned keywords/tags/context — an empty note is
+  refused and the prior note preserved.
+
+---
+
 ## v0.30.0: ClawMem no longer deletes document rows
 
 No schema change, no re-embed, no reindex. **Check whether you set `purge_after_days`:**

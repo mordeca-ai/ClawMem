@@ -38,8 +38,8 @@ import { selectScoringRegime, rankRawPrimary, VECTOR_SCORE_BASIS, FTS_SCORE_BASI
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
 import { listCollections } from "./collections.ts";
-import { classifyIntent, decomposeQuery, extractTemporalConstraint, type IntentType } from "./intent.ts";
-import { adaptiveTraversal, mergeTraversalResults, mpfpTraversal } from "./graph-traversal.ts";
+import { decomposeQuery, extractTemporalConstraint, type IntentType } from "./intent.ts";
+import { runCausalRetrieval, hasCausalSignal, hasTimelineSignal, type CausalAssociation } from "./causal-retrieval.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { startConsolidationWorker, stopConsolidationWorker } from "./consolidation.ts";
 import {
@@ -144,12 +144,12 @@ function degradedGuidanceText(legs: DegradedLeg[]): string {
 function classifyRetrievalMode(query: string): "keyword" | "semantic" | "causal" | "timeline" | "discovery" | "complex" | "hybrid" {
   const q = query.toLowerCase();
 
-  // Timeline (highest precision signals — check first)
-  if (/\b(last session|yesterday|prior session|previous session|last time we|handoff|what happened last|what did we do|cross.session|earlier today|this morning|what we discussed|when we last)\b/i.test(q)) return "timeline";
+  // Timeline (highest precision signals — check first). Shared signal source with the REST
+  // classifier (causal-retrieval.ts) so the two never drift again.
+  if (hasTimelineSignal(q)) return "timeline";
 
   // Causal
-  if (/\b(why did|why was|why were|what caused|what led to|reason for|decided to|decision about|trade.?off|instead of|chose to|because we)\b/i.test(q)) return "causal";
-  if (/^why\b/i.test(q)) return "causal";
+  if (hasCausalSignal(q)) return "causal";
 
   // Discovery
   if (/\b(similar to|related to|what else|what other|reminds? me of|like this|comparable|neighbors)\b/i.test(q)) return "discovery";
@@ -314,77 +314,33 @@ This is the recommended entry point for ALL memory queries.`,
         return { content: [{ type: "text", text: lines.join('\n') }], structuredContent: { mode: effectiveMode, sessions } };
       }
 
-      // --- Causal mode → intent classification + graph traversal ---
+      // --- Causal mode → shared intent-aware causal pipeline (v0.32.0) ---
+      // Same pipeline as intent_search, differing only in eligibility (default-filtered) and
+      // the WHY observation lane; entity expansion stays off (legacy stage, intent_search-only).
       if (effectiveMode === "causal") {
         const llm = getDefaultLlamaCpp();
-        const intent = await classifyIntent(query, llm, store.db);
-        const bm25Results = store.searchFTS(query, 30, undefined, undefined, undefined, excl);
-        let vecResults: SearchResult[] = [];
-        let causalDegraded: DegradedLeg | undefined;
-        try {
-          const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, 30, { excludeCollections: excl });
-          vecResults = det.results;
-          // Causal mode runs ONE vector call — flat single-vector shape per the documented
-          // contract (T8-M5), not the multi-leg degradedLegs aggregate.
-          if (det.degraded && det.degradedReason) causalDegraded = { leg: "causal:vector", reason: det.degradedReason };
-        } catch (e) { rethrowIfFatalVectorError(e); /* else: no vectors */ }
-        const rrfWeights = intent.intent === 'WHY' ? [1.0, 1.5] : intent.intent === 'WHEN' ? [1.5, 1.0] : [1.0, 1.0];
-        const fusedRanked = reciprocalRankFusion([bm25Results.map(toRanked), vecResults.map(toRanked)], rrfWeights);
-        let fused: SearchResult[] = attachRrfScores(fusedRanked, [...bm25Results, ...vecResults]);
+        const { intent, results: causalResults, associations, degraded } = await runCausalRetrieval(store, llm, query, {
+          stages: { traversal: true, mpfp: true, entityExpansion: false, rerank: true, causalOneHop: true },
+          baseEligibility: { excludeCollections: excl },
+          whyObservationLane: true,
+        });
+        // Causal mode reports the flat single-vector degraded shape per the documented
+        // contract (T8-M5), not the multi-leg degradedLegs aggregate.
+        const causalDegraded: DegradedLeg | undefined = degraded.length > 0
+          ? { leg: degraded[0]!.leg, reason: degraded[0]!.reason }
+          : undefined;
 
-        if (intent.intent === 'WHY' || intent.intent === 'ENTITY') {
-          try {
-            const anchorEmb = await llm.embed(query);
-            if (anchorEmb) {
-              const traversed = adaptiveTraversal(store.db, fused.slice(0, 10).map(r => ({ hash: r.hash, score: r.score })), {
-                maxDepth: 2, beamWidth: 5, budget: 30,
-                intent: intent.intent, queryEmbedding: anchorEmb.embedding,
-                // Visibility policy threaded INTO traversal (T3-H2): excluded nodes are pruned
-                // before beam selection and score normalization, not just hidden at hydration.
-                excludeCollections: excl,
-              });
-              const merged = mergeTraversalResults(store.db, fused.map(r => ({ hash: r.hash, score: r.score })), traversed);
-              // Hydrate merged results back to SearchResult format
-              const fusedMap = new Map(fused.map(r => [r.hash, r]));
-              fused = merged.map(m => {
-                const orig = fusedMap.get(m.hash);
-                if (orig) return { ...orig, score: m.score };
-                // Graph-discovered node — hydrate from DB (defense-in-depth visibility guard;
-                // traversal-level pruning is the primary barrier)
-                const doc = store.db.prepare(`
-                  SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
-                  FROM documents d
-                  LEFT JOIN content c ON c.hash = d.hash
-                  WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
-                `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
-                if (!doc) return null;
-                if (excl && excl.includes(doc.collection)) return null;
-                return {
-                  filepath: `clawmem://${doc.collection}/${doc.path}`,
-                  displayPath: `${doc.collection}/${doc.path}`,
-                  title: doc.title || doc.path.split("/").pop() || "",
-                  context: null,
-                  hash: doc.hash,
-                  docid: doc.hash.slice(0, 6),
-                  collectionName: doc.collection,
-                  modifiedAt: doc.modified_at || "",
-                  bodyLength: doc.body?.length || 0,
-                  body: doc.body || "",
-                  score: m.score,
-                  source: "vec" as const,
-                } satisfies SearchResult;
-              }).filter((r): r is SearchResult => r !== null);
-            }
-          } catch { /* graph traversal failed — continue with base results */ }
-        }
-
-        const enriched = enrichResults(store, fused, query);
+        const enriched = enrichResults(store, causalResults, query);
         const scored = applyCompositeScoring(enriched, query).slice(0, lim);
-        const items = scored.map(r => ({
-          docid: `#${r.docid}`, path: r.displayPath, title: r.title,
-          score: Math.round(r.compositeScore * 100) / 100,
-          snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
-        }));
+        const items = scored.map(r => {
+          const causal = associations.get(r.filepath);
+          return {
+            docid: `#${r.docid}`, path: r.displayPath, title: r.title,
+            score: Math.round(r.compositeScore * 100) / 100,
+            snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
+            ...(causal ? { causal } : {}),
+          };
+        });
         const causalDegradedFields = causalDegraded ? { degraded: true as const, degradedReason: causalDegraded.reason } : {};
         const degradedNote = causalDegraded ? `\n${degradedGuidanceText([causalDegraded])}` : "";
         return {
@@ -1716,165 +1672,39 @@ This is the recommended entry point for ALL memory queries.`,
       const store = getStore(vault);
       const llm = getDefaultLlamaCpp();
 
-      // Step 1: Intent classification
-      const intent = force_intent
-        ? { intent: force_intent as IntentType, confidence: 1.0 }
-        : await classifyIntent(query, llm, store.db);
-
-      // Step 1b: Temporal constraint — convert intent's local dates to UTC for search
-      // extractTemporalConstraint() already returns UTC; intent classification stores local dates
-      const dateRange = (intent.temporal_start && intent.temporal_end)
-        ? {
-            start: intent.temporal_start.includes('T') ? intent.temporal_start : new Date(intent.temporal_start + 'T00:00:00').toISOString(),
-            end: intent.temporal_end.includes('T') ? intent.temporal_end : new Date(intent.temporal_end + 'T23:59:59.999').toISOString(),
-          }
-        : extractTemporalConstraint(query) || undefined;
-
-      // Step 2: Baseline search (BM25 + Vector) — with temporal filter if detected
-      const bm25Results = store.searchFTS(query, 30, undefined, undefined, dateRange);
-      const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30, undefined, undefined, dateRange);
-
-      // Step 3: Intent-weighted RRF
-      const rrfWeights = intent.intent === 'WHEN'
-        ? [1.5, 1.0]  // Boost BM25 for temporal (dates in text)
-        : intent.intent === 'WHY'
-        ? [1.0, 1.5]  // Boost vector for causal (semantic)
-        : [1.0, 1.0]; // Balanced
-
-      const fusedRanked = reciprocalRankFusion([bm25Results.map(toRanked), vecResults.map(toRanked)], rrfWeights);
-
-      // Map RRF results back to SearchResult with updated scores
-      const fused: SearchResult[] = attachRrfScores(fusedRanked, [...bm25Results, ...vecResults]);
-
-      // Step 4: Graph expansion (if enabled and intent allows)
-      let expanded = fused;
-      if (enable_graph_traversal && (intent.intent === 'WHY' || intent.intent === 'ENTITY')) {
-        const anchorEmbeddingResult = await llm.embed(query);
-        if (anchorEmbeddingResult) {
-          const traversed = adaptiveTraversal(store.db, fused.slice(0, 10).map(r => ({ hash: r.hash, score: r.score })), {
-            maxDepth: 2,
-            beamWidth: 5,
-            budget: 30,
-            intent: intent.intent,
-            queryEmbedding: anchorEmbeddingResult.embedding,
-          });
-
-          // Merge traversed nodes with original results
-          const merged = mergeTraversalResults(
-            store.db,
-            fused.map(r => ({ hash: r.hash, score: r.score })),
-            traversed
-          );
-
-          // Step 4b: MPFP multi-path traversal (runs intent-specific meta-path patterns)
-          const mpfpNodes = mpfpTraversal(
-            store.db,
-            fused.slice(0, 10).map(r => ({ hash: r.hash, score: r.score })),
-            intent.intent,
-            20
-          );
-          // Normalize MPFP scores to [0,1] before merging (raw Forward Push mass is unbounded)
-          const maxMpfpScore = mpfpNodes.length > 0 ? Math.max(...mpfpNodes.map(n => n.score)) : 1;
-          const mpfpNormalizer = maxMpfpScore > 0 ? 1 / maxMpfpScore : 1;
-
-          // Merge normalized MPFP results into merged array
-          for (const node of mpfpNodes) {
-            const normalizedScore = node.score * mpfpNormalizer;
-            const doc = store.db.prepare(`SELECT hash FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL LIMIT 1`).get(node.docId) as { hash: string } | undefined;
-            if (doc) {
-              const existing = merged.find(m => m.hash === doc.hash);
-              if (existing) {
-                existing.score = Math.max(existing.score, normalizedScore * 0.9);
-              } else {
-                merged.push({ hash: doc.hash, score: normalizedScore * 0.75 });
-              }
-            }
-          }
-
-          // Step 4c: Entity co-occurrence graph expansion (ENTITY intent only)
-          if (intent.intent === 'ENTITY') {
-            // Get doc IDs from top fused results for entity seed lookup
-            const seedDocIds = fused.slice(0, 10).map(r => {
-              const row = store.db.prepare(`SELECT id FROM documents WHERE hash = ? AND active = 1 LIMIT 1`).get(r.hash) as { id: number } | undefined;
-              return row?.id;
-            }).filter((id): id is number => id !== undefined);
-
-            const entityNeighbors = getEntityGraphNeighbors(store.db, seedDocIds, 15);
-            for (const en of entityNeighbors) {
-              const doc = store.db.prepare(`SELECT hash FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL LIMIT 1`).get(en.docId) as { hash: string } | undefined;
-              if (doc && !merged.some(m => m.hash === doc.hash)) {
-                merged.push({ hash: doc.hash, score: en.score * 0.7 }); // Slight discount for entity-graph-only hits
-              }
-            }
-          }
-
-          // Convert back to SearchResult format — hydrate graph-discovered nodes from DB
-          expanded = merged.map(m => {
-            const original = fused.find(f => f.hash === m.hash);
-            if (original) return { ...original, score: m.score };
-            // Graph-discovered node not in original fused results — hydrate from DB
-            const doc = store.db.prepare(`
-              SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
-              FROM documents d
-              LEFT JOIN content c ON c.hash = d.hash
-              WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
-            `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
-            if (!doc) return null;
-            return {
-              filepath: `clawmem://${doc.collection}/${doc.path}`,
-              displayPath: `${doc.collection}/${doc.path}`,
-              title: doc.title || doc.path.split("/").pop() || "",
-              context: null,
-              hash: doc.hash,
-              docid: doc.hash.slice(0, 6),
-              collectionName: doc.collection,
-              modifiedAt: doc.modified_at || "",
-              bodyLength: doc.body?.length || 0,
-              body: doc.body || "",
-              score: m.score,
-              source: "vec" as const,
-            } satisfies SearchResult;
-          }).filter((r): r is SearchResult => r !== null);
-        }
-      }
-
-      // Step 5: Rerank top 30 and blend scores (same pattern as query tool)
-      const toRerank = expanded.slice(0, 30);
-      const rerankDocs = toRerank.map(r => ({
-        file: r.filepath,
-        text: r.body?.slice(0, 200) || r.title,
-      }));
-
-      const reranked = await store.rerank(query, rerankDocs);
-
-      // Blend original + rerank scores using file-keyed join (matching query tool pattern)
-      const rerankMap = new Map(reranked.map(r => [r.file, r.score]));
-      const rankMap = new Map(toRerank.map((r, i) => [r.filepath, i + 1]));
-      const blendedResults = toRerank.map(r => {
-        const rerankScore = rerankMap.get(r.filepath) || 0;
-        const rank = rankMap.get(r.filepath) || toRerank.length;
-        const origWeight = rank <= 3 ? 0.75 : rank <= 10 ? 0.60 : 0.40;
-        const blended = origWeight * r.score + (1 - origWeight) * rerankScore;
-        return { ...r, score: blended };
+      // Shared intent-aware causal pipeline (v0.32.0) — unfiltered by design (system memory is
+      // this tool's substrate; docs/reference/mcp-tools.md), so no observation lane: its anchors
+      // already reach _clawmem. enable_graph_traversal=false disables EVERY graph stage
+      // (adaptive, MPFP, entity expansion, causal one-hop); anchor search + rerank remain.
+      const graphOn = enable_graph_traversal !== false;
+      const { intent, results: pipelineResults, associations } = await runCausalRetrieval(store, llm, query, {
+        forceIntent: force_intent as IntentType | undefined,
+        stages: { traversal: graphOn, mpfp: graphOn, entityExpansion: graphOn, rerank: true, causalOneHop: graphOn },
+        baseEligibility: {},
+        whyObservationLane: false,
       });
-      blendedResults.sort((a, b) => b.score - a.score);
+      const expanded = pipelineResults;
 
-      // Step 6: Composite scoring
-      const enriched = enrichResults(store, blendedResults, query);
+      // Composite scoring
+      const enriched = enrichResults(store, expanded, query);
 
       const scored = applyCompositeScoring(enriched, query);
 
-      // Format results
-      const results = scored.slice(0, limit || 10).map(r => ({
-        docid: r.docid,
-        file: r.filepath,
-        title: r.title,
-        score: r.score,
-        compositeScore: r.compositeScore,
-        context: r.context,
-        snippet: r.body?.slice(0, 300) || '',
-        contentType: r.contentType,
-      }));
+      // Format results — one-hop causal hits carry their associations (anchor + direction)
+      const results = scored.slice(0, limit || 10).map(r => {
+        const causal = associations.get(r.filepath);
+        return {
+          docid: r.docid,
+          file: r.filepath,
+          title: r.title,
+          score: r.score,
+          compositeScore: r.compositeScore,
+          context: r.context,
+          snippet: r.body?.slice(0, 300) || '',
+          contentType: r.contentType,
+          ...(causal ? { causal } : {}),
+        };
+      });
 
       return {
         content: [{
@@ -1921,6 +1751,7 @@ This is the recommended entry point for ALL memory queries.`,
       const degradedLegs: DegradedLeg[] = [];
 
       let clauseIdx = 0;
+      const planAssociations = new Map<string, CausalAssociation[]>();
       for (const clause of sortedClauses) {
         const clauseExcl = resolveExcludedCollections(includeInternal, clause.collections);
         let results: SearchResult[] = [];
@@ -1931,59 +1762,26 @@ This is the recommended entry point for ALL memory queries.`,
           results = det.results;
           if (det.degraded && det.degradedReason) degradedLegs.push({ leg: `clause${clauseIdx}:vector`, reason: det.degradedReason });
         } else if (clause.type === 'graph') {
-          // Graph clause: run intent_search-style retrieval
-          const intent = await classifyIntent(clause.query, llm, store.db);
-          const bm25 = store.searchFTS(clause.query, 15, undefined, clause.collections, undefined, clauseExcl);
-          const detGraph = await store.searchVecDetailed(clause.query, DEFAULT_EMBED_MODEL, 15, { collections: clause.collections, excludeCollections: clauseExcl });
-          const vec = detGraph.results;
-          if (detGraph.degraded && detGraph.degradedReason) degradedLegs.push({ leg: `clause${clauseIdx}:graph:vector`, reason: detGraph.degradedReason });
-          const fused = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
-          // Carry the RRF-fused score (parity with causal + intent_search): the graph
-          // traversal below anchors on `score`, which must be RRF-scale, not raw single-channel.
-          // vec-first: this site historically preferred the vector variant on duplicate
-          // paths (its pre-helper Map construction let later entries overwrite) — preserved.
-          results = attachRrfScores(fused, [...vec, ...bm25]);
-
-          // Graph expansion for WHY/ENTITY
-          if (intent.intent === 'WHY' || intent.intent === 'ENTITY') {
-            const anchorEmb = await llm.embed(clause.query);
-            if (anchorEmb) {
-              const traversed = adaptiveTraversal(store.db, results.slice(0, 5).map(r => ({ hash: r.hash, score: r.score })), {
-                maxDepth: 2, beamWidth: 3, budget: 15, intent: intent.intent, queryEmbedding: anchorEmb.embedding,
-                // Visibility policy threaded INTO traversal (T6-H1): parity with memory_retrieve causal
-                excludeCollections: clauseExcl,
-              });
-              const merged = mergeTraversalResults(store.db, results.map(r => ({ hash: r.hash, score: r.score })), traversed);
-              const expandedMap = new Map(results.map(r => [r.hash, r]));
-              results = merged.map(m => {
-                const existing = expandedMap.get(m.hash);
-                if (existing) return { ...existing, score: m.score };
-                // Graph-discovered node — hydrate from DB (defense-in-depth visibility guard)
-                const doc = store.db.prepare(`
-                  SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
-                  FROM documents d
-                  LEFT JOIN content c ON c.hash = d.hash
-                  WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
-                `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
-                if (!doc) return null;
-                if (clauseExcl && clauseExcl.includes(doc.collection)) return null;
-                return {
-                  filepath: `clawmem://${doc.collection}/${doc.path}`,
-                  displayPath: `${doc.collection}/${doc.path}`,
-                  title: doc.title || doc.path.split("/").pop() || "",
-                  context: null,
-                  hash: doc.hash,
-                  docid: doc.hash.slice(0, 6),
-                  collectionName: doc.collection,
-                  modifiedAt: doc.modified_at || "",
-                  bodyLength: doc.body?.length || 0,
-                  body: doc.body || "",
-                  score: m.score,
-                  source: "vec" as const,
-                } satisfies SearchResult;
-              }).filter((r): r is SearchResult => r !== null);
+          // Graph clause → shared causal pipeline (v0.32.0), keeping this site's bounded
+          // variant: traversal + one-hop only, smaller budgets, no MPFP/entity/rerank
+          // (the plan-level RRF below does the final ranking). clause.collections now
+          // constrain traversal too, not just anchors.
+          const { results: graphResults, degraded: graphDegraded, associations: graphAssociations } = await runCausalRetrieval(store, llm, clause.query, {
+            stages: { traversal: true, mpfp: false, entityExpansion: false, rerank: false, causalOneHop: true },
+            budgets: { anchorLimit: 15, seedCount: 5, traversalBeam: 3, traversalBudget: 15 },
+            baseEligibility: { allowCollections: clause.collections, excludeCollections: clauseExcl },
+            whyObservationLane: true,
+          });
+          for (const d of graphDegraded) degradedLegs.push({ leg: `clause${clauseIdx}:graph:${d.leg.replace(/^causal:/, "")}`, reason: d.reason });
+          // One-hop associations survive clause merging and reach the final items (T6-F10).
+          for (const [fp, assoc] of graphAssociations) {
+            const existing = planAssociations.get(fp) ?? [];
+            for (const a of assoc) {
+              if (!existing.some(e => e.anchorDocid === a.anchorDocid && e.direction === a.direction)) existing.push(a);
             }
+            planAssociations.set(fp, existing);
           }
+          results = graphResults;
         }
         clauseDetails.push({ type: clause.type, query: clause.query, priority: clause.priority, resultCount: results.length });
         allResults.push(...results);
@@ -2020,22 +1818,30 @@ This is the recommended entry point for ALL memory queries.`,
       const planDegradedNote = degradedLegs.length > 0 ? `\n${degradedGuidanceText(degradedLegs)}` : "";
 
       if (compact) {
-        const items = scored.map(r => ({
-          docid: `#${r.docid}`, path: r.displayPath, title: r.title,
-          score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
-          snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
-          authored_at: r.authoredAt ?? null,
-        }));
+        const items = scored.map(r => {
+          const causal = planAssociations.get(r.filepath);
+          return {
+            docid: `#${r.docid}`, path: r.displayPath, title: r.title,
+            score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
+            snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+            authored_at: r.authoredAt ?? null,
+            ...(causal ? { causal } : {}),
+          };
+        });
         return {
           content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${planDegradedNote}` }],
           structuredContent: { plan: clauseDetails, results: items, ...planDegraded },
         };
       }
 
-      const items = scored.map(r => ({
-        docid: r.docid, file: r.filepath, title: r.title, score: r.score,
-        compositeScore: r.compositeScore, context: r.context, snippet: r.body?.slice(0, 300) || '', contentType: r.contentType,
-      }));
+      const items = scored.map(r => {
+        const causal = planAssociations.get(r.filepath);
+        return {
+          docid: r.docid, file: r.filepath, title: r.title, score: r.score,
+          compositeScore: r.compositeScore, context: r.context, snippet: r.body?.slice(0, 300) || '', contentType: r.contentType,
+          ...(causal ? { causal } : {}),
+        };
+      });
       return {
         content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items, query)}${planDegradedNote}` }],
         structuredContent: { plan: clauseDetails, results: items, ...planDegraded },
@@ -2162,7 +1968,7 @@ This is the recommended entry point for ALL memory queries.`,
         };
       }
 
-      const triples = store.queryEntityTriples(entityId, { asOf: as_of, direction });
+      const triples = store.queryEntityTriples(entityId, { asOf: as_of, direction, includeProvenance: true, provenanceLimit: 5 });
       const stats = store.getTripleStats();
 
       if (triples.length === 0) {
@@ -2177,7 +1983,18 @@ This is the recommended entry point for ALL memory queries.`,
         const validity = t.current ? "current" : `ended ${t.validTo}`;
         const from = t.validFrom ? ` (since ${t.validFrom})` : "";
         const conf = Math.round(t.confidence * 100);
-        lines.push(`[${t.direction}] ${t.subject} → ${t.predicate} → ${t.object}${from} [${validity}, ${conf}%]`);
+        // Evidence summary (v0.32.0): count of UNIQUE evidence sources plus a bounded source
+        // list. Evidence with no source document renders as `unattributed`, never null/null.
+        let evidence = "";
+        const count = t.evidenceCount ?? 0;
+        if (count > 0 && t.sources && t.sources.length > 0) {
+          // Repeated paths stay repeated (same doc, different facts): the `+M more` remainder is
+          // computed from the rows actually shown, so deduping the display would misreport it.
+          const shown = t.sources.map(s => (s.docId != null && s.collection && s.path) ? `${s.collection}/${s.path}` : "unattributed");
+          const more = count - t.sources.length;
+          evidence = ` [evidence ×${count}; sources: ${shown.join(", ")}${more > 0 ? ` +${more} more` : ""}]`;
+        }
+        lines.push(`[${t.direction}] ${t.subject} → ${t.predicate} → ${t.object}${from} [${validity}, ${conf}%]${evidence}`);
       }
 
       return {

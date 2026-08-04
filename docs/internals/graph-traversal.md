@@ -62,7 +62,20 @@ Both `generateMemoryLinks()` and `buildSemanticGraph()` insert `semantic` edges.
 | Outbound (source→target) | All: semantic, supporting, contradicts, causal, temporal |
 | Inbound (target→source) | Only: semantic, entity |
 
-This is intentional — temporal and causal edges are directional by nature.
+This is intentional — temporal and causal edges are directional by nature. Backward causal reach
+("why did B happen?" → the cause A) is provided by the shared causal pipeline's **bounded one-hop
+causal step** (v0.32.0, `src/causal-retrieval.ts`), not by widening this asymmetry: it walks
+`relation_type='causal'` in both directions for one hop, capped at 3 hits per anchor and 10
+unique endpoints.
+
+### Candidate eligibility (v0.32.0)
+
+`adaptiveTraversal` and `mpfpTraversal` accept a `CandidateEligibility` policy — collection
+allow/exclude and an effective-time window on `COALESCE(authored_at, modified_at)`. The core
+predicates (`active = 1`, `invalidated_at IS NULL`) are baked into every neighbor/edge query and
+cannot be waived: ineligible rows never enter beam selection, per-node top-k, or Forward Push
+mass — previously an inactive or invalidated document could consume budget while being hidden
+from output.
 
 ## When to run build_graphs
 
