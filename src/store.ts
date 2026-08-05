@@ -415,6 +415,7 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
       confidence REAL NOT NULL DEFAULT 0.5,
       access_count INTEGER NOT NULL DEFAULT 0,
       content_hash TEXT,
+      origin TEXT,
       FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
       UNIQUE(collection, path)
     )
@@ -450,6 +451,13 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
     // three indiscriminately, so a forget on a file-backed document was silently undone by
     // the next reindex. NULL = legacy row (pre-migration), treated as 'absent'.
     ["deactivated_reason", "ALTER TABLE documents ADD COLUMN deactivated_reason TEXT"],
+    // Origin-aware reconciliation: WHO owns the row's lifecycle. 'fs' = created/maintained
+    // by the filesystem indexer (reconciled against disk); 'api' = DB-born (hooks,
+    // saveMemory, beads sync, REST) — these have no backing file BY DESIGN, so the absence
+    // reconciler must never deactivate them. NULL = ambiguous legacy row; exempt, adopted by
+    // the next writer to TOUCH it (indexer → 'fs', saveMemory → 'api'), never inferred —
+    // content_hash proves nothing about ownership (mined imports write it too).
+    ["origin", "ALTER TABLE documents ADD COLUMN origin TEXT"],
   ];
   for (const [col, sql] of migrations) {
     if (!colNames.has(col)) {
@@ -540,6 +548,24 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
       db.exec(`UPDATE documents SET last_accessed_at = modified_at WHERE last_accessed_at IS NULL`);
     }
   } catch { /* ignore if already backfilled */ }
+
+  // Origin migration verification. Verified explicitly like deactivated_reason above: the
+  // migration loop swallows ALTER errors, and reconciliation semantics must never silently
+  // depend on a column that never arrived. There is deliberately NO content_hash-based
+  // backfill: mined imports (`clawmem mine`) also write content_hash through the indexing
+  // pipeline, so its presence proves nothing about ownership — a backfill would mis-stamp
+  // DB-born imports as 'fs' (1,353 such rows measured in one live vault). Legacy rows stay
+  // NULL (exempt) and are adopted by the next writer to TOUCH them: the indexer stamps its
+  // origin on every path including unchanged files; saveMemory stamps 'api'.
+  const hasOrigin = (
+    db.prepare("PRAGMA table_info(documents)").all() as { name: string }[]
+  ).some(c => c.name === "origin");
+  if (!hasOrigin) {
+    console.warn(
+      `[clawmem] could not add the origin column on this open. Filesystem-absence ` +
+      `reconciliation is disabled until it succeeds; it is retried on the next open.`,
+    );
+  }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
@@ -1657,7 +1683,7 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, origin?: DocumentOrigin) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; pinned: number; snoozed_until: string | null; confidence: number } | null;
   findAnyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; active: number } | null;
   reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => boolean;
@@ -1665,6 +1691,7 @@ export type Store = {
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
   deactivateDocument: (collectionName: string, path: string, reason: DeactivationReason) => void;
   getActiveDocumentPaths: (collectionName: string) => string[];
+  getReconcilableDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
@@ -1855,7 +1882,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
+    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, origin?: DocumentOrigin) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, origin),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
     findAnyDocument: (collectionName: string, path: string) => findAnyDocument(db, collectionName, path),
     reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => reactivateDocument(db, documentId, title, hash, modifiedAt),
@@ -1863,6 +1890,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
     deactivateDocument: (collectionName: string, path: string, reason: DeactivationReason) => deactivateDocument(db, collectionName, path, reason),
     getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
+    getReconcilableDocumentPaths: (collectionName: string) => getReconcilableDocumentPaths(db, collectionName),
 
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
@@ -2813,6 +2841,16 @@ export function insertContent(db: Database, hash: string, content: string, creat
 /**
  * Insert a new document into the documents table.
  */
+/**
+ * Who owns a document row's lifecycle (origin-aware reconciliation).
+ * 'fs'  — created/maintained by the filesystem indexer; reconciled against disk.
+ * 'api' — DB-born (hooks, saveMemory, beads sync, REST); no backing file BY DESIGN, so
+ *         filesystem absence means nothing and the reconciler must never deactivate it.
+ * NULL  — ambiguous legacy row (pre-migration); exempt from reconciliation, adopted by the
+ *         next writer to touch it (indexer → 'fs', saveMemory → 'api'). Never inferred.
+ */
+export type DocumentOrigin = "fs" | "api";
+
 export function insertDocument(
   db: Database,
   collectionName: string,
@@ -2820,14 +2858,17 @@ export function insertDocument(
   title: string,
   hash: string,
   createdAt: string,
-  modifiedAt: string
+  modifiedAt: string,
+  origin: DocumentOrigin = "api"
 ): void {
   // Guard: gray-matter can coerce YAML values to Date/boolean/null — SQLite rejects these
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
+  // origin defaults to 'api': a caller this parameter has not reached yet becomes exempt
+  // from filesystem reconciliation — stale-active at worst, never a destroyed DB-born row.
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
-  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt);
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, origin)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt, origin);
 }
 
 // =============================================================================
@@ -2904,7 +2945,44 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
   bodyHasher.update(params.body);
   const bodyHash = bodyHasher.digest("hex");
 
+  // --- Ownership + lifecycle preflight (before ANY write, including dedup's counters) ---
+  // Rejecting later would leak writes: an orphaned content row on a rejected insert, or a
+  // dedup counter bump on a row the caller had no claim to. Rules: an ACTIVE
+  // filesystem-owned row is never overwritten (this function's contract excludes file-backed
+  // indexing — API content masquerading as the unchanged file would never be re-read past
+  // the indexer's content-hash short-circuit, and file removal would absence-deactivate it).
+  // An INACTIVE row at the path is a lifecycle state — forget/archive are memory decisions
+  // (§55.6 D9) and an absence-deactivated row's recovery is a deliberate operation — so it
+  // is neither overwritten nor resurrected; it also occupies UNIQUE(collection, path), where
+  // a blind insert would orphan the content row on the rethrow. NULL-origin ACTIVE rows are
+  // claimable — saveMemory touching one IS the proof of API ownership; content_hash proves
+  // nothing (mined imports write it too).
+  const pathRow = db.prepare(
+    `SELECT origin, active, deactivated_reason FROM documents WHERE collection = ? AND path = ?`
+  ).get(params.collection, params.path) as
+    { origin: string | null; active: number; deactivated_reason: string | null } | null;
+  if (pathRow) {
+    if (pathRow.active === 1 && pathRow.origin === "fs") {
+      throw new Error(
+        `saveMemory: path collision with a filesystem-owned document ` +
+        `(${params.collection}/${params.path}) — refusing to overwrite. ` +
+        `Write API memories to a path the filesystem indexer does not own.`,
+      );
+    }
+    if (pathRow.active === 0) {
+      throw new Error(
+        `saveMemory: path is occupied by an inactive document ` +
+        `(${params.collection}/${params.path}, deactivated_reason=${pathRow.deactivated_reason ?? "null"}) — ` +
+        `lifecycle decisions are not overwritten. Write to a new path, or restore the ` +
+        `document deliberately first.`,
+      );
+    }
+  }
+
   // --- Dedup check: same normalized_hash within window ---
+  // Candidates are restricted to API-claimable rows: a filesystem-owned row is never a dedup
+  // target (it also never carries a normalized_hash today — belt and suspenders), and a
+  // NULL-origin candidate is adopted 'api' by the counter update (touch-adoption).
   const dedupRow = db.prepare(`
     SELECT id, duplicate_count
     FROM documents
@@ -2912,6 +2990,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
       AND collection = ?
       AND content_type = ?
       AND normalized_hash = ?
+      AND (origin IS NULL OR origin = 'api')
       AND datetime(created_at) >= datetime('now', ?)
     ORDER BY created_at DESC
     LIMIT 1
@@ -2927,106 +3006,140 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
     // incoming authorship advances authored_at monotonically (CASE, not scalar
     // MAX — MAX(NULL, x) is NULL in SQLite and could never populate an
     // initially unknown row); absent incoming leaves the column untouched.
+    //
+    // The UPDATE re-checks ownership ATOMICALLY: between the SELECT above and this
+    // statement, another process (the indexer) may adopt a NULL candidate as 'fs' —
+    // stamping 'api' over that fresh declaration would be a silent ownership overwrite.
+    // Zero changes means the candidate was claimed mid-flight; the call falls through to
+    // the transactional write phase, which revalidates the requested path (insert, an
+    // API-owned update, or rejection via the conflict handling).
+    let dedupChanges: number;
     if (authoredAt) {
-      db.prepare(`
+      dedupChanges = db.prepare(`
         UPDATE documents
         SET duplicate_count = duplicate_count + 1,
             last_seen_at = ?,
+            origin = 'api',
             authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END
-        WHERE id = ?
-      `).run(now, authoredAt, authoredAt, dedupRow.id);
+        WHERE id = ? AND active = 1 AND (origin IS NULL OR origin = 'api')
+      `).run(now, authoredAt, authoredAt, dedupRow.id).changes;
     } else {
-      db.prepare(`
+      dedupChanges = db.prepare(`
         UPDATE documents
         SET duplicate_count = duplicate_count + 1,
-            last_seen_at = ?
-        WHERE id = ?
-      `).run(now, dedupRow.id);
+            last_seen_at = ?,
+            origin = 'api'
+        WHERE id = ? AND active = 1 AND (origin IS NULL OR origin = 'api')
+      `).run(now, dedupRow.id).changes;
     }
+
+    if (dedupChanges > 0) {
+      return {
+        action: 'deduplicated',
+        docId: dedupRow.id,
+        duplicateCount: dedupRow.duplicate_count + 1,
+      };
+    }
+    // Candidate lost to a concurrent ownership claim — fall through to the write phase.
+  }
+
+  // --- Write phase (transactional) ---
+  // Content insert + document insert + the conflict path run in ONE transaction, so a race
+  // rejection (the indexer claiming the path between preflight and insert) rolls the content
+  // row back instead of leaking an orphan. Bun's Database.transaction nests via savepoints,
+  // so a caller-held transaction is safe.
+  const writePhase = db.transaction((): SaveMemoryResult => {
+    // Store content
+    db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+      .run(bodyHash, params.body, now);
+
+    // Insert document row
+    try {
+      db.prepare(`
+        INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
+                               content_type, confidence, quality_score, normalized_hash,
+                               duplicate_count, revision_count, last_seen_at, topic_key, authored_at,
+                               origin)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?, 'api')
+      `).run(
+        params.collection,
+        params.path,
+        params.title,
+        bodyHash,
+        now,
+        now,
+        params.contentType,
+        params.confidence ?? 0.5,
+        params.qualityScore ?? 0.5,
+        normHash,
+        now,
+        params.topicKey ?? null,
+        authoredAt,
+      );
+    } catch (err: any) {
+      // UNIQUE(collection, path) conflict — update existing row
+      if (err?.message?.includes("UNIQUE constraint")) {
+        const existing = db.prepare(
+          "SELECT id, origin FROM documents WHERE collection = ? AND path = ? AND active = 1"
+        ).get(params.collection, params.path) as { id: number; origin: string | null } | null;
+
+        if (existing) {
+          // Race guard for the ownership preflight above: the indexer may have claimed this
+          // path between the preflight and the insert. Same rule — an explicit 'fs' owner is
+          // never overwritten (the throw rolls this transaction back, content row included);
+          // NULL stays claimable and the update below stamps 'api'.
+          if (existing.origin === "fs") {
+            throw new Error(
+              `saveMemory: path collision with a filesystem-owned document ` +
+              `(${params.collection}/${params.path}) — refusing to overwrite. ` +
+              `Write API memories to a path the filesystem indexer does not own.`,
+            );
+          }
+          // §51.1: same monotonic authored_at advancement as the dedup branch. The update
+          // also stamps origin='api': saveMemory touching the row IS proof of API ownership,
+          // healing legacy NULL-origin rows on their next write.
+          const authoredSet = authoredAt
+            ? ", authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END"
+            : "";
+          const updateVals: (string | number | null)[] = [
+            bodyHash, params.title, now, params.contentType,
+            params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
+            now,
+          ];
+          if (authoredAt) updateVals.push(authoredAt, authoredAt);
+          updateVals.push(existing.id);
+          db.prepare(`
+            UPDATE documents
+            SET hash = ?, title = ?, modified_at = ?, content_type = ?,
+                confidence = ?, quality_score = ?, normalized_hash = ?,
+                revision_count = revision_count + 1, last_seen_at = ?, origin = 'api'${authoredSet}
+            WHERE id = ?
+          `).run(...updateVals);
+
+          const updated = db.prepare("SELECT revision_count FROM documents WHERE id = ?")
+            .get(existing.id) as { revision_count: number } | null;
+
+          return {
+            action: 'updated',
+            docId: existing.id,
+            revisionCount: updated?.revision_count ?? 1,
+          };
+        }
+      }
+      throw err;
+    }
+
+    // Get the inserted row ID
+    const newDoc = db.prepare(
+      "SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1"
+    ).get(params.collection, params.path) as { id: number } | null;
 
     return {
-      action: 'deduplicated',
-      docId: dedupRow.id,
-      duplicateCount: dedupRow.duplicate_count + 1,
+      action: 'inserted',
+      docId: newDoc?.id ?? -1,
     };
-  }
-
-  // --- Insert new document ---
-  // Store content
-  db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
-    .run(bodyHash, params.body, now);
-
-  // Insert document row
-  try {
-    db.prepare(`
-      INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
-                             content_type, confidence, quality_score, normalized_hash,
-                             duplicate_count, revision_count, last_seen_at, topic_key, authored_at)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?)
-    `).run(
-      params.collection,
-      params.path,
-      params.title,
-      bodyHash,
-      now,
-      now,
-      params.contentType,
-      params.confidence ?? 0.5,
-      params.qualityScore ?? 0.5,
-      normHash,
-      now,
-      params.topicKey ?? null,
-      authoredAt,
-    );
-  } catch (err: any) {
-    // UNIQUE(collection, path) conflict — update existing row
-    if (err?.message?.includes("UNIQUE constraint")) {
-      const existing = db.prepare(
-        "SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1"
-      ).get(params.collection, params.path) as { id: number } | null;
-
-      if (existing) {
-        // §51.1: same monotonic authored_at advancement as the dedup branch.
-        const authoredSet = authoredAt
-          ? ", authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END"
-          : "";
-        const updateVals: (string | number | null)[] = [
-          bodyHash, params.title, now, params.contentType,
-          params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
-          now,
-        ];
-        if (authoredAt) updateVals.push(authoredAt, authoredAt);
-        updateVals.push(existing.id);
-        db.prepare(`
-          UPDATE documents
-          SET hash = ?, title = ?, modified_at = ?, content_type = ?,
-              confidence = ?, quality_score = ?, normalized_hash = ?,
-              revision_count = revision_count + 1, last_seen_at = ?${authoredSet}
-          WHERE id = ?
-        `).run(...updateVals);
-
-        const updated = db.prepare("SELECT revision_count FROM documents WHERE id = ?")
-          .get(existing.id) as { revision_count: number } | null;
-
-        return {
-          action: 'updated',
-          docId: existing.id,
-          revisionCount: updated?.revision_count ?? 1,
-        };
-      }
-    }
-    throw err;
-  }
-
-  // Get the inserted row ID
-  const newDoc = db.prepare(
-    "SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1"
-  ).get(params.collection, params.path) as { id: number } | null;
-
-  return {
-    action: 'inserted',
-    docId: newDoc?.id ?? -1,
-  };
+  });
+  return writePhase();
 }
 
 // =============================================================================
@@ -3265,6 +3378,33 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
     SELECT path FROM documents WHERE collection = ? AND active = 1
   `).all(collectionName) as { path: string }[];
   return rows.map(r => r.path);
+}
+
+/**
+ * Paths eligible for filesystem-absence reconciliation: active rows the filesystem indexer
+ * owns (origin = 'fs'). DB-born rows (origin = 'api' — hooks, saveMemory, beads, REST) have
+ * no backing file BY DESIGN; treating their absence from disk as deletion destroyed
+ * hook-written memories (measured in one production vault: 2,430 of 2,437 DB-born rows
+ * deactivated). NULL-origin legacy rows are exempt too — fail-safe.
+ *
+ * Failure posture is fail-SAFE: on a pre-migration schema (the one error this function
+ * recognizes) it returns NO paths — reconciliation simply does not run until the migration
+ * lands, and the open-time warning reports that state. There is no inference fallback:
+ * content_hash proves nothing about ownership (mined imports write it too). Every other
+ * error propagates (the caller's transaction rolls back); no failure may widen the
+ * enumeration.
+ */
+export function getReconcilableDocumentPaths(db: Database, collectionName: string): string[] {
+  try {
+    const rows = db.prepare(`
+      SELECT path FROM documents WHERE collection = ? AND active = 1 AND origin = 'fs'
+    `).all(collectionName) as { path: string }[];
+    return rows.map(r => r.path);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/no such column.*origin/i.test(msg)) throw err;
+    return [];
+  }
 }
 
 export { formatQueryForEmbedding, formatDocForEmbedding };

@@ -59,6 +59,31 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.34.0: origin-aware reconciliation
+
+**Migration is automatic** on first open and additive only: one new column
+(`documents.origin`). No data backfill — deliberately: `content_hash` proves nothing about
+ownership (mined imports write it too), so legacy rows stay `NULL` (exempt from absence
+reconciliation) and are adopted by the next writer to touch them. Files present on disk adopt
+`fs` on the next index pass of their collection; hook/`saveMemory` rows adopt `api` on their
+next write.
+
+**Behaviour changes to expect:**
+- A row whose file was already deleted *before* upgrading is no longer auto-deactivated —
+  nothing proves the indexer owned it. Retire it with `memory_forget` or a lifecycle sweep if
+  unwanted.
+- `saveMemory` now rejects a write to a path occupied by a filesystem-owned document or by an
+  inactive document (lifecycle decisions stick), instead of silently overwriting.
+- `clawmem mine` is additive: re-mining into the same collection no longer deactivates
+  earlier batches.
+
+**Verify after upgrading:** `clawmem update` on any collection, then confirm hook-written
+rows survive it — e.g. `sqlite3 <vault> "SELECT COUNT(*) FROM documents WHERE origin='api'
+AND active=0 AND deactivated_reason='absent'"` should stay at its pre-upgrade value (new
+absence deactivations of `api` rows can no longer occur).
+
+---
+
 ## v0.33.0: the causal witness writer + Stop-hook deadline + docid validation
 
 **Migration is automatic** on first open and additive only: four new tables (`causal_runs`,

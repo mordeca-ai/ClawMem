@@ -4,6 +4,54 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.34.0 — origin-aware reconciliation: DB-born memories survive filesystem indexing
+
+The filesystem absence reconciler treated every active row in a collection as
+filesystem-owned: any stored path missing from disk was deactivated `absent` on every pass.
+Rows created directly in the database — hook observations, `saveMemory` output, beads sync,
+REST writes — have no backing file BY DESIGN, so sharing a collection with indexed files
+destroyed them wholesale (measured in one production vault: 2,430 of 2,437 DB-born rows
+inactive). Every document row now records its lifecycle owner, and reconciliation only ever
+touches rows the indexer actually owns.
+
+### The ownership model
+
+A new `documents.origin` column: `fs` (created/maintained by the filesystem indexer;
+reconciled against disk), `api` (DB-born; absence on disk means nothing), `NULL` (ambiguous
+legacy row — exempt). Ownership is DECLARED by writers or ADOPTED on first touch, never
+inferred: the indexer stamps `fs` on every path it takes — insert, update, reactivation, and
+the unchanged short-circuit — while `saveMemory` and `insertDocument` default-stamp `api`.
+There is deliberately no migration backfill: `content_hash` proves nothing about ownership
+(mined imports write it through the same pipeline), so legacy rows heal only when a writer
+touches them. On a pre-migration schema the reconciler enumerates nothing at all —
+fail-closed, reported by an open-time warning — and any other enumeration error propagates
+instead of widening the enumeration.
+
+### Ownership boundaries, both directions
+
+A path collision across origins is rejected visibly, never resolved by silent takeover.
+`saveMemory` preflights the requested path before ANY write: an active filesystem-owned path
+throws, and an inactive row at the path throws too — lifecycle decisions are not overwritten,
+per the v0.31.0 rules. Its write phase is transactional, so a mid-flight indexer claim rolls
+the whole write back rather than leaking orphaned content, and dedup only counts against
+API-claimable candidates through an ownership-conditional atomic update, so a concurrent
+claim is never overwritten. Symmetrically, the indexer skips (and warns about) a file
+appearing at an API-owned path — active or inactive — instead of adopting it.
+
+### `clawmem mine` is additive now
+
+Mine imports run in a new `importMode`: rows are stamped `api` on every write path, and
+absence reconciliation is skipped entirely — the staging snapshot is transient, so a later
+mine into the same collection no longer deactivates earlier batches.
+
+### Upgrading
+
+The `origin` column is added automatically on first open; no action is required. Two
+behaviour changes to know about: a row whose file was already deleted BEFORE upgrading is no
+longer auto-deactivated (nothing proves the indexer owned it — retire it with `memory_forget`
+or a lifecycle sweep if unwanted), and a `saveMemory` write to a path occupied by a
+filesystem-owned or inactive document now fails loudly instead of silently overwriting.
+
 ## v0.33.0 — the causal writer returns, evidence-first
 
 v0.32.0 rebuilt causal *reading* and noted that restoring causal *inference* was a separate,
@@ -34,9 +82,10 @@ while writing zero graph state: run it for a while and read the audit before arm
 
 ### Pre-cut edges: preflight, resolve, restore
 
-Causal edges written by the pre-v0.30 writer carry old-format metadata. The reader materializes
-the valid ones lazily on first touch; edges whose metadata cannot yield a valid witness make the
-writer fail closed rather than guess. `clawmem migrate causal-witnesses --preflight` reports a
+Causal edges written by the pre-v0.30 writer carry old-format metadata. The reader synthesizes
+witness evidence from the valid ones in memory for display (nothing is written on read); the
+armed writer materializes that evidence durably the first time it touches such an edge; edges
+whose metadata cannot yield a valid witness make the writer fail closed rather than guess. `clawmem migrate causal-witnesses --preflight` reports a
 census and emits a binding manifest; `--resolve-unmaterializable keep-weight|retire-edge` acts
 only on explicitly selected edges whose full row image still matches the manifest fingerprint;
 retirement is archive-style and reversible (`--restore-edge`, fail-closed: a restore never

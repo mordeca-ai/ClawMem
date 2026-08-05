@@ -458,9 +458,11 @@ async function cmdMine(args: string[]) {
     }
     await Promise.all(writePromises);
 
-    // Index through existing pipeline
+    // Index through the existing pipeline in importMode: mined rows are DB-born ('api') and
+    // the staging root is transient, so absence reconciliation must not run — a later mine
+    // into the same collection would otherwise deactivate every earlier batch.
     console.log(`\n${c.cyan}Indexing ${totalChunks} conversation chunks${c.reset} as collection '${collectionName}'`);
-    const stats = await indexCollection(s, collectionName, stagingDir, "**/*.md");
+    const stats = await indexCollection(s, collectionName, stagingDir, "**/*.md", { importMode: true });
     const datedNote = stats.dated > 0 ? `, ${c.cyan}◷${stats.dated}${c.reset} dated` : "";
     console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged${datedNote}`);
 
