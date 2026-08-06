@@ -116,7 +116,7 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `beads_sync` / `vault_sync` / `list_vaults` | Beads from Dolt / index a dir into a named vault / list vaults. |
 | `diary_write` / `diary_read` | Diary entries — non-hooked envs only (in Claude Code hooks capture this). |
 
-**Multi-vault:** all tools accept an optional `vault` param (omit for single-vault mode). **Progressive disclosure:** ALWAYS `compact=true` first → review snippets/scores → `get` / `multi_get` for full content. → full param docs: [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md).
+**Multi-vault:** all tools accept an optional `vault` param (omit for single-vault mode). Automatic hook surfacing reads only the general vault unless `retrieval.surface_secondary_vaults` is enabled (default off, v0.35.0). **Progressive disclosure:** ALWAYS `compact=true` first → review snippets/scores → `get` / `multi_get` for full content. → full param docs: [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md).
 
 ---
 

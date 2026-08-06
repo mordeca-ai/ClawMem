@@ -4,6 +4,42 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.35.0 — secondary-vault surfacing is now opt-in
+
+Multi-vault deployments: the `context-surfacing` hook used to merge results from a
+configured secondary vault into every prompt's injected context, unconditionally. Anything
+indexed into that vault could surface in any session — vault separation held for explicit
+queries but not for the automatic feed, and there was no switch.
+
+Automatic cross-vault surfacing is now a config gate, **default OFF**: out of the box the
+hook reads only the general vault, and a configured secondary vault stays isolated unless
+deliberately queried (a `vault`-parameter MCP call) or deliberately opted back in:
+
+```yaml
+# ~/.config/clawmem/config.yaml            # or env, which wins:
+retrieval:                                 # CLAWMEM_SURFACE_SECONDARY_VAULTS=true
+  surface_secondary_vaults: true
+```
+
+The details that matter:
+
+- The automatic secondary lane is the configured named `skill` vault (the same one the
+  recall mirror attributes usage to); the knob does not fan out across every named vault.
+- The gate governs the automatic hook feed only. Explicit `vault` MCP calls, `list_vaults`,
+  `vault_sync`, and Stop-hook usage attribution are unchanged.
+- Opted in, behaviour is exactly the old one — including best-effort fail-open when the
+  secondary vault is unavailable.
+- One gate, one producer: every downstream secondary-vault path in the hook keys off the
+  tag the gated block sets, so OFF starves them all — including the recall mirror, which
+  then writes nothing into the secondary vault.
+- Config is process-cached: restart long-lived processes (watcher, MCP server) after
+  changing it; hooks are per-event processes and pick it up on their next run.
+- If secondary-vault content *also* reaches the general vault as an ordinary indexed
+  collection, that is a separate route this gate does not touch — remove the collection
+  from the general config if full isolation is the goal.
+- No schema migration, no reindex, no re-embed. Only the literal `true` (env) / boolean
+  `true` (yaml) enables.
+
 ## v0.34.0 — origin-aware reconciliation: DB-born memories survive filesystem indexing
 
 The filesystem absence reconciler treated every active row in a collection as

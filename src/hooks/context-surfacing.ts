@@ -9,7 +9,7 @@
 import type { Store, SearchResult } from "../store.ts";
 import { DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, resolveStore } from "../store.ts";
 import { searchVecBounded } from "../vector-daemon.ts";
-import { getVaultPath, getActiveProfile } from "../config.ts";
+import { getVaultPath, getActiveProfile, surfaceSecondaryVaults } from "../config.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
   makeContextOutput,
@@ -245,8 +245,14 @@ export async function contextSurfacing(
     }
   }
 
-  // Dual-query: also search skill vault if configured (secondary source)
-  if (getVaultPath("skill")) {
+  // Dual-query: also search the secondary vault when cross-vault surfacing is
+  // enabled (retrieval.surface_secondary_vaults / CLAWMEM_SURFACE_SECONDARY_VAULTS).
+  // Default OFF since v0.35.0 — automatic surfacing reads only the general vault,
+  // so a configured secondary vault stays isolated unless deliberately opted in.
+  // Every downstream secondary-vault path (snooze routing, enrichment, the recall
+  // mirror) keys off the `_fromVault` tag set here, so this single gate starves
+  // them all when disabled.
+  if (surfaceSecondaryVaults() && getVaultPath("skill")) {
     try {
       const skillStore = resolveStore("skill", skillStoreOpts);
       const skillResults = skillStore.searchFTS(retrievalQuery, 5);

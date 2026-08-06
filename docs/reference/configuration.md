@@ -47,6 +47,7 @@ The context-surfacing hook `timeout` is **not** an env var — it lives in `~/.c
 | Variable | Default | Effect |
 |---|---|---|
 | `CLAWMEM_VAULTS` | (none) | JSON map of vault name → SQLite path. E.g. `{"work":"~/.cache/clawmem/work.sqlite"}`. Paths support `~`. (Also configurable in `~/.config/clawmem/config.yaml` under `vaults:`.) |
+| `CLAWMEM_SURFACE_SECONDARY_VAULTS` | `false` | Lets the `context-surfacing` hook merge a configured secondary vault's results into the automatically injected context (v0.35.0; the automatic lane is the named `skill` vault). Off, automatic surfacing reads only the general vault — explicit `vault`-parameter MCP calls are unaffected either way. Only the literal `true` enables. Also configurable as `retrieval.surface_secondary_vaults` in `config.yaml` (env wins). Process-cached — restart the watcher / MCP server after changing it. |
 
 ## A-MEM & consolidation
 

@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.33.0**.
+Guide for upgrading between released versions. Current: **v0.35.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -58,6 +58,28 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
 
 ---
+
+## v0.35.0: secondary-vault surfacing is now opt-in
+
+**No migration** — no schema change, no reindex, no re-embed. One behaviour change to check.
+
+**Behaviour change:** the `context-surfacing` hook no longer merges a configured secondary
+vault's results into the automatically injected context by default. Single-vault
+deployments are unaffected. If you run multi-vault AND relied on automatic cross-vault
+surfacing, re-enable it:
+
+```yaml
+# ~/.config/clawmem/config.yaml
+retrieval:
+  surface_secondary_vaults: true
+```
+
+or `CLAWMEM_SURFACE_SECONDARY_VAULTS=true` (env wins over yaml; only the literal `true`
+enables). Config is process-cached — restart long-lived processes (`clawmem watch`, the
+MCP server) after changing it; hook invocations are per-event processes and pick it up on
+their next run.
+
+Explicit `vault`-parameter MCP calls are not affected by the gate in either state.
 
 ## v0.34.0: origin-aware reconciliation
 
