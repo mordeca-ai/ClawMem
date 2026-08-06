@@ -275,9 +275,52 @@ export type EnrichedResult = {
   revisionCount: number;
 };
 
+/**
+ * Per-factor decomposition of one result's composite score (the `memory_rank`
+ * explain surface, v0.36.0). Every field is captured from the SAME computation
+ * that produced `compositeScore` — never recomputed — so the identity
+ *   (weightedBlend × qualityMultiplier × lengthFactor × frequencyBoostMultiplier
+ *    × canonicalMultiplier + pinBoost) × coActivationMultiplier === finalComposite
+ * holds exactly: `lengthFactor` already reflects the 0.3 floor, and `pinBoost` is
+ * the delta actually applied after the 1.0 cap (0 when unpinned).
+ */
+export type RankBreakdown = {
+  weights: CompositeWeights;
+  recencyIntent: boolean;
+  searchScore: number;
+  recencyScore: number;
+  computedConfidence: number;
+  storedConfidence: number;
+  blendedConfidence: number;
+  /** weights.search·search + weights.recency·recency + weights.confidence·confidence */
+  weightedBlend: number;
+  qualityMultiplier: number;
+  /** The length multiplier max() ACTUALLY selected: 0.3 when the floor branch won,
+   *  else 1/(1+0.5·log2(len/500)). For negative pre-length scores the selection flips
+   *  relative to the sign-positive reading — the recorded factor always reproduces the
+   *  applied result exactly. */
+  lengthFactor: number;
+  lengthFloorApplied: boolean;
+  frequencyBoostMultiplier: number;
+  canonicalMultiplier: number;
+  /** Additive pin delta actually applied (post-cap); 0 when unpinned. NEGATIVE when
+   *  the 1.0 cap clamps an above-1.0 pre-pin score down — for such docs the pin
+   *  branch acts as clamp-to-1.0, not a boost (quality/frequency/canonical
+   *  multipliers can push the pre-pin composite to ~1.63). */
+  pinBoost: number;
+  /** Filled during the co-activation stage; 1 when no boost applied */
+  coActivationMultiplier: number;
+  /** Recency-intent queries additionally resort handoff/decision/progress first —
+   *  an ORDERING effect on the result list, not a score change */
+  typePriorityResort: boolean;
+  /** Equals the result's compositeScore (kept in sync through co-activation) */
+  finalComposite: number;
+};
+
 export type ScoredResult = EnrichedResult & {
   compositeScore: number;
   recencyScore: number;
+  rankBreakdown?: RankBreakdown;
 };
 
 export type CoActivationFn = (path: string) => { path: string; count: number }[];
@@ -309,6 +352,8 @@ export type CompositeScoringOptions = {
   now?: Date;
   /** Test/experiment only: apply `weights` even under recency intent (bypass the RECENCY_WEIGHTS switch). */
   forceWeights?: boolean;
+  /** Attach a per-factor RankBreakdown to each result (memory_rank). Zero scoring change. */
+  explain?: boolean;
 };
 
 export function applyCompositeScoring(
@@ -344,9 +389,16 @@ export function applyCompositeScoring(
 
     // Length normalization: penalize verbose entries that dominate via keyword density
     // anchor=500 chars. At anchor → 1.0x, 1000 → 0.75x, 2000 → 0.57x. Never boosts short docs.
+    // The two branches are computed explicitly so explain can record the factor max()
+    // ACTUALLY selected — for a negative pre-length score (unconstrained stored
+    // confidence can drive the blend negative) the selection flips relative to the
+    // sign-positive reading, and recording max(0.3, lenFactor) would break the identity.
     const lenRatio = Math.log2(Math.max((r.bodyLength || 500) / 500, 1));
     const lenFactor = 1 / (1 + 0.5 * lenRatio);
-    adjusted = Math.max(adjusted * 0.3, adjusted * lenFactor);
+    const lenFloorBranch = adjusted * 0.3;
+    const lenScaledBranch = adjusted * lenFactor;
+    const lenFloorSelected = lenFloorBranch > lenScaledBranch;
+    adjusted = Math.max(lenFloorBranch, lenScaledBranch);
 
     // Engram integration: revision durability signal (Phase 3)
     // revision_count is weighted more heavily than duplicate_count (evolution vs noise).
@@ -357,14 +409,38 @@ export function applyCompositeScoring(
     const freqBoost = freqSignal > 0 ? Math.min(0.10, Math.log1p(freqSignal) * 0.03) : 0;
     adjusted *= (1 + freqBoost);
 
-    adjusted *= canonicalMemoryMultiplier(r.displayPath, r.contentType, query);
+    const canonicalMult = canonicalMemoryMultiplier(r.displayPath, r.contentType, query);
+    adjusted *= canonicalMult;
 
     // Pin boost: +0.3 additive, capped at 1.0
+    const prePin = adjusted;
     if (r.pinned) {
       adjusted = Math.min(1.0, adjusted + 0.3);
     }
 
-    return { ...r, compositeScore: adjusted, recencyScore: recency };
+    const scoredResult: ScoredResult = { ...r, compositeScore: adjusted, recencyScore: recency };
+    if (options?.explain) {
+      scoredResult.rankBreakdown = {
+        weights,
+        recencyIntent,
+        searchScore: r.score,
+        recencyScore: recency,
+        computedConfidence: computed,
+        storedConfidence: storedConf,
+        blendedConfidence: conf,
+        weightedBlend: composite,
+        qualityMultiplier,
+        lengthFactor: lenFloorSelected ? 0.3 : lenFactor,
+        lengthFloorApplied: lenFloorSelected,
+        frequencyBoostMultiplier: 1 + freqBoost,
+        canonicalMultiplier: canonicalMult,
+        pinBoost: adjusted - prePin,
+        coActivationMultiplier: 1,
+        typePriorityResort: recencyIntent,
+        finalComposite: adjusted,
+      };
+    }
+    return scoredResult;
   });
 
   // Co-activation boost: docs frequently accessed alongside top results get a boost
@@ -391,7 +467,12 @@ export function applyCompositeScoring(
         const coCount = coActivatedCounts.get(stripPrefix(r.filepath));
         if (coCount) {
           // Boost capped at 15% to prevent runaway amplification
-          r.compositeScore *= 1 + Math.min(coCount / 10, 0.15);
+          const coMult = 1 + Math.min(coCount / 10, 0.15);
+          r.compositeScore *= coMult;
+          if (r.rankBreakdown) {
+            r.rankBreakdown.coActivationMultiplier = coMult;
+            r.rankBreakdown.finalComposite = r.compositeScore;
+          }
         }
       }
     }

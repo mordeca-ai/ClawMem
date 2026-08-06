@@ -4,6 +4,65 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.0 — the ranking pipeline and vault lifecycle become inspectable
+
+Two read-only diagnostic MCP tools. Composite ranking and lifecycle state were
+previously observable only from the outside: you saw the final ordering and the final
+counts, and answering "why did this doc outrank that one" or "how do this collection's
+rows distribute across origin, activity, and age" meant re-deriving scorer behaviour by
+hand.
+
+### memory_stats — lifecycle + ranking-metadata aggregates
+
+Deterministic SQL aggregates per collection: counts by active state, origin×active
+cross-tabs (`fs` / `api` / legacy-`NULL` rows from the v0.34.0 ownership model), pinned
+counts, accrual (7d/30d) and created-at span, deactivation reasons, and
+mean/median/min/max distributions over `access_count`, `confidence`, `quality_score`,
+and effective-time age (`authored_at ?? modified_at` — the same axis recency ranking
+decays on since v0.27.0). Counts and cross-tabs cover all rows; distributions cover
+ACTIVE rows only, since ranking never sees inactive rows. Complements `index_stats`
+(embedding coverage / content types); nothing is filtered — system collections
+included. Fail-loud by contract: a stats tool that silently dropped a section would
+report a smaller vault as if it were the whole truth.
+
+### memory_rank — composite ranking explanation
+
+Runs the real FTS + composite pipeline for a query and returns each result's
+per-factor breakdown — weights applied (`default` | `query` profile, with the
+recency-intent override behaving exactly as in production), recency and
+blended-confidence inputs, quality/length/frequency/canonical multipliers, signed pin
+delta, co-activation — plus raw-vs-composite rank shifts.
+
+The details that matter:
+
+- **The breakdown is captured inside the scorer, never recomputed.** The recorded
+  factors reproduce `compositeScore` exactly, and `explain` changes no score and no
+  ordering — the diagnostic cannot drift from the thing it explains.
+- **Raw ordering is production's** — `search`'s non-recency regime including its
+  pin → legacy-composite → path tie contract — not a re-sort of the composite-ordered
+  array, which would let exact raw ties inherit composite order and make the
+  diagnostic circular.
+- **Output is the union of the composite top-N and the raw top-N.** A raw winner the
+  composite ordering demoted below the cutoff stays visible (`demotedRawWinner`,
+  `⚠ demoted raw winner` marker) with its true composite rank — the exact signature a
+  ranking investigation looks for, and the one a composite-only view would hide.
+- **The pin cap is reported truthfully.** On composite surfaces the pin boost is
+  `min(1.0, score + 0.3)` — and quality (×1.3), frequency (×1.10), and canonical
+  (×1.14) multipliers can push a pre-pin composite above 1.0, so the cap can CLAMP a
+  pinned doc below its unpinned twin. `memory_rank` renders that as a negative `pinΔ`
+  rather than hiding it. Known defect, queued behind a judged golden set; scoring
+  behaviour is deliberately unchanged in this release.
+- Ranks are keyed by filepath — docids are content-hash prefixes, so identical-content
+  documents at different paths share a docid and would otherwise overwrite each
+  other's rank.
+- Both tools return structured errors carrying the available list on unknown
+  `collection` or `vault` names. `memory_rank` joins the default-`_clawmem`-filtered
+  tools (`includeInternal: true` reaches system memory); `memory_stats` filters
+  nothing.
+- `memory_rank` candidates are FTS-only — no vector or LLM stage; deterministic and
+  cheap enough to run casually.
+- No schema change, no migration, no reindex, no re-embed.
+
 ## v0.35.0 — secondary-vault surfacing is now opt-in
 
 Multi-vault deployments: the `context-surfacing` hook used to merge results from a

@@ -59,7 +59,7 @@ clawmem doctor                              # full health check (clawmem status 
 | `feedback-loop` | Stop | tracks referenced notes → confidence boosts, co-activations, utility signals |
 
 **Default behavior:** read injected `<vault-context>` first; if sufficient, answer immediately.
-**Blind spots (by design):** hooks filter `_clawmem/` artifacts, enforce score thresholds, cap token budget — **absence in `<vault-context>` does NOT mean absence in memory.** If expected memory wasn't surfaced, escalate to Tier 3. Note the default-filtered MCP retrieval tools (`search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, `find_similar`) exclude `_clawmem` by default since v0.21.0 — pass `includeInternal: true` when system-internal memory (observations/handoffs/deductions) is the target. `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are NOT filtered — system memory is their substrate by design. Since v0.32.0, WHY-classified queries on the filtered causal routes additionally reach `_clawmem` *observation* documents (never handoffs/deductions) through a bounded observation lane, so causal answers can surface their reasoning artifacts without `includeInternal`.
+**Blind spots (by design):** hooks filter `_clawmem/` artifacts, enforce score thresholds, cap token budget — **absence in `<vault-context>` does NOT mean absence in memory.** If expected memory wasn't surfaced, escalate to Tier 3. Note the default-filtered MCP retrieval tools (`search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, `find_similar`; `memory_rank` since v0.36.0) exclude `_clawmem` by default since v0.21.0 — pass `includeInternal: true` when system-internal memory (observations/handoffs/deductions) is the target. `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are NOT filtered — system memory is their substrate by design. Since v0.32.0, WHY-classified queries on the filtered causal routes additionally reach `_clawmem` *observation* documents (never handoffs/deductions) through a bounded observation lane, so causal answers can surface their reasoning artifacts without `includeInternal`.
 **Profiles:** `speed` / `balanced` (default) / `deep` set the kept-score ratio (65% / 55% / 45%) + an activation floor; only `deep` adds query expansion + reranking to the hook path. → [docs/concepts/hooks-vs-mcp.md](docs/concepts/hooks-vs-mcp.md).
 
 ### Tier 3 — agent-initiated (one targeted MCP call)
@@ -113,6 +113,8 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `memory_evolution_status` | How a doc's A-MEM metadata evolved over time. |
 | `lifecycle_status` / `lifecycle_sweep` / `lifecycle_restore` | Lifecycle stats / archive stale (dry-run default, archives only — ClawMem never deletes rows) / restore. |
 | `index_stats` / `status` / `reindex` | Doc counts + embedding coverage / quick health / re-index (does NOT embed). |
+| `memory_stats` | Lifecycle + ranking-metadata aggregates per collection: origin×active cross-tabs, pinned, accrual, access/confidence/quality/effective-age distributions. Deeper than `index_stats`; includes system collections. |
+| `memory_rank` | "Why did X outrank Y" — real-pipeline composite breakdown per result (weights, recency, confidence, multipliers, signed pinΔ, co-activation) + raw-vs-composite rank shifts; demoted raw winners stay visible. Diagnostic, not a retrieval tool. |
 | `beads_sync` / `vault_sync` / `list_vaults` | Beads from Dolt / index a dir into a named vault / list vaults. |
 | `diary_write` / `diary_read` | Diary entries — non-hooked envs only (in Claude Code hooks capture this). |
 
@@ -207,7 +209,7 @@ Maintenance agent for Tier-3 work the main agent neglects. Install: `clawmem set
 
 ## Integrations
 
-- **Claude Code** — `clawmem setup hooks && clawmem setup mcp`. Hooks = 90% auto; 31 MCP tools = 10%.
+- **Claude Code** — `clawmem setup hooks && clawmem setup mcp`. Hooks = 90% auto; 33 MCP tools = 10%.
 - **OpenClaw** — native memory plugin (`kind: memory`, v0.10.0+): `clawmem setup openclaw`. → [docs/guides/openclaw-plugin.md](docs/guides/openclaw-plugin.md).
 - **Hermes** — `MemoryProvider` plugin: copy `src/hermes/` into `$HERMES_HOME/plugins/clawmem/`. → [docs/guides/hermes-plugin.md](docs/guides/hermes-plugin.md).
 - **REST API** — `clawmem serve [--port 7438]`. → [docs/reference/rest-api.md](docs/reference/rest-api.md).

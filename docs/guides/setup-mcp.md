@@ -28,9 +28,9 @@ Add to your MCP client config:
 
 ## What it exposes
 
-The MCP server registers 31 tools:
+The MCP server registers 33 tools:
 
-**Retrieval** — `memory_retrieve`, `query`, `search`, `vsearch`, `intent_search`, `query_plan`
+**Retrieval** — `memory_retrieve`, `query`, `search`, `vsearch`, `intent_search`, `query_plan`, `memory_rank`
 
 **Documents** — `get`, `multi_get`, `find_similar`, `find_causal_links`, `timeline`, `memory_evolution_status`, `session_log`
 
@@ -38,7 +38,7 @@ The MCP server registers 31 tools:
 
 **Lifecycle** — `lifecycle_status`, `lifecycle_sweep`, `lifecycle_restore`
 
-**Maintenance** — `status`, `reindex`, `index_stats`, `build_graphs`, `profile`, `beads_sync`
+**Maintenance** — `status`, `reindex`, `index_stats`, `memory_stats`, `build_graphs`, `profile`, `beads_sync`
 
 **Vault** — `list_vaults`, `vault_sync`
 

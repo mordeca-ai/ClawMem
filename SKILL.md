@@ -104,6 +104,8 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `memory_evolution_status` | How a doc's A-MEM metadata evolved over time. |
 | `lifecycle_status` / `lifecycle_sweep` / `lifecycle_restore` | Lifecycle stats / archive stale (dry-run default, archives only — ClawMem never deletes rows) / restore auto-archived. |
 | `index_stats` / `status` / `reindex` | Doc counts + embedding coverage / quick health / force re-index (does NOT embed). |
+| `memory_stats` | Lifecycle + ranking-metadata aggregates per collection: origin×active cross-tabs, pinned, accrual, access/confidence/quality/effective-age distributions. Deeper than `index_stats`. |
+| `memory_rank` | "Why did X outrank Y" — real-pipeline composite breakdown (weights, multipliers, signed pinΔ, co-activation) + raw-vs-composite rank shifts. Diagnostic, not retrieval. |
 | `beads_sync` / `vault_sync` / `list_vaults` | Beads issues from Dolt / index a dir into a named vault / list vaults. |
 
 **Multi-vault:** all tools accept an optional `vault` param (omit for single-vault mode). **Progressive disclosure:** ALWAYS `compact=true` first → review snippets/scores → `get` / `multi_get` for full content.

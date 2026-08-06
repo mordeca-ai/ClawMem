@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.35.0**.
+Guide for upgrading between released versions. Current: **v0.36.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -56,6 +56,20 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 ```
 
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.36.0: memory_stats + memory_rank diagnostics
+
+**No migration** — no schema change, no reindex, no re-embed, and no behaviour change
+to any existing tool. Two new read-only MCP tools: `memory_stats` (per-collection
+lifecycle + ranking-metadata aggregates) and `memory_rank` (per-result composite
+ranking breakdown with raw-vs-composite rank shifts). See
+[mcp-tools.md](../reference/mcp-tools.md) for parameters.
+
+The MCP stdio server is respawned per agent session, so new sessions see the tools
+immediately; reconnect (`/mcp` in Claude Code) any session that stays open across the
+upgrade. Hooks, the watcher, and all retrieval semantics are untouched.
 
 ---
 
