@@ -9,6 +9,7 @@
 import type { TranscriptMessage } from "./hooks.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { MAX_LLM_GENERATE_TIMEOUT_MS } from "./limits.ts";
+import { isSchemaPlaceholder } from "./schema-placeholder.ts";
 
 // =============================================================================
 // Types
@@ -125,29 +126,118 @@ Rules:
 - If a section has nothing relevant, write "None"`;
 
 // =============================================================================
-// Transcript Preparation
+// Transcript Preparation — Priority-Based Formatting
+//
+// Priority levels (lower = more important):
+//   P0 — First user message (original request)
+//   P1 — Last assistant message (final response)
+//   P2 — Tool calls + tool errors
+//   P3 — Other user/assistant messages
+//   P4 — System messages
 // =============================================================================
 
-function prepareTranscript(messages: TranscriptMessage[]): string {
-  const recent = messages.slice(-MAX_TRANSCRIPT_MESSAGES);
-  const lines: string[] = [];
-  let charCount = 0;
-  const charBudget = MAX_TRANSCRIPT_TOKENS * 4; // ~4 chars per token
+const P_USER_INSTRUCTION = 0;
+const P_FINAL_RESPONSE = 1;
+const P_TOOL_ACTIVITY = 2;
+const P_CONVERSATION = 3;
+const P_SYSTEM = 4;
 
-  for (const msg of recent) {
-    if (charCount >= charBudget) break;
+export type PrioritizedMessage = {
+  priority: number;
+  index: number;  // original position for chronological reassembly
+  role: string;
+  content: string;
+};
 
-    const maxChars = msg.role === "user" ? MAX_USER_MSG_CHARS : MAX_ASSISTANT_MSG_CHARS;
-    const content = msg.content.length > maxChars
-      ? msg.content.slice(0, maxChars) + "..."
-      : msg.content;
+function isToolContent(content: string): boolean {
+  return content.includes("[tool_use") || content.includes("[tool_result");
+}
 
-    const line = `[${msg.role}]: ${content}`;
-    lines.push(line);
-    charCount += line.length;
+export function classifyMessages(messages: TranscriptMessage[]): PrioritizedMessage[] {
+  const classified: PrioritizedMessage[] = [];
+  let firstUserSeen = false;
+
+  // Find last assistant message that is NOT a tool message (real final response)
+  const lastRealAssistantIdx = messages.reduce(
+    (last, m, i) => (m.role === "assistant" && !isToolContent(m.content)) ? i : last, -1
+  );
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
+    let priority: number;
+
+    // Tool content check first — tool messages in assistant role stay P2
+    if (isToolContent(msg.content)) {
+      priority = P_TOOL_ACTIVITY;
+    } else if (msg.role === "user" && !firstUserSeen) {
+      priority = P_USER_INSTRUCTION;
+      firstUserSeen = true;
+    } else if (msg.role === "assistant" && i === lastRealAssistantIdx) {
+      priority = P_FINAL_RESPONSE;
+    } else if (msg.role === "system") {
+      priority = P_SYSTEM;
+    } else {
+      priority = P_CONVERSATION;
+    }
+
+    classified.push({ priority, index: i, role: msg.role, content: msg.content });
   }
 
-  return lines.join("\n");
+  return classified;
+}
+
+export function prepareTranscript(messages: TranscriptMessage[]): string {
+  const recent = messages.slice(-MAX_TRANSCRIPT_MESSAGES);
+  const charBudget = MAX_TRANSCRIPT_TOKENS * 4; // ~4 chars per token
+
+  const classified = classifyMessages(recent);
+
+  // Phase 1: Critical (P0 + P1) — always included, truncated to per-role limits
+  const critical = classified.filter(m => m.priority <= P_FINAL_RESPONSE);
+  const criticalLines = critical.map(m => {
+    const maxChars = m.role === "user" ? MAX_USER_MSG_CHARS * 2 : MAX_ASSISTANT_MSG_CHARS * 2;
+    const content = m.content.length > maxChars ? m.content.slice(0, maxChars) + "..." : m.content;
+    return { ...m, content, formatted: `[${m.role}]: ${content}` };
+  });
+  let used = criticalLines.reduce((sum, l) => sum + l.formatted.length + 1, 0);
+
+  // Phase 2: Tool activity (P2) — budget-allocated, truncate to fit (not drop)
+  const toolMsgs = classified.filter(m => m.priority === P_TOOL_ACTIVITY);
+  const toolLines: typeof criticalLines = [];
+  for (const m of toolMsgs) {
+    if (used >= charBudget) break;
+    const remaining = charBudget - used;
+    const prefix = `[${m.role}]: `;
+    const overhead = prefix.length + 1; // +1 for newline join
+    if (remaining <= overhead + 20) break; // not enough room for meaningful content
+    const contentBudget = Math.min(500, remaining - overhead);
+    const content = m.content.length > contentBudget
+      ? m.content.slice(0, contentBudget - 3) + "..."
+      : m.content;
+    const formatted = `${prefix}${content}`;
+    toolLines.push({ ...m, content, formatted });
+    used += formatted.length + 1;
+  }
+
+  // Phase 3: Conversation (P3) — fills remaining budget
+  const convMsgs = classified.filter(m => m.priority === P_CONVERSATION);
+  const convLines: typeof criticalLines = [];
+  for (const m of convMsgs) {
+    if (used >= charBudget) break;
+    const maxChars = m.role === "user" ? MAX_USER_MSG_CHARS : MAX_ASSISTANT_MSG_CHARS;
+    const content = m.content.length > maxChars ? m.content.slice(0, maxChars) + "..." : m.content;
+    const formatted = `[${m.role}]: ${content}`;
+    if (used + formatted.length + 1 <= charBudget) {
+      convLines.push({ ...m, content, formatted });
+      used += formatted.length + 1;
+    }
+  }
+
+  // Reassemble in chronological order
+  const all = [...criticalLines, ...toolLines, ...convLines];
+  all.sort((a, b) => a.index - b.index);
+
+  return all.map(l => l.formatted).join("\n");
 }
 
 // =============================================================================
@@ -179,31 +269,9 @@ export const VALID_PREDICATES = new Set([
 // Predicates whose <object> should be stored as a literal (not resolved to an entity).
 export const LITERAL_PREDICATES = new Set(["prefers", "avoids"]);
 
-// Exact placeholder strings that must never be persisted as facts or triple components.
-// Defense-in-depth: even though the prompt no longer places example text inside
-// <fact>/<subject>/<object> tags, a weak model could still echo these phrases.
-const SCHEMA_PLACEHOLDER_STRINGS = new Set([
-  "individual atomic fact",
-  "atomic fact",
-  "one atomic claim per fact element",
-  "brief descriptive title",
-  "canonical entity name",
-]);
-
-// Regex for template placeholder markers: {{...}}, <!--...-->, ${...}.
-// Intentionally narrow — earlier drafts rejected any line starting with
-// "example:" / "placeholder:", which false-positived legitimate facts like
-// "Example: QMD switched to Bun in v0.2". Shape-only matching avoids that
-// drift; the exact-string blocklist above handles known echoed placeholders.
-const PLACEHOLDER_REGEX = /^(\{\{.*\}\}|<!--.*-->|\$\{.*\})/;
-
-function isSchemaPlaceholder(text: string): boolean {
-  if (!text) return true;
-  const normalized = text.trim().toLowerCase();
-  if (SCHEMA_PLACEHOLDER_STRINGS.has(normalized)) return true;
-  if (PLACEHOLDER_REGEX.test(normalized)) return true;
-  return false;
-}
+// Anti-parrot residue guard (SCHEMA_PLACEHOLDER_STRINGS / PLACEHOLDER_REGEX / isSchemaPlaceholder)
+// now lives in ./schema-placeholder.ts, shared with the consolidation + conversation-synthesis
+// extraction paths. Imported at the top of this file.
 
 export function parseObservationXml(xml: string): Observation | null {
   const typeMatch = xml.match(/<type>\s*(.*?)\s*<\/type>/s);

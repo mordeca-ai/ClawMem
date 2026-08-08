@@ -109,6 +109,14 @@ export type EmbedOptions = {
   model?: string;
   isQuery?: boolean;
   title?: string;
+  /**
+   * Abort signal for the remote embed fetch AND its 429-retry backoff (B4).
+   * The query path passes AbortSignal.timeout(<remaining budget>) so a slow or
+   * rate-limited embed cannot outlive the caller's deadline. Without it, the
+   * hook's Promise.race only ABANDONS the embed promise — the underlying fetch
+   * and retry sleeps keep running; the signal actually CANCELS them.
+   */
+  signal?: AbortSignal;
 };
 
 /**
@@ -320,6 +328,13 @@ export type LlamaCppConfig = {
    */
   remoteLlmUrl?: string;
   /**
+   * API key for the remote LLM service (independent of the embed/rerank keys —
+   * the LLM endpoint may point at a different authenticated host than embedding).
+   * When set, sent as Authorization: Bearer header with chat completion requests.
+   * Env: CLAWMEM_LLM_API_KEY
+   */
+  remoteLlmApiKey?: string;
+  /**
    * Remote LLM model name to send with chat completion requests.
    * Env: CLAWMEM_LLM_MODEL
    */
@@ -436,6 +451,7 @@ export class LlamaCpp implements LLM {
   private remoteEmbedApiKey: string | null;
   private remoteEmbedModel: string;
   private remoteLlmUrl: string | null;
+  private remoteLlmApiKey: string | null;
   private remoteLlmModel: string;
   private remoteLlmReasoningEffort: string | null;
   private remoteLlmNoThink: boolean;
@@ -479,6 +495,7 @@ export class LlamaCpp implements LLM {
     this.remoteEmbedApiKey = config.remoteEmbedApiKey || null;
     this.remoteEmbedModel = config.remoteEmbedModel || "embedding";
     this.remoteLlmUrl = config.remoteLlmUrl || null;
+    this.remoteLlmApiKey = config.remoteLlmApiKey || null;
     const normalizedRemoteLlmModel = config.remoteLlmModel?.trim();
     this.remoteLlmModel = normalizedRemoteLlmModel || "qwen3";
     this.remoteLlmReasoningEffort = normalizeRemoteLlmReasoningEffort(config.remoteLlmReasoningEffort);
@@ -749,7 +766,7 @@ export class LlamaCpp implements LLM {
     // Remote server or cloud API — preferred path
     if (this.remoteEmbedUrl && !this.isRemoteEmbedDown()) {
       const extraParams = this.getCloudEmbedParams(!!options.isQuery);
-      const result = await this.embedRemote(text, extraParams);
+      const result = await this.embedRemote(text, extraParams, undefined, options.signal);
       if (result) return result;
       // Cloud providers don't fall back — if API key is set, the user chose cloud
       if (this.isCloudEmbedding()) return null;
@@ -762,6 +779,13 @@ export class LlamaCpp implements LLM {
     // Remote is in cooldown or was never configured — try local fallback
     if (this.remoteEmbedUrl && this.isRemoteEmbedDown()) {
       if (process.env.CLAWMEM_NO_LOCAL_MODELS === "true") return null;
+      // Medium-fix (B4): a deadline-bounded caller (query path, signal set)
+      // cannot afford a local model load/download during a remote cooldown —
+      // embedLocal ignores the abort signal and can run for seconds/minutes.
+      // Skip the local fallback and let the caller degrade (searchVec → [] →
+      // FTS). Pure-local mode (no remoteEmbedUrl) never enters this branch, so
+      // local-only deployments still embed.
+      if (options.signal) return null;
       this.noteRemoteFallback(
         "embed",
         this.isLoopbackUrl(this.remoteEmbedUrl)
@@ -1003,6 +1027,14 @@ export class LlamaCpp implements LLM {
     return headers;
   }
 
+  private getLlmHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.remoteLlmApiKey) {
+      headers["Authorization"] = `Bearer ${this.remoteLlmApiKey}`;
+    }
+    return headers;
+  }
+
   /**
    * Token-aware cap seam (5r0rd): tokenize `text`, and if it exceeds
    * `maxTokens`, slice to the first `maxTokens` tokens and detokenize back to
@@ -1074,23 +1106,49 @@ export class LlamaCpp implements LLM {
     return Math.floor(delayMs * (0.75 + Math.random() * 0.5));
   }
 
-  private async embedRemote(text: string, extraParams: Record<string, unknown> = {}, retries = 5): Promise<EmbeddingResult | null> {
+  /**
+   * Sleep for `ms`, resolving early if `signal` aborts. Returns true if the
+   * wait was cut short by an abort (caller should stop retrying), false if it
+   * slept the full duration. Without this, a 429 backoff (up to 30s) would run
+   * to completion even after the caller's deadline elapsed (B4).
+   */
+  private async abortableDelay(ms: number, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return true;
+    if (!signal) {
+      await new Promise(r => setTimeout(r, ms));
+      return false;
+    }
+    return await new Promise<boolean>((resolve) => {
+      const onAbort = () => { clearTimeout(timer); resolve(true); };
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(false);
+      }, ms);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  private async embedRemote(text: string, extraParams: Record<string, unknown> = {}, retries = 5, signal?: AbortSignal): Promise<EmbeddingResult | null> {
     if (this.isRemoteEmbedDown()) return null;
     const input = await this.truncateForEmbed(text);
     for (let attempt = 0; attempt < retries; attempt++) {
+      if (signal?.aborted) return null; // caller deadline already elapsed — do not start another attempt
       try {
         const body: Record<string, unknown> = { input, model: this.remoteEmbedModel, ...extraParams };
         const resp = await fetch(`${this.remoteEmbedUrl}/v1/embeddings`, {
           method: "POST",
           headers: this.getEmbedHeaders(),
           body: JSON.stringify(body),
-          signal: this.remoteFetchSignal(),
+          // 1d1fn/62xr.5 bound + upstream v0.17 caller cancellation: always deadline the
+          // fetch, and additionally honor the caller's signal when one is passed.
+          signal: this.remoteFetchSignal(signal),
         });
         if (resp.status === 429) {
           const retryAfter = this.parseRetryAfter(resp);
           const delay = retryAfter ?? Math.min(1000 * 2 ** attempt, 30000);
-          console.error(`Remote embed rate-limited, retry ${attempt + 1}/${retries} in ${this.jitter(delay)}ms`);
-          await new Promise(r => setTimeout(r, this.jitter(delay)));
+          const jittered = this.jitter(delay);
+          console.error(`Remote embed rate-limited, retry ${attempt + 1}/${retries} in ${jittered}ms`);
+          if (await this.abortableDelay(jittered, signal)) return null; // deadline elapsed during backoff
           continue;
         }
         if (!resp.ok) {
@@ -1106,6 +1164,13 @@ export class LlamaCpp implements LLM {
           model: data.model || this.remoteEmbedUrl!,
         };
       } catch (error) {
+        // An abort/timeout is an intentional caller-driven cancellation (the
+        // query-path deadline), NOT a transport failure — do not trip the 60s
+        // remote-down cooldown, which would needlessly force local fallback.
+        const name = (error as { name?: string })?.name;
+        if (signal?.aborted || name === "AbortError" || name === "TimeoutError") {
+          return null;
+        }
         if (this.isTransportError(error)) {
           this.markRemoteEmbedDown();
         } else {
@@ -1244,7 +1309,7 @@ export class LlamaCpp implements LLM {
       }
       const resp = await fetch(buildRemoteChatCompletionsUrl(this.remoteLlmUrl!), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: this.getLlmHeaders(),
         body: JSON.stringify(body),
         signal: this.remoteFetchSignal(signal),
       });
@@ -1564,6 +1629,7 @@ export function getDefaultLlamaCpp(): LlamaCpp {
       remoteEmbedApiKey: embedApiKey,
       remoteEmbedModel: process.env.CLAWMEM_EMBED_MODEL || undefined,
       remoteLlmUrl: process.env.CLAWMEM_LLM_URL || undefined,
+      remoteLlmApiKey: process.env.CLAWMEM_LLM_API_KEY || undefined,
       remoteLlmModel: process.env.CLAWMEM_LLM_MODEL?.trim() || undefined,
       remoteLlmReasoningEffort: process.env.CLAWMEM_LLM_REASONING_EFFORT || undefined,
       remoteLlmNoThink: (() => {

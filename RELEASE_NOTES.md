@@ -4,6 +4,121 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.20.0 — Vector-query daemon: a hard cap on the cold synchronous MATCH
+
+v0.16.0 and v0.17.0 bounded the `context-surfacing` hook's vector leg with wall-clock deadlines and kept the sqlite-vec payload warm with a watcher prewarm, but those are probability reductions: a synchronous `bun:sqlite` MATCH exposes no interrupt, so once a cold scan on a large vault is in flight it blocks the hook's event loop past the 8-15s budget and the in-thread `Promise.race` timer cannot fire. v0.17.0 tracked the true hard cap — moving the scan off the hook's event loop — as deferred. This release ships it.
+
+- **Vector-query daemon, hosted by the watcher (opt-in, a pure optimization layer).** `clawmem watch` now runs a per-vault unix-domain socket daemon. The `context-surfacing` hook sends only the query string; the daemon runs Step 1 — the embed plus the blocking sqlite-vec MATCH — in its own process and returns the raw `{hash_seq, distance}` matches, which the hook hydrates locally (Step 2). With the blocking scan off the hook's event loop, the hook's real `setTimeout` finally fires: a cold scan that would have blocked the turn now times out fast and falls back to FTS with bounded latency. `searchVec` is split into `searchVecMatch` (Step 1) and `hydrateVecResults` (Step 2); the in-process `searchVec` composes them, so its contract is unchanged, and both hook vector legs — primary and deep-escalation — are bounded, not just the first.
+- **Strict graceful degradation — never a dependency.** When the watcher isn't running the socket is absent and the hook uses the in-process path exactly as before. When the daemon is busy or misbehaving the hook drops to FTS rather than re-running the scan in-process (which would reintroduce the block). A read-path model mismatch still surfaces as `VecReadModelMismatchError` (warned once) across the socket, preserving the v0.18.0 contract.
+- **Single-flight, deadline-on-receipt, and a private socket.** At most one scan runs per vault; a request arriving mid-scan gets an immediate `busy` (→ FTS) rather than queuing, and a request whose deadline already elapsed is dropped without scanning — so cold-scan pileups cannot starve the watcher. The socket lives under `$XDG_RUNTIME_DIR/clawmem/` (0700 dir, 0600 socket), is keyed per vault DB path, refuses to clobber a live daemon from another watcher, and is unlinked on shutdown. `CLAWMEM_VEC_TIMING=1` logs per-leg outcome and elapsed for attribution.
+
+### Verification
+
+`bun test` → 1447 pass / 0 fail — the project's release gate. New bug-first tests in `tests/unit/vector-daemon.test.ts` (16, deterministic under `--rerun-each 3`) cover the socket protocol (serve, malformed, oversized, teardown), single-flight and deadline-on-receipt, the per-vault socket derivation, and the client's full fail-open matrix (absent → in-process, busy/error → FTS, model-mismatch → typed rethrow); the Step-1 scan is dependency-injected so they run without an embedding server. A bare `tsc --noEmit` remains a non-gate for the reasons noted under v0.18.0; the new `src/vector-daemon.ts` and the split `src/store.ts` add no new type errors over that baseline. Reviewed by an independent cross-model adversarial pass (codex / GPT-5.5-high): a fresh DESIGN gate on the spec at build time, then code review to zero remaining findings.
+
+### What didn't change
+
+Retrieval quality, scoring, ranking, and the vault format are untouched — the daemon returns the same Step-1 matches the in-process path would, hydrated by the same Step-2 query. A deployment that does not run `clawmem watch` gets byte-identical behavior to v0.19.0. The daemon hosts the general vault only; skill-vault vector queries stay in-process (a far smaller surface, not the ~2 GB risk).
+
+## v0.19.0 — Priority-based transcript formatting for session extraction
+
+The `decision-extractor` and session-summary Stop hooks prepared their LLM input by walking the last N messages and truncating each to a per-role character cap until a flat budget ran out. Under that scheme a long run of mid-conversation tool output could exhaust the budget before the final assistant message (the actual outcome) was reached, and the original user request — the single most important anchor for extraction — carried the same weight as any other message. Extraction quality degraded on exactly the long, tool-heavy sessions where good observations matter most.
+
+- **Priority-based transcript assembly.** `prepareTranscript` now classifies each message before budgeting: P0 the first user message (the original request), P1 the last real assistant message (the final response, skipping trailing tool calls), P2 tool activity, P3 the remaining conversation, P4 system messages. The critical P0/P1 pair is always included (at a doubled per-role cap); tool activity and then conversation fill the remaining budget and are *truncated to fit* rather than dropped wholesale; the result is reassembled in chronological order so the LLM still sees a coherent sequence. Tool detection keys off the generic `[tool_use` / `[tool_result` markers, so a transcript that ends on a tool call correctly keeps the preceding assistant text as the final response instead of mislabeling the tool call as the outcome.
+
+### Verification
+
+`bun test` → 1431 pass / 0 fail — the project's release gate. New bug-first tests in `tests/unit/observer.test.ts` cover `classifyMessages` (P0–P4 assignment, plus the end-on-tool and all-tool edge cases where no P1 exists) and `prepareTranscript` (P0/P1 always present, chronological order preserved, tight-budget prioritization, and tool messages truncated-to-fit rather than dropped). A bare `tsc --noEmit` remains a non-gate for the reasons noted under v0.18.0; the changed `src/observer.ts` adds no new type errors over that baseline. Reviewed by an independent cross-model adversarial pass (codex / GPT-5.5-high) to zero remaining findings.
+
+### What didn't change
+
+Retrieval quality, scoring, the vault format, and every public API are untouched. The formatter keeps the same `TranscriptMessage[] → string` contract; only the selection and ordering of what survives truncation changed. A session short enough to fit the budget is formatted with the same content as before, now in guaranteed-chronological order.
+
+## v0.18.0 — Read-path embedding-model guard, extraction parrot-hardening, remote LLM/rerank auth
+
+Three independent hardenings gathered from a QMD-upstream survey. The first is a behavior change on the query path (a new fatal that replaces silently-wrong results) and drives the minor bump; the other two are additive.
+
+- **Read-path embedding-model consistency guard (contract change).** A vault embedded with one model and then queried after the active embedding endpoint switched to a *different model at the same dimension* silently matched the new query vector against the old stored vectors — cosine-meaningless results that `VecDimensionMismatchError` cannot catch (the dimension is unchanged). `searchVec` now compares the endpoint-returned model against the vault's stored model(s) after the query embed and throws `VecReadModelMismatchError` unless the vault holds exactly one model equal to the active one — a heterogeneous vault (more than one stored model) is rejected too, since the extra model's vectors still pollute the space. The comparison uses the endpoint's own reported model, not the caller's model alias, and is cached per connection keyed on SQLite's `data_version` so a cross-process `clawmem embed --force` invalidates a stale verdict. Explicit query paths (MCP tools, the REST server, the CLI) surface the error; the fail-open hooks (`context-surfacing`, the Stop-hook `decision-extractor`) warn once per process and degrade to BM25 rather than dropping the turn. Remedy: `clawmem embed --force`.
+- **Extraction prompts hardened against parroting.** The conversation-synthesis and deductive-synthesis prompts carried copyable few-shot examples with concrete, real-looking content; a weak local extraction model run out of distribution echoed them verbatim instead of extracting. Both examples are replaced with structure-only `{{...}}` skeletons, and a shared residue guard — extracted from the observer path into `src/schema-placeholder.ts` and now imported by all three extraction paths — rejects any output that echoes a schema placeholder or template marker. A new `placeholderRejects` counter surfaces echoed drafts in the deductive-synthesis stats. The guard deliberately does not blocklist the removed example text (plausible real facts like an OAuth decision would false-positive); it keys off the skeleton markers instead.
+- **Remote LLM + reranker authentication.** `generateRemote` (the remote LLM path) and the remote reranker path sent no `Authorization` header, so neither could point at an authenticated cloud endpoint. New independent env vars `CLAWMEM_LLM_API_KEY` and `CLAWMEM_RERANK_API_KEY` add a `Bearer` header when set, mirroring the existing `CLAWMEM_EMBED_API_KEY`. The three keys are independent (the services may sit behind different hosts). Additive and backward-compatible — no header is sent when a key is unset.
+
+### Verification
+
+`bun test` → 1228 unit + 131 integration + 35 hooks = 1394 pass / 0 fail — the project's release gate. (A bare `tsc --noEmit` is not a gate here: the root tsconfig pulls in a vendored example app whose deps aren't installed, and the tree carries pre-existing type-loose test idioms; the changed W1/W2/W3 source adds no new type errors over that baseline.) New and expanded bug-first tests: `tests/unit/embed-dimension-safety.test.ts` (read-path model mismatch, endpoint-model-vs-caller-arg discrimination, heterogeneous-vault rejection, cross-connection `data_version` invalidation, and the fatal-rethrow helper), `tests/unit/schema-placeholder.test.ts` (residue detection with an explicit false-positive boundary), `tests/unit/conversation-synthesis.test.ts` and `tests/integration/deductive-guardrails.integration.test.ts` (skeleton echoes rejected, residue filtered), and `tests/unit/llm-remote-config.test.ts` + `tests/unit/rerank-health.test.ts` (auth headers present when configured, absent when not, keys independent). Reviewed across all three workstreams by an independent cross-model adversarial pass (codex / GPT-5.5-high) to zero remaining findings.
+
+### What didn't change
+
+Retrieval quality, scoring, and the vault format are untouched. The read-path guard fires only on an actual model divergence — a correctly-embedded vault behaves exactly as in v0.17.0. When no auth keys are set, the LLM and reranker requests are byte-identical to before.
+
+## v0.17.0 — Harden the `context-surfacing` hook budget + cancellable embeds (follow-up to v0.16.0)
+
+v0.16.0 fixed the dominant `context-surfacing` hook-timeout causes (the unbounded synchronous vector leg and the init-backfill write lock). This release closes the residual write-contention and embed-cancellation gaps on the same hook path, and keeps the warm-cache guarantee alive on long-running hosts.
+
+- **Best-effort hook writes fail fast under contention.** The hook's own writes (the dedup UPSERT, `context_usage`, recall events, co-activations) are all best-effort, but the dedup UPSERT ran early and unguarded — a contended `SQLITE_BUSY` there aborted the whole hook before it could return context. It is now fail-open, and the `context-surfacing` hook process caps its own `busy_timeout` (1500ms) so a contended best-effort write fails fast instead of stalling the budget. The cap is scoped to that process only (the Stop hooks keep the 5000ms default), and the skill-vault opens on the hook path inherit the same cap.
+- **Cancellable embeds.** `embed()` now honors an `AbortSignal` end to end: the underlying fetch is cancellable, the 429 retry backoff aborts mid-sleep instead of sleeping through every retry, and an aborted embed is classified as cancellation — not a transport failure — so it no longer trips the 60s remote-down cooldown. `searchVec`/`getEmbedding` derive the signal from their wall-clock deadline, and a deadline also suppresses the unbounded local-model fallback so a hook embed cannot start a model load past its budget. The indexing batch-embed path is unchanged.
+- **Periodic vector prewarm.** The watcher's one-shot prewarm warms the OS page cache once; on a long-running host under memory pressure the kernel can evict the vector payload between hook calls, letting a cold synchronous scan creep back onto the hook path. The watcher now re-runs the embed-independent prewarm on an interval — `CLAWMEM_PREWARM_INTERVAL_MS`, default 10 minutes, `0` disables, values below a 60s floor are clamped up — to keep the payload resident. This is a probability reduction, not a hard cap: a true bound on the uninterruptible synchronous scan needs process isolation and is tracked as deferred.
+- **Two test-methodology fixes (source proven correct, not adjusted).** A pre-existing topic-boost fail-open test conflated the focus-topic variable with sequential recall-feedback state and read the real skill vault; it now uses two identically-seeded stores plus hermetic vault isolation, and the zero-match fail-open contract is proven byte-identical. A pre-existing watcher heavy-lane test set a `0..23` quiet-window believing it meant "any hour," but the window is end-exclusive, so the test failed during the 23:00 local hour; it now omits the window (always-open) and a hermetic unit guard pins the end-exclusive boundary.
+
+### Verification
+
+`bun test` → 1390 pass / 0 fail. New and expanded bug-first tests: `tests/unit/hook-timeout-fix.test.ts` (dedup fail-open under a held write lock, the named-vault `busy_timeout` cap, periodic prewarm firing + clean teardown, and the interval resolver's strict parse + floor) and `tests/unit/llm-fallback.test.ts` (embed `AbortSignal` across the fetch, the 429 backoff, the cooldown classification, and the local-fallback suppression). Each was guard-verified — it fails on the pre-fix source and passes after. Reviewed by an independent cross-model adversarial pass (GPT-5.5 high) to zero remaining findings.
+
+### What didn't change
+
+Retrieval quality, scoring, and the vault format are untouched. The `busy_timeout` cap is scoped to the `context-surfacing` hook process, so the Stop hooks and every other command keep the operational default. On any host that does not run the watcher, behavior is exactly as in v0.16.0 (the periodic prewarm lives only in the watcher).
+
+## v0.16.0 — Fix: `context-surfacing` UserPromptSubmit hook intermittently times out
+
+The `context-surfacing` hook could intermittently exceed its UserPromptSubmit budget ("hook timed out — output discarded"), especially on the first prompt after a fresh boot and across concurrent sessions. The dominant cause was **not** inference or host memory: the vector leg ran a *synchronous* `sqlite-vec` scan that the `Promise.race(vectorTimeout)` guard could not bound (a synchronous call blocks the event loop, so the timer never fires), and every writable hook open ran an unconditional backfill `UPDATE` that could wait out `busy_timeout` under writer contention.
+
+- **Bounded vector search on the hook path.** `searchVec` now takes a wall-clock deadline and self-aborts before the blocking `MATCH` if the budget elapsed during the async embed. Both the balanced and deep-escalation vector legs race the embed against the remaining budget and clear their timers, so a pending timer no longer keeps the hook process alive after results are in hand.
+- **No write lock on a healthy init.** The `last_accessed_at` backfill is read-guarded (skipped when nothing needs it) and `initializeDatabase`'s `busy_timeout` is capped to the caller's value, so a writable hook open no longer waits out the init `busy_timeout` under contention.
+- **Watcher-side vector prewarm.** A single embed-independent prewarm (a zero-vector `MATCH`) warms the sqlite-vec payload into the OS page cache on watcher startup so the first post-boot hook call isn't cold. It runs only in the watcher process (never per-session), reports success only when a scan actually ran, and never blocks startup.
+
+Cross-model reviewed (GPT-5.5, five rounds to zero findings). New tests: `tests/unit/hook-timeout-fix.test.ts`.
+
+## v0.15.1 — Fix: macOS bootstrap fails to load the sqlite-vec extension (Issue #20)
+
+On macOS, `clawmem bootstrap` (and `clawmem doctor`) failed at the database step with `This build of sqlite3 does not support dynamic extension loading`. Apple's built-in SQLite — which Bun uses by default — is compiled without extension-loading support, so the `sqlite-vec` vector extension cannot load. The prior macOS handling probed only the Apple-Silicon Homebrew path and swallowed the failure silently, so a fresh macOS install with no `brew install sqlite` (and Intel Macs, whose Homebrew prefix differs) hit the bare extension-loading error with no guidance. Yoloshii/ClawMem#20.
+
+What changed:
+
+- **Broader extension-capable SQLite detection** (`src/store.ts`): `setCustomSQLite()` now probes the Apple-Silicon (`/opt/homebrew`) *and* Intel (`/usr/local`) Homebrew prefixes, falling back to `brew --prefix sqlite` for non-standard prefixes (only when the standard paths are absent, so the common case pays no subprocess cost). Every candidate is existence-checked before use — `setCustomSQLite()` with an invalid path hard-crashes Bun (oven-sh/bun#18811), so the existence guard is load-bearing, not cosmetic.
+- **Actionable error instead of the cryptic one** (`src/store.ts`): both `sqlite-vec` load sites now route through a helper that, on macOS, rewrites the "does not support dynamic extension loading" failure into guidance to run `brew install sqlite` (naming the detected SQLite path, or noting none was found). `clawmem bootstrap` and `clawmem doctor` surface this message directly instead of the bare extension error.
+- **Troubleshooting entry** (`docs/troubleshooting.md` → "Bun runtime"): documents the symptom, the `brew install sqlite` fix, and the auto-detection behavior.
+
+### Verification
+
+`bun test tests/unit/` → 1183 pass / 0 fail. A new bug-first test (`tests/unit/store.macos-sqlite.test.ts`, 5 cases) asserts the error mapping: macOS + no Homebrew SQLite → `brew install sqlite` guidance; macOS + a detected-but-failing SQLite → `brew reinstall` + the path; non-macOS and unrelated errors pass through untouched. It fails on the pre-fix source (no mapping existed) and passes after.
+
+### What didn't change
+
+- No change to retrieval, scoring, the vault format, or any non-macOS code path — on Linux/Windows the macOS detection block is skipped entirely and `sqlite-vec` loads exactly as before. This is a macOS-only install fix.
+
+## v0.15.0 — Agent-instruction refactor (AGENTS.md as lean SSOT) + antipattern durability fix
+
+The agent-facing instruction surface was three overlapping copies — `CLAUDE.md` and `AGENTS.md` were byte-identical 72 KB / 800-line twins (2.2× over Codex's 32 KiB `AGENTS.md` cap, which truncates silently), and `SKILL.md` was an 830-line third copy. All three duplicated each other and the existing `docs/` tree. This release aligns to the convention — `AGENTS.md` is the lean root SSOT, `CLAUDE.md` imports it, `SKILL.md` is on-demand operational guidance, and the deep reference lives in `docs/`. It also fixes a latent scoring bug found during review: `antipattern` memories were decaying despite being documented and intended as durable.
+
+What changed:
+
+- **`AGENTS.md` is now a lean root SSOT** (72,637 → ~17.7 KB, under the 32 KiB cap). Keeps the agent-facing essentials — inference-at-a-glance, install, the 90/10 retrieval model + Tier-2 hook table, the 3-rule escalation gate, Tier-3 tool routing + MCP tool table, query-optimization levers, composite-scoring summary, indexing rules, lifecycle, anti-patterns, integrations — and points into `docs/` for everything deep, with a reference index at the foot.
+- **`CLAUDE.md` is now an `@AGENTS.md` import** (72,637 → 379 bytes), ending the byte-identical twin and its dual-maintenance drift. Claude Code reads `CLAUDE.md` natively, so the import bridges to the single SSOT.
+- **`SKILL.md` trimmed to an on-demand operational reference** (830 → ~267 lines, `version` 2.0.0): escalation gate, tool routing, the 4 query-optimization levers, pipeline behavior, composite scoring, lifecycle, gotchas — with repo-relative pointers. Setup / inference / config / internals deliberately live in `AGENTS.md` + `docs/`.
+- **New `docs/guides/inference-services.md`** consolidates the inference / model / server-setup content that was triplicated across `AGENTS.md`, the README "GPU Services" wall, and `cloud-embedding.md`, with a stack-decision matrix (QMD-native vs SOTA z-stack vs cloud embedding) up front.
+- **New `docs/reference/configuration.md`** — a complete environment-variable reference (every `CLAWMEM_*` var except the internal, process-set `CLAWMEM_STDIO_MODE`).
+- **README**: the "GPU Services" setup wall collapsed to a ~20-line decision callout linking the new guide (81.5 → 71.5 KB); the "Agent Instructions" file-roles table updated; `docs/guides/systemd-services.md` gained the scheduled `clawmem-rerank-health` unit (previously documented only in the old AGENTS.md).
+- **`package.json` `files[]` now includes `docs/`** so the relative `docs/` pointers in the shipped `AGENTS.md` / `CLAUDE.md` / `SKILL.md` resolve for npm consumers, not just git clones.
+- **Fix — `antipattern` memories are now durable** (`src/memory.ts`): `antipattern` was in `DECAY_EXEMPT_TYPES` and mapped to a `semantic` relation, but was **omitted from `HALF_LIVES` and `TYPE_BASELINES`**, so it fell through to the 60-day half-life / 0.5 baseline defaults — i.e. it decayed despite being documented as ∞ half-life / 0.75 baseline. Added `antipattern: Infinity` to `HALF_LIVES` and `antipattern: 0.75` to `TYPE_BASELINES` (matching the documented values). Accumulated negative patterns now persist as intended and rank with a durable baseline.
+
+### Verification
+
+`bun test tests/unit/` → 1178 pass / 0 fail. A new bug-first test (`tests/unit/memory.scoring.test.ts`) asserts `antipattern` durability — `recencyScore` returns 1.0 at one year old, `antipattern` confidence outranks `note` (exercising the 0.75 baseline), and the attention-decay exemption holds; it fails on the pre-fix source and passes after. Every relative link in the refactored files was resolved; `AGENTS.md` confirmed under 32 KiB; `CLAUDE.md` confirmed no longer a byte-twin. Reviewed by an independent cross-model adversarial pass (codex / GPT-5.5-high) across the refactor and the source fix to zero remaining findings.
+
+### What didn't change
+
+- **No retrieval-pipeline, scoring-formula, or vault-format change** beyond the `antipattern` durability fix. Documented facts, tool routing, hook behavior, and scoring weights are preserved — moved, condensed, or consolidated, not altered.
+- The only runtime behavior change is `antipattern` memories no longer decaying (and getting a 0.75 vs 0.5 baseline); every other content type's half-life and baseline is unchanged.
+
 ## v0.14.0 — Reranker health guard: detect a silently-degenerate reranker (doctor + scheduled check + runtime emit)
 
 v0.11.3 deprecated the broken zerank-2 GGUF and shipped a faithful sidecar; v0.12.0 made the reranker the dominant ranking signal. Together they raised the stakes of a *silent* reranker failure: the broken GGUF returned HTTP 200 + valid JSON + finite positive ~1e-11 scores — passing every liveness check — yet contributed nothing at weight 0.9 and silently collapsed the final ranking to RRF. `blendRerank`'s usability check was `score > 0`, which those ~1e-11 scores passed, and `clawmem doctor` had no reranker probe at all. This release makes that failure mode impossible to miss.
@@ -104,7 +219,7 @@ What changed:
 
 ### Verification
 
-`tsc` clean on the touched files; full unit suite green (187 pass). Live end-to-end against the running expansion server: typed shape, zero echo, zero template-junk, correct per-type routing, cache round-trip. Validated under a fresh GPT-5.5 high-reasoning adversarial review via `codex exec` (impl-review session `019ef534`, separate from the design session `019eefbe`): Turn 1 surfaced three real findings — a leaked llm-level fallback being cached, partial acceptance of a malformed typed-cache entry, and CLI expansion-only candidates dropped after RRF — each fixed and re-verified to verbatim "zero remaining findings."
+`tsc` clean on the touched files; full unit suite green (187 pass). Live end-to-end against the running expansion server: typed shape, zero echo, zero template-junk, correct per-type routing, cache round-trip. Validated under a fresh GPT-5.5 high-reasoning adversarial review via `codex exec` (a separate impl-review session from the design session): Turn 1 surfaced three real findings — a leaked llm-level fallback being cached, partial acceptance of a malformed typed-cache entry, and CLI expansion-only candidates dropped after RRF — each fixed and re-verified to verbatim "zero remaining findings."
 
 ### What didn't change
 
@@ -128,7 +243,7 @@ What changed in the embedding write path:
 
 ### Verification
 
-Validated across a 9-turn GPT-5.5 high-reasoning adversarial review under `codex exec` (session `019eefbe`): a diagnosis pass, four design passes (which overturned an initial "defer the concurrency lease" decision by demonstrating that two same-dimension models can silently build a heterogeneous index), and four code-review passes that drove findings 6 → 4 → 3 → 2 → **0** ("vector-table mutations are now atomic, lease-fenced, and dimension/model consistent"). Ships with new unit tests covering throw-on-mismatch, `getVecTableDim` states, the lease fence on insert/clear, the hash-change trigger, attempt-budget resets, and `getVecModels` heterogeneity detection; full suite green except one pre-existing unrelated integration test.
+Validated across a 9-turn GPT-5.5 high-reasoning adversarial review under `codex exec`: a diagnosis pass, four design passes (which overturned an initial "defer the concurrency lease" decision by demonstrating that two same-dimension models can silently build a heterogeneous index), and four code-review passes that drove findings 6 → 4 → 3 → 2 → **0** ("vector-table mutations are now atomic, lease-fenced, and dimension/model consistent"). Ships with new unit tests covering throw-on-mismatch, `getVecTableDim` states, the lease fence on insert/clear, the hash-change trigger, attempt-budget resets, and `getVecModels` heterogeneity detection; full suite green except one pre-existing unrelated integration test.
 
 ### What didn't change
 
@@ -429,7 +544,7 @@ The override repoints the cached `_session_id`, rebuilds `_transcript_path` for 
 
 ### Verification
 
-Validated across three turns of GPT-5.5 high-reasoning adversarial review under `codex exec`, session `019e46bc-0848-7540-a1ce-913000112da1`. Turn 1 (design) returned no-ship-as-written and caught two real bugs in the initial design — a reset-gated prefetch leak (stale recall crossing into `/resume` and `/branch` sessions) and an ABA race from resetting the prefetch generation to zero — and prescribed the snapshot-at-queue-time fix. Turn 2 verified the implemented design against a standalone behavioral test covering the switch / reset / compression / prefetch-race paths → verbatim "zero remaining design findings — can ship." Turn 3 re-cleared a final added assertion.
+Validated across three turns of GPT-5.5 high-reasoning adversarial review under `codex exec`. Turn 1 (design) returned no-ship-as-written and caught two real bugs in the initial design — a reset-gated prefetch leak (stale recall crossing into `/resume` and `/branch` sessions) and an ABA race from resetting the prefetch generation to zero — and prescribed the snapshot-at-queue-time fix. Turn 2 verified the implemented design against a standalone behavioral test covering the switch / reset / compression / prefetch-race paths → verbatim "zero remaining design findings — can ship." Turn 3 re-cleared a final added assertion.
 
 ### What didn't change
 
@@ -467,7 +582,7 @@ The same `tokenizeForFTS5` is shared with the two `entities_fts` MATCH builders 
 
 ### Verification
 
-Validated across four turns of GPT-5.5 high-reasoning adversarial review under `codex exec`, session `019e4595-43b3-7b40-b8a0-bc684f22e2e6`. Turn 1 cleared the approach; Turn 2 confirmed the `documents_fts` fix correct + injection-safe but **caught the entity prefix-starvation regression**; Turn 3 rejected a 1-char-only band-aid (the same starvation hit short multi-char names like `Go`); Turn 4 cleared the exact-first fix verbatim "**zero remaining findings**" after re-running the repros (`C++` resolves, `Go` resolves, `clawme`→`ClawMem` recall holds).
+Validated across four turns of GPT-5.5 high-reasoning adversarial review under `codex exec`. Turn 1 cleared the approach; Turn 2 confirmed the `documents_fts` fix correct + injection-safe but **caught the entity prefix-starvation regression**; Turn 3 rejected a 1-char-only band-aid (the same starvation hit short multi-char names like `Go`); Turn 4 cleared the exact-first fix verbatim "**zero remaining findings**" after re-running the repros (`C++` resolves, `Go` resolves, `clawme`→`ClawMem` recall holds).
 
 Test coverage: 8 new bug-first tests in `tests/integration/store-search.test.ts` (compound, non-adjacent AND, slash-path via the filepath column, 1-char tokens, apostrophe behavior-lock, FTS5-specials no-throw, punctuation-only → empty) + 4 entity starvation regression tests in `tests/unit/entity.test.ts` (`C++` and `Go`, each across `resolveEntityCanonical` and `searchEntities`). Five of the store tests fail on the pre-fix code; all pass after. Full suite: 1298 pass / 0 fail. `tsc --noEmit` clean for the changed files.
 
@@ -479,7 +594,7 @@ Test coverage: 8 new bug-first tests in `tests/integration/store-search.test.ts`
 
 ### Cross-references
 
-- Codex review session: `019e4595-43b3-7b40-b8a0-bc684f22e2e6` (4 turns; T2 caught the entity regression, T4 zero remaining findings)
+- Codex review: 4 turns (T2 caught the entity regression, T4 zero remaining findings)
 - Primary surfaces: `src/store.ts` (`tokenizeForFTS5`, `buildFTS5Query`), `src/entity.ts` (`gatherEntityFTSCandidates`, both `entities_fts` sites)
 
 ---
@@ -502,7 +617,7 @@ The docstring in `initializeDatabase()` carries the rationale durably so a futur
 
 ### Verification
 
-The change set was validated against two turns of GPT-5.5 high-reasoning adversarial code review (cumulative ~401K tokens) under `codex exec`, session `019e2aeb-7995-74d0-b3f3-bbd32567eec2`. Turn 1 verdict was APPROVED WITH MODIFICATIONS — zero High, one Medium (soften the readonly-branch comment from "takes a brief write lock" to "can contend when switching/initializing WAL state"), one Low (mention BOTH `agent_end` AND `before_reset` parallel Stop-hook fan-outs). Both modifications applied. Turn 2 cleared verbatim "**Zero remaining findings on the Issue #13 fix. Ship as is. Ready to tag v0.10.5.**" Turn 2 also independently verified the skill-forge mirror byte-identical via `cmp -s` on all four changed files.
+The change set was validated against two turns of GPT-5.5 high-reasoning adversarial code review (cumulative ~401K tokens) under `codex exec`. Turn 1 verdict was APPROVED WITH MODIFICATIONS — zero High, one Medium (soften the readonly-branch comment from "takes a brief write lock" to "can contend when switching/initializing WAL state"), one Low (mention BOTH `agent_end` AND `before_reset` parallel Stop-hook fan-outs). Both modifications applied. Turn 2 cleared verbatim "**Zero remaining findings on the Issue #13 fix. Ship as is. Ready to tag v0.10.5.**" Turn 2 also independently verified the skill-forge mirror byte-identical via `cmp -s` on all four changed files.
 
 Test coverage: 3 new tests in `tests/integration/store-concurrent-init.test.ts` (NEW) + supporting `tests/helpers/concurrent-init-worker.ts` (NEW). Two source-text assertion gates (deterministic — catch the exact regression an accidental re-swap would introduce, anchored on the function body for `initializeDatabase` and on the `// Readonly:` comment marker for the readonly branch) plus one subprocess concurrent-init test (spawns 3 `bun run` worker processes against the same on-disk DB in `mkdtempSync(tmpdir())`, 60s timeout, asserts all 3 exit 0 without `SQLITE_BUSY` or "database is locked" in stderr).
 
@@ -529,7 +644,7 @@ No runtime change. Standing "doc-line-refs ride the next release" pattern from p
 ### Cross-references
 
 - Issue: https://github.com/yoloshii/ClawMem/issues/13 (@jcgau, first-time contributor)
-- Codex review session: `019e2aeb-7995-74d0-b3f3-bbd32567eec2` (Turn 1 APPROVED WITH MODIFICATIONS, Turn 2 zero remaining findings)
+- Codex review: Turn 1 APPROVED WITH MODIFICATIONS, Turn 2 zero remaining findings
 - Parallel Stop-hook fan-out sites covered by this fix: `src/openclaw/engine.ts:449` (`handleAgentEnd`), `src/openclaw/engine.ts:576` (`handleBeforeReset`), `src/hermes/__init__.py:518` (Python thread fan-out)
 - Companion 2026-05-14 OpenClaw upstream-survey driving the doc-comment line-ref bump: a local memory note (`memory/openclaw-v2026.4.x-analysis.md`)
 
@@ -823,9 +938,9 @@ Two context-surfacing upgrades. §11.1 adds a `<vault-facts>` SPO-triple injecti
 
 ### §11.1 — `<vault-facts>` knowledge-graph injection
 
-- **Three-path prompt-only entity extraction** — the seed set for `<vault-facts>` comes from the raw prompt ONLY, via three independent paths: (a) a canonical `vault:type:slug` regex (e.g. `default:project:clawmem`), (b) proper-noun extraction validated via exact-match `resolveEntityTypeExact` that skips ambiguous names resolving to multiple types, and (c) a longer-first n-gram scan (3-gram > 2-gram > 1-gram, cased + lowercased) for technical vocabulary like `forge-stack`, `oauth2`, `gpu node`. Prompt-only is a HARD CONSTRAINT — entity seeds never come from `surfacedDocs[i].body` or any retrieval-phase field, so a topic-boosted off-topic doc from §11.4 cannot pollute the facts block with facts about unrelated entities.
+- **Three-path prompt-only entity extraction** — the seed set for `<vault-facts>` comes from the raw prompt ONLY, via three independent paths: (a) a canonical `vault:type:slug` regex (e.g. `default:project:clawmem`), (b) proper-noun extraction validated via exact-match `resolveEntityTypeExact` that skips ambiguous names resolving to multiple types, and (c) a longer-first n-gram scan (3-gram > 2-gram > 1-gram, cased + lowercased) for technical vocabulary like `vector-store`, `oauth2`, `gpu node`. Prompt-only is a HARD CONSTRAINT — entity seeds never come from `surfacedDocs[i].body` or any retrieval-phase field, so a topic-boosted off-topic doc from §11.4 cannot pollute the facts block with facts about unrelated entities.
 - **Validate-then-count candidate ordering (Codex §11.1 Turn 5 invariant)** — per-path, candidates are validated against the entity index BEFORE counting against the 100-candidate cap. Without this ordering, a long prompt dominated by unvalidated capitalized noise (path b raw extraction) would starve the lowercase/hyphenated n-gram lane (path c) and the technical-vocabulary recall would silently drop. The cap also preserves prompt order as a tiebreaker so the first mentioned entities win under pressure.
-- **Cross-path entity-id dedup + longer-n-gram tie-breaker** — if the same entity resolves via multiple paths (e.g. "ClawMem" as a proper noun AND "clawmem" as a 1-gram), the cross-path dedup collapses it to one `entity_id` and the sourcePath from the first-matching path wins. For n-gram ties, longer n-grams outrank shorter ones (`forge-stack` as a 1-gram compound beats `forge` + `stack` as separate tokens).
+- **Cross-path entity-id dedup + longer-n-gram tie-breaker** — if the same entity resolves via multiple paths (e.g. "ClawMem" as a proper noun AND "clawmem" as a 1-gram), the cross-path dedup collapses it to one `entity_id` and the sourcePath from the first-matching path wins. For n-gram ties, longer n-grams outrank shorter ones (`vector-store` as a 1-gram compound beats `vector` + `store` as separate tokens).
 - **Cross-entity triple dedup (Codex §11.1 Turn 1 fix)** — when both endpoints of a triple are seeded from the prompt (e.g. the prompt mentions both `ClawMem` and `Bun`, and the graph has `ClawMem depends_on Bun`), `store.queryEntityTriples` returns the triple from both sides (outgoing from ClawMem, incoming to Bun). `buildVaultFactsBlock` now dedupes by a stable `${subject}\u0000${predicate}\u0000${object}` key before budgeting so the same fact isn't emitted twice and budget isn't spent twice. Per-entity `maxTriplesPerEntity` cap still applies BEFORE dedup (anti-monopoly is enforced per entity first, then dedup collapses cross-entity duplicates).
 - **Profile-gated `factsTokens` sub-budget** — a new `ProfileConfig.factsTokens` field gives `<vault-facts>` a dedicated token allowance that cannot steal from the existing `<facts>` / `<relationships>` budget. `speed`=0 disables the stage entirely (zero overhead on the fast profile). `balanced`=200 tokens (~50 triples at default 4-char/token estimate). `deep`=250 tokens. Truncation always at the triple boundary, never mid-triple, never emits an empty block. If `OVERHEAD >= budgetTokens` the block is dropped — established blocks take priority.
 - **Schema migration — `idx_entity_nodes_lower_name`** — `store.ts` adds `CREATE INDEX IF NOT EXISTS idx_entity_nodes_lower_name ON entity_nodes(LOWER(name), vault)` on first open. This expression index backs the new `batchLookupNames` query (`WHERE LOWER(name) IN (...) AND vault = ?`) which would otherwise degenerate to a full scan on large vaults. Idempotent, runs once, harmless if the binary is later rolled back to v0.8.5 (SQLite ignores the unused index).

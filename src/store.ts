@@ -14,7 +14,7 @@
 
 import { Database } from "bun:sqlite";
 import { Glob } from "bun";
-import { realpathSync } from "node:fs";
+import { realpathSync, existsSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
@@ -299,17 +299,82 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 // Database initialization
 // =============================================================================
 
-// On macOS, use Homebrew's SQLite which supports extensions
+// On macOS, Apple's built-in libsqlite3 — which Bun uses by default — is
+// compiled WITHOUT extension-loading support, so sqliteVec.load() fails with
+// "This build of sqlite3 does not support dynamic extension loading" (Issue #20).
+// Point Bun at an extension-capable SQLite (Homebrew's) via setCustomSQLite()
+// BEFORE the first Database is opened. setCustomSQLite() must receive a path
+// that EXISTS — an invalid path hard-crashes Bun (oven-sh/bun#18811) — so every
+// candidate is existence-checked first. The resolved path (or null) is recorded
+// so loadVecExtension() can emit an actionable error when no extension-capable
+// SQLite is installed, instead of the cryptic extension-loading failure.
+
+/** macOS only: the extension-capable SQLite activated via setCustomSQLite, or null if none was found. */
+let macosCustomSqlitePath: string | null = null;
+
 if (process.platform === "darwin") {
-  const homebrewSqlitePath = "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib";
-  try {
-    if (Bun.file(homebrewSqlitePath).size > 0) {
-      Database.setCustomSQLite(homebrewSqlitePath);
-    }
-  } catch { }
+  const candidates = [
+    "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib", // Homebrew (Apple Silicon)
+    "/usr/local/opt/sqlite/lib/libsqlite3.dylib",    // Homebrew (Intel)
+  ];
+  // For a non-standard Homebrew prefix, ask brew directly — but only when the
+  // standard paths are absent, so the common case pays no subprocess cost.
+  if (!candidates.some(p => existsSync(p))) {
+    try {
+      const brew = Bun.spawnSync(["brew", "--prefix", "sqlite"], { stdout: "pipe", stderr: "ignore" });
+      const prefix = brew.success ? brew.stdout.toString().trim() : "";
+      if (prefix) candidates.push(`${prefix}/lib/libsqlite3.dylib`);
+    } catch { /* brew not installed — nothing more to probe */ }
+  }
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    try {
+      Database.setCustomSQLite(candidate);
+      macosCustomSqlitePath = candidate;
+      break;
+    } catch { /* not usable — try the next candidate */ }
+  }
 }
 
-function initializeDatabase(db: Database): void {
+/**
+ * Translate a sqlite-vec load failure into an actionable error on macOS, where
+ * the default system SQLite cannot load extensions (Issue #20). Pure + exported
+ * for tests: pass `platform` / `foundPath` explicitly to exercise either branch.
+ * Non-macOS, or any unrelated error, is returned unchanged.
+ */
+export function explainVecLoadError(
+  err: unknown,
+  platform: string = process.platform,
+  foundPath: string | null = macosCustomSqlitePath,
+): Error {
+  const original = err instanceof Error ? err : new Error(String(err));
+  const isExtensionError = /does not support dynamic extension loading/i.test(original.message);
+  if (platform !== "darwin" || !isExtensionError) return original;
+
+  const detail = foundPath === null
+    ? "No Homebrew SQLite was found at the standard locations (/opt/homebrew or /usr/local)."
+    : `A custom SQLite was set from ${foundPath}, but it still cannot load extensions — try 'brew reinstall sqlite'.`;
+  return new Error(
+    "ClawMem could not load the sqlite-vec extension: macOS's built-in SQLite is " +
+    "compiled without extension support.\n" +
+    "Fix: install an extension-capable SQLite with Homebrew, then re-run:\n" +
+    "    brew install sqlite\n" +
+    `${detail}\n` +
+    "More detail: docs/troubleshooting.md (\"Bun runtime\" -> sqlite-vec on macOS), Yoloshii/ClawMem#20.\n" +
+    `Original error: ${original.message}`,
+  );
+}
+
+/** Load the sqlite-vec extension, surfacing an actionable error on macOS (Issue #20). */
+function loadVecExtension(db: Database): void {
+  try {
+    sqliteVec.load(db);
+  } catch (err) {
+    throw explainVecLoadError(err);
+  }
+}
+
+function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   // Set busy_timeout FIRST so subsequent PRAGMAs (journal_mode in particular,
   // which acquires a write lock when switching or initializing WAL state) wait
   // instead of returning SQLITE_BUSY when concurrent Stop hooks
@@ -317,11 +382,13 @@ function initializeDatabase(db: Database): void {
   // before_reset hook fan-out in src/openclaw/engine.ts — open the DB
   // simultaneously. busy_timeout is a connection-level setting that only
   // governs *subsequent* statements (default busy handler is NULL → SQLITE_BUSY
-  // returns immediately), so it must precede the contending PRAGMAs. 15s is
-  // well within the 30s Stop hook timeout. createStore() resets to operational
+  // returns immediately), so it must precede the contending PRAGMAs. The init
+  // busy_timeout defaults to 15s (well within the 30s Stop hook timeout) but is
+  // capped to the caller's opts.busyTimeout — hook opens pass 5000 so init cannot
+  // wait out the 8-15s UserPromptSubmit budget. createStore() resets to operational
   // value (5000ms or opts.busyTimeout) after DDL completes. Issue #13.
-  db.exec("PRAGMA busy_timeout = 15000");
-  sqliteVec.load(db);
+  db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+  loadVecExtension(db);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
@@ -398,9 +465,17 @@ function initializeDatabase(db: Database): void {
     }
   }
 
-  // Backfill last_accessed_at from modified_at for existing docs
+  // Backfill last_accessed_at from modified_at for existing docs.
+  // Guarded by a read first: on an already-backfilled DB the UPDATE is skipped, so a writable
+  // open takes NO write lock here and cannot wait on busy_timeout under concurrent writers.
+  // (The unconditional UPDATE previously ran on EVERY writable open — including the
+  // context-surfacing UserPromptSubmit hook — and could block up to busy_timeout when another
+  // process held the write lock, pushing the hook past its 8-15s deadline.)
   try {
-    db.exec(`UPDATE documents SET last_accessed_at = modified_at WHERE last_accessed_at IS NULL`);
+    const needsBackfill = db.prepare(`SELECT 1 FROM documents WHERE last_accessed_at IS NULL LIMIT 1`).get();
+    if (needsBackfill) {
+      db.exec(`UPDATE documents SET last_accessed_at = modified_at WHERE last_accessed_at IS NULL`);
+    }
   } catch { /* ignore if already backfilled */ }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
@@ -973,6 +1048,16 @@ const contextUsageHasQueryTextCache = new WeakMap<Database, boolean>();
  */
 export class FatalVectorError extends Error {}
 
+/**
+ * Rethrow a fatal vector error (dimension / model / schema mismatch) so a searchVec() fallback
+ * catch surfaces it instead of silently degrading to BM25. Transient conditions (timeout, absent
+ * vectors) are NOT FatalVectorError and remain swallowed by the caller, as before. Apply this at the
+ * FTS-fallback catch sites that wrap searchVec.
+ */
+export function rethrowIfFatalVectorError(e: unknown): void {
+  if (e instanceof FatalVectorError) throw e;
+}
+
 export class VecDimensionMismatchError extends FatalVectorError {
   constructor(public readonly existingDim: number, public readonly requestedDim: number) {
     super(`Embedding dimension changed: vectors_vec is float[${existingDim}] but the model now returns float[${requestedDim}]. Run 'clawmem embed --force' to clear and rebuild the full vault.`);
@@ -991,6 +1076,33 @@ export class VecModelMismatchError extends FatalVectorError {
   constructor(public readonly expectedModel: string, public readonly actualModel: string) {
     super(`Embedding model changed mid-run: the vault is being built with "${expectedModel}" but the endpoint now returns "${actualModel}". Mixing different models in one vector space (even at the same dimension) makes cosine similarity meaningless. Run 'clawmem embed --force' to rebuild with the current model.`);
     this.name = "VecModelMismatchError";
+  }
+}
+
+/**
+ * Read-path sibling of VecModelMismatchError. VecModelMismatchError fires only mid-embed-run; this
+ * one fires on the QUERY path when the vault's stored vectors were embedded with one model but the
+ * active embedding endpoint now returns a different model at the SAME dimension (so the dimension
+ * guard cannot catch it). Matching the new model's query vector against the old model's stored
+ * vectors is cosine-meaningless, so searchVec throws this rather than serving corrupted results.
+ */
+export class VecReadModelMismatchError extends FatalVectorError {
+  constructor(public readonly storedModels: string[], public readonly activeModel: string) {
+    super(`Embedding model mismatch on the query path: the vault's vectors were embedded with ${storedModels.map(m => `"${m}"`).join(", ")} but the active embedding endpoint now returns "${activeModel}". At the same dimension the dimension guard cannot catch this, and matching the new model's query vector against the old model's stored vectors makes cosine similarity meaningless. Run 'clawmem embed --force' to rebuild the vault with the current model.`);
+    this.name = "VecReadModelMismatchError";
+  }
+}
+
+// Fail-open surfacing for a read-path model mismatch: warn LOUDLY once per process, then let the
+// caller degrade to BM25. For hooks that MUST NOT throw — context-surfacing (UserPromptSubmit) and
+// the Stop hooks (decision-extractor) — a throwing hook breaks that turn. Explicit query paths use
+// rethrowIfFatalVectorError instead. The once-flag is process-global so the warning fires exactly
+// once no matter which hook trips it first.
+let _warnedVectorModelMismatch = false;
+export function warnOnceOnVectorModelMismatch(e: unknown): void {
+  if (e instanceof VecReadModelMismatchError && !_warnedVectorModelMismatch) {
+    _warnedVectorModelMismatch = true;
+    console.warn(`[clawmem] ${e.message}`);
   }
 }
 
@@ -1085,6 +1197,83 @@ export function getVecTableDim(db: Database): number | null {
 }
 
 /**
+ * Prewarm the sqlite-vec payload into OS page cache with a single brute-force MATCH using a ZERO
+ * query vector. Decoupled from the embedding server on purpose — it works when the embed server is
+ * down at boot or CLAWMEM_NO_LOCAL_MODELS=true, unlike a searchVec()-based prewarm (which embeds
+ * first and would silently no-op). Returns true ONLY if a scan actually ran (a vector table with a
+ * known dimension exists), so callers never log a false-positive "warmed". The k-NN MATCH is
+ * brute-force, so it touches every vector chunk — exactly the payload we want cache-resident.
+ */
+export function prewarmVectors(db: Database): boolean {
+  const dim = getVecTableDim(db);
+  if (!dim || dim <= 0) return false;
+  const zero = new Float32Array(dim);
+  db.prepare(`SELECT hash_seq FROM vectors_vec WHERE embedding MATCH ? AND k = ?`).all(zero, 1);
+  return true;
+}
+
+/**
+ * Keep the sqlite-vec payload resident in the OS page cache by re-running the brute-force
+ * prewarm on an interval. The one-shot prewarm at watcher startup warms the cache ONCE; on a
+ * long-running host under memory pressure the kernel can evict the (potentially ~1.5 GB) vector
+ * payload between hook calls, and the next cold SYNCHRONOUS MATCH in the context-surfacing hook
+ * path can then blow the 8-15s hook budget (bun:sqlite exposes no interrupt, so an in-flight
+ * scan cannot be abandoned). Re-touching the pages biases the kernel LRU toward keeping them
+ * resident — a PROBABILITY reduction, NOT a hard cap. The hard cap (moving the blocking scan off
+ * the hook's event loop so its deadline can fire) is the deferred BACKLOG Source 46 daemon.
+ *
+ * Best-effort: never throws; a per-tick failure is swallowed so the timer keeps running. Returns
+ * the interval handle (the caller MUST clear it on shutdown) or null when disabled (intervalMs
+ * <= 0 or non-finite). The handle is unref'd so it never by itself keeps the process alive.
+ * `onPrewarm(ran)` is an optional observability hook fired after each attempt — `ran` is whether
+ * a scan actually executed (i.e. a dimensioned vector table exists).
+ */
+export function startPeriodicPrewarm(
+  db: Database,
+  intervalMs: number,
+  onPrewarm?: (ran: boolean) => void,
+): ReturnType<typeof setInterval> | null {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return null;
+  const timer = setInterval(() => {
+    let ran = false;
+    try { ran = prewarmVectors(db); } catch { /* best-effort: unexpected SQL error */ }
+    if (onPrewarm) { try { onPrewarm(ran); } catch { /* observer must never break the timer */ } }
+  }, intervalMs);
+  (timer as { unref?: () => void }).unref?.();
+  return timer;
+}
+
+/** Floor for the periodic re-prewarm interval. Below this, a large-vault (~1.5 GB) brute-force scan
+ *  runs near-continuously and can saturate the watcher event loop + I/O, so any smaller positive
+ *  request is clamped UP to this value. */
+export const PREWARM_MIN_INTERVAL_MS = 60_000;
+/** Default periodic re-prewarm interval when CLAWMEM_PREWARM_INTERVAL_MS is unset or unparseable. */
+export const PREWARM_DEFAULT_INTERVAL_MS = 600_000;
+
+/**
+ * Resolve the raw CLAWMEM_PREWARM_INTERVAL_MS env value into a SAFE interval for the watcher. This
+ * policy is kept OUT of the permissive `startPeriodicPrewarm` mechanism (so unit tests can still use
+ * tiny intervals) and applied only on the production env path.
+ *   - unset / empty / unparseable → default (600000). Garbage must NOT silently disable the
+ *     mitigation, nor be read as a tiny interval.
+ *   - exactly 0 → 0 (the documented off switch; `startPeriodicPrewarm` then returns null).
+ *   - negative → default (nonsensical; neither an intentional disable nor a fast loop).
+ *   - 0 < n < floor → clamped UP to the 60s floor. Prevents the near-continuous scan loop that e.g.
+ *     "1" or "1e3" would otherwise schedule. NOTE: `Number("1e3") === 1000` whereas
+ *     `parseInt("1e3", 10) === 1`, so `Number()` is used deliberately (parseInt silently truncates
+ *     at the "e").
+ *   - n >= floor → floored to an integer and used as-is.
+ */
+export function resolvePrewarmIntervalMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return PREWARM_DEFAULT_INTERVAL_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return PREWARM_DEFAULT_INTERVAL_MS;
+  if (n === 0) return 0;
+  if (n < 0) return PREWARM_DEFAULT_INTERVAL_MS;
+  return Math.max(PREWARM_MIN_INTERVAL_MS, Math.floor(n));
+}
+
+/**
  * The DISTINCT non-empty embedding models stored in the vault (empty array if no
  * embeddings exist). Used to detect model drift BETWEEN runs — a different model at
  * the SAME dimension produces a heterogeneous vector space that dimension checks
@@ -1158,7 +1347,7 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1294,7 +1483,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     ? new Database(resolvedPath, { readonly: true })
     : new Database(resolvedPath);
   if (!opts?.readonly) {
-    initializeDatabase(db);
+    initializeDatabase(db, opts?.busyTimeout ?? 15000);
   } else {
     // Readonly: set busy_timeout FIRST so the journal_mode PRAGMA below
     // doesn't race when concurrent processes open the DB. PRAGMA
@@ -1303,11 +1492,11 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     // production caller in this repo currently passes readonly:true,
     // but the ordering invariant should hold regardless. Issue #13.
     db.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
-    sqliteVec.load(db);
+    loadVecExtension(db);
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA query_only = ON");
   }
-  // For the writable branch: initializeDatabase() set 15000 during DDL —
+  // For the writable branch: initializeDatabase() set opts.busyTimeout (default 15000) during DDL —
   // reset to operational value here. For readonly: already set inside the
   // branch above; this assignment is a no-op rewrite to the same value.
   db.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
@@ -1354,7 +1543,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => searchFTS(db, query, limit, collectionId, collections, dateRange),
-    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => searchVec(db, query, model, limit, collectionId, collections, dateRange),
+    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadlineMs),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
@@ -3571,12 +3760,66 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): Promise<SearchResult[]> {
+// W1 read-path model-consistency cache, keyed on SQLite's `data_version` so a CROSS-PROCESS vault
+// rebuild invalidates a stale OK verdict. `data_version` changes whenever ANOTHER connection commits
+// (e.g. a separate `clawmem embed --force` process re-embeds with a different model) — exactly the
+// multi-process staleness case — and is a cheap header read (no scan), unlike the getVecModels()
+// DISTINCT+JOIN it guards. Same-connection writes don't bump it, but in-process model swaps are
+// already blocked by the embed-time VecModelMismatchError / clearAllEmbeddings drop.
+const verifiedQueryEmbedModels = new WeakMap<Database, { dataVersion: number; model: string }>();
+
+/**
+ * Guard the query path against a same-dimension embedding-model swap. Compares the ENDPOINT-returned
+ * model (NOT the caller's DEFAULT_EMBED_MODEL arg, which is a local alias unrelated to what the
+ * endpoint actually serves) against the models the vault's active vectors were embedded with. The
+ * vault is consistent ONLY when it holds EXACTLY ONE model equal to the endpoint's — a heterogeneous
+ * vault (length > 1) is cosine-corrupt even if the endpoint matches one of the models, because the
+ * other model's vectors still pollute the space. Throws VecReadModelMismatchError otherwise; no-ops
+ * when the vault has no vectors yet.
+ */
+function assertQueryEmbedModelConsistent(db: Database, endpointModel: string): void {
+  const dataVersion = (db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version;
+  const cached = verifiedQueryEmbedModels.get(db);
+  if (cached && cached.dataVersion === dataVersion && cached.model === endpointModel) return;
+
+  const storedModels = getVecModels(db);
+  if (storedModels.length === 0) return; // nothing embedded yet — nothing to be inconsistent with
+
+  if (!(storedModels.length === 1 && storedModels[0] === endpointModel)) {
+    throw new VecReadModelMismatchError(storedModels, endpointModel);
+  }
+
+  // Consistent — memoize under the current data_version. A cross-process rebuild bumps data_version,
+  // invalidating this entry so the next query re-reads content_vectors.
+  verifiedQueryEmbedModels.set(db, { dataVersion, model: endpointModel });
+}
+
+// Step 1 of vector search — the expensive, off-loadable half: embed the query, guard the wall-clock
+// deadline, then run the SYNCHRONOUS sqlite-vec MATCH. Returns raw {hash_seq, distance} hits;
+// collection/date filtering is a Step-2 concern. Split out (BACKLOG Source 46) so the vector-query
+// daemon can run JUST this half on the long-lived watcher — keeping the blocking MATCH off the hook's
+// event loop — while the hook hydrates locally via hydrateVecResults(). In-process searchVec() below
+// composes the two, so its public contract is unchanged.
+export async function searchVecMatch(db: Database, query: string, model: string, limit: number = 20, deadlineMs?: number): Promise<{ hash_seq: string; distance: number }[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedding = await getEmbedding(query, model, true);
-  if (!embedding) return [];
+  const embedResult = await getEmbedding(query, model, true, deadlineMs);
+  if (!embedResult) return [];
+
+  // W1: read-path embedding-model consistency gate. On a same-dimension model swap (which
+  // VecDimensionMismatchError cannot catch) this throws VecReadModelMismatchError rather than
+  // serving cosine-meaningless results. Cached per (db, model) — the DISTINCT runs at most once
+  // per model per process.
+  assertQueryEmbedModelConsistent(db, embedResult.model);
+
+  const embedding = embedResult.embedding;
+
+  // Guard-defect fix: the caller's Promise.race(vectorTimeout) cannot interrupt the SYNCHRONOUS
+  // sqlite-vec MATCH below (bun:sqlite blocks the event loop) and does NOT cancel this promise.
+  // If the wall-clock budget already elapsed during the async embed above, bail here so a
+  // timed-out vector leg cannot resume and re-block the hook after it fell back to FTS.
+  if (deadlineMs !== undefined && Date.now() >= deadlineMs) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
@@ -3584,12 +3827,17 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // See: https://github.com/tobi/qmd/pull/23
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
-  const vecResults = db.prepare(`
+  return db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
   `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+}
 
+// Step 2 of vector search — the cheap, local half: hydrate raw {hash_seq, distance} hits into
+// SearchResult[] via indexed JOINs, collection/date filtering, and per-doc dedup. Pure primary-key
+// SQLite lookups — safe to run in the short-lived hook process even when Step 1 ran in the daemon.
+export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; distance: number }[], limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): SearchResult[] {
   if (vecResults.length === 0) return [];
 
   // Step 2: Get chunk info and document data
@@ -3673,16 +3921,36 @@ export async function searchVec(db: Database, query: string, model: string, limi
     });
 }
 
+// In-process vector search — Step 1 (MATCH) + Step 2 (hydrate) composed. Public contract unchanged;
+// the daemon-backed hook path (context-surfacing) instead calls searchVecMatch (in the daemon) +
+// hydrateVecResults (locally), so the blocking MATCH never runs on the hook's event loop.
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number): Promise<SearchResult[]> {
+  const vecResults = await searchVecMatch(db, query, model, limit, deadlineMs);
+  return hydrateVecResults(db, vecResults, limit, collectionId, collections, dateRange);
+}
+
 // =============================================================================
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, deadlineMs?: number): Promise<{ embedding: number[]; model: string } | null> {
   const llm = getDefaultLlamaCpp();
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
-  const result = await llm.embed(formattedText, { model, isQuery });
-  return result?.embedding || null;
+  // B4: bound the remote embed fetch + its 429 backoff to the caller's wall-clock
+  // deadline. Under the context-surfacing hook's Promise.race the abandoned embed
+  // promise otherwise keeps its fetch + retry sleeps running; AbortSignal.timeout
+  // actually cancels them, so a slow/rate-limited embed can no longer outlive the
+  // hook budget.
+  let signal: AbortSignal | undefined;
+  if (deadlineMs !== undefined) {
+    const remaining = deadlineMs - Date.now();
+    if (remaining <= 0) return null; // deadline already elapsed — skip the embed entirely
+    signal = AbortSignal.timeout(remaining);
+  }
+  const result = await llm.embed(formattedText, { model, isQuery, signal });
+  if (!result?.embedding) return null;
+  return { embedding: result.embedding, model: result.model };
 }
 
 /**
@@ -4044,19 +4312,24 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Cap parallelism at 4 to prevent VRAM exhaustion
   if (uncachedDocs.length > 0) {
     // rerankUrl hoisted to function scope above (d0hz) so it namespaces the cache key.
+    const rerankApiKey = Bun.env.CLAWMEM_RERANK_API_KEY;
     let scored = false;
 
     // Try remote GPU reranker first
     // Truncate to ~400 chars per doc to fit within server's 512-token context
     // (query + document must fit in one pair; ~2 chars/token for mixed content)
     if (rerankUrl) {
+      // Independent of the embed/LLM keys — the rerank endpoint may be a different
+      // authenticated host. Sent as Authorization: Bearer when CLAWMEM_RERANK_API_KEY is set.
+      const rerankHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      if (rerankApiKey) rerankHeaders["Authorization"] = `Bearer ${rerankApiKey}`;
       try {
         // Process in batches of 4 to prevent VRAM exhaustion
         for (let i = 0; i < uncachedDocs.length; i += 4) {
           const batch = uncachedDocs.slice(i, i + 4);
           const resp = await fetch(`${rerankUrl}/v1/rerank`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: rerankHeaders,
             body: JSON.stringify({
               query: rerankQuery,
               documents: batch.map(d => d.text.slice(0, 400)),

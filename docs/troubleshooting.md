@@ -12,6 +12,15 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - If both snap bun (`/snap/bin/bun`) and native bun (`~/.bun/bin/bun`) are installed, `which bun` may return the snap version. Direct `bun -e` or `bun run` commands will use the wrong binary.
 - Fix: The `bin/clawmem` wrapper handles this automatically. For manual commands, use `~/.bun/bin/bun` explicitly or add `~/.bun/bin` to PATH before `/snap/bin`.
 
+**macOS: `bootstrap` / `doctor` fails with "does not support dynamic extension loading" (sqlite-vec on macOS)**
+- `clawmem bootstrap` (or `clawmem doctor`) fails at the database step because macOS's built-in SQLite — which Bun uses by default — is compiled without extension-loading support, so the `sqlite-vec` vector extension cannot load. Symptom: `✗ Database: ... This build of sqlite3 does not support dynamic extension loading`. Yoloshii/ClawMem#20.
+- Fix: install an extension-capable SQLite via Homebrew, then re-run bootstrap:
+  ```bash
+  brew install sqlite
+  clawmem bootstrap ~/notes --name notes
+  ```
+- ClawMem auto-detects Homebrew's SQLite at the standard prefixes (`/opt/homebrew` on Apple Silicon, `/usr/local` on Intel) and at `brew --prefix sqlite` for non-standard prefixes — installing it is all that's required, no env var or config. If it still fails after `brew install sqlite`, run `brew reinstall sqlite` and confirm `ls $(brew --prefix sqlite)/lib/libsqlite3.dylib` resolves.
+
 ## Embedding & GPU
 
 **"Local model download blocked" error**
@@ -127,6 +136,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - If the error persists after v0.1.8: restart the watcher to clear accumulated state (`systemctl --user restart clawmem-watcher.service`). Check `systemctl --user status clawmem-watcher.service` for memory usage — healthy is under 100MB, bloated is 400MB+.
 - **v0.2.4 fix:** Hook's SQLite `busy_timeout` was 500ms — too tight. During A-MEM enrichment or heavy indexing, the watcher can hold write locks for 500ms+, causing the hook's DB open to fail with SQLITE_BUSY. Raised to 5000ms (matches MCP server). The hook's 8s outer timeout still leaves 3s for actual work after a 5s busy wait.
 - **v0.3.1 fix:** Shell `timeout` wrappers (e.g., `timeout 8 clawmem hook context-surfacing`) kill the process with exit 124 and no stderr — Claude Code reports "Failed with non-blocking status code: No stderr output". This affects all hook events (UserPromptSubmit, Stop, SessionStart, PreCompact), not just Stop hooks. Fix: Remove shell `timeout` from all hook commands and use Claude Code's native `timeout` property instead. Run `clawmem setup hooks` to reinstall with correct config (v0.3.1+), or manually update `~/.claude/settings.json` — see [setup-hooks](guides/setup-hooks.md).
+- **Large vault + intermittent hook timeout (`timed out after 8s`) — FIXED in v0.16.0.** Earlier this was diagnosed as pure cold-start (fresh Bun process, opening a large `index.sqlite`, re-reading evicted index pages) with "give the host more RAM" as the durable fix — but the dominant causes were two code-level defects: (1) the `context-surfacing` vector leg ran a *synchronous* `sqlite-vec` scan that the `Promise.race(vectorTimeout)` guard could not bound (a synchronous call blocks the event loop, so the timer never fires), and (2) every writable hook open ran an unconditional backfill `UPDATE` that could wait out `busy_timeout` under writer contention. **v0.16.0 fixes both:** `searchVec` takes a real wall-clock deadline and self-aborts before the blocking scan; both vector legs race the embed against the remaining budget and clear their timers; the init backfill is read-guarded and the init `busy_timeout` is capped to the caller's value; and the watcher prewarms the sqlite-vec payload into the page cache on startup (embed-independent, watcher-only). A cold page cache still adds latency to the genuine first post-boot call, so host RAM headroom + the prewarm help the margin — but on a large vault the scan cost, not RAM, was the trigger. A modest `timeout` bump (see the tradeoffs table under *Hooks slow or near timeout*) remains a secondary margin. The `deep` profile additionally reranks (extra remote round-trips), widening the cold-call window; `balanced` (default) does not rerank. **v0.20.0** adds the true hard cap: run `clawmem watch` and the hook sends the query to the watcher, which runs the blocking scan off the hook's event loop and returns the raw matches for local hydration — a cold scan then times out fast and falls back to FTS instead of blocking the turn. It is a pure optimization layer: when the watcher isn't running the hook uses the in-process, deadline-bounded path unchanged.
 
 **Watcher memory bloat (400MB+)**
 - The watcher accumulates memory when processing high-frequency file change events. The most common trigger was Claude Code session transcript `.jsonl` files changing on every keystroke during active conversations. Each event opened the database briefly, and over hours of active use, memory grew to 400-800MB.
@@ -186,7 +196,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 | Cloud embedding (`CLAWMEM_EMBED_API_KEY` set) | ~500ms | HTTP call to cloud provider, no `node-llama-cpp` needed. |
 
 - **Fix by setup type:**
-  - **Best:** Run `llama-server` locally — even on the same machine, a persistent server eliminates the per-invocation import. See [GPU Services](../README.md#gpu-services) for setup. This is what most users will do in practice.
+  - **Best:** Run `llama-server` locally — even on the same machine, a persistent server eliminates the per-invocation import. See [the inference services guide](guides/inference-services.md) for setup. This is what most users will do in practice.
   - **Quick:** Set `CLAWMEM_PROFILE=speed` — disables vector search in hooks entirely, pure BM25, never loads `node-llama-cpp`. Hooks complete in under 500ms.
   - **Cloud:** Set `CLAWMEM_EMBED_API_KEY` + `CLAWMEM_EMBED_URL` + `CLAWMEM_EMBED_MODEL` — query embedding via cloud API, no local models needed in the hook path.
   - **Fail-fast:** Set `CLAWMEM_NO_LOCAL_MODELS=true` — prevents `node-llama-cpp` from loading at all. Hooks degrade to BM25-only when GPU servers are unreachable, instead of blocking for 3.5s on a fallback import.
@@ -211,6 +221,8 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
   | 5s or less | Only viable with `llama-server` running or `CLAWMEM_PROFILE=speed`. In-process models will always timeout. |
 
   The timeout applies per invocation. A slow first prompt (cold start) doesn't mean subsequent prompts will be slow — Bun caches modules after the first load, and `node-llama-cpp` model files are cached on disk after the first download. Subsequent prompts in the same session are typically faster.
+
+  **Exception — large vaults (intermittent, pre-v0.16.0):** before v0.16.0 the hook could time out on *certain* turns (not just the first) because of an unbounded synchronous `sqlite-vec` scan plus an init-time write-lock wait — see *"UserPromptSubmit hook error" (intermittent)* above. **Upgrade to v0.16.0**, which bounds the scan and the init path and prewarms the cache (v0.20.0 adds the vector-query daemon — a true hard cap on the cold scan when the watcher runs). Host RAM headroom + the watcher prewarm still help the genuine cold-call margin, but they were not the root cause.
 
   **Stop hooks** (`decision-extractor`, `handoff-generator`, `feedback-loop`) default to 30s (v0.3.1+, was 10s prior) because they run LLM inference (observer model). These run at session end, so latency doesn't block the user.
 
@@ -276,7 +288,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 **Gateway fails to start with "Missing config. Run `openclaw setup` or set gateway.mode=local"**
 - On system-service OpenClaw deployments where the gateway runs as a different user than the owner of `~/<gateway-user's-home>/.openclaw/`, the gateway cannot traverse into its own config directory if the directory is 700 (`drwx------`). The error is misleading — the config file itself is readable (correctly chowned by the systemd `ExecStartPre` step), but the parent directory has no group-execute bit, so the gateway user cannot even `cd` into it to open the file.
 - Verify: `sudo stat /home/<installer>/.openclaw | grep Access` — if it shows `(0700/drwx------)`, this is the cause.
-- Fix: `sudo chmod 750 /home/<installer>/.openclaw` (owner rwx, group rx). The gateway user must be a member of the owning group — check with `id <gateway-user>` and confirm `<installer-group>` is listed. On Debian-family systems with a `sciros:sciros`-owned home directory and an `openclaw:openclaw` gateway that is also in the `sciros` group, `chmod 750` is enough.
+- Fix: `sudo chmod 750 /home/<installer>/.openclaw` (owner rwx, group rx). The gateway user must be a member of the owning group — check with `id <gateway-user>` and confirm `<installer-group>` is listed. On Debian-family systems with an `appuser:appuser`-owned home directory and an `openclaw:openclaw` gateway that is also in the `appuser` group, `chmod 750` is enough.
 - Single-user installs are not affected — the gateway IS the home directory owner and has full access regardless of group perms.
 
 **"plugins.entries.clawmem: plugin not found (stale config entry ignored)"**

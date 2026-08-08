@@ -8,6 +8,9 @@ import { existsSync, mkdirSync, readFileSync } from "fs";
 import { resolve as pathResolve, basename } from "path";
 import {
   createStore,
+  prewarmVectors,
+  startPeriodicPrewarm,
+  resolvePrewarmIntervalMs,
   enableProductionMode,
   getDefaultDbPath,
   canonicalDocId,
@@ -24,6 +27,7 @@ import {
   VecModelMismatchError,
   EmbedLeaseLostError,
 } from "./store.ts";
+import { startVectorDaemon, type VectorDaemonHandle } from "./vector-daemon.ts";
 import {
   getDefaultLlamaCpp,
   setDefaultLlamaCpp,
@@ -96,9 +100,9 @@ enableProductionMode();
 
 let store: Store | null = null;
 
-function getStore(): Store {
+function getStore(busyTimeout: number = 5000): Store {
   if (!store) {
-    store = createStore(undefined, { busyTimeout: 5000 });
+    store = createStore(undefined, { busyTimeout });
   }
   return store;
 }
@@ -1348,17 +1352,34 @@ function printResults(results: Array<{ displayPath: string; title: string; compo
 // Hook dispatch
 // =============================================================================
 
+// B3: the context-surfacing UserPromptSubmit hook runs under a tight budget
+// (8s repo default). Its OWN writes — dedup UPSERT, context_usage, recall
+// events, co-activations — are all best-effort/fail-open, but under writer
+// contention each could otherwise wait up to the store default busy_timeout
+// (5000ms) and blow the budget. Cap this process's busy_timeout so a contended
+// write fails fast (SQLITE_BUSY → skipped by the fail-open guards) instead of
+// stalling. Reads are unaffected (WAL readers never wait on the write lock).
+const CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS = 1500;
+
 async function cmdHook(args: string[]) {
   const hookName = args[0];
   if (!hookName) die("Usage: clawmem hook <name>");
 
   const input = await readHookInput();
-  const s = getStore();
+  // Open the store capped from the START for the context-surfacing hook (not just after open via the
+  // PRAGMA below) so a contended init cannot wait the full 5000ms default before it is narrowed. Other
+  // hooks (Stop-lane, 30s budget) keep the 5000ms default.
+  const s = getStore(hookName === "context-surfacing" ? CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS : 5000);
   let output: HookOutput;
 
   try {
     switch (hookName) {
       case "context-surfacing":
+        // Scope the small busy_timeout to THIS process only. Each `clawmem
+        // hook` invocation runs exactly one hook, so the Stop hooks
+        // (decision-extractor / handoff-generator / feedback-loop, 30s budget)
+        // run in separate processes and keep the store default (5000ms).
+        try { s.db.exec(`PRAGMA busy_timeout = ${CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS}`); } catch { /* non-fatal */ }
         output = await contextSurfacing(s, input);
         break;
       case "session-bootstrap":
@@ -2108,6 +2129,8 @@ async function cmdWatch() {
   let stopHeavyLane: (() => Promise<void>) | null = null;
   let watcherHandle: { close: () => void } | null = null;
   let checkpointTimerHandle: Timer | null = null;
+  let prewarmTimerHandle: ReturnType<typeof setInterval> | null = null;
+  let vectorDaemonHandle: VectorDaemonHandle | null = null;
 
   // Graceful shutdown — stop workers, close watchers, then exit. SIGTERM
   // handling is critical for systemd `systemctl --user stop` to shut down
@@ -2116,6 +2139,19 @@ async function cmdWatch() {
   // its own withWorkerLease finally block before we close the store.
   const shutdown = async (signal: string) => {
     console.log(`\n${c.dim}[watch] Received ${signal}, shutting down...${c.reset}`);
+    // Clear the periodic prewarm FIRST — before the awaited worker drains below. The timer is
+    // unref'd but still fires while the loop is alive; a tick landing mid-drain would run the
+    // synchronous ~1.5 GB scan and delay shutdown. Clearing it here is the only guard against that.
+    if (prewarmTimerHandle) {
+      clearInterval(prewarmTimerHandle);
+      prewarmTimerHandle = null;
+    }
+    // Stop the vector daemon early — before the awaited worker drain below — so no new socket-driven
+    // scan starts mid-shutdown. close() stops the listener and unlinks the socket file.
+    if (vectorDaemonHandle) {
+      vectorDaemonHandle.close();
+      vectorDaemonHandle = null;
+    }
     if (stopHeavyLane) {
       await stopHeavyLane();
       stopHeavyLane = null;
@@ -2163,6 +2199,40 @@ async function cmdWatch() {
     console.log(`${c.dim}[watch] Starting heavy maintenance lane worker${c.reset}`);
     stopHeavyLane = startHeavyMaintenanceWorker(s, llm, cfg);
   }
+
+  // Prewarm the sqlite-vec chunks into OS page cache ONCE, in the single long-lived watcher
+  // process only (never in the per-session MCP processes — N concurrent cold scans would be an
+  // I/O storm). The context-surfacing UserPromptSubmit hook runs a SYNCHRONOUS sqlite-vec MATCH
+  // that cannot be time-bounded in-thread (bun:sqlite exposes no interrupt); a cold ~1.5 GB scan
+  // can blow the hook's 8-15s budget. A single warm scan here keeps the hook-path scan sub-second.
+  // Deferred + best-effort so it never delays watcher startup and never throws.
+  setTimeout(() => {
+    try {
+      // prewarmVectors is embed-independent and returns true ONLY when a scan actually ran,
+      // so we never log a false-positive "prewarmed" (embed down at boot / no vectors yet).
+      if (prewarmVectors(s.db)) console.log(`${c.dim}[watch] vector cache prewarmed${c.reset}`);
+    } catch { /* best-effort: unexpected SQL error */ }
+  }, 0);
+
+  // B5 Option C: keep the vector payload warm against OS page-cache eviction BETWEEN hook calls.
+  // The one-shot prewarm above warms once; on a long-running host under memory pressure the kernel
+  // can evict the payload and let a cold synchronous MATCH creep back into the context-surfacing
+  // hook path. Re-touching the pages on an interval biases the kernel LRU toward keeping them
+  // resident (a PROBABILITY reduction, not a hard cap — the hard cap is the deferred BACKLOG
+  // Source 46 daemon). Cleared FIRST in shutdown(); the handle is unref'd so it never keeps the
+  // process alive by itself. resolvePrewarmIntervalMs enforces a strict parse + 60s floor so a
+  // stray tiny value (e.g. "1", or "1e3" which parseInt would read as 1) cannot schedule a
+  // near-continuous scan loop. Set CLAWMEM_PREWARM_INTERVAL_MS=0 to disable. Default 10 min.
+  const prewarmIntervalMs = resolvePrewarmIntervalMs(Bun.env.CLAWMEM_PREWARM_INTERVAL_MS);
+  prewarmTimerHandle = startPeriodicPrewarm(s.db, prewarmIntervalMs);
+  if (prewarmTimerHandle) {
+    console.log(`${c.dim}[watch] periodic vector prewarm every ${Math.round(prewarmIntervalMs / 1000)}s${c.reset}`);
+  }
+
+  // BACKLOG Source 46: vector-query daemon — HARD cap on the cold synchronous MATCH. Runs Step 1 off
+  // the hook's event loop on this long-lived watcher; the hook connects only when the socket exists,
+  // so it is a pure optimization layer (null on bind failure → the hook keeps its in-process fallback).
+  vectorDaemonHandle = await startVectorDaemon(s, (msg) => console.log(`${c.dim}${msg}${c.reset}`));
 
   watcherHandle = startWatcher(dirs, {
     debounceMs: 2000,

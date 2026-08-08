@@ -86,7 +86,13 @@ describe("remote embed fetch timeout (1d1fn)", () => {
   );
 
   it(
-    "AC2: timeout DOMException trips the breaker — remaining fragments fail fast, no per-fragment full wait",
+    // Contract updated at the v0.17.0 upstream sync (9jyc0): an abort/timeout is now
+    // classified as caller-driven cancellation, NOT a transport failure — it must NOT
+    // trip the 60s remote-down cooldown (which would needlessly force local fallback
+    // on the query path whose deadline merely elapsed). The 1d1fn guarantee that
+    // survives is the per-fetch deadline itself: every fragment fails at the bound,
+    // never at Bun's unbounded connect/idle wait.
+    "AC2 (v0.17 revision): timeout is cancellation — bounded per-fragment failure, breaker NOT tripped",
     async () => {
       process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
       const hung = startHangingServer();
@@ -96,23 +102,22 @@ describe("remote embed fetch timeout (1d1fn)", () => {
           remoteFetchTimeoutMs: 300,
         });
 
-        // First fragment eats the timeout and should trip markRemoteEmbedDown().
+        // First fragment eats the timeout; classified as cancellation, no cooldown.
         const first = await llm.embed("fragment 1");
         expect(first).toBeNull();
         const connectionsAfterFirst = hung.connectionCount();
         expect(connectionsAfterFirst).toBeGreaterThanOrEqual(1);
 
-        // Remaining fragments (simulating the 38-fragment batch from 62xr.5)
-        // must fail FAST — breaker is tripped, no new connection, no wait.
+        // A subsequent fragment is still ATTEMPTED (breaker untripped — upstream v0.17
+        // contract) and again fails at ~the configured bound, not an unbounded wait.
         const start = Date.now();
-        const results = await Promise.all(
-          Array.from({ length: 5 }, (_, i) => llm.embed(`fragment ${i + 2}`))
-        );
+        const second = await llm.embed("fragment 2");
         const elapsed = Date.now() - start;
 
-        expect(results.every(r => r === null)).toBe(true);
-        expect(elapsed).toBeLessThan(150); // no fetch attempted at all — in-cooldown short-circuit
-        expect(hung.connectionCount()).toBe(connectionsAfterFirst); // no new sockets opened
+        expect(second).toBeNull();
+        expect(elapsed).toBeGreaterThanOrEqual(250); // real attempt, bounded by the deadline
+        expect(elapsed).toBeLessThan(3000);
+        expect(hung.connectionCount()).toBeGreaterThan(connectionsAfterFirst); // new socket — no cooldown short-circuit
       } finally {
         hung.stop();
       }
