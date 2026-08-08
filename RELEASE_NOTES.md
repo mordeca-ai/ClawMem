@@ -4,6 +4,152 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.25.0 — extraction retry-with-error-feedback + decision half-life + entity-neighbor hub-bias fix
+
+Three independently reviewed items from the strategic queue (§13.1, §36.11, BL-001) — the first queue burndown since the ranking was locked. Three files, three pipelines, no shared invariants.
+
+### §13.1 — retry-with-error-feedback on every LLM extraction path (`src/llm-retry.ts`)
+
+ClawMem's extraction surfaces were single-shot: one `generate()` attempt, and any malformed/empty response failed open to `[]`/`null` with no signal to the model about what went wrong — invisible data loss on every transient formatting miss. All eight extraction call sites now ride `withRetryAndFeedback` (pattern re-authored from Volt's llm-map validation loop):
+
+- **Stateless corrective retries** (default 3 attempts): each retry is a fresh `generate()` call with a reconstructed prompt — original prompt + the parse error + a 500-char excerpt of the previous response — never a conversation continuation.
+- **Hard wall-clock deadline** shared across all attempts: no attempt starts past the deadline, and an in-flight `generate()` is raced against it — a backend that ignores the abort signal cannot hold the helper past the budget.
+- **Fail-open on exhaustion** (null → the same `[]`/`null` callers already handled), now with a terminal `[llm-retry] <label>: exhausted…` warning naming the call site.
+- Call sites: observer `extractObservations`/`extractSummary`, conversation-synthesis `extractFactsFromConversation`, A-MEM `constructMemoryNote`/`generateMemoryLinks`/`evolveMemories`/`inferCausalLinks`, entity `extractEntities`. Parse closures own whole-response STRUCTURAL validation (so a malformed payload triggers a corrective retry instead of a silent post-loop drop — including integer-validated causal-link indexes, closing a partial-write path); semantic/domain filtering stays outside the loop.
+- Accounting change: a transient failure that recovers on retry no longer counts as an LLM failure in `mine --synthesize` stats; only terminal exhaustion does.
+
+### §36.11 — decision ranking half-life: ∞ → 180 days (`src/memory.ts`)
+
+`HALF_LIVES.decision = Infinity` pinned recency at 1.0 forever, so a silently-abandoned decision ("we'll use X" → quietly moved to Y, with no contradictory write to trigger supersession) kept winning ranking indefinitely. Decisions now decay on a 180-day half-life. **Ranking durability only:** `decision` keeps its attention-decay exemption, nothing is deleted or archived (lifecycle policy is separate), the access-frequency extension still stretches frequently-resurfaced decisions toward 3×, and `deductive`/`preference`/`hub`/`antipattern` stay infinite. An unaccessed 180-day-old decision drops to recency 0.5 — still fully searchable, just no longer permanently ahead of fresher material.
+
+### BL-001 — `getEntityGraphNeighbors` hub-bias fix (`src/entity.ts`)
+
+The entity-neighbor path ranked by raw co-occurrence count — reintroducing exactly the hub bias the edge-creation path's IDF suppression exists to prevent (one path suppressed hubs, the other reinforced them). Neighbor ranking now blends count with IDF specificity (`min(1, log1p(count)/5) × clamp(idf/3.0)`, sharing the edge path's 3.0 threshold via `ENTITY_IDF_SPECIFICITY_THRESHOLD`):
+
+- **Score-before-limit:** every co-occurring candidate is scored, THEN the pool is capped at 30 — a specific neighbor at raw-count rank 31+ can now surface (the old SQL `ORDER BY count DESC LIMIT 30` excluded it before scoring).
+- **Best-path-per-doc:** candidates are traversed in blended-score order, so a document reachable via both a hub and a specific entity keeps the specific path's score and `viaEntity`.
+- **Active-only IDF + hydration:** IDF populations are active-documents-only (archived mentions can no longer distort specificity), archived-only candidates are dropped from the pool, and hydration excludes archived documents before its per-entity LIMIT. One grouped CTE query supplies counts and active doc-frequency together (no N+1).
+
+### Quality gates
+
+Full suite 1,577/0. Each item independently reviewed by a cross-model adversarial pass (codex / GPT-5.6) to verbatim "Zero remaining findings — ship as is.": §13.1 in 3 turns, §36.11 in 2, BL-001 in 3 (bug-first — the failing hub-bias test predates the fix).
+
+---
+
+## v0.24.0 — raw-BM25-primary ranking for `search` (judged keyword eval) + bypass A/B toolkit
+
+v0.23.0 made the FTS relevance signal real and deliberately deferred any ranking-contract change to a judged eval. That eval ran: 43 judged keyword targets (23 discovery + 20 family-disjoint held-out) with objectively-labeled fairness shapes (14 raw-favorable "exact-old", 22 composite-favorable "fresh-among-many"), frozen floors and decision rules pre-registered before any comparison was computed. **Raw-BM25-primary beat the shipping composite decisively**: combined MRR 0.848 vs 0.415, hit@1 33 vs 6; held-out 0.875/16-at-#1 vs 0.335/zero-at-#1 (the composite missed the absolute floors outright); composite lost even on its OWN favorable shape (fresh-among-many 0.348 vs 0.801) — the recency/quality/co-activation multipliers bury keyword relevance rather than refine it. One paired regression (one position) in 43 cases; controls clean in both arms.
+
+### Behavior changes
+
+- **`search` ranks non-recency queries by the RAW BM25 transform** (`|bm25|/(1+|bm25|)`), mirroring the v0.22.0 vector-route pattern. Metadata — including pin — participates only inside groups of exactly-equal raw scores (deterministic tie order: pinned, then legacy composite, then path). `structuredContent` carries `scoreBasis: "fts-bm25"`. FTS-transform values and vector cosines remain independent, non-comparable channels.
+- **`minScore` on `search`** now filters the raw score for non-recency queries and has NO default — omitted means no filter, an explicit `0` is honored. Recency-intent queries ("latest…", "recent…") keep the composite regime with the previous default-0 floor and report `scoreBasis: "composite"`.
+- **Unchanged surfaces:** hooks/context-surfacing, `query`, `query_plan`, `intent_search`, `memory_retrieve`'s composite modes, the CLI `search` command, and the REST API keep their existing scoring. The change is scoped to the MCP `search` tool, exactly as evaluated.
+- **Bypass ops escape hatch:** `CLAWMEM_DISABLE_FTS_BYPASS=true` forces the full expansion path at both strong-signal-bypass consumers (MCP `query` pipeline + CLI `query`) — built for the 49.3 A/B harness, kept as an operational kill switch.
+- **`expandQueryCacheKey` exported** — the exact `llm_cache` key `expandQuery` reads/writes, so eval harnesses can delete/verify expansion cache rows without replicating private key construction.
+- **Bypass characterization (49.3, frozen census):** on a frozen 127-query census (51 judged keyword cases + 76 firing-hunt probes) over the frozen production snapshot, the strong-signal bypass fired on THREE — 3/51 on the judged set, 0/76 among the probes — all lone-or-near-lone pools, all with the correct top document. Frozen-corpus characterization only: the probes were selected to hunt firings, so these rates say nothing about production firing prevalence (unmeasured), and the firing set is snapshot-relative — one probe term began firing on the live index hours later as new documents mentioned it. On this frozen snapshot/census the gap ≥ 0.15 condition fired rarely — sibling documents suppress the gap on this corpus. Eval tooling: `scripts/eval-keyword-acceptance.ts` (freeze/run, FTS-only) and `scripts/eval-bypass-ab.ts` (freeze/run, live-service A/B with a verified expansion-cache freeze and census integrity re-execution).
+- **Bypass A/B verdict (49.3):** on the frozen census's complete fired population (3 natural cases; pre-registered zero-allowance gates; run gated on frozen service identity + an embed-geometry canary drift-check + rerank health), the bypass lost nothing — zero dropouts, zero hard regressions, bypass-arm MRR +0.038 higher — and saves ~56% wall time where it fires (1.9 s vs 4.3 s with a warm expansion cache). Verdict: `SAFE ON FROZEN CENSUS (n=3 fired; zero-allowance gates); population risk unvalidated` — thresholds 0.85/0.15 stand on this census; no tuning proposed.
+
+---
+
+## v0.23.0 — monotonic BM25 exposed score (the FTS relevance signal was a constant)
+
+The v0.22.0 design gate discovered that `searchFTS`'s exposed score was computed as `1 / (1 + Math.max(0, bm25))` — but FTS5's `bm25()` is negative-is-better and ≤ 0 for every match (0/4,962 positive rows measured on a production vault), so **every FTS result carried the identical score 1.0**. SQL ordering was correct; everything downstream of the exposed score was not: composite ranking on FTS surfaces (`search`, REST keyword, CLI, `memory_retrieve` keyword and its semantic-mode FTS fallback, hook FTS lanes) was effectively metadata-only, the `query` pipeline's strong-signal bypass could never fire on multi-hit queries yet always fired on single-hit ones, hook injection systematically preferred FTS-sourced docs over vector-sourced ones (1.0 vs cosine), and every score-threshold gate was vacuous.
+
+### Behavior changes
+
+- **Exposed FTS score is now `|bm25|/(1+|bm25|)`** (`ftsScoreFromBm25`, exported): monotonic in match strength, bounded [0,1), per-row stable, clamps a hypothetical positive input to 0.
+- **`search` keeps the composite regime** (a regime change is gated on the 49.2 judged keyword eval) — but its searchScore input is now real, so keyword relevance finally contributes ordering. Observed `score`/`compositeScore` values shift accordingly; `minScore` semantics are unchanged. Compact results report the composite; non-compact carry both `score` (raw transform) and `compositeScore`.
+- **Strong-signal bypass is functional**: fires only on a strong (≥ 0.85 ⇔ |bm25| ≥ 5.67), clearly separated (gap ≥ 0.15) top hit; a lone weak match no longer triggers it. One shared helper (`hasStrongFtsSignal`) now backs both the MCP `query` pipeline and the CLI `query` command (previously a drifted duplicate).
+- **`memory_forget` targeting is stricter and safer**: the confidence gate (`score ≥ 0.7`, or a ≥ 0.2 gap when 2+ candidates exist) is live — previously every FTS candidate scored 1.0 and was auto-selected, including a lone garbage match. Weak matches now return the candidate list for disambiguation. Non-destructive pin/snooze behavior is unchanged.
+- **`query_plan`'s graph clause now carries RRF-fused scores into graph traversal** (parity with the causal and `intent_search` paths, via a shared `attachRrfScores` helper) — traversal seed mass was previously anchored on raw single-channel scores.
+- **Consolidation dup-gate and curator BM25 probe are live**: the `score ≥ 0.7` duplicate filter and the `> 0.3` retrieval probe actually discriminate now. A near-empty vault may honestly report a degraded BM25 probe where it previously passed vacuously.
+- **Scale honesty**: FTS-transform scores and vector cosines are independent monotonic signals, not a calibrated common scale. Mixed-channel merge points (REST hybrid max-merge, hook dedup) are no longer degenerate, but cross-channel calibration remains future, eval-gated work.
+
+Follow-on work: BACKLOG 49.2 (judged keyword eval → `search` regime recommendation; reports bypass firings) and 49.3 (query-pipeline A/B before any bypass-threshold tuning).
+
+---
+
+## v0.22.0 — raw-similarity-primary ranking for the direct vector routes
+
+v0.21.0 removed the system-internal junk from the direct tools' results; the direct-pipeline eval it mandated then showed the composite scoring layer itself was the remaining defect on those routes: on a judged set against the live vault, pure raw cosine ranked 16/19 targets #1 (MRR 0.912) while the shipping composite ranked 1/19 (MRR 0.307), filtered 14/19 correct answers below the old `minScore` floor, and got WORSE with deeper candidate pools. Attribution was measured per stage: length normalization caused the floor kills; the pin +0.3 additive made one pinned, heavily-accessed hub document top-1 for nearly every query including nonsense controls; re-mixing the weights could not help because every multiplier is larger than the 0.03–0.10 raw margins that separate right answers from wrong ones in the compressed-high band of modern embedding models.
+
+### Behavior change: raw ordering on the evidenced vector routes
+
+- **`vsearch` and `memory_retrieve` semantic/discovery modes** rank non-recency queries by RAW vector cosine. Document metadata — including pin — participates only inside groups of exactly-equal raw scores (deterministic tie order: pinned, then legacy composite, then path). `structuredContent` carries `scoreBasis: "vector-cosine"`; raw cosine is embedding-model-specific and not comparable to composite values.
+- **`minScore` on `vsearch`** now filters the raw score for non-recency queries and has NO default — omitted means no filter, an explicit `0` is honored (nullish handling). Recency-intent queries keep the composite regime with its 0.3 default floor and report `scoreBasis: "composite"`.
+- **Recency-intent queries are unchanged everywhere** (RECENCY_WEIGHTS composite, newest-first behavior, contentType priority sort), selected through one centralized regime function. The semantic/discovery FTS *fallback* (vector leg unavailable) also keeps composite — its scores are not cosine.
+- **Unchanged routes:** `search` (BM25), `query`, `query_plan`, `intent_search`, hooks/context-surfacing, and `memory_retrieve` keyword/hybrid/causal/complex. `find_similar` was already raw-ranked and is untouched (docs now say so). A BM25 ranking eval is backlogged separately — its exposed score is currently non-monotonic (`Math.max(0, bm25)` flattens FTS5's negative-is-better scores), a pre-existing issue this release documents but does not change.
+- **Pin re-documented:** pin = lifecycle retention + prioritization among relevance-equivalent results. On composite surfaces it keeps the +0.3 boost; on the raw routes it breaks exact ties only. "Persistent surfacing" — a pinned document floating above more relevant ones on every query — was the measured hub defect, not a feature.
+- **`retrieval.mcp_direct_tuned_weights` is superseded and has no effect.** Its own gate evidence (the direct-pipeline eval) measured tuned weights at 1/19 hit@1. The key is still parsed; setting it logs a once-per-process warning.
+
+### Verification
+
+`bun test` → 1504 pass / 0 fail (new: constructed-tie units — pin wins inside an exact-score tie group and never crosses a boundary; regime selection; no-default-floor + explicit-zero `minScore` handling; route-level raw-ordering regressions including the incident fixture, which now proves the inversion cannot recur even with `includeInternal: true`). A frozen, deterministic acceptance gate (`scripts/eval-acceptance.ts`: vault snapshot + frozen `asOf` clock + per-case frozen query vectors through the guarded precomputed-vector path) passed all predeclared criteria: pin-invariance rank identity on non-recency cases; exact match to the frozen composite baseline on recency cases; no control-query hub dominance and no pinned top-1; discovery set 23/23 in-pool, hit@1 18/23, MRR 0.870; held-out family-disjoint set hit@1 17/20, hit@5 19/20, MRR 0.879 against floors of 12/20, 17/20, and 0.75 declared before the set was authored. Design and implementation adversarially reviewed cross-model to explicit clearance (5-turn DESIGN gate, 14 findings folded).
+
+## v0.21.0 — vsearch trust hardening: internal-collection exclusion, geometry canary, embed survivability
+
+A live incident exposed a stacked failure: an embedding server silently producing non-discriminating vectors for the vault's dominant register (a last-token model whose GGUF conversion lost its EOS-append flag), amplified by composite scoring floating system-internal docs over true matches — while every existing health check passed. The server-side cause is an operator fix; this release closes the client-side amplification and the detection gaps, and hardens the embed run that the remediation itself crashed.
+
+### Behavior change: `_clawmem` excluded from MCP retrieval by default
+
+`search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` no longer return the system-internal `_clawmem` collection (observations/deductions/handoffs) unless asked: pass `includeInternal: true`, or name `_clawmem` in an explicit `collection` filter. `find_similar` auto-includes internal neighbors when the reference document is itself internal. `intent_search` / `find_causal_links` / `kg_query` / `session_log` / `timeline` are unfiltered by design — system memory is their substrate. Exclusion happens at the store layer (SQL predicate for BM25; escalating MATCH depth for vectors) and inside graph traversal (excluded nodes are pruned before beam selection and score normalization), so internal docs neither appear NOR consume candidate/beam budget.
+
+Vector-side contract: under exclusion the scan escalates depth until `limit` allowed documents hydrate, capped at 4,096 fragments. Cap-limited under-fills carry an explicit `degraded: true` + `degradedReason` (`excluded-dominant` when distinct excluded docs account for the shortfall, `cap-truncation` when fragment dedup drives it); multi-leg routes aggregate `any(leg)` with per-leg reasons in `structuredContent.degradedLegs`. Plain small-vault exhaustion returns a normal short list with no marker.
+
+### Embedding-geometry canary (preflight + doctor)
+
+- `clawmem embed` now runs a pair-separation probe battery BEFORE any destructive step — a broken-geometry server aborts the run before `--force` clears anything (override: `--force-geometry`). The battery uses the production embed templates and includes terminus + truncation controls that catch unanchored last-token readouts; self-similarity alone cannot (stored-vs-fresh stayed 0.999 through the entire incident).
+- Baselines are stored per (probe-version, model, dimension) profile in a new `embed_canary` table as **first-healthy calibrations** — healthy runs never roll the reference; `clawmem embed --force --recalibrate-canary` is the explicit replacement operation (intrinsic sanity floors govern its gate, since the old baseline is exactly what it replaces). Margins alert relative to the calibrated baseline (< 50%) with an absolute backstop, and drift (stored-vs-fresh probe cos < 0.98) flags a changed serving stack behind an unchanged model name. Mixed dimensions/models across one battery (a flapping endpoint) are a hard failure, and a `--force` clear never proceeds on an UNVALIDATED endpoint. Mid-run drift, an unverifiable run end, or a no-preflight override persists a durable `embed_geometry_taint` flag (lease-fenced) that keeps `doctor` nonzero until a verified full rebuild clears it.
+- `clawmem doctor` gains the canary (section 10) and a sampled persisted-vs-fresh check on real index rows (section 11): fragments are reconstructed through the production parse/split/format pipeline and compared to their stored vectors. New vectors persist an `embed_input_fp` (SHA-256 of the exact embed input) enabling full validation; pre-0.21.0 rows validate structurally with title provenance flagged unavailable until their next re-embed. Definitive failures (fingerprint mismatch = stale input; fingerprint match + low cosine = corruption) exit nonzero immediately — sampling coverage can never mask them.
+
+### Embed-run survivability
+
+The incident's remediation run died on a transient `SQLITE_BUSY`: the failure-marker write itself crashed a `--force` rebuild at doc 344/4,995 with the index already cleared. Now: the embed connection runs a 10s busy timeout (set on the ACTIVE connection, covering `update --embed`'s cached store; kept short so synchronous waits cannot starve the 30s lease heartbeat), retries are asynchronous and bounded with a lease-loss abort between attempts, `markEmbedStart/Synced/Failed` are lease-fenced in-transaction, a marker that still fails logs-and-continues instead of killing the run, and `--force` skips the post-clear stale-embedding cleanup (a no-op that could only add a die-after-clear window).
+
+### Also
+
+- `latest` now routes to recency intent (`RECENCY_PATTERNS`) — "latest decisions" was scoring under non-recency weights.
+- Config knob `retrieval.mcp_direct_tuned_weights` (default **false**; env `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS`): opt-in to score the MCP direct tools' non-recency queries with the retrieval-tuned `query`-tool weights. The default flip is gated on a direct-pipeline eval — the existing n=199 evidence covered only the hybrid `query` pipeline.
+- Read-only template A/B evaluator (`scripts/eval-query-template.ts`): ranks known-target queries under query-template / doc-template / raw formatting against the live index through the same model+dimension guards as production, writing nothing. Measured post-incident: a doc-templated query ranked the true target #1 where the query template ranked it #383 — a query-side-only template change needs no re-embed.
+- Production vector search now runs an explicit pre-MATCH dimension check via a shared query-vector compatibility guard (previously model-consistency only).
+- Docs: the zembed-1 launch line ships with `--pooling last --override-kv tokenizer.ggml.add_eos_token=bool:true` (the missing flags seeded the incident); troubleshooting's claim that a re-embed is "not required" after a pooling fix is corrected (it IS required — same-dimension geometries are incompatible); the missing-EOS-anchor signature, shared-suffix diagnostic confound, compressed-high similarity bands, and watcher/`tee` operational notes are documented.
+
+### Verification
+
+`bun test` → 1492 pass / 0 fail (45 new regressions: escalation fill / cap-exhaustion markers / dedup-collapse / mixed-cause truthfulness / small-vault no-marker; traversal beam parity; shared-guard model+dimension; canary healthy/collapsed/drift/unavailable/mixed-endpoint; fail-closed preflight gate matrix; first-healthy baseline calibration; sampled-validation tiers incl. definitive-failure non-maskability, canonical-alias dedup, and hard attempt caps; busy-retry semantics; lease-fenced markers; `latest` routing; route-level MCP tests over an in-memory transport for all six retrieval tools incl. the incident composite-ranking fixture). Design adversarially reviewed to explicit clearance in a 7-turn cross-model DESIGN gate (34 findings folded); implementation review findings (fail-open canary gate, unbounded sampling, canonical-identity blindness, rolling baselines, taint persistence, and route coverage) folded before ship.
+
+## v0.20.2 — Beads sync hardening: argument-safe exec, telemetry-off spawns
+
+`runBd` assembled a shell string and ran it through `execSync`, leaving argument interpolation to the shell, and bd v1.1.0 upstream turned on anonymous usage metrics by default with a remote reporting endpoint and a spawned flush sender — so every bd invocation ClawMem makes during a sync would have phoned home on upgraded installs.
+
+- **`execFileSync` replaces the shell string** (`src/beads.ts`): arguments pass as an array with no shell interpolation; same timeout, cwd, and error handling.
+- **Telemetry is disabled for ClawMem-spawned bd calls only.** The spawn env forces `BD_DISABLE_METRICS=1` and `BD_DISABLE_EVENT_FLUSH=1`. Older bd releases ignore the unknown variables (verified on v0.58.0); a user's own interactive bd keeps whatever metrics preference they chose — automated sync calls would only have skewed it.
+
+### Verification
+
+`bun test` → 1447 pass / 0 fail. Empirical matrix on both ends of the supported bd range: v0.58.0 and v1.1.0 return identical rows with and without the env pair. The exec seam was flagged in an independent cross-model adversarial review (codex / GPT-5.5).
+
+### What didn't change
+
+The parse schema, sync semantics, dep-type bridging, and document shape are untouched. v0.20.2 is byte-identical in behavior to v0.20.1 except for the exec mechanism and the spawned-call env.
+
+## v0.20.1 — Beads sync against bd v1.1.0: full-backlog list, dead field dropped, claim leases surfaced
+
+An upstream delta survey of beads v1.0.5 → v1.1.0 (`gastownhall/beads`, formerly `steveyegge/beads`) found three drift points in the sync:
+
+- **The 50-issue silent truncation is gone.** `queryBeadsList` inherited `bd list`'s default cap, so backlogs past 50 issues silently synced a prefix. The query now passes `--limit 0` (unlimited) — verified live against bd v0.58.0 and v1.1.0, so the fix does not raise the version floor.
+- **`quality_score` dropped from the parse** (`src/beads.ts` interface, normalizer, and formatter). Upstream removed the field at v0.62.0; it was `omitempty` even before, so real `bd list --json` output stopped carrying it long ago. This is bd's per-issue field — ClawMem's own indexing-time quality scoring is a different mechanism and is untouched.
+- **Claim leases surfaced.** bd v1.1.0 issues can carry `lease_expires_at` / `heartbeat_at`; the sync now parses both and renders a `**Claim Lease**: expires …` line when present, so agent-claimed work is visible in indexed memory. Absent on older bd → the line is skipped.
+
+### Verification
+
+`bun test` → 1447 pass / 0 fail. No ClawMem consumer references the dropped field (`store.ts` / `mcp.ts` / CLI checked). `--limit 0` and field behavior exercised against live databases on bd v0.58.0 and v1.1.0.
+
+### What didn't change
+
+Dependency-type bridging is untouched — the new upstream dep types (`tracks`, `until`, `authored-by`, `assigned-to`, `approved-by`, `attests`) fall to the existing `semantic` default exactly as unmapped types always have. Watcher behavior, `.beads/` discovery, and document format are unchanged apart from the two field-level items above.
+
 ## v0.20.0 — Vector-query daemon: a hard cap on the cold synchronous MATCH
 
 v0.16.0 and v0.17.0 bounded the `context-surfacing` hook's vector leg with wall-clock deadlines and kept the sqlite-vec payload warm with a watcher prewarm, but those are probability reductions: a synchronous `bun:sqlite` MATCH exposes no interrupt, so once a cold scan on a large vault is in flight it blocks the hook's event loop past the 8-15s budget and the in-thread `Promise.race` timer cannot fire. v0.17.0 tracked the true hard cap — moving the scan off the hook's event loop — as deferred. This release ships it.

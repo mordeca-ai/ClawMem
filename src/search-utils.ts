@@ -210,6 +210,48 @@ export function toRanked(r: SearchResult): RankedResult {
   };
 }
 
+/**
+ * Map RRF-fused results back to their originating SearchResults, carrying the FUSED
+ * score. Downstream consumers — graph-traversal anchors, composite enrichment — must
+ * see the fusion's relevance scale, not a raw single-channel score (S49.1 U2: the
+ * query_plan graph clause used to drop the fused score, anchoring traversal on raw
+ * FTS values). First occurrence wins when a doc appears in multiple channels
+ * (matching the previous `find`-based lookups); fused entries with no originating
+ * SearchResult are dropped.
+ */
+export function attachRrfScores(fused: RankedResult[], originals: SearchResult[]): SearchResult[] {
+  const byPath = new Map<string, SearchResult>();
+  for (const r of originals) {
+    if (!byPath.has(r.filepath)) byPath.set(r.filepath, r);
+  }
+  return fused
+    .map(fr => { const orig = byPath.get(fr.file); return orig ? { ...orig, score: fr.score } : null; })
+    .filter((r): r is SearchResult => r !== null);
+}
+
+/**
+ * BM25 strong-signal check on ftsScoreFromBm25-scale results: the top hit is strong
+ * (≥ 0.85 ⇔ |bm25| ≥ 5.67) AND clearly separated from #2 (gap ≥ 0.15; a missing #2
+ * counts as 0, so a lone WEAK hit does not qualify). Callers use this to skip LLM
+ * query expansion when the keyword answer is unambiguous.
+ */
+export function hasStrongFtsSignal(results: SearchResult[]): boolean {
+  if (results.length === 0) return false;
+  const top = results[0]!.score;
+  const second = results.length > 1 ? results[1]!.score : 0;
+  return top >= 0.85 && (top - second) >= 0.15;
+}
+
+/**
+ * Ops escape hatch for the BM25 strong-signal bypass: CLAWMEM_DISABLE_FTS_BYPASS=true
+ * forces the full expansion path on every query (both the MCP `query` pipeline and the
+ * CLI `query` consume this). Read at call time so A/B harnesses and tests can toggle
+ * per invocation; `hasStrongFtsSignal` itself stays pure.
+ */
+export function ftsBypassEnabled(): boolean {
+  return process.env.CLAWMEM_DISABLE_FTS_BYPASS !== "true";
+}
+
 // =============================================================================
 // Fusion + Rerank Blending (master-harness-z7o4y)
 // =============================================================================

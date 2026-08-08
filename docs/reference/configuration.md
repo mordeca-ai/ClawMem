@@ -38,6 +38,7 @@ Full provider matrix and behavior: [../guides/cloud-embedding.md](../guides/clou
 |---|---|---|
 | `CLAWMEM_PROFILE` | `balanced` | `speed` / `balanced` / `deep`. Sets the kept-score ratio (65% / 55% / 45%), vector timeout, max results, and the `factsTokens` sub-budget. Only `deep` adds query expansion + reranking to the hook path. `speed` makes hooks BM25-only (sub-500ms). |
 | `CLAWMEM_NUDGE_INTERVAL` | `15` | Prompts between lifecycle tool use before a `<vault-nudge>` is injected. `0` to disable. |
+| `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` | (superseded) | **No effect since v0.22.0.** The direct-pipeline eval this knob was gated on measured tuned weights at 1/19 hit@1; the direct vector routes now rank by raw cosine instead (see [mcp-tools](mcp-tools.md) → Scoring regimes). Still parsed for backward compatibility — setting it (env or `retrieval.mcp_direct_tuned_weights` in `config.yaml`) logs a once-per-process warning. |
 
 The context-surfacing hook `timeout` is **not** an env var — it lives in `~/.claude/settings.json` (8s default). See [../troubleshooting.md](../troubleshooting.md) → *Tuning the context-surfacing hook timeout*.
 

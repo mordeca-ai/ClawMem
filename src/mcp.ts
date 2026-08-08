@@ -33,7 +33,8 @@ import {
   type EnrichedResult,
   type CoActivationFn,
 } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFtsSignal, ftsBypassEnabled, attachRrfScores, type RankedResult } from "./search-utils.ts";
+import { selectScoringRegime, rankRawPrimary, VECTOR_SCORE_BASIS, FTS_SCORE_BASIS, COMPOSITE_SCORE_BASIS } from "./scoring-regime.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
 import { listCollections } from "./collections.ts";
@@ -114,6 +115,32 @@ function splitIntoWindows(text: string, windowSize: number, overlap = 200): stri
 }
 
 /** Classify query into retrieval mode based on signal patterns */
+// =============================================================================
+// Retrieval visibility policy (VSEARCH-TRUST-HARDENING (b))
+// =============================================================================
+
+// System-internal collections excluded from MCP retrieval by default. Hook precedent:
+// FILTERED_PATHS in context-surfacing. Opt-ins: the includeInternal param, or an explicit
+// collection filter naming an internal collection.
+const INTERNAL_COLLECTIONS = ["_clawmem"];
+
+function resolveExcludedCollections(includeInternal: boolean | undefined, collections?: string[]): string[] | undefined {
+  if (includeInternal) return undefined;
+  if (collections && collections.some(c => INTERNAL_COLLECTIONS.includes(c))) return undefined;
+  return INTERNAL_COLLECTIONS;
+}
+
+type DegradedLeg = { leg: string; reason: "excluded-dominant" | "cap-truncation" };
+
+// Only excluded-dominant carries the includeInternal advice — cap-truncation must stay
+// truthful when the shortfall is dedup-driven (T5-M2).
+function degradedGuidanceText(legs: DegradedLeg[]): string {
+  const anyExcludedDominant = legs.some(l => l.reason === "excluded-dominant");
+  return anyExcludedDominant
+    ? "Note: nearest-neighbor region dominated by excluded internal docs — pass includeInternal:true or refine the query."
+    : "Note: vector results truncated at the scan cap.";
+}
+
 function classifyRetrievalMode(query: string): "keyword" | "semantic" | "causal" | "timeline" | "discovery" | "complex" | "hybrid" {
   const q = query.toLowerCase();
 
@@ -161,7 +188,13 @@ function addLineNumbers(text: string, startLine: number = 1): string {
 // MCP Server
 // =============================================================================
 
-export async function startMcpServer(): Promise<void> {
+/**
+ * Build the fully-registered MCP server WITHOUT connecting a transport.
+ * Extracted from startMcpServer so tests can drive the real tool handlers over an
+ * in-memory transport (route-level regressions for visibility exclusion + degraded
+ * markers). Returns the server plus a close() that releases every store handle.
+ */
+export function buildMcpServer(): { server: McpServer; store: Store; closeAllStores: () => void } {
   const store = createStore(undefined, { busyTimeout: 5000 });
 
   // Vault store cache: prevents connection churn, closed on shutdown
@@ -251,13 +284,16 @@ This is the recommended entry point for ALL memory queries.`,
         mode: z.enum(["auto", "keyword", "semantic", "causal", "timeline", "discovery", "complex", "hybrid"]).optional().default("auto").describe("Override auto-detection: keyword=BM25, semantic=vector, causal=graph traversal, timeline=session history, discovery=similar docs, complex=multi-topic, hybrid=full pipeline"),
         limit: z.number().optional().default(10),
         compact: z.boolean().optional().default(true),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, mode, limit, compact, vault }) => {
+    async ({ query, mode, limit, compact, includeInternal, vault }) => {
       const store = getStore(vault);
       const effectiveMode = mode === "auto" ? classifyRetrievalMode(query) : mode;
       const lim = limit || 10;
+      const excl = resolveExcludedCollections(includeInternal);
+      const degradedLegs: DegradedLeg[] = [];
 
       // --- Timeline mode → session log ---
       if (effectiveMode === "timeline") {
@@ -282,16 +318,19 @@ This is the recommended entry point for ALL memory queries.`,
       if (effectiveMode === "causal") {
         const llm = getDefaultLlamaCpp();
         const intent = await classifyIntent(query, llm, store.db);
-        const bm25Results = store.searchFTS(query, 30);
+        const bm25Results = store.searchFTS(query, 30, undefined, undefined, undefined, excl);
         let vecResults: SearchResult[] = [];
-        try { vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30); } catch (e) { rethrowIfFatalVectorError(e); /* else: no vectors */ }
+        let causalDegraded: DegradedLeg | undefined;
+        try {
+          const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, 30, { excludeCollections: excl });
+          vecResults = det.results;
+          // Causal mode runs ONE vector call — flat single-vector shape per the documented
+          // contract (T8-M5), not the multi-leg degradedLegs aggregate.
+          if (det.degraded && det.degradedReason) causalDegraded = { leg: "causal:vector", reason: det.degradedReason };
+        } catch (e) { rethrowIfFatalVectorError(e); /* else: no vectors */ }
         const rrfWeights = intent.intent === 'WHY' ? [1.0, 1.5] : intent.intent === 'WHEN' ? [1.5, 1.0] : [1.0, 1.0];
         const fusedRanked = reciprocalRankFusion([bm25Results.map(toRanked), vecResults.map(toRanked)], rrfWeights);
-        const allSearch = [...bm25Results, ...vecResults];
-        let fused: SearchResult[] = fusedRanked.map(fr => {
-          const orig = allSearch.find(r => r.filepath === fr.file);
-          return orig ? { ...orig, score: fr.score } : null;
-        }).filter((r): r is SearchResult => r !== null);
+        let fused: SearchResult[] = attachRrfScores(fusedRanked, [...bm25Results, ...vecResults]);
 
         if (intent.intent === 'WHY' || intent.intent === 'ENTITY') {
           try {
@@ -300,6 +339,9 @@ This is the recommended entry point for ALL memory queries.`,
               const traversed = adaptiveTraversal(store.db, fused.slice(0, 10).map(r => ({ hash: r.hash, score: r.score })), {
                 maxDepth: 2, beamWidth: 5, budget: 30,
                 intent: intent.intent, queryEmbedding: anchorEmb.embedding,
+                // Visibility policy threaded INTO traversal (T3-H2): excluded nodes are pruned
+                // before beam selection and score normalization, not just hidden at hydration.
+                excludeCollections: excl,
               });
               const merged = mergeTraversalResults(store.db, fused.map(r => ({ hash: r.hash, score: r.score })), traversed);
               // Hydrate merged results back to SearchResult format
@@ -307,7 +349,8 @@ This is the recommended entry point for ALL memory queries.`,
               fused = merged.map(m => {
                 const orig = fusedMap.get(m.hash);
                 if (orig) return { ...orig, score: m.score };
-                // Graph-discovered node — hydrate from DB
+                // Graph-discovered node — hydrate from DB (defense-in-depth visibility guard;
+                // traversal-level pruning is the primary barrier)
                 const doc = store.db.prepare(`
                   SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
                   FROM documents d
@@ -315,6 +358,7 @@ This is the recommended entry point for ALL memory queries.`,
                   WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
                 `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
                 if (!doc) return null;
+                if (excl && excl.includes(doc.collection)) return null;
                 return {
                   filepath: `clawmem://${doc.collection}/${doc.path}`,
                   displayPath: `${doc.collection}/${doc.path}`,
@@ -341,23 +385,34 @@ This is the recommended entry point for ALL memory queries.`,
           score: Math.round(r.compositeScore * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
         }));
+        const causalDegradedFields = causalDegraded ? { degraded: true as const, degradedReason: causalDegraded.reason } : {};
+        const degradedNote = causalDegraded ? `\n${degradedGuidanceText([causalDegraded])}` : "";
         return {
-          content: [{ type: "text", text: `[routed: causal, intent: ${intent.intent}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
-          structuredContent: { mode: effectiveMode, intent, results: items },
+          content: [{ type: "text", text: `[routed: causal, intent: ${intent.intent}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${degradedNote}` }],
+          structuredContent: { mode: effectiveMode, intent, results: items, ...causalDegradedFields },
         };
       }
 
-      // --- Complex mode → query decomposition ---
+      // --- Complex mode → query decomposition (multi-leg: per-clause degraded aggregation, T6-M1) ---
       if (effectiveMode === "complex") {
         const llm = getDefaultLlamaCpp();
         const clauses = await decomposeQuery(query, llm, store.db);
         const allResults: SearchResult[] = [];
+        let clauseIdx = 0;
         for (const clause of clauses.sort((a, b) => a.priority - b.priority)) {
+          const clauseExcl = resolveExcludedCollections(includeInternal, clause.collections);
           let results: SearchResult[] = [];
-          if (clause.type === 'bm25') results = store.searchFTS(clause.query, 20, undefined, clause.collections);
-          else if (clause.type === 'vector') { try { results = await store.searchVec(clause.query, DEFAULT_EMBED_MODEL, 20, undefined, clause.collections); } catch (e) { rethrowIfFatalVectorError(e); /* */ } }
-          else if (clause.type === 'graph') { results = store.searchFTS(clause.query, 15, undefined, clause.collections); }
+          if (clause.type === 'bm25') results = store.searchFTS(clause.query, 20, undefined, clause.collections, undefined, clauseExcl);
+          else if (clause.type === 'vector') {
+            try {
+              const det = await store.searchVecDetailed(clause.query, DEFAULT_EMBED_MODEL, 20, { collections: clause.collections, excludeCollections: clauseExcl });
+              results = det.results;
+              if (det.degraded && det.degradedReason) degradedLegs.push({ leg: `complex:clause${clauseIdx}:vector`, reason: det.degradedReason });
+            } catch (e) { rethrowIfFatalVectorError(e); /* */ }
+          }
+          else if (clause.type === 'graph') { results = store.searchFTS(clause.query, 15, undefined, clause.collections, undefined, clauseExcl); }
           allResults.push(...results);
+          clauseIdx++;
         }
         const seen = new Set<string>();
         const deduped = allResults.filter(r => { if (seen.has(r.filepath)) return false; seen.add(r.filepath); return true; });
@@ -368,37 +423,59 @@ This is the recommended entry point for ALL memory queries.`,
           score: Math.round(r.compositeScore * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
         }));
+        const degradedNote = degradedLegs.length > 0 ? `\n${degradedGuidanceText(degradedLegs)}` : "";
         return {
-          content: [{ type: "text", text: `[routed: complex, ${clauses.length} clauses] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
-          structuredContent: { mode: effectiveMode, clauses: clauses.length, results: items },
+          content: [{ type: "text", text: `[routed: complex, ${clauses.length} clauses] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${degradedNote}` }],
+          structuredContent: { mode: effectiveMode, clauses: clauses.length, results: items, ...(degradedLegs.length > 0 ? { degraded: true, degradedLegs } : {}) },
         };
       }
 
       // --- Keyword / Semantic / Discovery / Hybrid modes ---
       let results: SearchResult[] = [];
+      let singleLegDegraded: DegradedLeg | undefined;
+      // semantic/discovery: the raw regime applies ONLY to results the vector leg actually
+      // served — the FTS fallback's scores are not cosine, so it keeps composite scoring.
+      let vectorLegServed = false;
       if (effectiveMode === "keyword") {
-        results = store.searchFTS(query, lim);
+        results = store.searchFTS(query, lim, undefined, undefined, undefined, excl);
       } else if (effectiveMode === "semantic" || effectiveMode === "discovery") {
-        try { results = await store.searchVec(query, DEFAULT_EMBED_MODEL, lim); } catch (e) { rethrowIfFatalVectorError(e); results = store.searchFTS(query, lim); }
+        try {
+          const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, lim, { excludeCollections: excl });
+          results = det.results;
+          vectorLegServed = true;
+          if (det.degraded && det.degradedReason) singleLegDegraded = { leg: `${effectiveMode}:vector`, reason: det.degradedReason };
+        } catch (e) { rethrowIfFatalVectorError(e); results = store.searchFTS(query, lim, undefined, undefined, undefined, excl); }
       } else {
         // Hybrid: BM25 + vector + RRF
-        const bm25 = store.searchFTS(query, 30);
+        const bm25 = store.searchFTS(query, 30, undefined, undefined, undefined, excl);
         let vec: SearchResult[] = [];
-        try { vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30); } catch (e) { rethrowIfFatalVectorError(e); /* */ }
+        try {
+          const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, 30, { excludeCollections: excl });
+          vec = det.results;
+          if (det.degraded && det.degradedReason) singleLegDegraded = { leg: "hybrid:vector", reason: det.degradedReason };
+        } catch (e) { rethrowIfFatalVectorError(e); /* */ }
         if (vec.length > 0) {
           const fusedRanked = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
-          const allSearch = [...bm25, ...vec];
-          results = fusedRanked.map(fr => {
-            const orig = allSearch.find(r => r.filepath === fr.file);
-            return orig ? { ...orig, score: fr.score } : null;
-          }).filter((r): r is SearchResult => r !== null);
+          results = attachRrfScores(fusedRanked, [...bm25, ...vec]);
         } else {
           results = bm25;
         }
       }
 
       const enriched = enrichResults(store, results, query);
-      const scored = applyCompositeScoring(enriched, query).slice(0, lim);
+      // v0.22.0 two-regime scoring (VSEARCH-RAW-PRIMARY-DESIGN.md R1/R4): vector-served
+      // semantic/discovery results on non-recency queries rank by raw cosine (metadata
+      // breaks exact ties only). Keyword/hybrid modes and the FTS fallback keep composite —
+      // their scores are not cosine, so the raw contract cannot hold there.
+      const rawRegime = vectorLegServed
+        && (effectiveMode === "semantic" || effectiveMode === "discovery")
+        && selectScoringRegime(query) === "raw";
+      const retrieveScoreBasis = rawRegime ? VECTOR_SCORE_BASIS : COMPOSITE_SCORE_BASIS;
+      const scored = rawRegime
+        ? rankRawPrimary(enriched, query).slice(0, lim)
+        : applyCompositeScoring(enriched, query).slice(0, lim);
+      const modeDegraded = singleLegDegraded ? { degraded: true as const, degradedReason: singleLegDegraded.reason } : {};
+      const modeDegradedNote = singleLegDegraded ? `\n${degradedGuidanceText([singleLegDegraded])}` : "";
       if (compact) {
         const items = scored.map(r => ({
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
@@ -406,8 +483,8 @@ This is the recommended entry point for ALL memory queries.`,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
         }));
         return {
-          content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
-          structuredContent: { mode: effectiveMode, results: items },
+          content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${modeDegradedNote}` }],
+          structuredContent: { mode: effectiveMode, results: items, scoreBasis: retrieveScoreBasis, ...modeDegraded },
         };
       }
       const items: SearchResultItem[] = scored.map(r => {
@@ -420,8 +497,8 @@ This is the recommended entry point for ALL memory queries.`,
         };
       });
       return {
-        content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items, query)}` }],
-        structuredContent: { mode: effectiveMode, results: items },
+        content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items, query)}${modeDegradedNote}` }],
+        structuredContent: { mode: effectiveMode, results: items, scoreBasis: retrieveScoreBasis, ...modeDegraded },
       };
     }
   );
@@ -481,7 +558,7 @@ This is the recommended entry point for ALL memory queries.`,
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: search (BM25 + composite)
+  // Tool: search (BM25 — raw-transform ranking; composite on recency intent)
   // ---------------------------------------------------------------------------
 
   server.registerTool(
@@ -492,23 +569,33 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         query: z.string().describe("Search query"),
         limit: z.number().optional().default(10),
-        minScore: z.number().optional().default(0),
+        minScore: z.number().optional().describe("Score floor. Non-recency queries filter the RAW FTS score, the monotonic |bm25|/(1+|bm25|) transform (default: no filter; explicit 0 honored). Recency-intent queries keep the composite-scale default 0."),
         collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, minScore, collection, compact, vault }) => {
+    async ({ query, limit, minScore, collection, compact, includeInternal, vault }) => {
       const store = getStore(vault);
       const collections = collection
         ? collection.split(",").map(c => c.trim()).filter(Boolean)
         : undefined;
-      const results = store.searchFTS(query, limit || 10, undefined, collections);
+      const excl = resolveExcludedCollections(includeInternal, collections);
+      const results = store.searchFTS(query, limit || 10, undefined, collections, undefined, excl);
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, results, query);
-      const scored = applyCompositeScoring(enriched, query, coFn)
-        .filter(r => r.compositeScore >= (minScore || 0));
+      // v0.24.0 two-regime scoring (S49-JUDGED-EVAL-DESIGN.md, SWITCH verdict): non-recency
+      // queries rank by the raw FTS transform — metadata (incl. pin) breaks exact score
+      // ties only, and minScore (if given) filters the raw score with NO default floor.
+      // Recency-intent queries keep the pre-v0.24.0 composite behavior including its
+      // default-0 floor.
+      const regime = selectScoringRegime(query);
+      const sScoreBasis = regime === "raw" ? FTS_SCORE_BASIS : COMPOSITE_SCORE_BASIS;
+      const scored = regime === "raw"
+        ? rankRawPrimary(enriched, query, coFn).filter(r => minScore === undefined || r.compositeScore >= minScore)
+        : applyCompositeScoring(enriched, query, coFn).filter(r => r.compositeScore >= (minScore || 0));
 
       if (compact) {
         const items = scored.map(r => ({
@@ -517,7 +604,7 @@ This is the recommended entry point for ALL memory queries.`,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
-        return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items } };
+        return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items, scoreBasis: sScoreBasis } };
       }
 
       const filtered: SearchResultItem[] = scored.map(r => {
@@ -536,7 +623,7 @@ This is the recommended entry point for ALL memory queries.`,
 
       return {
         content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
-        structuredContent: { results: filtered },
+        structuredContent: { results: filtered, scoreBasis: sScoreBasis },
       };
     }
   );
@@ -553,13 +640,14 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         query: z.string().describe("Natural language query"),
         limit: z.number().optional().default(10),
-        minScore: z.number().optional().default(0.3),
+        minScore: z.number().optional().describe("Score floor. Non-recency queries filter the RAW cosine score (default: no filter; explicit 0 honored; cosine values are embedding-model-specific). Recency-intent queries keep the composite-scale default 0.3."),
         collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, minScore, collection, compact, vault }) => {
+    async ({ query, limit, minScore, collection, compact, includeInternal, vault }) => {
       const store = getStore(vault);
       const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
       if (!tableExists) {
@@ -569,12 +657,25 @@ This is the recommended entry point for ALL memory queries.`,
       const collections = collection
         ? collection.split(",").map(c => c.trim()).filter(Boolean)
         : undefined;
-      const results = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit || 10, undefined, collections);
+      const excl = resolveExcludedCollections(includeInternal, collections);
+      const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, limit || 10, { collections, excludeCollections: excl });
+      const results = det.results;
+      const vsDegraded = det.degraded && det.degradedReason ? { degraded: true as const, degradedReason: det.degradedReason } : {};
+      const vsDegradedNote = det.degraded && det.degradedReason ? `\n${degradedGuidanceText([{ leg: "vsearch", reason: det.degradedReason }])}` : "";
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, results, query);
-      const scored = applyCompositeScoring(enriched, query, coFn)
-        .filter(r => r.compositeScore >= (minScore || 0.3));
+      // v0.22.0 two-regime scoring (VSEARCH-RAW-PRIMARY-DESIGN.md R1–R4): non-recency
+      // queries rank by raw cosine — metadata (incl. pin) breaks exact score ties only,
+      // and minScore (if given) filters the raw score with NO default floor. Recency-intent
+      // queries keep the pre-v0.22.0 composite behavior including its 0.3 default.
+      const regime = selectScoringRegime(query);
+      const vsScoreBasis = regime === "raw" ? VECTOR_SCORE_BASIS : COMPOSITE_SCORE_BASIS;
+      const scored = regime === "raw"
+        ? rankRawPrimary(enriched, query, coFn).filter(r => minScore === undefined || r.compositeScore >= minScore)
+        // Recency branch preserves v0.21 semantics EXACTLY, including `||`: an explicit
+        // minScore of 0 still applies the 0.3 composite floor (R4 unchanged-recency contract).
+        : applyCompositeScoring(enriched, query, coFn).filter(r => r.compositeScore >= (minScore || 0.3));
 
       if (compact) {
         const items = scored.map(r => ({
@@ -583,7 +684,7 @@ This is the recommended entry point for ALL memory queries.`,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
-        return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items } };
+        return { content: [{ type: "text", text: `${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${vsDegradedNote}` }], structuredContent: { results: items, scoreBasis: vsScoreBasis, ...vsDegraded } };
       }
 
       const items: SearchResultItem[] = scored.map(r => {
@@ -601,8 +702,8 @@ This is the recommended entry point for ALL memory queries.`,
       });
 
       return {
-        content: [{ type: "text", text: formatSearchSummary(items, query) }],
-        structuredContent: { results: items },
+        content: [{ type: "text", text: `${formatSearchSummary(items, query)}${vsDegradedNote}` }],
+        structuredContent: { results: items, scoreBasis: vsScoreBasis, ...vsDegraded },
       };
     }
   );
@@ -625,14 +726,16 @@ This is the recommended entry point for ALL memory queries.`,
         diverse: z.boolean().optional().default(true).describe("Apply MMR diversity filter to reduce near-duplicate results"),
         intent: z.string().optional().describe("Domain intent hint for disambiguation — steers expansion, reranking, chunk selection, and snippet extraction"),
         candidateLimit: z.number().optional().default(30).describe("Max candidates reaching the reranker (default 30)"),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, minScore, collection, compact, diverse, intent, candidateLimit, vault }) => {
+    async ({ query, limit, minScore, collection, compact, diverse, intent, candidateLimit, includeInternal, vault }) => {
       const store = getStore(vault);
       const candLimit = candidateLimit || 30;
       const rankedLists: RankedResult[][] = [];
       const docidMap = new Map<string, string>();
+      const degradedLegs: DegradedLeg[] = [];
       const hasVectors = !!store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
       // Step 0: Temporal constraint extraction (pure regex, ~0ms)
@@ -642,13 +745,11 @@ This is the recommended entry point for ALL memory queries.`,
       const collections = collection
         ? collection.split(",").map(c => c.trim()).filter(Boolean)
         : undefined;
-      const initialFts = store.searchFTS(query, 20, undefined, collections, dateRange);
-      const topScore = initialFts.length > 0 ? Math.abs(initialFts[0]!.score) : 0;
-      const secondScore = initialFts.length > 1 ? Math.abs(initialFts[1]!.score) : 0;
+      const excl = resolveExcludedCollections(includeInternal, collections);
+      const initialFts = store.searchFTS(query, 20, undefined, collections, dateRange, excl);
       // When intent is provided, disable strong-signal bypass — the obvious BM25
       // match may not be what the caller wants (e.g. "performance" with intent "web page load times")
-      const hasStrongSignal = !intent && initialFts.length > 0
-        && topScore >= 0.85 && (topScore - secondScore) >= 0.15;
+      const hasStrongSignal = !intent && ftsBypassEnabled() && hasStrongFtsSignal(initialFts);
 
       // Step 2: Query expansion (skipped if strong signal). Typed routing —
       // original → BOTH FTS + vector (2× RRF anchor), lex → FTS only, vec/hyde → vector only.
@@ -663,30 +764,34 @@ This is the recommended entry point for ALL memory queries.`,
         rankedLists.push(initialFts.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
       }
       if (hasVectors) {
-        const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 20, undefined, collections, dateRange);
-        if (vecResults.length > 0) {
-          for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+        const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, 20, { collections, dateRange, excludeCollections: excl });
+        if (det.degraded && det.degradedReason) degradedLegs.push({ leg: "vector:original", reason: det.degradedReason });
+        if (det.results.length > 0) {
+          for (const r of det.results) docidMap.set(r.filepath, r.docid);
+          rankedLists.push(det.results.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
         }
       }
       // Lists contributed by the original query — these get the 2× RRF weight.
       const numOriginalLists = rankedLists.length;
 
       // Typed expansions — route by type: lex → FTS, vec/hyde → vector.
+      let expansionIdx = 0;
       for (const eq of expanded) {
         if (eq.type === 'lex') {
-          const ftsResults = store.searchFTS(eq.query, 20, undefined, collections, dateRange);
+          const ftsResults = store.searchFTS(eq.query, 20, undefined, collections, dateRange, excl);
           if (ftsResults.length > 0) {
             for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
             rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
           }
         } else if (hasVectors) {
-          const vecResults = await store.searchVec(eq.query, DEFAULT_EMBED_MODEL, 20, undefined, collections, dateRange);
-          if (vecResults.length > 0) {
-            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+          const det = await store.searchVecDetailed(eq.query, DEFAULT_EMBED_MODEL, 20, { collections, dateRange, excludeCollections: excl });
+          if (det.degraded && det.degradedReason) degradedLegs.push({ leg: `vector:expansion${expansionIdx}`, reason: det.degradedReason });
+          if (det.results.length > 0) {
+            for (const r of det.results) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(det.results.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
           }
         }
+        expansionIdx++;
       }
 
       // Step 2b: Temporal proximity channel (if dateRange detected)
@@ -694,14 +799,17 @@ This is the recommended entry point for ALL memory queries.`,
       if (dateRange) {
         const centerMs = (new Date(dateRange.start).getTime() + new Date(dateRange.end).getTime()) / 2;
         const rangeMs = Math.max(new Date(dateRange.end).getTime() - new Date(dateRange.start).getTime(), 86400000);
+        const temporalExclSql = excl && excl.length > 0
+          ? ` AND d.collection NOT IN (${excl.map(() => '?').join(',')})`
+          : "";
         const temporalDocs = store.db.prepare(`
           SELECT 'clawmem://' || d.collection || '/' || d.path as filepath,
                  d.collection || '/' || d.path as displayPath,
                  d.title, d.modified_at
           FROM documents d
-          WHERE d.active = 1 AND d.invalidated_at IS NULL AND d.modified_at >= ? AND d.modified_at <= ?
+          WHERE d.active = 1 AND d.invalidated_at IS NULL AND d.modified_at >= ? AND d.modified_at <= ?${temporalExclSql}
           ORDER BY d.modified_at DESC LIMIT 30
-        `).all(dateRange.start, dateRange.end) as { filepath: string; displayPath: string; title: string; modified_at: string }[];
+        `).all(dateRange.start, dateRange.end, ...(excl ?? [])) as { filepath: string; displayPath: string; title: string; modified_at: string }[];
 
         if (temporalDocs.length > 0) {
           const temporalRanked: RankedResult[] = temporalDocs.map(d => {
@@ -732,6 +840,7 @@ This is the recommended entry point for ALL memory queries.`,
                 WHERE d.id = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
               `).get(en.docId) as { collection: string; path: string; title: string; body: string | null } | undefined;
               if (!doc) return null;
+              if (excl && excl.includes(doc.collection)) return null;
               return {
                 file: `clawmem://${doc.collection}/${doc.path}`,
                 displayPath: `${doc.collection}/${doc.path}`,
@@ -838,6 +947,10 @@ This is the recommended entry point for ALL memory queries.`,
       if (diverse !== false) scored = applyMMRDiversity(scored);
       scored = scored.slice(0, limit || 10);
 
+      // Multi-leg degraded aggregation (T5-M1): route marker = any(leg), per-leg reasons retained.
+      const queryDegraded = degradedLegs.length > 0 ? { degraded: true as const, degradedLegs } : {};
+      const queryDegradedNote = degradedLegs.length > 0 ? `\n${degradedGuidanceText(degradedLegs)}` : "";
+
       if (compact) {
         const items = scored.map(r => ({
           docid: `#${docidMap.get(r.filepath) || r.docid}`, path: r.displayPath, title: r.title,
@@ -845,7 +958,7 @@ This is the recommended entry point for ALL memory queries.`,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
-        return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items } };
+        return { content: [{ type: "text", text: `${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${queryDegradedNote}` }], structuredContent: { results: items, ...queryDegraded } };
       }
 
       const items: SearchResultItem[] = scored.map(r => {
@@ -863,8 +976,8 @@ This is the recommended entry point for ALL memory queries.`,
       });
 
       return {
-        content: [{ type: "text", text: formatSearchSummary(items, query) }],
-        structuredContent: { results: items },
+        content: [{ type: "text", text: `${formatSearchSummary(items, query)}${queryDegradedNote}` }],
+        structuredContent: { results: items, ...queryDegraded },
       };
     }
   );
@@ -987,9 +1100,11 @@ This is the recommended entry point for ALL memory queries.`,
 
     const top = candidates[0]!;
 
-    // Clear winner: high score OR significant gap to #2
+    // Clear winner: high score OR significant gap to #2. The gap clause requires an
+    // actual #2 to gap against — a lone weak candidate must not qualify (destructive
+    // ops would otherwise auto-select a garbage single match).
     const gap = candidates.length > 1 ? top.score - candidates[1]!.score : 1.0;
-    const confident = top.score >= 0.7 || gap >= 0.2;
+    const confident = top.score >= 0.7 || (candidates.length > 1 && gap >= 0.2);
 
     // For destructive ops (forget), require higher confidence
     if (destructive && !confident) {
@@ -1274,10 +1389,11 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         file: z.string().describe("Path of reference document"),
         limit: z.number().optional().default(5),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs — excluded by default (auto-included when the REFERENCE doc is itself internal)"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ file, limit, vault }) => {
+    async ({ file, limit, includeInternal, vault }) => {
       const store = getStore(vault);
       const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
       if (!tableExists) {
@@ -1293,14 +1409,21 @@ This is the recommended entry point for ALL memory queries.`,
       const body = store.getDocumentBody(result) ?? "";
       const title = result.title || file;
 
+      // Internal-reference auto-exception (T2-M7): exploring FROM an internal doc is an
+      // explicit ask for the internal space — include internal neighbors.
+      const refIsInternal = INTERNAL_COLLECTIONS.includes(result.collectionName);
+      const excl = resolveExcludedCollections(includeInternal || refIsInternal);
+
       // Use the document's content as the search query
       const queryText = `${title}\n${body.slice(0, 1000)}`;
-      const vecResults = await store.searchVec(queryText, DEFAULT_EMBED_MODEL, (limit || 5) + 1);
+      const det = await store.searchVecDetailed(queryText, DEFAULT_EMBED_MODEL, (limit || 5) + 1, { excludeCollections: excl });
 
       // Filter out the reference document itself
-      const similar = vecResults
+      const similar = det.results
         .filter(r => r.filepath !== result.filepath)
         .slice(0, limit || 5);
+      const fsDegraded = det.degraded && det.degradedReason ? { degraded: true as const, degradedReason: det.degradedReason } : {};
+      const fsDegradedNote = det.degraded && det.degradedReason ? `\n${degradedGuidanceText([{ leg: "find_similar", reason: det.degradedReason }])}` : "";
 
       const items: SearchResultItem[] = similar.map(r => {
         const { line, snippet } = extractSnippet(r.body || "", title, 200);
@@ -1315,8 +1438,8 @@ This is the recommended entry point for ALL memory queries.`,
       });
 
       return {
-        content: [{ type: "text", text: `${items.length} similar to "${title}":\n${items.map(i => `  ${i.file} (${Math.round(i.score * 100)}%)`).join('\n')}` }],
-        structuredContent: { reference: file, results: items },
+        content: [{ type: "text", text: `${items.length} similar to "${title}":\n${items.map(i => `  ${i.file} (${Math.round(i.score * 100)}%)`).join('\n')}${fsDegradedNote}` }],
+        structuredContent: { reference: file, results: items, ...fsDegraded },
       };
     }
   );
@@ -1602,11 +1725,7 @@ This is the recommended entry point for ALL memory queries.`,
       const fusedRanked = reciprocalRankFusion([bm25Results.map(toRanked), vecResults.map(toRanked)], rrfWeights);
 
       // Map RRF results back to SearchResult with updated scores
-      const allSearchResults = [...bm25Results, ...vecResults];
-      const fused: SearchResult[] = fusedRanked.map(fr => {
-        const original = allSearchResults.find(r => r.filepath === fr.file);
-        return original ? { ...original, score: fr.score } : null;
-      }).filter((r): r is SearchResult => r !== null);
+      const fused: SearchResult[] = attachRrfScores(fusedRanked, [...bm25Results, ...vecResults]);
 
       // Step 4: Graph expansion (if enabled and intent allows)
       let expanded = fused;
@@ -1765,10 +1884,11 @@ This is the recommended entry point for ALL memory queries.`,
         query: z.string().describe("Complex or multi-topic query"),
         limit: z.number().optional().default(10),
         compact: z.boolean().optional().default(true).describe("Return compact results"),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, compact, vault }) => {
+    async ({ query, limit, compact, includeInternal, vault }) => {
       const store = getStore(vault);
       const llm = getDefaultLlamaCpp();
 
@@ -1779,23 +1899,31 @@ This is the recommended entry point for ALL memory queries.`,
       const sortedClauses = [...clauses].sort((a, b) => a.priority - b.priority);
       const allResults: SearchResult[] = [];
       const clauseDetails: { type: string; query: string; priority: number; resultCount: number }[] = [];
+      const degradedLegs: DegradedLeg[] = [];
 
+      let clauseIdx = 0;
       for (const clause of sortedClauses) {
+        const clauseExcl = resolveExcludedCollections(includeInternal, clause.collections);
         let results: SearchResult[] = [];
         if (clause.type === 'bm25') {
-          results = store.searchFTS(clause.query, 20, undefined, clause.collections);
+          results = store.searchFTS(clause.query, 20, undefined, clause.collections, undefined, clauseExcl);
         } else if (clause.type === 'vector') {
-          results = await store.searchVec(clause.query, DEFAULT_EMBED_MODEL, 20, undefined, clause.collections);
+          const det = await store.searchVecDetailed(clause.query, DEFAULT_EMBED_MODEL, 20, { collections: clause.collections, excludeCollections: clauseExcl });
+          results = det.results;
+          if (det.degraded && det.degradedReason) degradedLegs.push({ leg: `clause${clauseIdx}:vector`, reason: det.degradedReason });
         } else if (clause.type === 'graph') {
           // Graph clause: run intent_search-style retrieval
           const intent = await classifyIntent(clause.query, llm, store.db);
-          const bm25 = store.searchFTS(clause.query, 15, undefined, clause.collections);
-          const vec = await store.searchVec(clause.query, DEFAULT_EMBED_MODEL, 15, undefined, clause.collections);
+          const bm25 = store.searchFTS(clause.query, 15, undefined, clause.collections, undefined, clauseExcl);
+          const detGraph = await store.searchVecDetailed(clause.query, DEFAULT_EMBED_MODEL, 15, { collections: clause.collections, excludeCollections: clauseExcl });
+          const vec = detGraph.results;
+          if (detGraph.degraded && detGraph.degradedReason) degradedLegs.push({ leg: `clause${clauseIdx}:graph:vector`, reason: detGraph.degradedReason });
           const fused = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
-          const searchMap = new Map([...bm25, ...vec].map(r => [r.filepath, r]));
-          results = fused
-            .map(fr => searchMap.get(fr.file))
-            .filter((r): r is SearchResult => r !== null);
+          // Carry the RRF-fused score (parity with causal + intent_search): the graph
+          // traversal below anchors on `score`, which must be RRF-scale, not raw single-channel.
+          // vec-first: this site historically preferred the vector variant on duplicate
+          // paths (its pre-helper Map construction let later entries overwrite) — preserved.
+          results = attachRrfScores(fused, [...vec, ...bm25]);
 
           // Graph expansion for WHY/ENTITY
           if (intent.intent === 'WHY' || intent.intent === 'ENTITY') {
@@ -1803,13 +1931,15 @@ This is the recommended entry point for ALL memory queries.`,
             if (anchorEmb) {
               const traversed = adaptiveTraversal(store.db, results.slice(0, 5).map(r => ({ hash: r.hash, score: r.score })), {
                 maxDepth: 2, beamWidth: 3, budget: 15, intent: intent.intent, queryEmbedding: anchorEmb.embedding,
+                // Visibility policy threaded INTO traversal (T6-H1): parity with memory_retrieve causal
+                excludeCollections: clauseExcl,
               });
               const merged = mergeTraversalResults(store.db, results.map(r => ({ hash: r.hash, score: r.score })), traversed);
               const expandedMap = new Map(results.map(r => [r.hash, r]));
               results = merged.map(m => {
                 const existing = expandedMap.get(m.hash);
                 if (existing) return { ...existing, score: m.score };
-                // Graph-discovered node — hydrate from DB
+                // Graph-discovered node — hydrate from DB (defense-in-depth visibility guard)
                 const doc = store.db.prepare(`
                   SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
                   FROM documents d
@@ -1817,6 +1947,7 @@ This is the recommended entry point for ALL memory queries.`,
                   WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
                 `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
                 if (!doc) return null;
+                if (clauseExcl && clauseExcl.includes(doc.collection)) return null;
                 return {
                   filepath: `clawmem://${doc.collection}/${doc.path}`,
                   displayPath: `${doc.collection}/${doc.path}`,
@@ -1837,6 +1968,7 @@ This is the recommended entry point for ALL memory queries.`,
         }
         clauseDetails.push({ type: clause.type, query: clause.query, priority: clause.priority, resultCount: results.length });
         allResults.push(...results);
+        clauseIdx++;
       }
 
       // Deduplicate by filepath, keeping highest score
@@ -1865,6 +1997,8 @@ This is the recommended entry point for ALL memory queries.`,
       const scored = applyCompositeScoring(enriched, query, coFn).slice(0, limit || 10);
 
       const planSummary = clauseDetails.map(c => `  ${c.type}(p${c.priority}): "${c.query}" → ${c.resultCount} results`).join("\n");
+      const planDegraded = degradedLegs.length > 0 ? { degraded: true as const, degradedLegs } : {};
+      const planDegradedNote = degradedLegs.length > 0 ? `\n${degradedGuidanceText(degradedLegs)}` : "";
 
       if (compact) {
         const items = scored.map(r => ({
@@ -1873,8 +2007,8 @@ This is the recommended entry point for ALL memory queries.`,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
         }));
         return {
-          content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
-          structuredContent: { plan: clauseDetails, results: items },
+          content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${planDegradedNote}` }],
+          structuredContent: { plan: clauseDetails, results: items, ...planDegraded },
         };
       }
 
@@ -1883,8 +2017,8 @@ This is the recommended entry point for ALL memory queries.`,
         compositeScore: r.compositeScore, context: r.context, snippet: r.body?.slice(0, 300) || '', contentType: r.contentType,
       }));
       return {
-        content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items, query)}` }],
-        structuredContent: { plan: clauseDetails, results: items },
+        content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items, query)}${planDegradedNote}` }],
+        structuredContent: { plan: clauseDetails, results: items, ...planDegraded },
       };
     }
   );
@@ -2651,6 +2785,12 @@ This is the recommended entry point for ALL memory queries.`,
       };
     }
   );
+
+  return { server, store, closeAllStores };
+}
+
+export async function startMcpServer(): Promise<void> {
+  const { server, store, closeAllStores } = buildMcpServer();
 
   // ---------------------------------------------------------------------------
   // Connect

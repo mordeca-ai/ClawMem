@@ -52,11 +52,24 @@ export interface LifecyclePolicy {
   dry_run: boolean;
 }
 
+export interface RetrievalConfig {
+  /**
+   * SUPERSEDED as of v0.22.0 and no longer consumed anywhere: the direct-pipeline
+   * eval this knob was gated on measured tuned weights at 1/19 hit@1 (BACKLOG
+   * Source 48), and the direct vector routes now rank by raw similarity instead
+   * (VSEARCH-RAW-PRIMARY-DESIGN.md). Still parsed so existing configs don't break;
+   * setting it warns once per process.
+   */
+  mcp_direct_tuned_weights: boolean;
+}
+
 export interface ClawMemConfig {
   /** Named vault paths (empty = single-vault mode) */
   vaults: VaultConfig;
   /** Lifecycle management policy */
   lifecycle?: LifecyclePolicy;
+  /** Retrieval behavior knobs */
+  retrieval?: RetrievalConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +154,8 @@ export function getUnpromotedObservationWeight(): number {
 // ---------------------------------------------------------------------------
 
 let _cachedConfig: ClawMemConfig | null = null;
+// Once-per-process compatibility warning for the superseded tuned-weights knob (v0.22.0).
+let _warnedTunedWeightsKnob = false;
 
 /**
  * Load vault configuration from env vars and config file.
@@ -201,7 +216,20 @@ export function loadVaultConfig(): ClawMemConfig {
     };
   }
 
-  _cachedConfig = { vaults, lifecycle };
+  // 4. Retrieval knobs (optional). Parsed for backward compatibility only —
+  // mcp_direct_tuned_weights is superseded as of v0.22.0 and has no effect.
+  let retrieval: RetrievalConfig | undefined;
+  const envTuned = process.env.CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS;
+  const yamlHasTuned = !!(parsedYaml?.retrieval && typeof parsedYaml.retrieval === "object"
+    && parsedYaml.retrieval.mcp_direct_tuned_weights !== undefined);
+  const yamlTuned = yamlHasTuned ? parsedYaml.retrieval.mcp_direct_tuned_weights === true : false;
+  retrieval = { mcp_direct_tuned_weights: envTuned !== undefined ? envTuned === "true" : yamlTuned };
+  if ((envTuned !== undefined || yamlHasTuned) && !_warnedTunedWeightsKnob) {
+    _warnedTunedWeightsKnob = true;
+    console.warn("[clawmem] retrieval.mcp_direct_tuned_weights / CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS is superseded as of v0.22.0 and has no effect — the direct vector routes rank by raw similarity.");
+  }
+
+  _cachedConfig = { vaults, lifecycle, retrieval };
   return _cachedConfig;
 }
 

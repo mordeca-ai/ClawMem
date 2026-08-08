@@ -28,7 +28,11 @@ export const HALF_LIVES: Record<string, number> = {
   research: 90,
   project: 120,
   preference: Infinity,
-  decision: Infinity,
+  // §36.11: long-finite so silently-abandoned decisions stop winning ranking
+  // (supersession only fires on an explicit contradictory write). Ranking
+  // durability only — no deletion/archival; access-freq extension still
+  // stretches frequently-resurfaced decisions toward 3×.
+  decision: 180,
   deductive: Infinity,
   hub: Infinity,
   antipattern: Infinity,
@@ -208,6 +212,7 @@ export const QUERY_WEIGHTS: CompositeWeights = { search: 0.7, recency: 0.15, con
 
 const RECENCY_PATTERNS = [
   /\brecent(ly)?\b/i,
+  /\blatest\b/i,
   /\blast\s+(session|time|week|month|few\s+days)\b/i,
   /\bleft\s+off\b/i,
   /\bwhere\s+(was|were)\s+(we|i)\b/i,
