@@ -42,6 +42,30 @@ These directories are always skipped during indexing:
 
 `_PRIVATE`, `.clawmem`, `.git`, `.obsidian`, `.logseq`, `.foam`, `.dendron`, `.trash`, `.stversions`, `node_modules`, `.cache`, `vendor`, `dist`, `build`, `gits`, `scraped`
 
+Any path segment beginning with `.` is also skipped, so dotfile directories need no entry.
+
+#### Adding your own
+
+There is no exclude key in `config.yaml` — the list is the `EXCLUDED_DIRS` set in `src/indexer.ts`, and adding to it is the supported way to exclude a directory convention ClawMem doesn't already know about:
+
+```ts
+export const EXCLUDED_DIRS = new Set([
+  "_PRIVATE",
+  "_snapshots",   // your archive convention
+  ".clawmem",
+  // ...
+]);
+```
+
+`shouldExclude()` matches **whole path segments**, not substrings, so an entry can only ever match a directory of exactly that name — a document *named* `backup-design.md` is unaffected by an entry called `backup`. The set is shared by the indexer and the file watcher, so one entry covers both reindex sweeps and live file events.
+
+Two operational notes:
+
+- **Restart the watcher** (`systemctl --user restart clawmem-watcher`) after editing the set. A running watcher holds the old list in memory and will keep indexing the directory you just excluded.
+- **Already-indexed documents retire on the next `clawmem update`** — the indexer deactivates stored paths that no longer match. No manual deletion is needed, and the documents remain in the database as `active=0` rather than being destroyed.
+
+The common case is an archive or versioned-copy directory holding timestamped duplicates of live documents (`_snapshots/<ts>/report.md` beside a live `report.md`). Indexing those yields several stale near-identical copies of the same document, and retrieval can surface a superseded revision as though it were current — a quiet correctness problem rather than a noisy one, since nothing errors.
+
 ## Documents
 
 Each indexed file becomes a document with:
@@ -56,7 +80,7 @@ Each indexed file becomes a document with:
 | `content_type` | Auto-detected: decision, deductive, preference, note, handoff, conversation, progress, research, hub, antipattern, project, milestone, problem |
 | `quality_score` | 0.0-1.0 based on length, structure, headings, lists, decision keywords, frontmatter |
 | `confidence` | Starts at 0.5, adjusted by contradiction detection and feedback |
-| `pinned` | Manual boost flag (+0.3 composite score) |
+| `pinned` | Lifecycle retention + priority among relevance-equivalent results (+0.3 on composite surfaces; exact-tie precedence on the raw vector routes) |
 | `snoozed_until` | Temporarily hidden from context surfacing |
 
 ## Fragments
@@ -100,10 +124,10 @@ When the worker finds a candidate existing observation to merge a new pattern in
 
 ### Phase 2 — contradiction-aware merge gate
 
-After the name-aware gate passes, the worker checks whether the new observation contradicts the existing one. A deterministic heuristic runs first (negation asymmetry, number/date mismatch), then an LLM check confirms. If the final confidence exceeds `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` (default `0.5`), the merge is blocked and one of two policies applies (controlled by `CLAWMEM_CONTRADICTION_POLICY`):
+After the name-aware gate passes, the worker checks whether the new observation contradicts the existing one. Since v0.29.0 the check runs through the configured **contradiction judge** (`CLAWMEM_JUDGE_*`, the same strict relation-array contract as the decision-extractor hook); with no judge configured, only the deterministic heuristic runs (negation asymmetry, number/date mismatch) and outcomes are constrained to the non-deactivating `link` policy. Mutation-authorizing evaluations commit durable `judge_runs`/`judge_events` audit rows in the same transaction as the resulting mutation; non-mutating outcomes write standalone rows. If the final confidence meets `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` (default `0.5`), the merge is blocked and one of two policies applies (configured via `CLAWMEM_CONTRADICTION_POLICY`):
 
-- `link` (default) — insert a new `consolidated_observations` row and create a `contradicts` edge in `memory_relations` between the two rows. Both remain active and queryable.
-- `supersede` — insert the new row and mark the old row `status='inactive'` with `invalidated_at`/`superseded_by` set. The old row is filtered from retrieval but preserved for audit.
+- `link` (default) — insert a new `consolidated_observations` row and set the old row's `invalidated_by` column as a **backlink** to the new row. Both remain active and queryable. *(Phase 2 does not insert `memory_relations` edges — `contradicts` edges come from Phase 3 deductive synthesis.)*
+- `supersede` — insert the new row and mark the old row `status='inactive'` with `invalidated_at`/`superseded_by` set. The old row is filtered from retrieval but preserved for audit. **Requires a configured judge**: without one, a configured `supersede` is loudly constrained to `link` (`clawmem doctor` reports the policy as inactive).
 
 Phase 3 deductive synthesis applies the same `contradicts` link for any draft that matches a prior deductive observation with conflicting content.
 
@@ -323,7 +347,7 @@ Guarded with `PRAGMA table_info(context_usage)` the same way the existing `turn_
 
 Raw prompt text has privacy implications. Two classes of `logEmptyTurn` call site exist in `contextSurfacing`, and they get different treatment:
 
-- **Pre-retrieval gates** — slash commands (`prompt.startsWith("/")`), too-short prompts (`< MIN_PROMPT_LENGTH`), `shouldSkipRetrieval` hits (greetings, shell commands, affirmations), and `wasPromptSeenRecently` / `isHeartbeatPrompt` dedupe. These are not meaningful user questions and carry a higher sensitivity profile (they often contain incidental tool output or noise). They write a `context_usage` row with `query_text = NULL` to keep `turn_index` aligned with the transcript but not persist the raw text.
+- **Pre-retrieval gates** — slash commands (`prompt.startsWith("/")`), too-short prompts (`< MIN_PROMPT_LENGTH` — unless the prompt matches the memory-intent `FORCE_RETRIEVE_PATTERNS`, which are checked before every skip gate so short queries like "what did I say?" still reach retrieval), `shouldSkipRetrieval` hits (greetings, shell commands, affirmations), and `wasPromptSeenRecently` / `isHeartbeatPrompt` dedupe. These are not meaningful user questions and carry a higher sensitivity profile (they often contain incidental tool output or noise). They write a `context_usage` row with `query_text = NULL` to keep `turn_index` aligned with the transcript but not persist the raw text.
 - **Post-retrieval empty paths** — empty result set, all results in `FILTERED_PATHS`, all results snoozed, activation floor not met, adaptive threshold filter, and empty `buildContext`. These are legitimate user questions that simply didn't match anything. They write a row with `query_text = prompt` so a follow-up turn ("try again" / "what about Y") can still use the intent via multi-turn lookback.
 
 The happy path (successful injection) also persists `query_text = prompt`.

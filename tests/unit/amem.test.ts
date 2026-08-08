@@ -1,12 +1,14 @@
 import { describe, it, expect } from "bun:test";
 
 import {
+  evolveMemories,
   extractJsonFromLLM,
   generateMemoryLinks,
   parseLinkGenerationFromLLM,
   parseMemoryNoteFromLLM,
 } from "../../src/amem.ts";
 import { insertContent, insertDocument } from "../../src/store.ts";
+import { createMockLLM } from "../helpers/mock-llm.ts";
 import { createTestStore, seedDocuments } from "../helpers/test-store.ts";
 
 // ─── extractJsonFromLLM ─────────────────────────────────────────────
@@ -469,3 +471,109 @@ describe("generateMemoryLinks vector readiness", () => {
     );
   });
 });
+
+// ─── §13.1 — evolveMemories structural validation inside the parse closure ───
+//
+// A malformed should_evolve=true payload must trigger a corrective retry
+// (not a silent post-loop rejection), while should_evolve=false needs no
+// payload fields at all.
+
+function seedEvolutionFixture() {
+  const store = createTestStore();
+  const [memId, nbId] = seedDocuments(store, [
+    { path: "mem.md", title: "Memory A", body: "memory body" },
+    { path: "nb.md", title: "Neighbor B", body: "neighbor body" },
+  ]) as [number, number];
+
+  store.db
+    .prepare(
+      "UPDATE documents SET amem_context = ?, amem_keywords = ?, amem_tags = ? WHERE id = ?"
+    )
+    .run("Original context.", '["orig"]', '["old-tag"]', memId);
+  store.db
+    .prepare("UPDATE documents SET amem_context = ? WHERE id = ?")
+    .run("Neighbor context.", nbId);
+  store.db
+    .prepare(
+      "INSERT INTO memory_relations (source_id, target_id, relation_type, weight, created_at) VALUES (?, ?, 'related', 0.9, ?)"
+    )
+    .run(memId, nbId, new Date().toISOString());
+
+  return { store, memId, nbId };
+}
+
+describe("evolveMemories retry-with-error-feedback (§13.1)", () => {
+  const MALFORMED_EVOLUTION = JSON.stringify({
+    should_evolve: true,
+    new_keywords: "not-an-array",
+    new_tags: [],
+    new_context: "",
+    reasoning: "",
+  });
+  const VALID_EVOLUTION = JSON.stringify({
+    should_evolve: true,
+    new_keywords: ["fresh"],
+    new_tags: ["new-tag"],
+    new_context: "Updated context.",
+    reasoning: "New evidence arrived.",
+  });
+
+  it("retries a malformed should_evolve=true payload and applies the corrected evolution", async () => {
+    const { store, memId, nbId } = seedEvolutionFixture();
+    const llm = createMockLLM();
+    llm.generate
+      .mockResolvedValueOnce({ text: MALFORMED_EVOLUTION, model: "mock", done: true })
+      .mockResolvedValueOnce({ text: VALID_EVOLUTION, model: "mock", done: true });
+
+    const result = await evolveMemories(store, llm as any, memId, nbId);
+
+    expect(result).toBe(true);
+    expect(llm.generate).toHaveBeenCalledTimes(2);
+    const retryPrompt = llm.generate.mock.calls[1]?.[0] as string;
+    expect(retryPrompt).toContain("did not match the expected structure");
+
+    const row = store.db
+      .prepare("SELECT amem_keywords, amem_context FROM documents WHERE id = ?")
+      .get(memId) as { amem_keywords: string; amem_context: string };
+    expect(row.amem_keywords).toBe('["fresh"]');
+    expect(row.amem_context).toBe("Updated context.");
+  });
+
+  it("fails open (no evolution) when every attempt returns a malformed payload", async () => {
+    const { store, memId, nbId } = seedEvolutionFixture();
+    const llm = createMockLLM();
+    llm.generate
+      .mockResolvedValueOnce({ text: MALFORMED_EVOLUTION, model: "mock", done: true })
+      .mockResolvedValueOnce({ text: MALFORMED_EVOLUTION, model: "mock", done: true })
+      .mockResolvedValueOnce({ text: MALFORMED_EVOLUTION, model: "mock", done: true });
+
+    const result = await evolveMemories(store, llm as any, memId, nbId);
+
+    expect(result).toBe(false);
+    expect(llm.generate).toHaveBeenCalledTimes(3);
+    const row = store.db
+      .prepare("SELECT amem_context FROM documents WHERE id = ?")
+      .get(memId) as { amem_context: string };
+    expect(row.amem_context).toBe("Original context.");
+  });
+
+  it("accepts should_evolve=false without payload fields — no retry burned on it", async () => {
+    const { store, memId, nbId } = seedEvolutionFixture();
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValueOnce({
+      text: '{"should_evolve": false}',
+      model: "mock",
+      done: true,
+    });
+
+    const result = await evolveMemories(store, llm as any, memId, nbId);
+
+    expect(result).toBe(false);
+    expect(llm.generate).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The retired first-witness-only causal writer (`inferCausalLinks`) and its
+// retry-with-feedback tests lived here through v0.32.0. The s342 causal writer
+// (strict single-shot, append-only witness sightings) is covered in
+// tests/unit/causal-writer.test.ts against `runCausalStep`.

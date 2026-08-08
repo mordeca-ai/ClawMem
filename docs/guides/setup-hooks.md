@@ -20,6 +20,12 @@ This installs hooks into `~/.claude/settings.json`:
 | `handoff-generator` | Stop | 30s | Summarize session for continuity |
 | `feedback-loop` | Stop | 30s | Track referenced notes, boost confidence |
 
+`decision-extractor` runs its model-bearing phases under an internal whole-handler
+budget, `CLAWMEM_STOP_BUDGET_MS` (default 25000 ms), so it finishes and persists
+before the host's 30s Stop timeout kills it. If you raise the budget, raise the
+installed hook `timeout` too — the host timeout must always exceed the budget
+plus a safety margin ([configuration](../reference/configuration.md)).
+
 ## Manual install (full reference)
 
 If you prefer to configure hooks manually instead of running `setup hooks`, add this to `~/.claude/settings.json`. Replace `/path/to/clawmem` with your actual install path (e.g. `~/.bun/bin/clawmem` or `~/clawmem/bin/clawmem`):
@@ -115,6 +121,20 @@ All hooks use Claude Code's native `timeout` property (in seconds). Stop hooks u
 The `context-surfacing` hook suppresses duplicate prompts using SHA-256 hashing with a 600-second window (`hook_dedupe` table). Heartbeat prompts are also detected and skipped.
 
 The Stop-event hooks (`decision-extractor`, `handoff-generator`, `feedback-loop`) use `saveMemory()` which enforces a 30-minute normalized content hash dedup window, preventing duplicate observations across concurrent or rapid sessions.
+
+## What the Stop hooks write
+
+`decision-extractor` does more than persist observations: when a contradiction **judge** is
+configured (`CLAWMEM_JUDGE_*`, v0.29.0 — disabled otherwise), it classifies each session's new
+facts against the memories they resemble, and a `contradiction` verdict lowers the older
+document's confidence by 0.25 (floored at 0.2). That is a ranking signal — the document stays
+retrievable.
+
+When erosion reaches the floor the hook can additionally set `invalidated_at`, which removes the
+document from FTS and vector retrieval outright. **That step is off by default** — it logs
+`WOULD invalidate` and writes nothing until you set `CLAWMEM_CONTRADICTION_INVALIDATE=true`. How
+much it would affect your vault depends on your confidence distribution and content-type mix, so
+measure before arming: [contradiction invalidation](contradiction-invalidation.md).
 
 ## Adding custom hooks alongside ClawMem
 

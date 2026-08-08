@@ -52,11 +52,34 @@ export interface LifecyclePolicy {
   dry_run: boolean;
 }
 
+export interface RetrievalConfig {
+  /**
+   * SUPERSEDED as of v0.22.0 and no longer consumed anywhere: the direct-pipeline
+   * eval this knob was gated on measured tuned weights at 1/19 hit@1 (BACKLOG
+   * Source 48), and the direct vector routes now rank by raw similarity instead
+   * (VSEARCH-RAW-PRIMARY-DESIGN.md). Still parsed so existing configs don't break;
+   * setting it warns once per process.
+   */
+  mcp_direct_tuned_weights: boolean;
+  /**
+   * Whether the context-surfacing hook also queries configured secondary vaults
+   * and merges their results into the injected context (v0.35.0). Default FALSE:
+   * out of the box, automatic surfacing reads only the general vault, so each
+   * vault's content stays isolated unless deliberately queried (explicit
+   * `vault`-parameter MCP calls are unaffected by this gate). Enable via
+   * `retrieval.surface_secondary_vaults: true` or
+   * CLAWMEM_SURFACE_SECONDARY_VAULTS=true (env wins).
+   */
+  surface_secondary_vaults: boolean;
+}
+
 export interface ClawMemConfig {
   /** Named vault paths (empty = single-vault mode) */
   vaults: VaultConfig;
   /** Lifecycle management policy */
   lifecycle?: LifecyclePolicy;
+  /** Retrieval behavior knobs */
+  retrieval?: RetrievalConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +164,8 @@ export function getUnpromotedObservationWeight(): number {
 // ---------------------------------------------------------------------------
 
 let _cachedConfig: ClawMemConfig | null = null;
+// Once-per-process compatibility warning for the superseded tuned-weights knob (v0.22.0).
+let _warnedTunedWeightsKnob = false;
 
 /**
  * Load vault configuration from env vars and config file.
@@ -195,13 +220,43 @@ export function loadVaultConfig(): ClawMemConfig {
     lifecycle = {
       archive_after_days: typeof lc.archive_after_days === "number" ? lc.archive_after_days : 90,
       type_overrides: typeof lc.type_overrides === "object" && lc.type_overrides !== null ? lc.type_overrides : {},
-      purge_after_days: typeof lc.purge_after_days === "number" ? lc.purge_after_days : null,
+      // INERT since v0.30.0 — ClawMem no longer physically deletes rows on any path.
+      // Still parsed so existing configs load, but only a positive finite value is
+      // accepted: `-1` or `Infinity` would previously have produced a future cutoff that
+      // deleted every archived row, including ones archived moments earlier.
+      purge_after_days:
+        typeof lc.purge_after_days === "number" &&
+        Number.isFinite(lc.purge_after_days) &&
+        lc.purge_after_days > 0
+          ? lc.purge_after_days
+          : null,
       exempt_collections: Array.isArray(lc.exempt_collections) ? lc.exempt_collections : [],
       dry_run: lc.dry_run !== false,
     };
   }
 
-  _cachedConfig = { vaults, lifecycle };
+  // 4. Retrieval knobs (optional). Parsed for backward compatibility only —
+  // mcp_direct_tuned_weights is superseded as of v0.22.0 and has no effect.
+  let retrieval: RetrievalConfig | undefined;
+  const envTuned = process.env.CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS;
+  const yamlHasTuned = !!(parsedYaml?.retrieval && typeof parsedYaml.retrieval === "object"
+    && parsedYaml.retrieval.mcp_direct_tuned_weights !== undefined);
+  const yamlTuned = yamlHasTuned ? parsedYaml.retrieval.mcp_direct_tuned_weights === true : false;
+  // Secondary-vault surfacing gate (v0.35.0): env overrides yaml; anything but the
+  // literal "true" (env) / boolean true (yaml) resolves to the default OFF.
+  const envSurface = process.env.CLAWMEM_SURFACE_SECONDARY_VAULTS;
+  const yamlSurface = !!(parsedYaml?.retrieval && typeof parsedYaml.retrieval === "object"
+    && parsedYaml.retrieval.surface_secondary_vaults === true);
+  retrieval = {
+    mcp_direct_tuned_weights: envTuned !== undefined ? envTuned === "true" : yamlTuned,
+    surface_secondary_vaults: envSurface !== undefined ? envSurface === "true" : yamlSurface,
+  };
+  if ((envTuned !== undefined || yamlHasTuned) && !_warnedTunedWeightsKnob) {
+    _warnedTunedWeightsKnob = true;
+    console.warn("[clawmem] retrieval.mcp_direct_tuned_weights / CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS is superseded as of v0.22.0 and has no effect — the direct vector routes rank by raw similarity.");
+  }
+
+  _cachedConfig = { vaults, lifecycle, retrieval };
   return _cachedConfig;
 }
 
@@ -220,6 +275,17 @@ export function getVaultPath(vaultName: string): string | undefined {
 export function listVaults(): string[] {
   const config = loadVaultConfig();
   return Object.keys(config.vaults);
+}
+
+/**
+ * Whether automatic context surfacing may query configured secondary vaults
+ * (`retrieval.surface_secondary_vaults` / CLAWMEM_SURFACE_SECONDARY_VAULTS).
+ * Default false — vault isolation is the out-of-the-box posture (v0.35.0).
+ * Explicit `vault`-parameter MCP calls are not governed by this gate.
+ */
+export function surfaceSecondaryVaults(): boolean {
+  const config = loadVaultConfig();
+  return config.retrieval?.surface_secondary_vaults === true;
 }
 
 /**

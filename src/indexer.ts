@@ -12,6 +12,7 @@ import { createHash } from "crypto";
 import type { Store } from "./store.ts";
 import { inferContentType, confidenceScore, type ContentType } from "./memory.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
+import { normalizeIsoTimestamp } from "./normalize.ts";
 
 // =============================================================================
 // Types
@@ -25,6 +26,37 @@ export interface DocumentMeta {
   workstream?: string;
   content_type?: ContentType;
   review_by?: string;
+  /** §51.1: authorship time (UTC ISO) from frontmatter; null = declared-but-invalid or absent → clears/leaves per branch */
+  authored_at?: string | null;
+}
+
+// =============================================================================
+// Authored-at Frontmatter Adapter (§51.1 D5)
+// =============================================================================
+
+// Strict date-only form, normalized to UTC midnight. Acceptance must not depend
+// on YAML quoting: quoted "2025-03-01" (string) and unquoted 2025-03-01
+// (gray-matter coerces to Date) are equivalent.
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * Frontmatter-specific adapter, distinct from the transcript rule: gray-matter
+ * has already discarded the lexical form, so Date instances are validated as
+ * finite Dates rather than re-parsed as RFC3339 strings. Returns UTC ISO or
+ * null (invalid/absent). Date-only precision is legitimate for hand-dated
+ * notes — sub-day uncertainty is insignificant against ClawMem's half-lives.
+ */
+export function authoredAtFromFrontmatter(value: unknown): string | null {
+  if (value instanceof Date) {
+    return isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  const dateOnly = DATE_ONLY_RE.exec(trimmed);
+  if (dateOnly) {
+    return normalizeIsoTimestamp(`${trimmed}T00:00:00Z`);
+  }
+  return normalizeIsoTimestamp(trimmed);
 }
 
 export interface IndexStats {
@@ -32,6 +64,8 @@ export interface IndexStats {
   updated: number;
   unchanged: number;
   removed: number;
+  /** §51.1: dated-only metadata transitions (authored_at set without touching modified_at / A-MEM) */
+  dated: number;
 }
 
 // =============================================================================
@@ -112,10 +146,15 @@ export function parseDocument(content: string, relativePath: string, defaultCont
           || (defaultContentType as ContentType | undefined)
           || inferContentType(relativePath),
         review_by: str(data.review_by),
+        // §51.1: string | null — null means "not validly declared", which CLEARS
+        // on the changed-content path (frontmatter is authoritative there).
+        authored_at: authoredAtFromFrontmatter(data.authored_at),
       },
     };
   } catch {
-    // If frontmatter parsing fails, treat entire content as body
+    // If frontmatter parsing fails, treat entire content as body.
+    // authored_at stays undefined (= leave any stored value untouched):
+    // a parse failure is not a declared absence.
     return {
       body: content,
       meta: {
@@ -176,15 +215,39 @@ function expandBraces(pattern: string): string[] {
   return match[1]!.split(",").map(s => s.trim());
 }
 
+/**
+ * Collections that are never reconciled against a filesystem root (§55.6 D5).
+ *
+ * `_clawmem` holds DB-created memory — observations, handoffs, deductions — which has no file
+ * behind it. Reconciling it against any root deactivates every row and nothing brings them back.
+ * §55.1 required reserving it for one tool; enforcing it in the reconciler covers every present
+ * and future caller instead.
+ */
+export const RESERVED_COLLECTIONS = new Set(["_clawmem"]);
+
 export async function indexCollection(
   store: Store,
   collectionName: string,
   collectionPath: string,
   pattern: string = "**/*.md",
-  options?: { forceEnrich?: boolean; defaultContentType?: string }
+  options?: { forceEnrich?: boolean; force?: boolean; importMode?: boolean; defaultContentType?: string }
 ): Promise<IndexStats> {
-  const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0 };
+  if (RESERVED_COLLECTIONS.has(collectionName)) {
+    throw new Error(
+      `Collection '${collectionName}' is database-created memory and has no filesystem source; ` +
+      `it cannot be reconciled against a root.`,
+    );
+  }
+  const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0 };
   const activePaths = new Set<string>();
+
+  // importMode: an additive DB-born ingest routed through the filesystem pipeline via a
+  // TRANSIENT staging root (`clawmem mine`). Rows are stamped origin 'api' — on insert AND on
+  // every update path, so a re-imported changed chunk never flips to 'fs' — and the
+  // whole-collection absence reconciliation below is skipped: absence from one run's staging
+  // snapshot means nothing, and a later import into the same collection must never deactivate
+  // earlier batches.
+  const rowOrigin = options?.importMode ? "api" as const : "fs" as const;
 
   // Get LLM instance for A-MEM enrichment
   const llm = getDefaultLlamaCpp();
@@ -233,11 +296,50 @@ export async function indexCollection(
       if (existing) {
         // Check if content changed via content hash
         const existingRow = store.db.prepare(
-          "SELECT content_hash FROM documents WHERE id = ?"
-        ).get(existing.id) as { content_hash: string | null } | null;
+          "SELECT content_hash, authored_at, origin FROM documents WHERE id = ?"
+        ).get(existing.id) as { content_hash: string | null; authored_at: string | null; origin: string | null } | null;
 
-        if (existingRow?.content_hash === contentHash) {
+        // Ownership-collision boundary: a row explicitly owned by the OPPOSITE origin is
+        // never silently taken over — the same rule saveMemory enforces for API writes onto
+        // filesystem rows, applied symmetrically (an import colliding with a real file, or a
+        // file appearing at an API row's path). Skip the write and surface it; NULL is the
+        // only claimable state, adopted by the first writer to touch it.
+        if (existingRow?.origin != null && existingRow.origin !== rowOrigin) {
+          console.warn(
+            `[indexer] ownership collision: ${collectionName}/${relativePath} is ` +
+            `'${existingRow.origin}'-owned; ${rowOrigin === "api" ? "import" : "filesystem"} write skipped`,
+          );
+          continue;
+        }
+
+        // §55.6 D7: `--force` re-parses and rewrites every file by bypassing this
+        // content-hash short-circuit. It replaces a blanket `UPDATE documents SET active = 0`
+        // that deactivated EVERY row in the vault — including `_clawmem` rows, which have no
+        // filesystem source and so were never reconstructed, with no `archived_at` and
+        // therefore no supported restore.
+        if (existingRow?.content_hash === contentHash && !options?.force) {
           stats.unchanged++;
+          // Origin adoption on the unchanged path: legacy NULL rows heal to their owner HERE
+          // — there is no open-time backfill (content_hash proves nothing about ownership;
+          // mined imports write it too), and this short-circuit is the only write path an
+          // unchanged file ever takes.
+          if (existingRow.origin === null) {
+            store.db.prepare("UPDATE documents SET origin = ? WHERE id = ?").run(rowOrigin, existing.id);
+          }
+          // §51.1 D5: unchanged-row adoption — a NULL row whose frontmatter
+          // already declares authored_at adopts it metadata-only (no modified_at
+          // bump, no A-MEM). The frontmatter-block substring pre-check gates the
+          // full parse so undated vaults pay near-zero.
+          if (existingRow.authored_at === null && content.startsWith("---")) {
+            const fmEnd = content.indexOf("\n---", 3);
+            if (fmEnd !== -1 && content.slice(0, fmEnd).includes("authored_at")) {
+              const { meta: adoptMeta } = parseDocument(content, relativePath);
+              if (typeof adoptMeta.authored_at === "string") {
+                store.updateDocumentMeta(existing.id, { authored_at: adoptMeta.authored_at });
+                stats.dated++;
+              }
+            }
+          }
           if (options?.forceEnrich) {
             // --enrich: queue unchanged docs for full enrichment (entity extraction, links)
             enrichQueue.push({ docId: existing.id, isNew: true });
@@ -245,16 +347,45 @@ export async function indexCollection(
           continue;
         }
 
-        // Content changed — update
+        // Content changed — parse, then check for the §51.1 dated-only
+        // transition first: body and every persisted metadata field unchanged
+        // with only authored_at differing → update authored_at + content_hash
+        // only. modified_at is preserved, stored confidence stays untouched,
+        // and no A-MEM enrichment is queued — re-mining an existing vault dates
+        // documents without operational side-effects.
         const { body, meta } = parseDocument(content, relativePath, options?.defaultContentType);
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
         const docHash = hashContent(body);
+        const contentType = meta.content_type || inferContentType(relativePath);
+
+        const prev = store.db.prepare(
+          "SELECT hash, title, domain, workstream, tags, content_type, review_by, authored_at FROM documents WHERE id = ?"
+        ).get(existing.id) as { hash: string; title: string; domain: string | null; workstream: string | null; tags: string | null; content_type: string; review_by: string | null; authored_at: string | null } | null;
+
+        // "Unchanged" per field mirrors what the normal path would write: fields
+        // the normal path leaves untouched (undefined) count as unchanged.
+        const datedOnly = prev !== null
+          && meta.authored_at !== undefined
+          && (meta.authored_at ?? null) !== prev.authored_at
+          && docHash === prev.hash
+          && title === prev.title
+          && (meta.domain === undefined || meta.domain === (prev.domain ?? undefined))
+          && (meta.workstream === undefined || meta.workstream === (prev.workstream ?? undefined))
+          && (meta.tags === undefined || JSON.stringify(meta.tags) === prev.tags)
+          && contentType === prev.content_type
+          && (meta.review_by === undefined || meta.review_by === (prev.review_by ?? undefined));
+
+        if (datedOnly) {
+          store.updateDocumentMeta(existing.id, { authored_at: meta.authored_at });
+          store.db.prepare("UPDATE documents SET content_hash = ?, origin = ? WHERE id = ?").run(contentHash, rowOrigin, existing.id);
+          stats.dated++;
+          continue;
+        }
 
         store.insertContent(docHash, body, now);
         store.updateDocument(existing.id, title, docHash, mtime.toISOString());
 
         // Update SAME metadata
-        const contentType = meta.content_type || inferContentType(relativePath);
         store.updateDocumentMeta(existing.id, {
           domain: meta.domain,
           workstream: meta.workstream,
@@ -264,20 +395,49 @@ export async function indexCollection(
           review_by: meta.review_by,
           confidence: confidenceScore(contentType, mtime, 0),
           quality_score: computeQualityScore(body, meta),
+          // §51.1: authoritative on the changed path — string sets, null clears,
+          // undefined (frontmatter parse failure) leaves the stored value.
+          authored_at: meta.authored_at,
         });
 
         // Update content_hash for next incremental check
-        store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, existing.id);
+        store.db.prepare("UPDATE documents SET content_hash = ?, origin = ? WHERE id = ?").run(contentHash, rowOrigin, existing.id);
 
         // Defer A-MEM enrichment until after commit
         enrichQueue.push({ docId: existing.id, isNew: false });
 
         stats.updated++;
       } else {
-        // Check for inactive (previously removed) doc at same path — reactivate instead of inserting
-        const inactive = store.db.prepare(
-          "SELECT id, hash FROM documents WHERE collection = ? AND path = ? AND active = 0"
-        ).get(collectionName, relativePath) as { id: number; hash: string } | null;
+        // Check for an inactive doc at the same path — reactivate instead of inserting.
+        // §55.6 D9: ONLY a row this reconciler deactivated for absence may come back. A row
+        // deactivated by `memory_forget` or by lifecycle archival is a memory decision, and
+        // reactivating it silently undid that decision — measured: a forget on a file-backed
+        // document survived only until the next `.md` change in its collection.
+        // NULL = legacy pre-migration row, treated as 'absent' so it is not stranded.
+        const inactiveRow = store.db.prepare(
+          "SELECT id, hash, deactivated_reason, origin FROM documents WHERE collection = ? AND path = ? AND active = 0"
+        ).get(collectionName, relativePath) as { id: number; hash: string; deactivated_reason: string | null; origin: string | null } | null;
+
+        // Forgotten / archived: leave it alone. Skipping the file — rather than falling through
+        // to the insert branch — is load-bearing: inserting would create a SECOND row at the
+        // same (collection, path) and resurrect the content under a new id, which is the same
+        // bug wearing a different shape.
+        if (inactiveRow && inactiveRow.deactivated_reason !== null && inactiveRow.deactivated_reason !== "absent") {
+          continue;
+        }
+
+        // Ownership-collision boundary (same rule as the active branch): an inactive row
+        // explicitly owned by the opposite origin is neither reactivated nor shadowed by a
+        // second insert at its path. Skip the file; resolving the collision is a deliberate
+        // operator action, never an indexing side effect.
+        if (inactiveRow && inactiveRow.origin != null && inactiveRow.origin !== rowOrigin) {
+          console.warn(
+            `[indexer] ownership collision: ${collectionName}/${relativePath} (inactive) is ` +
+            `'${inactiveRow.origin}'-owned; ${rowOrigin === "api" ? "import" : "filesystem"} write skipped`,
+          );
+          continue;
+        }
+        const inactive = inactiveRow;
 
         const { body, meta } = parseDocument(content, relativePath, options?.defaultContentType);
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
@@ -287,9 +447,9 @@ export async function indexCollection(
         store.insertContent(docHash, body, now);
 
         if (inactive) {
-          // Reactivate existing row
-          store.db.prepare("UPDATE documents SET active = 1, hash = ?, title = ?, modified_at = ?, content_hash = ? WHERE id = ?")
-            .run(docHash, title, mtime.toISOString(), contentHash, inactive.id);
+          // Reactivate existing row. §55.6 D9: clear the provenance on the way back.
+          store.db.prepare("UPDATE documents SET active = 1, hash = ?, title = ?, modified_at = ?, content_hash = ?, origin = ?, deactivated_reason = NULL WHERE id = ?")
+            .run(docHash, title, mtime.toISOString(), contentHash, rowOrigin, inactive.id);
           store.updateDocumentMeta(inactive.id, {
             domain: meta.domain,
             workstream: meta.workstream,
@@ -299,11 +459,12 @@ export async function indexCollection(
             review_by: meta.review_by,
             confidence: confidenceScore(contentType, mtime, 0),
             quality_score: computeQualityScore(body, meta),
+            authored_at: meta.authored_at,
           });
           enrichQueue.push({ docId: inactive.id, isNew: false });
         } else {
           // Truly new document
-          store.insertDocument(collectionName, relativePath, title, docHash, now, mtime.toISOString(), meta.description ?? null);
+          store.insertDocument(collectionName, relativePath, title, docHash, now, mtime.toISOString(), meta.description ?? null, rowOrigin);
           const newDoc = store.findActiveDocument(collectionName, relativePath);
           if (newDoc) {
             store.updateDocumentMeta(newDoc.id, {
@@ -315,6 +476,7 @@ export async function indexCollection(
               review_by: meta.review_by,
               confidence: confidenceScore(contentType, mtime, 0),
               quality_score: computeQualityScore(body, meta),
+              authored_at: meta.authored_at,
             });
             store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, newDoc.id);
             enrichQueue.push({ docId: newDoc.id, isNew: true });
@@ -325,12 +487,22 @@ export async function indexCollection(
       }
     }
 
-    // Deactivate documents that no longer exist on disk
-    const storedPaths = store.getActiveDocumentPaths(collectionName);
-    for (const storedPath of storedPaths) {
-      if (!activePaths.has(storedPath)) {
-        store.deactivateDocument(collectionName, storedPath);
-        stats.removed++;
+    // Deactivate documents that no longer exist on disk. Origin-aware: only rows the
+    // filesystem indexer owns (origin = 'fs') are enumerated — DB-born rows (hooks,
+    // saveMemory, beads, REST; origin = 'api') have no backing file BY DESIGN, and
+    // reconciling them against disk deactivated them on every pass. NULL-origin legacy
+    // rows are exempt too (fail-safe; they are adopted by the next writer to touch them —
+    // there is no backfill, and content_hash proves nothing about ownership since mined
+    // imports write it too). Skipped entirely in importMode: the
+    // staging root is transient, so absence from it means nothing.
+    if (!options?.importMode) {
+      const storedPaths = store.getReconcilableDocumentPaths(collectionName);
+      for (const storedPath of storedPaths) {
+        if (!activePaths.has(storedPath)) {
+          // §55.6 D9: record WHY. Only 'absent' is reversible by a later reconciliation.
+          store.deactivateDocument(collectionName, storedPath, "absent");
+          stats.removed++;
+        }
       }
     }
 

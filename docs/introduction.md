@@ -6,7 +6,7 @@ ClawMem is an open-source memory engine for Claude Code and AI agents. It runs o
 
 - **Indexes** markdown documents into a local SQLite vault with full-text search (BM25) and vector embeddings
 - **Retrieves** relevant context automatically via hooks or on-demand via MCP tools / REST API
-- **Scores** results using composite scoring (relevance, recency, confidence, quality, co-activation)
+- **Scores** results per route: raw vector cosine on the direct vector tools (v0.22.0), the raw BM25 transform on non-recency `search` (v0.24.0), composite scoring (relevance, recency, confidence, quality, co-activation) on the hook and hybrid pipelines
 - **Tracks** decisions, handoffs, and session history across conversations
 - **Traverses** causal and semantic graphs to answer "why" and "what led to" questions
 
@@ -50,7 +50,7 @@ ClawMem is an open-source memory engine for Claude Code and AI agents. It runs o
  GPU Services (llama-server)
    ├── :8088 — Embedding (EmbeddingGemma-300M default, zembed-1 SOTA upgrade)
    ├── :8089 — LLM (qmd-query-expansion-1.7B)
-   └── :8090 — Reranker (qwen3-reranker-0.6B default, zerank-2 SOTA upgrade)
+   └── :8090 — Reranker (qwen3-reranker-0.6B default, zerank-2 seq-cls sidecar SOTA upgrade)
 ```
 
 ## Key design principles
@@ -76,7 +76,7 @@ The agents that get the most from ClawMem are the ones with rich, diverse collec
 | Domain expertise | Reference docs, runbooks, SOPs | Provides stable context that rarely changes |
 | Project notes | Status updates, meeting notes, specs | Keeps the agent current on project state |
 
-A practical starting point: configure each project collection to index every `.md` file in the project (`pattern: "**/*.md"`). The composite scoring system handles the rest — decisions and hubs never decay, progress notes fade after 45 days, and the quality multiplier rewards well-structured documents over flat text dumps.
+A practical starting point: configure each project collection to index every `.md` file in the project (`pattern: "**/*.md"`). The composite scoring system handles the rest — hubs and preferences never decay, decisions fade very slowly (180-day half-life), progress notes fade after 45 days, and the quality multiplier rewards well-structured documents over flat text dumps.
 
 ### Document structure matters
 

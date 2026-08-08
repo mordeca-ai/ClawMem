@@ -79,28 +79,38 @@ describe("document CRUD", () => {
     expect(updated.title).toBe("New Title");
   });
 
-  it("deactivateDocument sets active=0", () => {
+  it("deactivateDocument sets active=0 and records why (S55.6 D9)", () => {
     insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
-    deactivateDocument(store.db, "test", "file.md");
+    deactivateDocument(store.db, "test", "file.md", "forget");
     const doc = findActiveDocument(store.db, "test", "file.md");
     expect(doc).toBeNull();
+    // The reason is not decoration: the indexer's reactivate branch keys on it, and a row
+    // deactivated by forget must never be brought back by a later reconciliation.
+    const row = store.db.prepare("SELECT deactivated_reason FROM documents WHERE collection = ? AND path = ?")
+      .get("test", "file.md") as { deactivated_reason: string | null };
+    expect(row.deactivated_reason).toBe("forget");
   });
 
   it("reactivateDocument re-enables inactive doc", () => {
     insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     const doc = findActiveDocument(store.db, "test", "file.md")!;
-    deactivateDocument(store.db, "test", "file.md");
+    deactivateDocument(store.db, "test", "file.md", "absent");
     reactivateDocument(store.db, doc.id, "Title", "h1", "2026-03-01T00:00:00Z");
     const reactivated = findActiveDocument(store.db, "test", "file.md");
     expect(reactivated).toBeDefined();
+    // Every successful active=1 writer clears the provenance, or a later absence would be
+    // mistaken for a still-standing lifecycle decision.
+    const row = store.db.prepare("SELECT deactivated_reason FROM documents WHERE id = ?")
+      .get(doc.id) as { deactivated_reason: string | null };
+    expect(row.deactivated_reason).toBeNull();
   });
 
   it("findAnyDocument returns inactive documents", () => {
     insertContent(store.db, "h1", "body", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "file.md", "Title", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
-    deactivateDocument(store.db, "test", "file.md");
+    deactivateDocument(store.db, "test", "file.md", "absent");
     const doc = findAnyDocument(store.db, "test", "file.md");
     expect(doc).toBeDefined();
   });
@@ -110,7 +120,7 @@ describe("document CRUD", () => {
     insertContent(store.db, "h2", "body2", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "a.md", "A", "h1", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
     insertDocument(store.db, "test", "b.md", "B", "h2", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z");
-    deactivateDocument(store.db, "test", "b.md");
+    deactivateDocument(store.db, "test", "b.md", "absent");
     const paths = getActiveDocumentPaths(store.db, "test");
     expect(paths).toContain("a.md");
     expect(paths).not.toContain("b.md");

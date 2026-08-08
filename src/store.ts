@@ -14,7 +14,7 @@
 
 import { Database } from "bun:sqlite";
 import { Glob } from "bun";
-import { realpathSync } from "node:fs";
+import { realpathSync, existsSync } from "node:fs";
 import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
@@ -26,6 +26,7 @@ import {
   isFallbackExpansion,
   type RerankDocument,
 } from "./llm.ts";
+import { normalizeIsoTimestamp } from "./normalize.ts";
 import {
   findContextForPath as collectionsFindContextForPath,
   addContext as collectionsAddContext,
@@ -34,7 +35,6 @@ import {
   getCollection,
   listCollections as collectionsListCollections,
   addCollection as collectionsAddCollection,
-  removeCollection as collectionsRemoveCollection,
   renameCollection as collectionsRenameCollection,
   setGlobalContext,
   loadConfig as collectionsLoadConfig,
@@ -53,9 +53,8 @@ import {
   generateMemoryLinks,
   evolveMemories,
   postIndexEnrich,
-  inferCausalLinks,
-  type ObservationWithDoc,
 } from "./amem.ts";
+import { parseLegacyEdgeWitness } from "./causal-reader.ts";
 import {
   enrichDocumentEntities,
   searchEntities,
@@ -299,17 +298,82 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 // Database initialization
 // =============================================================================
 
-// On macOS, use Homebrew's SQLite which supports extensions
+// On macOS, Apple's built-in libsqlite3 — which Bun uses by default — is
+// compiled WITHOUT extension-loading support, so sqliteVec.load() fails with
+// "This build of sqlite3 does not support dynamic extension loading" (Issue #20).
+// Point Bun at an extension-capable SQLite (Homebrew's) via setCustomSQLite()
+// BEFORE the first Database is opened. setCustomSQLite() must receive a path
+// that EXISTS — an invalid path hard-crashes Bun (oven-sh/bun#18811) — so every
+// candidate is existence-checked first. The resolved path (or null) is recorded
+// so loadVecExtension() can emit an actionable error when no extension-capable
+// SQLite is installed, instead of the cryptic extension-loading failure.
+
+/** macOS only: the extension-capable SQLite activated via setCustomSQLite, or null if none was found. */
+let macosCustomSqlitePath: string | null = null;
+
 if (process.platform === "darwin") {
-  const homebrewSqlitePath = "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib";
-  try {
-    if (Bun.file(homebrewSqlitePath).size > 0) {
-      Database.setCustomSQLite(homebrewSqlitePath);
-    }
-  } catch { }
+  const candidates = [
+    "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib", // Homebrew (Apple Silicon)
+    "/usr/local/opt/sqlite/lib/libsqlite3.dylib",    // Homebrew (Intel)
+  ];
+  // For a non-standard Homebrew prefix, ask brew directly — but only when the
+  // standard paths are absent, so the common case pays no subprocess cost.
+  if (!candidates.some(p => existsSync(p))) {
+    try {
+      const brew = Bun.spawnSync(["brew", "--prefix", "sqlite"], { stdout: "pipe", stderr: "ignore" });
+      const prefix = brew.success ? brew.stdout.toString().trim() : "";
+      if (prefix) candidates.push(`${prefix}/lib/libsqlite3.dylib`);
+    } catch { /* brew not installed — nothing more to probe */ }
+  }
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    try {
+      Database.setCustomSQLite(candidate);
+      macosCustomSqlitePath = candidate;
+      break;
+    } catch { /* not usable — try the next candidate */ }
+  }
 }
 
-function initializeDatabase(db: Database): void {
+/**
+ * Translate a sqlite-vec load failure into an actionable error on macOS, where
+ * the default system SQLite cannot load extensions (Issue #20). Pure + exported
+ * for tests: pass `platform` / `foundPath` explicitly to exercise either branch.
+ * Non-macOS, or any unrelated error, is returned unchanged.
+ */
+export function explainVecLoadError(
+  err: unknown,
+  platform: string = process.platform,
+  foundPath: string | null = macosCustomSqlitePath,
+): Error {
+  const original = err instanceof Error ? err : new Error(String(err));
+  const isExtensionError = /does not support dynamic extension loading/i.test(original.message);
+  if (platform !== "darwin" || !isExtensionError) return original;
+
+  const detail = foundPath === null
+    ? "No Homebrew SQLite was found at the standard locations (/opt/homebrew or /usr/local)."
+    : `A custom SQLite was set from ${foundPath}, but it still cannot load extensions — try 'brew reinstall sqlite'.`;
+  return new Error(
+    "ClawMem could not load the sqlite-vec extension: macOS's built-in SQLite is " +
+    "compiled without extension support.\n" +
+    "Fix: install an extension-capable SQLite with Homebrew, then re-run:\n" +
+    "    brew install sqlite\n" +
+    `${detail}\n` +
+    "More detail: docs/troubleshooting.md (\"Bun runtime\" -> sqlite-vec on macOS), Yoloshii/ClawMem#20.\n" +
+    `Original error: ${original.message}`,
+  );
+}
+
+/** Load the sqlite-vec extension, surfacing an actionable error on macOS (Issue #20). */
+function loadVecExtension(db: Database): void {
+  try {
+    sqliteVec.load(db);
+  } catch (err) {
+    throw explainVecLoadError(err);
+  }
+}
+
+function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   // Set busy_timeout FIRST so subsequent PRAGMAs (journal_mode in particular,
   // which acquires a write lock when switching or initializing WAL state) wait
   // instead of returning SQLITE_BUSY when concurrent Stop hooks
@@ -317,11 +381,13 @@ function initializeDatabase(db: Database): void {
   // before_reset hook fan-out in src/openclaw/engine.ts — open the DB
   // simultaneously. busy_timeout is a connection-level setting that only
   // governs *subsequent* statements (default busy handler is NULL → SQLITE_BUSY
-  // returns immediately), so it must precede the contending PRAGMAs. 15s is
-  // well within the 30s Stop hook timeout. createStore() resets to operational
+  // returns immediately), so it must precede the contending PRAGMAs. The init
+  // busy_timeout defaults to 15s (well within the 30s Stop hook timeout) but is
+  // capped to the caller's opts.busyTimeout — hook opens pass 5000 so init cannot
+  // wait out the 8-15s UserPromptSubmit budget. createStore() resets to operational
   // value (5000ms or opts.busyTimeout) after DDL completes. Issue #13.
-  db.exec("PRAGMA busy_timeout = 15000");
-  sqliteVec.load(db);
+  db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+  loadVecExtension(db);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
@@ -359,6 +425,7 @@ function initializeDatabase(db: Database): void {
       confidence REAL NOT NULL DEFAULT 0.5,
       access_count INTEGER NOT NULL DEFAULT 0,
       content_hash TEXT,
+      origin TEXT,
       FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
       UNIQUE(collection, path)
     )
@@ -391,6 +458,19 @@ function initializeDatabase(db: Database): void {
     // master-harness-s1lli: persist description frontmatter so it can be
     // recovered + embedded at embed time (mirrors the z7o4y title fix).
     ["description", "ALTER TABLE documents ADD COLUMN description TEXT"],
+    ["authored_at", "ALTER TABLE documents ADD COLUMN authored_at TEXT"],
+    // §55.6 D9: WHY a row was deactivated. `active` is written by three unrelated owners —
+    // absence reconciliation, forget, and archival — and the indexer used to reactivate all
+    // three indiscriminately, so a forget on a file-backed document was silently undone by
+    // the next reindex. NULL = legacy row (pre-migration), treated as 'absent'.
+    ["deactivated_reason", "ALTER TABLE documents ADD COLUMN deactivated_reason TEXT"],
+    // Origin-aware reconciliation: WHO owns the row's lifecycle. 'fs' = created/maintained
+    // by the filesystem indexer (reconciled against disk); 'api' = DB-born (hooks,
+    // saveMemory, beads sync, REST) — these have no backing file BY DESIGN, so the absence
+    // reconciler must never deactivate them. NULL = ambiguous legacy row; exempt, adopted by
+    // the next writer to TOUCH it (indexer → 'fs', saveMemory → 'api'), never inferred —
+    // content_hash proves nothing about ownership (mined imports write it too).
+    ["origin", "ALTER TABLE documents ADD COLUMN origin TEXT"],
   ];
   for (const [col, sql] of migrations) {
     if (!colNames.has(col)) {
@@ -398,10 +478,107 @@ function initializeDatabase(db: Database): void {
     }
   }
 
-  // Backfill last_accessed_at from modified_at for existing docs
+  // The loop above swallows every ALTER error, so a real failure (SQLITE_BUSY, disk) is
+  // indistinguishable from "already there" — and the follow-up query would then raise
+  // `no such column`, which the handler below treats as benign. Check explicitly instead,
+  // or a genuinely failed migration ships as silence.
+  const hasDeactivationReason = (
+    db.prepare("PRAGMA table_info(documents)").all() as { name: string }[]
+  ).some(c => c.name === "deactivated_reason");
+  if (!hasDeactivationReason) {
+    console.warn(
+      `[clawmem] could not add the deactivated_reason column on this open. Forget and archival ` +
+      `remain reversible by indexing until it succeeds; it is retried on the next open.`,
+    );
+  }
+
+  // §55.6 D9 migration. Both halves are read-guarded so an already-migrated DB takes NO
+  // write lock here (same reason as the last_accessed_at backfill below).
   try {
-    db.exec(`UPDATE documents SET last_accessed_at = modified_at WHERE last_accessed_at IS NULL`);
+    if (!hasDeactivationReason) throw new Error("deactivated_reason column absent");
+    // (a) Backfill provenance for rows archival already marked. Legacy rows deactivated by
+    //     forget are indistinguishable from absence at this point, so they stay NULL and keep
+    //     today's reactivate-on-return behaviour rather than being stranded — from here
+    //     forward, forget is durable.
+    const needsReasonBackfill = db.prepare(
+      `SELECT 1 FROM documents WHERE active = 0 AND archived_at IS NOT NULL AND deactivated_reason IS NULL LIMIT 1`
+    ).get();
+    if (needsReasonBackfill) {
+      db.exec(`UPDATE documents SET deactivated_reason = 'archive' WHERE active = 0 AND archived_at IS NOT NULL AND deactivated_reason IS NULL`);
+    }
+    // (b) REPAIR, not merely prevent: released versions could reactivate an archived row while
+    //     leaving archived_at set — an internally inconsistent state with no legitimate meaning.
+    //     Restore those to a consistent archived state and report, since silently re-archiving
+    //     rows a user may have been reading would be its own surprise.
+    //
+    //     Count and update run in ONE transaction: two processes opening the store concurrently
+    //     would otherwise both read the same count while only one performed the repair, and the
+    //     loser would report a repair it did not make.
+    const repaired = db.transaction(() => {
+      const row = db.prepare(
+        `SELECT COUNT(*) AS n FROM documents WHERE active = 1 AND archived_at IS NOT NULL`
+      ).get() as { n: number } | undefined;
+      const n = row?.n ?? 0;
+      if (n > 0) {
+        db.prepare(`UPDATE documents SET active = 0, deactivated_reason = 'archive' WHERE active = 1 AND archived_at IS NOT NULL`).run();
+      }
+      return n;
+    })();
+    if (repaired > 0) {
+      console.warn(
+        `[clawmem] repaired ${repaired} archived document(s) that a previous reindex had ` +
+        `reactivated while still marked archived. Use lifecycle_restore to bring any of them back.`,
+      );
+    }
+  } catch (err) {
+    // Do NOT fail open silently. A read-only handle or a pre-migration schema is expected and
+    // benign; anything else (SQLITE_BUSY, a genuine SQL fault) means this process is running
+    // WITHOUT the migration, and the user needs to know rather than discovering it as behaviour.
+    const msg = err instanceof Error ? err.message : String(err);
+    // A missing column is NOT benign here — it is already reported above with its own message,
+    // so absorbing it a second time would double-report; anything else that is not a read-only
+    // handle or a pre-migration table is a real failure the user must see.
+    const alreadyReported = /deactivated_reason column absent/.test(msg);
+    const benign = alreadyReported || /readonly|read-only|no such table/i.test(msg);
+    if (!benign) {
+      console.warn(
+        `[clawmem] deactivation-provenance migration did not run on this open (${msg}). ` +
+        `Forget/archive may still be reversible by indexing until it succeeds; it is retried on ` +
+        `the next open.`,
+      );
+    }
+  }
+
+  // Backfill last_accessed_at from modified_at for existing docs.
+  // Guarded by a read first: on an already-backfilled DB the UPDATE is skipped, so a writable
+  // open takes NO write lock here and cannot wait on busy_timeout under concurrent writers.
+  // (The unconditional UPDATE previously ran on EVERY writable open — including the
+  // context-surfacing UserPromptSubmit hook — and could block up to busy_timeout when another
+  // process held the write lock, pushing the hook past its 8-15s deadline.)
+  try {
+    const needsBackfill = db.prepare(`SELECT 1 FROM documents WHERE last_accessed_at IS NULL LIMIT 1`).get();
+    if (needsBackfill) {
+      db.exec(`UPDATE documents SET last_accessed_at = modified_at WHERE last_accessed_at IS NULL`);
+    }
   } catch { /* ignore if already backfilled */ }
+
+  // Origin migration verification. Verified explicitly like deactivated_reason above: the
+  // migration loop swallows ALTER errors, and reconciliation semantics must never silently
+  // depend on a column that never arrived. There is deliberately NO content_hash-based
+  // backfill: mined imports (`clawmem mine`) also write content_hash through the indexing
+  // pipeline, so its presence proves nothing about ownership — a backfill would mis-stamp
+  // DB-born imports as 'fs' (1,353 such rows measured in one live vault). Legacy rows stay
+  // NULL (exempt) and are adopted by the next writer to TOUCH them: the indexer stamps its
+  // origin on every path including unchanged files; saveMemory stamps 'api'.
+  const hasOrigin = (
+    db.prepare("PRAGMA table_info(documents)").all() as { name: string }[]
+  ).some(c => c.name === "origin");
+  if (!hasOrigin) {
+    console.warn(
+      `[clawmem] could not add the origin column on this open. Filesystem-absence ` +
+      `reconciliation is disabled until it succeeds; it is retried on the next open.`,
+    );
+  }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
@@ -421,6 +598,8 @@ function initializeDatabase(db: Database): void {
   // Timeline indexes use existing columns (modified_at, id) — always safe
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_timeline ON documents(modified_at, id) WHERE active = 1`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_timeline_coll ON documents(collection, modified_at, id) WHERE active = 1`);
+  // §51.1: temporal predicates filter on effective time (authorship when known, filing time otherwise)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_effective_time ON documents(COALESCE(authored_at, modified_at)) WHERE active = 1`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
 
   // Cache table for LLM API calls
@@ -447,6 +626,31 @@ function initializeDatabase(db: Database): void {
       model TEXT NOT NULL,
       embedded_at TEXT NOT NULL,
       PRIMARY KEY (hash, seq)
+    )
+  `);
+
+  // Geometry-canary baseline (VSEARCH-TRUST-HARDENING (d)): per-profile probe vectors +
+  // measured pair-margins from the last healthy embed run. NOT content_vectors — canary
+  // probes must never pollute retrieval.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS embed_canary (
+      probe_id TEXT NOT NULL,
+      profile_key TEXT NOT NULL,
+      embedding BLOB NOT NULL,
+      pair_margins TEXT NOT NULL,
+      embedded_at TEXT NOT NULL,
+      PRIMARY KEY (probe_id, profile_key)
+    )
+  `);
+
+  // Durable vault health flags (T8-M1): e.g. embed_geometry_taint — a detected mid-run
+  // geometry change must survive the process so doctor stays nonzero until a verified
+  // full rebuild clears it.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS vault_flags (
+      flag TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     )
   `);
 
@@ -579,6 +783,10 @@ function initializeDatabase(db: Database): void {
     ["fragment_type", "ALTER TABLE content_vectors ADD COLUMN fragment_type TEXT"],
     ["fragment_label", "ALTER TABLE content_vectors ADD COLUMN fragment_label TEXT"],
     ["canonical_id", "ALTER TABLE content_vectors ADD COLUMN canonical_id TEXT"],
+    // Embed-input fingerprint (VSEARCH-TRUST-HARDENING (d).4 / T4-M2): SHA-256 over the
+    // UTF-8 bytes of the exact final formatDocForEmbedding(...) string. Rows without it
+    // (legacy) are title-unverifiable at doctor time until their next re-embed.
+    ["embed_input_fp", "ALTER TABLE content_vectors ADD COLUMN embed_input_fp TEXT"],
   ];
   for (const [col, sql] of cvMigrations) {
     if (!cvColNames.has(col)) {
@@ -708,6 +916,124 @@ function initializeDatabase(db: Database): void {
   // MPFP composite index for efficient neighbor loading (GPT 5.4 recommendation)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_mpfp ON memory_relations(source_id, relation_type, weight DESC, target_id)`);
 
+  // s342 causal writer (C4′): per-invocation audit runs. run_key is UNIQUE NOT
+  // NULL so a key collision fails loudly BEFORE inference results are written.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS causal_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_key TEXT NOT NULL UNIQUE,
+      session_id TEXT,
+      source TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      model TEXT,
+      prompt_version TEXT,
+      prompt_sha256 TEXT,
+      response_sha256 TEXT,
+      outcome TEXT NOT NULL,
+      new_doc_count INTEGER NOT NULL DEFAULT 0,
+      window_doc_count INTEGER NOT NULL DEFAULT 0,
+      candidate_count INTEGER NOT NULL DEFAULT 0,
+      admitted_count INTEGER NOT NULL DEFAULT 0,
+      edges_written INTEGER NOT NULL DEFAULT 0,
+      edges_refused INTEGER NOT NULL DEFAULT 0,
+      edges_errored INTEGER NOT NULL DEFAULT 0,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      duration_ms INTEGER
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_causal_runs_ts ON causal_runs(started_at DESC, id DESC)`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS causal_run_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL REFERENCES causal_runs(id) ON DELETE CASCADE,
+      scope TEXT NOT NULL CHECK (scope IN ('document','pair','write')),
+      event_type TEXT NOT NULL,
+      source_doc_id INTEGER,
+      target_doc_id INTEGER,
+      source_fact_ordinal INTEGER,
+      target_fact_ordinal INTEGER,
+      confidence REAL,
+      detail TEXT,
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_causal_run_events_run ON causal_run_events(run_id, id)`);
+
+  // s342: append-only fact-pair witness sightings on causal edges. Identity is
+  // the ORDINAL pair (facts are display snapshots); a live row must carry
+  // visible evidence + full attribution; legacy rows (ordinals = -1) keep their
+  // explicitly different compatibility contract. Witnesses are dependent
+  // evidence of the edge — the composite FK cascades with it, never a second
+  // lifecycle identity. Audit retention deletes runs only: run_id detaches via
+  // SET NULL while denormalized model/prompt/run_key attribution survives.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS causal_witness_sightings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_id INTEGER NOT NULL,
+      target_id INTEGER NOT NULL,
+      relation_type TEXT NOT NULL DEFAULT 'causal' CHECK (relation_type = 'causal'),
+      source_fact_ordinal INTEGER NOT NULL,
+      target_fact_ordinal INTEGER NOT NULL,
+      source_fact TEXT,
+      target_fact TEXT,
+      reasoning TEXT NOT NULL DEFAULT '',
+      confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+      model_identity TEXT NOT NULL DEFAULT '',
+      prompt_version TEXT NOT NULL DEFAULT '',
+      run_key TEXT NOT NULL,
+      run_id INTEGER REFERENCES causal_runs(id) ON DELETE SET NULL,
+      legacy INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      CHECK ((legacy = 0 AND source_fact_ordinal >= 0 AND target_fact_ordinal >= 0)
+          OR (legacy = 1 AND source_fact_ordinal = -1 AND target_fact_ordinal = -1)),
+      CHECK (legacy = 1 OR (length(COALESCE(source_fact,'')) > 0
+                        AND length(COALESCE(target_fact,'')) > 0
+                        AND length(reasoning) > 0
+                        AND length(model_identity) > 0
+                        AND length(prompt_version) > 0
+                        AND length(run_key) > 0)),
+      FOREIGN KEY (source_id, target_id, relation_type)
+        REFERENCES memory_relations(source_id, target_id, relation_type) ON DELETE CASCADE
+    )
+  `);
+  // ONE live sighting per (edge, ordinal pair, invocation); recurrence across
+  // runs APPENDS under its own run_key. Plain columns — a valid targeted
+  // ON CONFLICT target for the partial-index upsert.
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_cws_live ON causal_witness_sightings
+    (source_id, target_id, source_fact_ordinal, target_fact_ordinal, run_key)
+    WHERE legacy = 0`);
+  // EXACTLY ONE legacy row per physical edge — repeated materialization throws.
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_cws_one_legacy ON causal_witness_sightings
+    (source_id, target_id) WHERE legacy = 1`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cws_edge ON causal_witness_sightings
+    (source_id, target_id, confidence DESC, created_at DESC, id DESC)`);
+
+  // s342: NON-PRUNED archive for operator-retired causal edges — the supported,
+  // reversible restoration path (`clawmem migrate causal-witnesses --restore-edge`).
+  // Full row image, no FKs: the archive must survive everything, including audit
+  // retention. An archive table (vs a retired_at column) keeps every existing
+  // graph reader predicate unchanged.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS retired_causal_edges (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_id INTEGER NOT NULL,
+      target_id INTEGER NOT NULL,
+      relation_type TEXT NOT NULL,
+      weight REAL,
+      metadata TEXT,
+      created_at TEXT,
+      contradict_confidence REAL,
+      retired_at TEXT NOT NULL,
+      retired_run_key TEXT NOT NULL,
+      operator_note TEXT,
+      fingerprint TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_retired_causal_edge ON retired_causal_edges
+    (source_id, target_id, relation_type)`);
+
   // A-MEM: Memory evolution tracking
   db.exec(`
     CREATE TABLE IF NOT EXISTS memory_evolution (
@@ -813,6 +1139,41 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_object ON entity_triples(object_entity_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_predicate ON entity_triples(predicate)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_valid ON entity_triples(valid_from, valid_to)`);
+
+  // Per-source evidence for SPO triples (v0.32.0). One row per distinct
+  // (triple, source_doc, source_fact) — the base row's inline source_doc_id/source_fact stay
+  // frozen as the first sighting. Uniqueness is null-normalized: a plain UNIQUE treats NULLs as
+  // distinct, which would let unattributed evidence duplicate unboundedly.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entity_triple_provenance (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      triple_id INTEGER NOT NULL REFERENCES entity_triples(id),
+      source_doc_id INTEGER REFERENCES documents(id),
+      source_fact TEXT,
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_etp_evidence ON entity_triple_provenance
+    (triple_id, COALESCE(source_doc_id, -1), COALESCE(source_fact, ''))`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_etp_triple_recent ON entity_triple_provenance
+    (triple_id, created_at DESC, id DESC)`);
+  // Idempotent backfill, READ-GUARDED (v0.16.0 discipline: a writable open on a healthy DB
+  // must not wait on busy_timeout) — the INSERT runs only when at least one triple still lacks
+  // a provenance row, so steady-state opens perform zero writes here. EVERY legacy triple gets
+  // a row: one whose inline evidence is entirely NULL gets a single unattributed row (the
+  // null-normalized unique index caps it at one), so evidenceCount is honest for legacy facts.
+  const needsEvidenceBackfill = db.prepare(`
+    SELECT 1 FROM entity_triples t
+    WHERE NOT EXISTS (SELECT 1 FROM entity_triple_provenance p WHERE p.triple_id = t.id)
+    LIMIT 1
+  `).get();
+  if (needsEvidenceBackfill) {
+    db.exec(`
+      INSERT OR IGNORE INTO entity_triple_provenance (triple_id, source_doc_id, source_fact, created_at)
+      SELECT id, source_doc_id, source_fact, COALESCE(created_at, datetime('now'))
+      FROM entity_triples
+    `);
+  }
 
   // Entity FTS5 for fuzzy name lookup
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(entity_id, name, entity_type)`);
@@ -955,6 +1316,57 @@ function initializeDatabase(db: Database): void {
       expires_at TEXT NOT NULL
     )
   `);
+
+  // v0.29.0: durable contradiction-judge audit. One judge_runs row per evaluation
+  // (a provider-failure→heuristic fallback is TWO rows linked by fallback_from_run_id,
+  // pruned as a unit via the self-FK cascade); judge_events carries per-verdict /
+  // per-reject / per-error facts. Interactive hosts do not persist hook stderr, so
+  // these rows are the only durable evidence erosion calibration can read.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS judge_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL DEFAULT (datetime('now')),
+      session_id TEXT,
+      consumer TEXT NOT NULL,
+      lane TEXT NOT NULL,
+      model TEXT,
+      endpoint TEXT,
+      prompt_version TEXT,
+      new_fact_count INTEGER NOT NULL DEFAULT 0,
+      candidate_count INTEGER NOT NULL DEFAULT 0,
+      response_sha256 TEXT,
+      outcome TEXT NOT NULL,
+      fallback_from_run_id INTEGER REFERENCES judge_runs(id) ON DELETE CASCADE,
+      entries_admitted INTEGER NOT NULL DEFAULT 0,
+      entries_rejected INTEGER NOT NULL DEFAULT 0,
+      entries_duplicate INTEGER NOT NULL DEFAULT 0,
+      entries_inconsistent INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_runs_consumer_ts ON judge_runs(consumer, ts DESC)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_runs_fallback ON judge_runs(fallback_from_run_id)`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS judge_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL REFERENCES judge_runs(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL,
+      new_idx INTEGER,
+      old_idx INTEGER,
+      new_ref TEXT,
+      old_ref TEXT,
+      relation TEXT,
+      confidence REAL,
+      reasoning_head TEXT,
+      reason_code TEXT,
+      action TEXT,
+      evidence_head TEXT,
+      score_before REAL,
+      score_after REAL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_events_run ON judge_events(run_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_events_action ON judge_events(action)`);
 }
 
 
@@ -972,6 +1384,16 @@ const contextUsageHasQueryTextCache = new WeakMap<Database, boolean>();
  * INCIDENT-2026-06-22 §12 + EMBED-LEASE-RENEWAL-DESIGN.md.
  */
 export class FatalVectorError extends Error {}
+
+/**
+ * Rethrow a fatal vector error (dimension / model / schema mismatch) so a searchVec() fallback
+ * catch surfaces it instead of silently degrading to BM25. Transient conditions (timeout, absent
+ * vectors) are NOT FatalVectorError and remain swallowed by the caller, as before. Apply this at the
+ * FTS-fallback catch sites that wrap searchVec.
+ */
+export function rethrowIfFatalVectorError(e: unknown): void {
+  if (e instanceof FatalVectorError) throw e;
+}
 
 export class VecDimensionMismatchError extends FatalVectorError {
   constructor(public readonly existingDim: number, public readonly requestedDim: number) {
@@ -991,6 +1413,33 @@ export class VecModelMismatchError extends FatalVectorError {
   constructor(public readonly expectedModel: string, public readonly actualModel: string) {
     super(`Embedding model changed mid-run: the vault is being built with "${expectedModel}" but the endpoint now returns "${actualModel}". Mixing different models in one vector space (even at the same dimension) makes cosine similarity meaningless. Run 'clawmem embed --force' to rebuild with the current model.`);
     this.name = "VecModelMismatchError";
+  }
+}
+
+/**
+ * Read-path sibling of VecModelMismatchError. VecModelMismatchError fires only mid-embed-run; this
+ * one fires on the QUERY path when the vault's stored vectors were embedded with one model but the
+ * active embedding endpoint now returns a different model at the SAME dimension (so the dimension
+ * guard cannot catch it). Matching the new model's query vector against the old model's stored
+ * vectors is cosine-meaningless, so searchVec throws this rather than serving corrupted results.
+ */
+export class VecReadModelMismatchError extends FatalVectorError {
+  constructor(public readonly storedModels: string[], public readonly activeModel: string) {
+    super(`Embedding model mismatch on the query path: the vault's vectors were embedded with ${storedModels.map(m => `"${m}"`).join(", ")} but the active embedding endpoint now returns "${activeModel}". At the same dimension the dimension guard cannot catch this, and matching the new model's query vector against the old model's stored vectors makes cosine similarity meaningless. Run 'clawmem embed --force' to rebuild the vault with the current model.`);
+    this.name = "VecReadModelMismatchError";
+  }
+}
+
+// Fail-open surfacing for a read-path model mismatch: warn LOUDLY once per process, then let the
+// caller degrade to BM25. For hooks that MUST NOT throw — context-surfacing (UserPromptSubmit) and
+// the Stop hooks (decision-extractor) — a throwing hook breaks that turn. Explicit query paths use
+// rethrowIfFatalVectorError instead. The once-flag is process-global so the warning fires exactly
+// once no matter which hook trips it first.
+let _warnedVectorModelMismatch = false;
+export function warnOnceOnVectorModelMismatch(e: unknown): void {
+  if (e instanceof VecReadModelMismatchError && !_warnedVectorModelMismatch) {
+    _warnedVectorModelMismatch = true;
+    console.warn(`[clawmem] ${e.message}`);
   }
 }
 
@@ -1085,6 +1534,83 @@ export function getVecTableDim(db: Database): number | null {
 }
 
 /**
+ * Prewarm the sqlite-vec payload into OS page cache with a single brute-force MATCH using a ZERO
+ * query vector. Decoupled from the embedding server on purpose — it works when the embed server is
+ * down at boot or CLAWMEM_NO_LOCAL_MODELS=true, unlike a searchVec()-based prewarm (which embeds
+ * first and would silently no-op). Returns true ONLY if a scan actually ran (a vector table with a
+ * known dimension exists), so callers never log a false-positive "warmed". The k-NN MATCH is
+ * brute-force, so it touches every vector chunk — exactly the payload we want cache-resident.
+ */
+export function prewarmVectors(db: Database): boolean {
+  const dim = getVecTableDim(db);
+  if (!dim || dim <= 0) return false;
+  const zero = new Float32Array(dim);
+  db.prepare(`SELECT hash_seq FROM vectors_vec WHERE embedding MATCH ? AND k = ?`).all(zero, 1);
+  return true;
+}
+
+/**
+ * Keep the sqlite-vec payload resident in the OS page cache by re-running the brute-force
+ * prewarm on an interval. The one-shot prewarm at watcher startup warms the cache ONCE; on a
+ * long-running host under memory pressure the kernel can evict the (potentially ~1.5 GB) vector
+ * payload between hook calls, and the next cold SYNCHRONOUS MATCH in the context-surfacing hook
+ * path can then blow the 8-15s hook budget (bun:sqlite exposes no interrupt, so an in-flight
+ * scan cannot be abandoned). Re-touching the pages biases the kernel LRU toward keeping them
+ * resident — a PROBABILITY reduction, NOT a hard cap. The hard cap (moving the blocking scan off
+ * the hook's event loop so its deadline can fire) is the deferred BACKLOG Source 46 daemon.
+ *
+ * Best-effort: never throws; a per-tick failure is swallowed so the timer keeps running. Returns
+ * the interval handle (the caller MUST clear it on shutdown) or null when disabled (intervalMs
+ * <= 0 or non-finite). The handle is unref'd so it never by itself keeps the process alive.
+ * `onPrewarm(ran)` is an optional observability hook fired after each attempt — `ran` is whether
+ * a scan actually executed (i.e. a dimensioned vector table exists).
+ */
+export function startPeriodicPrewarm(
+  db: Database,
+  intervalMs: number,
+  onPrewarm?: (ran: boolean) => void,
+): ReturnType<typeof setInterval> | null {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return null;
+  const timer = setInterval(() => {
+    let ran = false;
+    try { ran = prewarmVectors(db); } catch { /* best-effort: unexpected SQL error */ }
+    if (onPrewarm) { try { onPrewarm(ran); } catch { /* observer must never break the timer */ } }
+  }, intervalMs);
+  (timer as { unref?: () => void }).unref?.();
+  return timer;
+}
+
+/** Floor for the periodic re-prewarm interval. Below this, a large-vault (~1.5 GB) brute-force scan
+ *  runs near-continuously and can saturate the watcher event loop + I/O, so any smaller positive
+ *  request is clamped UP to this value. */
+export const PREWARM_MIN_INTERVAL_MS = 60_000;
+/** Default periodic re-prewarm interval when CLAWMEM_PREWARM_INTERVAL_MS is unset or unparseable. */
+export const PREWARM_DEFAULT_INTERVAL_MS = 600_000;
+
+/**
+ * Resolve the raw CLAWMEM_PREWARM_INTERVAL_MS env value into a SAFE interval for the watcher. This
+ * policy is kept OUT of the permissive `startPeriodicPrewarm` mechanism (so unit tests can still use
+ * tiny intervals) and applied only on the production env path.
+ *   - unset / empty / unparseable → default (600000). Garbage must NOT silently disable the
+ *     mitigation, nor be read as a tiny interval.
+ *   - exactly 0 → 0 (the documented off switch; `startPeriodicPrewarm` then returns null).
+ *   - negative → default (nonsensical; neither an intentional disable nor a fast loop).
+ *   - 0 < n < floor → clamped UP to the 60s floor. Prevents the near-continuous scan loop that e.g.
+ *     "1" or "1e3" would otherwise schedule. NOTE: `Number("1e3") === 1000` whereas
+ *     `parseInt("1e3", 10) === 1`, so `Number()` is used deliberately (parseInt silently truncates
+ *     at the "e").
+ *   - n >= floor → floored to an integer and used as-is.
+ */
+export function resolvePrewarmIntervalMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return PREWARM_DEFAULT_INTERVAL_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return PREWARM_DEFAULT_INTERVAL_MS;
+  if (n === 0) return 0;
+  if (n < 0) return PREWARM_DEFAULT_INTERVAL_MS;
+  return Math.max(PREWARM_MIN_INTERVAL_MS, Math.floor(n));
+}
+
+/**
  * The DISTINCT non-empty embedding models stored in the vault (empty array if no
  * embeddings exist). Used to detect model drift BETWEEN runs — a different model at
  * the SAME dimension produces a heterogeneous vector space that dimension checks
@@ -1132,14 +1658,10 @@ export type Store = {
 
   // Cleanup and maintenance
   deleteLLMCache: () => number;
-  // deleteInactiveDocuments/cleanupOrphanedContent require an explicit scope
-  // ({ collection: string } | { all: true }) — see master-harness-t5i0.
-  // A bare call with no scope argument is a TypeScript compile error.
-  // (cleanupOrphanedVectors was removed with upstream v0.11.0 — unfenced vector
-  // mutation, no production caller; cleanStaleEmbeddings is the fenced replacement.)
-  deleteInactiveDocuments: (scope: CleanupScope, opts?: CleanupOptions) => number;
-  cleanupOrphanedContent: (scope: CleanupScope, opts?: CleanupOptions) => number;
-  purgeCollection: (collectionName: string) => { documents: number; content: number; vectors: number };
+  // v0.30.0 doctrine supersedes the t5i0 scoped-delete surface: no code path may
+  // hard-delete documents rows (deleteInactiveDocuments and purgeCollection removed;
+  // cleanupOrphanedContent's predicate is cascade-proof by construction).
+  cleanupOrphanedContent: () => number;
   vacuumDatabase: () => void;
 
   // Context
@@ -1157,12 +1679,13 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => Promise<SearchResult[]>;
+  searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => Promise<VecSearchDetailedResult>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
+  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, options?: RerankProbeOptions) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
@@ -1176,23 +1699,29 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null, origin?: DocumentOrigin) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; pinned: number; snoozed_until: string | null; confidence: number } | null;
   findAnyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; active: number } | null;
-  reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
+  reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => boolean;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
-  deactivateDocument: (collectionName: string, path: string) => void;
+  deactivateDocument: (collectionName: string, path: string, reason: DeactivationReason) => void;
   getActiveDocumentPaths: (collectionName: string) => string[];
+  getReconcilableDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
   getHashesNeedingFragments: () => { hash: string; body: string; path: string; title: string; collection: string; description: string | null }[];
   clearAllEmbeddings: (leaseGuard?: LeaseGuard) => void;
   getVectorConsistency: () => { cvCount: number; vvCount: number; cvMissingVv: number; vvOrphan: number; pending: number };
-  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard) => void;
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard, embedInputFp?: string) => void;
   insertEmbeddingsBatch: (writes: EmbeddingWrite[], leaseGuard?: LeaseGuard) => void;
   cleanStaleEmbeddings: (leaseGuard?: LeaseGuard) => number;
+  saveCanaryBaseline: (profileKey: string, probes: { probeId: string; embedding: Float32Array }[], pairMargins: Record<string, number>, leaseGuard?: LeaseGuard) => void;
+  getCanaryBaseline: (profileKey: string) => { probes: Map<string, Float32Array>; pairMargins: Record<string, number>; embeddedAt: string } | null;
+  setVaultFlag: (flag: string, value: string, leaseGuard?: LeaseGuard) => void;
+  getVaultFlag: (flag: string) => string | null;
+  clearVaultFlag: (flag: string, leaseGuard?: LeaseGuard) => void;
 
   // SAME: Observation metadata
   updateObservationFields: (docPath: string, collectionName: string, fields: { observation_type?: string; facts?: string; narrative?: string; concepts?: string; files_read?: string; files_modified?: string }) => void;
@@ -1209,17 +1738,17 @@ export type Store = {
   markUsageReferenced: (id: number) => void;
 
   // SAME: Document metadata operations
-  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }) => void;
+  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number; authored_at?: string | null }) => void;
   incrementAccessCount: (paths: string[]) => void;
-  getDocumentsByType: (contentType: string, limit?: number) => DocumentRow[];
+  getDocumentsByType: (contentType: string, limit?: number, opts?: { orderBy?: "operational" | "effective" }) => DocumentRow[];
   getStaleDocuments: (beforeDate: string) => DocumentRow[];
   pinDocument: (collection: string, path: string, pinned: boolean) => void;
   snoozeDocument: (collection: string, path: string, until: string | null) => void;
 
   // Embed state tracking
-  markEmbedStart: (hash: string) => void;
-  markEmbedSynced: (hash: string) => void;
-  markEmbedFailed: (hash: string, error: string) => void;
+  markEmbedStart: (hash: string, leaseGuard?: LeaseGuard) => void;
+  markEmbedSynced: (hash: string, leaseGuard?: LeaseGuard) => void;
+  markEmbedFailed: (hash: string, error: string, leaseGuard?: LeaseGuard) => void;
   getEmbedStats: () => { pending: number; synced: number; failed: number };
 
   // Beads integration
@@ -1228,16 +1757,16 @@ export type Store = {
 
   // MAGMA graph building
   buildTemporalBackbone: () => number;
+  countActiveRelations: (relationType: string) => number;
   buildSemanticGraph: (threshold?: number) => Promise<number>;
 
   // A-MEM: Self-Evolving Memory
   constructMemoryNote: (llm: any, docId: number) => Promise<any>;
-  storeMemoryNote: (docId: number, note: any) => void;
+  storeMemoryNote: (docId: number, note: any) => boolean;
   generateMemoryLinks: (llm: any, docId: number, kNeighbors?: number) => Promise<number>;
   evolveMemories: (llm: any, memoryId: number, triggeredBy: number) => Promise<boolean>;
   postIndexEnrich: (llm: any, docId: number, isNew: boolean) => Promise<void>;
-  inferCausalLinks: (llm: any, observations: ObservationWithDoc[]) => Promise<number>;
-  findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => CausalLink[];
+  findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => CausalEdgesResult;
   getEvolutionTimeline: (docId: number, limit?: number) => EvolutionEntry[];
 
   // Entity resolution + co-occurrence
@@ -1248,7 +1777,7 @@ export type Store = {
   // SPO knowledge graph
   addTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, options?: { validFrom?: string; validTo?: string; confidence?: number; sourceDocId?: number; sourceFact?: string }) => number;
   invalidateTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, endedDate?: string) => number;
-  queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both" }) => { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean }[];
+  queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both"; includeProvenance?: boolean; provenanceLimit?: number }) => { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean; evidenceCount?: number; sources?: { docId: number | null; collection: string | null; path: string | null; fact: string | null; at: string }[] }[];
   getTripleStats: () => { totalTriples: number; currentFacts: number; expiredFacts: number; predicateTypes: string[] };
 
   // Recall tracking
@@ -1276,7 +1805,6 @@ export type Store = {
   archiveDocuments: (ids: number[]) => number;
   getArchiveCandidates: (policy: import("./collections.ts").LifecyclePolicy) => { id: number; collection: string; path: string; title: string; modified_at: string; last_accessed_at: string | null; content_type: string }[];
   restoreArchivedDocuments: (filter: { ids?: number[]; collection?: string; sinceDate?: string }) => number;
-  purgeArchivedDocuments: (olderThanDays: number) => number;
   getLifecycleStats: () => { active: number; archived: number; forgotten: number; pinned: number; snoozed: number; neverAccessed: number; oldestAccess: string | null };
   searchArchived: (query: string, limit?: number) => { id: number; collection: string; path: string; title: string; archived_at: string; score: number }[];
 };
@@ -1294,7 +1822,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     ? new Database(resolvedPath, { readonly: true })
     : new Database(resolvedPath);
   if (!opts?.readonly) {
-    initializeDatabase(db);
+    initializeDatabase(db, opts?.busyTimeout ?? 15000);
   } else {
     // Readonly: set busy_timeout FIRST so the journal_mode PRAGMA below
     // doesn't race when concurrent processes open the DB. PRAGMA
@@ -1303,11 +1831,11 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     // production caller in this repo currently passes readonly:true,
     // but the ordering invariant should hold regardless. Issue #13.
     db.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
-    sqliteVec.load(db);
+    loadVecExtension(db);
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA query_only = ON");
   }
-  // For the writable branch: initializeDatabase() set 15000 during DDL —
+  // For the writable branch: initializeDatabase() set opts.busyTimeout (default 15000) during DDL —
   // reset to operational value here. For readonly: already set inside the
   // branch above; this assignment is a no-op rewrite to the same value.
   db.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
@@ -1333,9 +1861,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Cleanup and maintenance
     deleteLLMCache: () => deleteLLMCache(db),
-    deleteInactiveDocuments: (scope: CleanupScope, opts?: CleanupOptions) => deleteInactiveDocuments(db, scope, opts),
-    cleanupOrphanedContent: (scope: CleanupScope, opts?: CleanupOptions) => cleanupOrphanedContent(db, scope, opts),
-    purgeCollection: (collectionName: string) => purgeCollection(db, collectionName),
+    cleanupOrphanedContent: () => cleanupOrphanedContent(db),
     vacuumDatabase: () => vacuumDatabase(db),
 
     // Context
@@ -1353,12 +1879,13 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => searchFTS(db, query, limit, collectionId, collections, dateRange),
-    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }) => searchVec(db, query, model, limit, collectionId, collections, dateRange),
+    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => searchFTS(db, query, limit, collectionId, collections, dateRange, excludeCollections, opts),
+    searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadlineMs),
+    searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => searchVecDetailed(db, query, model, limit, opts),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent),
+    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, options?: RerankProbeOptions) => rerank(query, documents, model, db, intent, options),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -1372,23 +1899,66 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, description),
+    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null, origin?: DocumentOrigin) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, description, origin),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
     findAnyDocument: (collectionName: string, path: string) => findAnyDocument(db, collectionName, path),
     reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => reactivateDocument(db, documentId, title, hash, modifiedAt),
     updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
     updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
-    deactivateDocument: (collectionName: string, path: string) => deactivateDocument(db, collectionName, path),
+    deactivateDocument: (collectionName: string, path: string, reason: DeactivationReason) => deactivateDocument(db, collectionName, path, reason),
     getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
+    getReconcilableDocumentPaths: (collectionName: string) => getReconcilableDocumentPaths(db, collectionName),
 
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     getHashesNeedingFragments: () => getHashesNeedingFragments(db),
     clearAllEmbeddings: (leaseGuard?: LeaseGuard) => clearAllEmbeddings(db, leaseGuard),
     getVectorConsistency: () => getVectorConsistency(db),
-    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, fragmentType, fragmentLabel, canonicalId, leaseGuard),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard, embedInputFp?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, fragmentType, fragmentLabel, canonicalId, leaseGuard, embedInputFp),
     insertEmbeddingsBatch: (writes: EmbeddingWrite[], leaseGuard?: LeaseGuard) => insertEmbeddingsBatch(db, writes, leaseGuard),
     cleanStaleEmbeddings: (leaseGuard?: LeaseGuard) => cleanStaleEmbeddings(db, leaseGuard),
+    saveCanaryBaseline: (profileKey: string, probes: { probeId: string; embedding: Float32Array }[], pairMargins: Record<string, number>, leaseGuard?: LeaseGuard) => {
+      const marginsJson = JSON.stringify(pairMargins);
+      const now = new Date().toISOString();
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`DELETE FROM embed_canary WHERE profile_key = ?`).run(profileKey);
+        const ins = db.prepare(`INSERT INTO embed_canary (probe_id, profile_key, embedding, pair_margins, embedded_at) VALUES (?, ?, ?, ?, ?)`);
+        for (const p of probes) {
+          ins.run(p.probeId, profileKey, new Uint8Array(p.embedding.buffer.slice(p.embedding.byteOffset, p.embedding.byteOffset + p.embedding.byteLength)), marginsJson, now);
+        }
+      }).immediate();
+    },
+    getCanaryBaseline: (profileKey: string) => {
+      const rows = db.prepare(`SELECT probe_id, embedding, pair_margins, embedded_at FROM embed_canary WHERE profile_key = ?`).all(profileKey) as { probe_id: string; embedding: Uint8Array; pair_margins: string; embedded_at: string }[];
+      if (rows.length === 0) return null;
+      const probes = new Map<string, Float32Array>();
+      for (const r of rows) {
+        const buf = new Uint8Array(r.embedding);
+        probes.set(r.probe_id, new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4));
+      }
+      let pairMargins: Record<string, number> = {};
+      try { pairMargins = JSON.parse(rows[0]!.pair_margins); } catch { /* malformed → empty */ }
+      return { probes, pairMargins, embeddedAt: rows[0]!.embedded_at };
+    },
+    // Lease-fenced (T9-M4): a holder reclaimed during an async end probe must not set or
+    // clear taint written by its successor — ownership check and mutation share one txn.
+    setVaultFlag: (flag: string, value: string, leaseGuard?: LeaseGuard) => {
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`INSERT OR REPLACE INTO vault_flags (flag, value, updated_at) VALUES (?, ?, ?)`).run(flag, value, new Date().toISOString());
+      }).immediate();
+    },
+    getVaultFlag: (flag: string) => {
+      const row = db.prepare(`SELECT value FROM vault_flags WHERE flag = ?`).get(flag) as { value: string } | undefined;
+      return row?.value ?? null;
+    },
+    clearVaultFlag: (flag: string, leaseGuard?: LeaseGuard) => {
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`DELETE FROM vault_flags WHERE flag = ?`).run(flag);
+      }).immediate();
+    },
 
     // SAME: Observation metadata
     updateObservationFields: (docPath: string, collectionName: string, fields) => updateObservationFieldsFn(db, docPath, collectionName, fields),
@@ -1407,29 +1977,40 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     // SAME: Document metadata operations
     updateDocumentMeta: (docId: number, meta) => updateDocumentMetaFn(db, docId, meta),
     incrementAccessCount: (paths: string[]) => incrementAccessCountFn(db, paths),
-    getDocumentsByType: (contentType: string, limit?: number) => getDocumentsByTypeFn(db, contentType, limit),
+    getDocumentsByType: (contentType: string, limit?: number, opts?: { orderBy?: "operational" | "effective" }) => getDocumentsByTypeFn(db, contentType, limit, opts),
     getStaleDocuments: (beforeDate: string) => getStaleDocumentsFn(db, beforeDate),
     pinDocument: (collection: string, path: string, pinned: boolean) => pinDocumentFn(db, collection, path, pinned),
     snoozeDocument: (collection: string, path: string, until: string | null) => snoozeDocumentFn(db, collection, path, until),
 
-    // Embed state tracking
-    markEmbedStart: (hash: string) => {
+    // Embed state tracking — lease-fenced (VSEARCH-TRUST-HARDENING (f).5): the ownership
+    // check and the state write share one transaction, so a reclaimed old holder cannot
+    // overwrite a successor's document state after its last fragment.
+    markEmbedStart: (hash: string, leaseGuard?: LeaseGuard) => {
       // Increment embed_attempts exactly ONCE per attempt, at the start, and set
       // 'pending' so a crash mid-document leaves the doc retryable (and selected by
       // getHashesNeedingFragments). The completion setters below are state-only — no
       // further increment — so a start + a failure for the same attempt cannot
       // double-count the retry budget.
-      db.prepare(`UPDATE documents SET embed_state = 'pending', embed_error = NULL, embed_attempts = COALESCE(embed_attempts, 0) + 1 WHERE hash = ? AND active = 1`).run(hash);
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`UPDATE documents SET embed_state = 'pending', embed_error = NULL, embed_attempts = COALESCE(embed_attempts, 0) + 1 WHERE hash = ? AND active = 1`).run(hash);
+      }).immediate();
     },
-    markEmbedSynced: (hash: string) => {
+    markEmbedSynced: (hash: string, leaseGuard?: LeaseGuard) => {
       // Success resets the retry budget: embed_attempts counts CONSECUTIVE failures
       // of the current content, so a successful (re-)embed must clear it — otherwise
       // a doc re-embedded many times (repeated content edits) accumulates attempts
       // and is wrongly excluded by the worklist's `embed_attempts < 3` guard.
-      db.prepare(`UPDATE documents SET embed_state = 'synced', embed_attempts = 0, embed_error = NULL WHERE hash = ? AND active = 1`).run(hash);
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`UPDATE documents SET embed_state = 'synced', embed_attempts = 0, embed_error = NULL WHERE hash = ? AND active = 1`).run(hash);
+      }).immediate();
     },
-    markEmbedFailed: (hash: string, error: string) => {
-      db.prepare(`UPDATE documents SET embed_state = 'failed', embed_error = ? WHERE hash = ? AND active = 1`).run(error, hash);
+    markEmbedFailed: (hash: string, error: string, leaseGuard?: LeaseGuard) => {
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        db.prepare(`UPDATE documents SET embed_state = 'failed', embed_error = ? WHERE hash = ? AND active = 1`).run(error, hash);
+      }).immediate();
     },
     getEmbedStats: () => {
       const stats = db.prepare(`
@@ -1448,6 +2029,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // MAGMA graph building
     buildTemporalBackbone: () => buildTemporalBackbone(db),
+    countActiveRelations: (relationType: string) => countActiveRelations(db, relationType),
     buildSemanticGraph: (threshold?: number) => buildSemanticGraph(db, threshold),
 
     // A-MEM: Self-Evolving Memory
@@ -1456,7 +2038,6 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     generateMemoryLinks: (llm: any, docId: number, kNeighbors?: number) => generateMemoryLinks({ db, dbPath: resolvedPath } as Store, llm, docId, kNeighbors),
     evolveMemories: (llm: any, memoryId: number, triggeredBy: number) => evolveMemories({ db, dbPath: resolvedPath } as Store, llm, memoryId, triggeredBy),
     postIndexEnrich: (llm: any, docId: number, isNew: boolean) => postIndexEnrich({ db, dbPath: resolvedPath } as Store, llm, docId, isNew),
-    inferCausalLinks: (llm: any, observations: ObservationWithDoc[]) => inferCausalLinks({ db, dbPath: resolvedPath } as Store, llm, observations),
     findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => findCausalLinks(db, docId, direction, maxDepth),
     getEvolutionTimeline: (docId: number, limit?: number) => getEvolutionTimeline(db, docId, limit),
 
@@ -1473,21 +2054,39 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         ? "object_entity_id = ? AND object_literal IS NULL"
         : "object_entity_id IS NULL AND object_literal = ?";
       const objParam = objectEntityId ?? objectLiteral;
-      const existing = db.prepare(
-        `SELECT id FROM entity_triples WHERE subject_entity_id = ? AND predicate = ? AND ${objClause} AND valid_to IS NULL`
-      ).get(subjectEntityId, pred, objParam) as { id: number } | null;
-      if (existing) return existing.id;
+      // Evidence rides in the same transaction as the base row — a triple must never exist
+      // without a provenance row. An entirely-unattributed sighting still writes its
+      // null-normalized row (the unique index collapses repeats to one), so evidenceCount
+      // stays honest rather than under-reporting unattributed corroboration as zero.
+      const insertEvidence = (tripleId: number) => {
+        db.prepare(`
+          INSERT OR IGNORE INTO entity_triple_provenance (triple_id, source_doc_id, source_fact, created_at)
+          VALUES (?, ?, ?, ?)
+        `).run(tripleId, options?.sourceDocId ?? null, options?.sourceFact ?? null, now);
+      };
+      const txn = db.transaction(() => {
+        const existing = db.prepare(
+          `SELECT id FROM entity_triples WHERE subject_entity_id = ? AND predicate = ? AND ${objClause} AND valid_to IS NULL`
+        ).get(subjectEntityId, pred, objParam) as { id: number } | null;
+        if (existing) {
+          insertEvidence(existing.id);
+          return existing.id;
+        }
 
-      const result = db.prepare(`
-        INSERT INTO entity_triples (subject_entity_id, predicate, object_entity_id, object_literal, valid_from, valid_to, confidence, source_doc_id, source_fact, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        subjectEntityId, pred, objectEntityId, objectLiteral,
-        options?.validFrom ?? null, options?.validTo ?? null,
-        options?.confidence ?? 1.0, options?.sourceDocId ?? null,
-        options?.sourceFact ?? null, now
-      );
-      return Number(result.lastInsertRowid);
+        const result = db.prepare(`
+          INSERT INTO entity_triples (subject_entity_id, predicate, object_entity_id, object_literal, valid_from, valid_to, confidence, source_doc_id, source_fact, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          subjectEntityId, pred, objectEntityId, objectLiteral,
+          options?.validFrom ?? null, options?.validTo ?? null,
+          options?.confidence ?? 1.0, options?.sourceDocId ?? null,
+          options?.sourceFact ?? null, now
+        );
+        const tripleId = Number(result.lastInsertRowid);
+        insertEvidence(tripleId);
+        return tripleId;
+      });
+      return txn.immediate() as number;
     },
 
     invalidateTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, endedDate?: string) => {
@@ -1503,10 +2102,10 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       return result.changes;
     },
 
-    queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both" }) => {
+    queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both"; includeProvenance?: boolean; provenanceLimit?: number }) => {
       const direction = options?.direction ?? "both";
       const asOf = options?.asOf;
-      const results: { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean }[] = [];
+      const results: { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean; evidenceCount?: number; sources?: { docId: number | null; collection: string | null; path: string | null; fact: string | null; at: string }[] }[] = [];
 
       if (direction === "outgoing" || direction === "both") {
         let query = `SELECT t.id, t.predicate, t.object_entity_id, t.object_literal, t.valid_from, t.valid_to, t.confidence,
@@ -1539,6 +2138,39 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         }
         for (const row of db.prepare(query).all(...params) as any[]) {
           results.push({ id: row.id, direction: "incoming", subject: row.sub_name, predicate: row.predicate, object: row.obj_name, validFrom: row.valid_from, validTo: row.valid_to, confidence: row.confidence, current: row.valid_to === null });
+        }
+      }
+
+      // Provenance is OPT-IN: the context-surfacing hook calls this per detected prompt entity
+      // and discards evidence fields — the default path must not pay these two queries.
+      if (options?.includeProvenance && results.length > 0) {
+        const provLimit = Math.max(1, options.provenanceLimit ?? 5);
+        const tripleIds = [...new Set(results.map(r => r.id))];
+        const ph = tripleIds.map(() => "?").join(",");
+        const counts = new Map<number, number>();
+        for (const row of db.prepare(
+          `SELECT triple_id, COUNT(*) AS n FROM entity_triple_provenance WHERE triple_id IN (${ph}) GROUP BY triple_id`
+        ).all(...tripleIds) as { triple_id: number; n: number }[]) {
+          counts.set(row.triple_id, row.n);
+        }
+        const sourcesByTriple = new Map<number, { docId: number | null; collection: string | null; path: string | null; fact: string | null; at: string }[]>();
+        for (const row of db.prepare(`
+          SELECT triple_id, source_doc_id, source_fact, created_at, collection, path FROM (
+            SELECT p.triple_id, p.source_doc_id, p.source_fact, p.created_at,
+                   d.collection AS collection, d.path AS path,
+                   ROW_NUMBER() OVER (PARTITION BY p.triple_id ORDER BY p.created_at DESC, p.id DESC) AS rn
+            FROM entity_triple_provenance p
+            LEFT JOIN documents d ON d.id = p.source_doc_id
+            WHERE p.triple_id IN (${ph})
+          ) WHERE rn <= ? ORDER BY triple_id, rn
+        `).all(...tripleIds, provLimit) as { triple_id: number; source_doc_id: number | null; source_fact: string | null; created_at: string; collection: string | null; path: string | null }[]) {
+          const list = sourcesByTriple.get(row.triple_id) ?? [];
+          list.push({ docId: row.source_doc_id, collection: row.collection, path: row.path, fact: row.source_fact, at: row.created_at });
+          sourcesByTriple.set(row.triple_id, list);
+        }
+        for (const r of results) {
+          r.evidenceCount = counts.get(r.id) ?? 0;
+          r.sources = sourcesByTriple.get(r.id) ?? [];
         }
       }
 
@@ -1769,17 +2401,25 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       if (ids.length === 0) return 0;
       const now = new Date().toISOString();
       const placeholders = ids.map(() => "?").join(",");
-      const result = db.prepare(`
-        UPDATE documents SET active = 0, archived_at = ?
-        WHERE id IN (${placeholders}) AND active = 1
-      `).run(now, ...ids);
-      return result.changes;
+      // `result.changes` is NOT the number of documents archived: the `documents_fts`
+      // triggers fire on this UPDATE and their shadow-table writes inflate the count
+      // (3 documents reported as 16). Count the matching rows explicitly, in the same
+      // transaction, so the number returned is the outcome rather than a side-effect total.
+      return db.transaction(() => {
+        const row = db.prepare(`
+          SELECT COUNT(*) AS n FROM documents WHERE id IN (${placeholders}) AND active = 1
+        `).get(...ids) as { n: number } | undefined;
+        db.prepare(`
+          UPDATE documents SET active = 0, archived_at = ?, deactivated_reason = 'archive'
+          WHERE id IN (${placeholders}) AND active = 1
+        `).run(now, ...ids);
+        return row?.n ?? 0;
+      })();
     },
 
     // Lifecycle management
     getArchiveCandidates: (policy) => getArchiveCandidatesFn(db, policy),
     restoreArchivedDocuments: (filter) => restoreArchivedDocumentsFn(db, filter),
-    purgeArchivedDocuments: (olderThanDays) => purgeArchivedDocumentsFn(db, olderThanDays),
     getLifecycleStats: () => getLifecycleStatsFn(db),
     searchArchived: (query, limit?) => searchArchivedFn(db, query, limit),
   };
@@ -1998,6 +2638,8 @@ export type DocumentRow = {
   title: string;
   hash: string;
   modifiedAt: string;
+  authoredAt: string | null;  // §51.1: authorship time; null = unknown
+  effectiveAt: string;        // §51.1: COALESCE(authored_at, modified_at) — content time
   domain: string | null;
   workstream: string | null;
   tags: string | null;
@@ -2084,215 +2726,44 @@ export function deleteLLMCache(db: Database): number {
   return result.changes;
 }
 
-/**
- * Mandatory scope for the DB-wide cleanup operations below (deleteInactiveDocuments,
- * cleanupOrphanedContent, cleanupOrphanedVectors). There is deliberately no default —
- * every call site must say explicitly whether it means one collection or the whole
- * database. This is the hardening for master-harness-t5i0: a bare, unscoped call to
- * deleteInactiveDocuments() previously hard-deleted 3566 pre-existing inactive
- * document rows (and their orphaned content/vectors) when only 50 disposable
- * smoke-test docs were meant to be purged.
- */
-export type CleanupScope = { collection: string } | { all: true };
+// NOTE: `deleteInactiveDocuments` was removed in v0.30.0. It ran
+// `DELETE FROM documents WHERE active = 0` — strictly broader than the retention purge,
+// since it destroyed every inactive row (archived AND forgotten) with no age restriction
+// and no authorization. It had no callers, but sat on the public `Store` interface, so any
+// holder of a store could invoke it. Deactivation must stay reversible; see the retention
+// note on the removed purge helper below.
 
 /**
- * Options shared by the scoped cleanup operations. `includeArchived` defaults to
- * false: lifecycle-archived rows (active = 0, archived_at IS NOT NULL, set by
- * `clawmem lifecycle sweep`) are restorable state, not garbage, and are spared by
- * default even under an `{all: true}` scope. Pass `includeArchived: true` to
- * deliberately also sweep archived rows (that is `clawmem lifecycle sweep`'s own
- * purge-after-days path, via purgeArchivedDocuments — NOT these functions).
+ * Remove content rows that no document references at all.
+ *
+ * The predicate must consider EVERY document, not just active ones. `documents.hash` is
+ * `ON DELETE CASCADE` on `content(hash)`, so deleting content still referenced by an
+ * archived or forgotten document destroys that document row too — a hard delete reached
+ * indirectly, which is exactly what the retention rule forbids. Scoping to `active = 1`
+ * did that: one archived document plus a cleanup call left zero documents.
+ *
+ * With the predicate below no cascade is possible, because nothing references the rows it
+ * removes. Returns the number of orphaned content rows deleted.
  */
-export interface CleanupOptions {
-  includeArchived?: boolean;
-}
-
-function assertCleanupScope(scope: CleanupScope): void {
-  if (!scope || typeof scope !== "object") {
-    throw new Error("cleanup scope is required: { collection: string } | { all: true }");
-  }
-  if ("collection" in scope) {
-    if (typeof scope.collection !== "string" || scope.collection.trim().length === 0) {
-      throw new Error("cleanup scope collection name must be a non-empty string");
-    }
-    if (/[*?[\]]/.test(scope.collection)) {
-      throw new Error(
-        `cleanup scope collection name is ambiguous (wildcard characters not supported): "${scope.collection}"`
-      );
-    }
-  } else if (!("all" in scope) || scope.all !== true) {
-    throw new Error("cleanup scope is required: { collection: string } | { all: true }");
-  }
-}
-
-/**
- * Remove inactive document records (active = 0), scoped to one named collection or
- * explicitly the whole database. By default, rows with archived_at IS NOT NULL
- * (lifecycle-archived, restorable) are spared regardless of scope; pass
- * opts.includeArchived = true to also delete them.
- * Returns the number of inactive documents deleted.
- */
-export function deleteInactiveDocuments(db: Database, scope: CleanupScope, opts: CleanupOptions = {}): number {
-  assertCleanupScope(scope);
-  const archivedGuard = opts.includeArchived ? "" : " AND archived_at IS NULL";
-  // Count via SELECT before DELETE rather than trusting run().changes: SQLite's
-  // changes() counter is cumulative across trigger side effects for the *same*
-  // top-level statement, which would over-report here if a row happened to still
-  // be FTS-indexed. Counting first keeps the return value an honest row count
-  // regardless of trigger/FK internals.
-  if ("collection" in scope) {
-    const before = db.prepare(
-      `SELECT COUNT(*) as c FROM documents WHERE active = 0 AND collection = ?${archivedGuard}`
-    ).get(scope.collection) as { c: number };
-    db.prepare(`DELETE FROM documents WHERE active = 0 AND collection = ?${archivedGuard}`).run(scope.collection);
-    return before.c;
-  }
-
-  const before = db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 0${archivedGuard}`).get() as { c: number };
-  db.prepare(`DELETE FROM documents WHERE active = 0${archivedGuard}`).run();
-  return before.c;
-}
-
-/**
- * Remove orphaned content hashes that are not referenced by any document still
- * considered "live" — active, or (by default) lifecycle-archived. Scoped to one
- * named collection or explicitly the whole database. Pass opts.includeArchived =
- * true to also drop content only referenced by archived rows (matching the
- * legacy active-only-liveness definition).
- * Returns the number of orphaned content hashes deleted.
- */
-export function cleanupOrphanedContent(db: Database, scope: CleanupScope, opts: CleanupOptions = {}): number {
-  assertCleanupScope(scope);
-  const liveClause = opts.includeArchived ? "active = 1" : "(active = 1 OR archived_at IS NOT NULL)";
-
-  // NOTE: content.hash is the parent side of `documents.hash REFERENCES
-  // content(hash) ON DELETE CASCADE` — deleting an orphaned content row will
-  // also cascade-delete any (already-inactive, non-live) document row still
-  // pointing at it. That is intentional here (it finishes GC'ing a forgotten
-  // document whose content just got swept) but it means run().changes is not
-  // a trustworthy content-row count — it includes the cascaded document
-  // deletes too. Count via SELECT before DELETE instead.
-  if ("collection" in scope) {
-    const before = db.prepare(`
-      SELECT COUNT(*) as c FROM content
-      WHERE hash IN (SELECT DISTINCT hash FROM documents WHERE collection = ?)
-        AND hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
-    `).get(scope.collection) as { c: number };
-    db.prepare(`
-      DELETE FROM content
-      WHERE hash IN (SELECT DISTINCT hash FROM documents WHERE collection = ?)
-        AND hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
-    `).run(scope.collection);
-    return before.c;
-  }
-
-  const before = db.prepare(`
-    SELECT COUNT(*) as c FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
-  `).get() as { c: number };
-  db.prepare(`
+export function cleanupOrphanedContent(db: Database): number {
+  const result = db.prepare(`
     DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents)
   `).run();
-  return before.c;
+  return result.changes;
 }
 
 // (Removed cleanupOrphanedVectors — an exposed, unfenced, non-transactional vector
 // mutation with no production caller. Use cleanStaleEmbeddings, which is lease-fenced
 // and atomic. See INCIDENT-2026-06-22 / codex review.)
 
-/**
- * Hard-delete a single named collection's documents — both active and inactive
- * (archived or forgotten) — plus their now-orphaned content and vector rows. This
- * is the collection-scoped purge API from master-harness-t5i0: the operation a
- * disposable smoke-test collection teardown actually needs, without reaching for
- * the DB-wide cleanup functions above and risking every other collection's
- * inactive/archived rows in the same pass.
- *
- * Unlike deleteInactiveDocuments/cleanupOrphaned*, this is a deliberate full
- * removal of one named collection (active rows included) — there is no
- * archived-row carve-out, because the caller is explicitly nuking that collection
- * in its entirety, not doing routine maintenance. Refuses an empty/missing or
- * wildcard-bearing collection name.
- *
- * Returns counts of rows deleted from each table.
- */
-export function purgeCollection(
-  db: Database,
-  collectionName: string
-): { documents: number; content: number; vectors: number } {
-  if (typeof collectionName !== "string" || collectionName.trim().length === 0) {
-    throw new Error("purgeCollection requires a non-empty collection name");
-  }
-  if (/[*?[\]]/.test(collectionName)) {
-    throw new Error(
-      `purgeCollection refuses an ambiguous collection name (wildcard characters not supported): "${collectionName}"`
-    );
-  }
-
-  const hashRows = db.prepare(
-    `SELECT DISTINCT hash FROM documents WHERE collection = ?`
-  ).all(collectionName) as { hash: string }[];
-
-  if (hashRows.length === 0) {
-    const exists = db.prepare(`SELECT 1 FROM documents WHERE collection = ? LIMIT 1`).get(collectionName);
-    if (!exists) {
-      throw new Error(`purgeCollection: no documents found for collection "${collectionName}" — nothing to purge`);
-    }
-  }
-
-  const hashes = hashRows.map(r => r.hash);
-  // Count via SELECT before DELETE: run().changes on a DELETE that touches an
-  // active (FTS-indexed) row is cumulative across the documents_fts sync
-  // trigger's internal shadow-table writes and over-reports the document
-  // count. Counting first keeps the return value an honest row count.
-  const docsBefore = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE collection = ?`).get(collectionName) as { c: number }).c;
-  db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
-
-  let contentDeleted = 0;
-  let vectorsDeleted = 0;
-
-  if (hashes.length > 0) {
-    const placeholders = hashes.map(() => "?").join(",");
-
-    const contentResult = db.prepare(`
-      DELETE FROM content
-      WHERE hash IN (${placeholders})
-        AND hash NOT IN (SELECT DISTINCT hash FROM documents)
-    `).run(...hashes);
-    contentDeleted = contentResult.changes;
-
-    const tableExists = db.prepare(`
-      SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'
-    `).get();
-    if (tableExists) {
-      const orphanHashRows = db.prepare(`
-        SELECT DISTINCT cv.hash FROM content_vectors cv
-        WHERE cv.hash IN (${placeholders})
-          AND cv.hash NOT IN (SELECT DISTINCT hash FROM documents)
-      `).all(...hashes) as { hash: string }[];
-
-      if (orphanHashRows.length > 0) {
-        const orphanHashes = orphanHashRows.map(r => r.hash);
-        const orphanPlaceholders = orphanHashes.map(() => "?").join(",");
-
-        db.prepare(`
-          DELETE FROM vectors_vec WHERE hash_seq IN (
-            SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
-            WHERE cv.hash IN (${orphanPlaceholders})
-          )
-        `).run(...orphanHashes);
-
-        const vecResult = db.prepare(`
-          DELETE FROM content_vectors WHERE hash IN (${orphanPlaceholders})
-        `).run(...orphanHashes);
-        vectorsDeleted = vecResult.changes;
-      }
-    }
-  }
-
-  return { documents: docsBefore, content: contentDeleted, vectors: vectorsDeleted };
-}
+// (Removed the t5i0 scoped cleanup surface — CleanupScope/CleanupOptions,
+// deleteInactiveDocuments, and purgeCollection — at the v0.36 sync (9jyc0):
+// upstream v0.30.0 removed physical document-row deletion from the package
+// entirely ("ClawMem stops deleting rows"), and the fork's collection purge is
+// exactly that capability. Disk reclamation is an out-of-band operator action
+// on the SQLite file. The t5i0 scope-guard's goal — bounding destructive
+// radius — is achieved more strongly by not offering destruction at all.)
 
 /**
  * Run VACUUM to reclaim unused space in the database.
@@ -2396,6 +2867,16 @@ export function insertContent(db: Database, hash: string, content: string, creat
 /**
  * Insert a new document into the documents table.
  */
+/**
+ * Who owns a document row's lifecycle (origin-aware reconciliation).
+ * 'fs'  — created/maintained by the filesystem indexer; reconciled against disk.
+ * 'api' — DB-born (hooks, saveMemory, beads sync, REST); no backing file BY DESIGN, so
+ *         filesystem absence means nothing and the reconciler must never deactivate it.
+ * NULL  — ambiguous legacy row (pre-migration); exempt from reconciliation, adopted by the
+ *         next writer to touch it (indexer → 'fs', saveMemory → 'api'). Never inferred.
+ */
+export type DocumentOrigin = "fs" | "api";
+
 export function insertDocument(
   db: Database,
   collectionName: string,
@@ -2404,14 +2885,17 @@ export function insertDocument(
   hash: string,
   createdAt: string,
   modifiedAt: string,
-  description?: string | null
+  description?: string | null,
+  origin: DocumentOrigin = "api"
 ): void {
   // Guard: gray-matter can coerce YAML values to Date/boolean/null — SQLite rejects these
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
+  // origin defaults to 'api': a caller this parameter has not reached yet becomes exempt
+  // from filesystem reconciliation — stale-active at worst, never a destroyed DB-born row.
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, description)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt, description ?? null);
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, description, origin)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt, description ?? null, origin);
 }
 
 // =============================================================================
@@ -2449,6 +2933,14 @@ export type SaveMemoryParams = {
   semanticPayload?: string;
   /** Topic key for future upsert support (Phase 2). */
   topicKey?: string;
+  /**
+   * §51.1: when the content was originally written (UTC ISO), as opposed to
+   * created_at/modified_at which stay filing/update time. Validated strictly;
+   * invalid values are treated as absent. Advances monotonically on dedup and
+   * path-conflict updates (a newer repeated assertion moves it forward;
+   * reprocessing older evidence never regresses it).
+   */
+  authoredAt?: string;
 };
 
 export type SaveMemoryResult = {
@@ -2475,13 +2967,51 @@ const DEDUP_WINDOW_MINUTES = 30;
 
 export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryResult {
   const now = new Date().toISOString();
+  const authoredAt = normalizeIsoTimestamp(params.authoredAt);
   const payload = params.semanticPayload || params.body;
   const normHash = hashNormalized(payload);
   const bodyHasher = new Bun.CryptoHasher("sha256");
   bodyHasher.update(params.body);
   const bodyHash = bodyHasher.digest("hex");
 
+  // --- Ownership + lifecycle preflight (before ANY write, including dedup's counters) ---
+  // Rejecting later would leak writes: an orphaned content row on a rejected insert, or a
+  // dedup counter bump on a row the caller had no claim to. Rules: an ACTIVE
+  // filesystem-owned row is never overwritten (this function's contract excludes file-backed
+  // indexing — API content masquerading as the unchanged file would never be re-read past
+  // the indexer's content-hash short-circuit, and file removal would absence-deactivate it).
+  // An INACTIVE row at the path is a lifecycle state — forget/archive are memory decisions
+  // (§55.6 D9) and an absence-deactivated row's recovery is a deliberate operation — so it
+  // is neither overwritten nor resurrected; it also occupies UNIQUE(collection, path), where
+  // a blind insert would orphan the content row on the rethrow. NULL-origin ACTIVE rows are
+  // claimable — saveMemory touching one IS the proof of API ownership; content_hash proves
+  // nothing (mined imports write it too).
+  const pathRow = db.prepare(
+    `SELECT origin, active, deactivated_reason FROM documents WHERE collection = ? AND path = ?`
+  ).get(params.collection, params.path) as
+    { origin: string | null; active: number; deactivated_reason: string | null } | null;
+  if (pathRow) {
+    if (pathRow.active === 1 && pathRow.origin === "fs") {
+      throw new Error(
+        `saveMemory: path collision with a filesystem-owned document ` +
+        `(${params.collection}/${params.path}) — refusing to overwrite. ` +
+        `Write API memories to a path the filesystem indexer does not own.`,
+      );
+    }
+    if (pathRow.active === 0) {
+      throw new Error(
+        `saveMemory: path is occupied by an inactive document ` +
+        `(${params.collection}/${params.path}, deactivated_reason=${pathRow.deactivated_reason ?? "null"}) — ` +
+        `lifecycle decisions are not overwritten. Write to a new path, or restore the ` +
+        `document deliberately first.`,
+      );
+    }
+  }
+
   // --- Dedup check: same normalized_hash within window ---
+  // Candidates are restricted to API-claimable rows: a filesystem-owned row is never a dedup
+  // target (it also never carries a normalized_hash today — belt and suspenders), and a
+  // NULL-origin candidate is adopted 'api' by the counter update (touch-adoption).
   const dedupRow = db.prepare(`
     SELECT id, duplicate_count
     FROM documents
@@ -2489,6 +3019,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
       AND collection = ?
       AND content_type = ?
       AND normalized_hash = ?
+      AND (origin IS NULL OR origin = 'api')
       AND datetime(created_at) >= datetime('now', ?)
     ORDER BY created_at DESC
     LIMIT 1
@@ -2500,90 +3031,145 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
   ) as { id: number; duplicate_count: number } | null;
 
   if (dedupRow) {
-    // Increment duplicate_count and update last_seen_at
-    db.prepare(`
-      UPDATE documents
-      SET duplicate_count = duplicate_count + 1,
-          last_seen_at = ?
-      WHERE id = ?
-    `).run(now, dedupRow.id);
+    // Increment duplicate_count and update last_seen_at. §51.1: a validated
+    // incoming authorship advances authored_at monotonically (CASE, not scalar
+    // MAX — MAX(NULL, x) is NULL in SQLite and could never populate an
+    // initially unknown row); absent incoming leaves the column untouched.
+    //
+    // The UPDATE re-checks ownership ATOMICALLY: between the SELECT above and this
+    // statement, another process (the indexer) may adopt a NULL candidate as 'fs' —
+    // stamping 'api' over that fresh declaration would be a silent ownership overwrite.
+    // Zero changes means the candidate was claimed mid-flight; the call falls through to
+    // the transactional write phase, which revalidates the requested path (insert, an
+    // API-owned update, or rejection via the conflict handling).
+    let dedupChanges: number;
+    if (authoredAt) {
+      dedupChanges = db.prepare(`
+        UPDATE documents
+        SET duplicate_count = duplicate_count + 1,
+            last_seen_at = ?,
+            origin = 'api',
+            authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END
+        WHERE id = ? AND active = 1 AND (origin IS NULL OR origin = 'api')
+      `).run(now, authoredAt, authoredAt, dedupRow.id).changes;
+    } else {
+      dedupChanges = db.prepare(`
+        UPDATE documents
+        SET duplicate_count = duplicate_count + 1,
+            last_seen_at = ?,
+            origin = 'api'
+        WHERE id = ? AND active = 1 AND (origin IS NULL OR origin = 'api')
+      `).run(now, dedupRow.id).changes;
+    }
+
+    if (dedupChanges > 0) {
+      return {
+        action: 'deduplicated',
+        docId: dedupRow.id,
+        duplicateCount: dedupRow.duplicate_count + 1,
+      };
+    }
+    // Candidate lost to a concurrent ownership claim — fall through to the write phase.
+  }
+
+  // --- Write phase (transactional) ---
+  // Content insert + document insert + the conflict path run in ONE transaction, so a race
+  // rejection (the indexer claiming the path between preflight and insert) rolls the content
+  // row back instead of leaking an orphan. Bun's Database.transaction nests via savepoints,
+  // so a caller-held transaction is safe.
+  const writePhase = db.transaction((): SaveMemoryResult => {
+    // Store content
+    db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+      .run(bodyHash, params.body, now);
+
+    // Insert document row
+    try {
+      db.prepare(`
+        INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
+                               content_type, confidence, quality_score, normalized_hash,
+                               duplicate_count, revision_count, last_seen_at, topic_key, description, authored_at,
+                               origin)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, 'api')
+      `).run(
+        params.collection,
+        params.path,
+        params.title,
+        bodyHash,
+        now,
+        now,
+        params.contentType,
+        params.confidence ?? 0.5,
+        params.qualityScore ?? 0.5,
+        normHash,
+        now,
+        params.topicKey ?? null,
+        params.description ?? null,
+        authoredAt,
+      );
+    } catch (err: any) {
+      // UNIQUE(collection, path) conflict — update existing row
+      if (err?.message?.includes("UNIQUE constraint")) {
+        const existing = db.prepare(
+          "SELECT id, origin FROM documents WHERE collection = ? AND path = ? AND active = 1"
+        ).get(params.collection, params.path) as { id: number; origin: string | null } | null;
+
+        if (existing) {
+          // Race guard for the ownership preflight above: the indexer may have claimed this
+          // path between the preflight and the insert. Same rule — an explicit 'fs' owner is
+          // never overwritten (the throw rolls this transaction back, content row included);
+          // NULL stays claimable and the update below stamps 'api'.
+          if (existing.origin === "fs") {
+            throw new Error(
+              `saveMemory: path collision with a filesystem-owned document ` +
+              `(${params.collection}/${params.path}) — refusing to overwrite. ` +
+              `Write API memories to a path the filesystem indexer does not own.`,
+            );
+          }
+          // §51.1: same monotonic authored_at advancement as the dedup branch. The update
+          // also stamps origin='api': saveMemory touching the row IS proof of API ownership,
+          // healing legacy NULL-origin rows on their next write.
+          const authoredSet = authoredAt
+            ? ", authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END"
+            : "";
+          const updateVals: (string | number | null)[] = [
+            bodyHash, params.title, now, params.contentType,
+            params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
+            now,
+          ];
+          if (authoredAt) updateVals.push(authoredAt, authoredAt);
+          updateVals.push(existing.id);
+          db.prepare(`
+            UPDATE documents
+            SET hash = ?, title = ?, modified_at = ?, content_type = ?,
+                confidence = ?, quality_score = ?, normalized_hash = ?,
+                revision_count = revision_count + 1, last_seen_at = ?, origin = 'api'${authoredSet}
+            WHERE id = ?
+          `).run(...updateVals);
+
+          const updated = db.prepare("SELECT revision_count FROM documents WHERE id = ?")
+            .get(existing.id) as { revision_count: number } | null;
+
+          return {
+            action: 'updated',
+            docId: existing.id,
+            revisionCount: updated?.revision_count ?? 1,
+          };
+        }
+      }
+      throw err;
+    }
+
+    // Get the inserted row ID
+    const newDoc = db.prepare(
+      "SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1"
+    ).get(params.collection, params.path) as { id: number } | null;
 
     return {
-      action: 'deduplicated',
-      docId: dedupRow.id,
-      duplicateCount: dedupRow.duplicate_count + 1,
+      action: 'inserted',
+      docId: newDoc?.id ?? -1,
     };
-  }
-
-  // --- Insert new document ---
-  // Store content
-  db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
-    .run(bodyHash, params.body, now);
-
-  // Insert document row
-  try {
-    db.prepare(`
-      INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
-                             content_type, confidence, quality_score, normalized_hash,
-                             duplicate_count, revision_count, last_seen_at, topic_key, description)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?)
-    `).run(
-      params.collection,
-      params.path,
-      params.title,
-      bodyHash,
-      now,
-      now,
-      params.contentType,
-      params.confidence ?? 0.5,
-      params.qualityScore ?? 0.5,
-      normHash,
-      now,
-      params.topicKey ?? null,
-      params.description ?? null,
-    );
-  } catch (err: any) {
-    // UNIQUE(collection, path) conflict — update existing row
-    if (err?.message?.includes("UNIQUE constraint")) {
-      const existing = db.prepare(
-        "SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1"
-      ).get(params.collection, params.path) as { id: number } | null;
-
-      if (existing) {
-        db.prepare(`
-          UPDATE documents
-          SET hash = ?, title = ?, modified_at = ?, content_type = ?,
-              confidence = ?, quality_score = ?, normalized_hash = ?,
-              revision_count = revision_count + 1, last_seen_at = ?
-          WHERE id = ?
-        `).run(
-          bodyHash, params.title, now, params.contentType,
-          params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
-          now, existing.id
-        );
-
-        const updated = db.prepare("SELECT revision_count FROM documents WHERE id = ?")
-          .get(existing.id) as { revision_count: number } | null;
-
-        return {
-          action: 'updated',
-          docId: existing.id,
-          revisionCount: updated?.revision_count ?? 1,
-        };
-      }
-    }
-    throw err;
-  }
-
-  // Get the inserted row ID
-  const newDoc = db.prepare(
-    "SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1"
-  ).get(params.collection, params.path) as { id: number } | null;
-
-  return {
-    action: 'inserted',
-    docId: newDoc?.id ?? -1,
-  };
+  });
+  return writePhase();
 }
 
 // =============================================================================
@@ -2742,12 +3328,22 @@ export function reactivateDocument(
   title: string,
   hash: string,
   modifiedAt: string
-): void {
+): boolean {
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
   // The reset_embed_on_hash_change trigger resets embed_state/attempts/error iff the
   // hash actually changes, so re-adding unchanged content preserves its valid vectors.
-  db.prepare(`UPDATE documents SET active = 1, title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(safeTitle, hash, modifiedAt, documentId);
+  //
+  // §55.6 D9: every successful active=1 writer clears the deactivation provenance — but this
+  // generic reactivator must not overrule a lifecycle decision. `updateProfile` calls it on any
+  // inactive profile row during a routine `clawmem update` (src/profile.ts), so without the
+  // predicate a forgotten profile came back on the next index — and an archived one came back
+  // still carrying `archived_at`, recreating the exact inconsistent state the migration repairs.
+  // Restoring an archived document is `restoreArchivedDocuments`' job, not this function's.
+  const result = db.prepare(
+    `UPDATE documents SET active = 1, title = ?, hash = ?, modified_at = ?, deactivated_reason = NULL
+     WHERE id = ? AND (deactivated_reason IS NULL OR deactivated_reason = 'absent')`,
+  ).run(safeTitle, hash, modifiedAt, documentId);
+  return result.changes > 0;
 }
 
 /**
@@ -2782,11 +3378,26 @@ export function updateDocument(
 }
 
 /**
- * Deactivate a document (mark as inactive but don't delete).
+ * Why a document was deactivated (§55.6 D9). Only `'absent'` is reversible by the indexer;
+ * `'forget'` and `'archive'` are lifecycle decisions it must never undo.
  */
-export function deactivateDocument(db: Database, collectionName: string, path: string): void {
-  db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = ? AND active = 1`)
-    .run(collectionName, path);
+export type DeactivationReason = "absent" | "forget" | "archive";
+
+/**
+ * Deactivate a document (mark as inactive but don't delete).
+ *
+ * `reason` is required because this one function serves two unrelated owners — the indexer's
+ * absence loop and the MCP/REST forget path — and the indexer's reactivate branch keys on it.
+ * Defaulting it would silently re-open the bug it exists to close.
+ */
+export function deactivateDocument(
+  db: Database,
+  collectionName: string,
+  path: string,
+  reason: DeactivationReason,
+): void {
+  db.prepare(`UPDATE documents SET active = 0, deactivated_reason = ? WHERE collection = ? AND path = ? AND active = 1`)
+    .run(reason, collectionName, path);
 }
 
 /**
@@ -2797,6 +3408,33 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
     SELECT path FROM documents WHERE collection = ? AND active = 1
   `).all(collectionName) as { path: string }[];
   return rows.map(r => r.path);
+}
+
+/**
+ * Paths eligible for filesystem-absence reconciliation: active rows the filesystem indexer
+ * owns (origin = 'fs'). DB-born rows (origin = 'api' — hooks, saveMemory, beads, REST) have
+ * no backing file BY DESIGN; treating their absence from disk as deletion destroyed
+ * hook-written memories (measured in one production vault: 2,430 of 2,437 DB-born rows
+ * deactivated). NULL-origin legacy rows are exempt too — fail-safe.
+ *
+ * Failure posture is fail-SAFE: on a pre-migration schema (the one error this function
+ * recognizes) it returns NO paths — reconciliation simply does not run until the migration
+ * lands, and the open-time warning reports that state. There is no inference fallback:
+ * content_hash proves nothing about ownership (mined imports write it too). Every other
+ * error propagates (the caller's transaction rolls back); no failure may widen the
+ * enumeration.
+ */
+export function getReconcilableDocumentPaths(db: Database, collectionName: string): string[] {
+  try {
+    const rows = db.prepare(`
+      SELECT path FROM documents WHERE collection = ? AND active = 1 AND origin = 'fs'
+    `).all(collectionName) as { path: string }[];
+    return rows.map(r => r.path);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/no such column.*origin/i.test(msg)) throw err;
+    return [];
+  }
 }
 
 export { formatQueryForEmbedding, formatDocForEmbedding };
@@ -2987,7 +3625,14 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
   // Normalize: remove leading # if present
   const shortHash = docid.startsWith('#') ? docid.slice(1) : docid;
 
-  if (shortHash.length < 1) return null;
+  // Structural validation BEFORE the value reaches LIKE: a docid is a hex
+  // prefix of a sha256 hash, 6–64 chars (the documented short-docid contract).
+  // Anything else returns not-found — this closes real holes on EVERY docid
+  // surface (destructive REST forget included): `_`/`%` are LIKE wildcards
+  // that matched arbitrary documents, a 1-char prefix is ambiguity-by-design,
+  // and an unbounded value made SQLite's LIKE throw ("pattern too complex")
+  // instead of answering.
+  if (!/^[0-9a-fA-F]{6,64}$/.test(shortHash)) return null;
 
   // Look up documents where hash starts with the short hash
   const doc = db.prepare(`
@@ -3225,27 +3870,13 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
 }
 
 /**
- * Remove a collection and clean up its documents.
- * Uses collections.ts to remove from YAML config and cleans up database.
+ * NOTE: the store-level `removeCollection` was removed in v0.30.0. It ran
+ * `DELETE FROM documents WHERE collection = ?` — an unauthorized hard delete of an entire
+ * collection's documents. It had no callers: `clawmem collection remove` goes through
+ * `collections.ts`'s `removeCollection`, which edits the YAML config only and leaves the
+ * indexed rows to deactivate on the next update. That is the reversible path and remains
+ * the only one. Do not reintroduce a row-destroying variant here.
  */
-export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
-  // Delete documents from database
-  const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
-
-  // Clean up orphaned content hashes
-  const cleanupResult = db.prepare(`
-    DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
-  `).run();
-
-  // Remove from YAML config (returns true if found and removed)
-  collectionsRemoveCollection(collectionName);
-
-  return {
-    deletedDocs: docResult.changes,
-    cleanedHashes: cleanupResult.changes
-  };
-}
 
 /**
  * Rename a collection.
@@ -3503,7 +4134,21 @@ export function buildFTS5Query(query: string): string | null {
   return buildAndGroup(query);
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): SearchResult[] {
+/**
+ * Convert an FTS5 bm25() value into a stable [0,1) relevance score where higher is better.
+ *
+ * FTS5's bm25() is negative-is-better: it returns -1 × the BM25 score, so it is ≤ 0 for
+ * every match. The transform is per-row and monotonic in match strength (|bm25|/(1+|bm25|))
+ * with no per-query normalization, so cross-query comparisons, minScore filters, and the
+ * strong-signal bypass all stay meaningful. A hypothetical positive input clamps to 0
+ * rather than inverting the ordering.
+ */
+export function ftsScoreFromBm25(bm25Score: number): number {
+  const m = Math.max(0, -bm25Score);
+  return m / (1 + m);
+}
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -3534,10 +4179,27 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     params.push(String(collectionId));
   }
 
-  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint)
+  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint).
+  // §51.1: content-time predicate — authorship when known, filing time otherwise.
   if (dateRange) {
-    sql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
+    sql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
     params.push(dateRange.start, dateRange.end);
+  }
+
+  // Visibility exclusion (VSEARCH-TRUST-HARDENING (b).1): excluded collections never enter
+  // the candidate pool, so `limit` is satisfied with allowed content by construction.
+  if (excludeCollections && excludeCollections.length > 0) {
+    const exPlaceholders = excludeCollections.map(() => '?').join(',');
+    sql += ` AND d.collection NOT IN (${exPlaceholders})`;
+    params.push(...excludeCollections);
+  }
+
+  // WHY observation lane (v0.32.0): the structural predicate is applied IN the candidate
+  // selection, so `limit` is satisfied with eligible observation documents by construction —
+  // a post-filter over a fixed overfetch could be starved by higher-ranked non-observation
+  // internal artifacts.
+  if (opts?.observationsOnly) {
+    sql += ` AND d.path LIKE 'observations/%' AND d.observation_type IS NOT NULL`;
   }
 
   // bm25 lower is better; sort ascending.
@@ -3547,9 +4209,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; modified_at: string; bm25_score: number }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
-    // Convert bm25 (lower is better) into a stable (0..1] score where higher is better.
-    // Avoid per-query normalization so "strong signal" heuristics can work.
-    const score = 1 / (1 + Math.max(0, row.bm25_score));
+    const score = ftsScoreFromBm25(row.bm25_score);
     return {
       filepath: row.filepath,
       displayPath: row.display_path,
@@ -3571,12 +4231,67 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): Promise<SearchResult[]> {
+// W1 read-path model-consistency cache, keyed on SQLite's `data_version` so a CROSS-PROCESS vault
+// rebuild invalidates a stale OK verdict. `data_version` changes whenever ANOTHER connection commits
+// (e.g. a separate `clawmem embed --force` process re-embeds with a different model) — exactly the
+// multi-process staleness case — and is a cheap header read (no scan), unlike the getVecModels()
+// DISTINCT+JOIN it guards. Same-connection writes don't bump it, but in-process model swaps are
+// already blocked by the embed-time VecModelMismatchError / clearAllEmbeddings drop.
+const verifiedQueryEmbedModels = new WeakMap<Database, { dataVersion: number; model: string }>();
+
+/**
+ * Guard the query path against a same-dimension embedding-model swap. Compares the ENDPOINT-returned
+ * model (NOT the caller's DEFAULT_EMBED_MODEL arg, which is a local alias unrelated to what the
+ * endpoint actually serves) against the models the vault's active vectors were embedded with. The
+ * vault is consistent ONLY when it holds EXACTLY ONE model equal to the endpoint's — a heterogeneous
+ * vault (length > 1) is cosine-corrupt even if the endpoint matches one of the models, because the
+ * other model's vectors still pollute the space. Throws VecReadModelMismatchError otherwise; no-ops
+ * when the vault has no vectors yet.
+ */
+function assertQueryEmbedModelConsistent(db: Database, endpointModel: string): void {
+  const dataVersion = (db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version;
+  const cached = verifiedQueryEmbedModels.get(db);
+  if (cached && cached.dataVersion === dataVersion && cached.model === endpointModel) return;
+
+  const storedModels = getVecModels(db);
+  if (storedModels.length === 0) return; // nothing embedded yet — nothing to be inconsistent with
+
+  if (!(storedModels.length === 1 && storedModels[0] === endpointModel)) {
+    throw new VecReadModelMismatchError(storedModels, endpointModel);
+  }
+
+  // Consistent — memoize under the current data_version. A cross-process rebuild bumps data_version,
+  // invalidating this entry so the next query re-reads content_vectors.
+  verifiedQueryEmbedModels.set(db, { dataVersion, model: endpointModel });
+}
+
+// Step 1 of vector search — the expensive, off-loadable half: embed the query, guard the wall-clock
+// deadline, then run the SYNCHRONOUS sqlite-vec MATCH. Returns raw {hash_seq, distance} hits;
+// collection/date filtering is a Step-2 concern. Split out (BACKLOG Source 46) so the vector-query
+// daemon can run JUST this half on the long-lived watcher — keeping the blocking MATCH off the hook's
+// event loop — while the hook hydrates locally via hydrateVecResults(). In-process searchVec() below
+// composes the two, so its public contract is unchanged.
+export async function searchVecMatch(db: Database, query: string, model: string, limit: number = 20, deadlineMs?: number): Promise<{ hash_seq: string; distance: number }[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedding = await getEmbedding(query, model, true);
-  if (!embedding) return [];
+  const embedResult = await getEmbedding(query, model, true, deadlineMs);
+  if (!embedResult) return [];
+
+  // W1: read-path embedding-model consistency gate + dimension check via the SHARED guard
+  // (same guard the eval-only precomputed-vector entry runs — the two paths cannot diverge).
+  // On a same-dimension model swap this throws VecReadModelMismatchError rather than serving
+  // cosine-meaningless results. Cached per (db, model) — the DISTINCT runs at most once per
+  // model per process.
+  assertQueryVectorCompatible(db, embedResult.model, embedResult.embedding.length);
+
+  const embedding = embedResult.embedding;
+
+  // Guard-defect fix: the caller's Promise.race(vectorTimeout) cannot interrupt the SYNCHRONOUS
+  // sqlite-vec MATCH below (bun:sqlite blocks the event loop) and does NOT cancel this promise.
+  // If the wall-clock budget already elapsed during the async embed above, bail here so a
+  // timed-out vector leg cannot resume and re-block the hook after it fell back to FTS.
+  if (deadlineMs !== undefined && Date.now() >= deadlineMs) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
@@ -3584,12 +4299,17 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // See: https://github.com/tobi/qmd/pull/23
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
-  const vecResults = db.prepare(`
+  return db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
   `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+}
 
+// Step 2 of vector search — the cheap, local half: hydrate raw {hash_seq, distance} hits into
+// SearchResult[] via indexed JOINs, collection/date filtering, and per-doc dedup. Pure primary-key
+// SQLite lookups — safe to run in the short-lived hook process even when Step 1 ran in the daemon.
+export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; distance: number }[], limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }): SearchResult[] {
   if (vecResults.length === 0) return [];
 
   // Step 2: Get chunk info and document data
@@ -3626,9 +4346,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
     params.push(String(collectionId));
   }
 
-  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint)
+  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint).
+  // §51.1: content-time predicate — authorship when known, filing time otherwise.
   if (dateRange) {
-    docSql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
+    docSql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
     params.push(dateRange.start, dateRange.end);
   }
 
@@ -3673,16 +4394,275 @@ export async function searchVec(db: Database, query: string, model: string, limi
     });
 }
 
+// In-process vector search — Step 1 (MATCH) + Step 2 (hydrate) composed. Public contract unchanged;
+// the daemon-backed hook path (context-surfacing) instead calls searchVecMatch (in the daemon) +
+// hydrateVecResults (locally), so the blocking MATCH never runs on the hook's event loop.
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number): Promise<SearchResult[]> {
+  const vecResults = await searchVecMatch(db, query, model, limit, deadlineMs);
+  return hydrateVecResults(db, vecResults, limit, collectionId, collections, dateRange);
+}
+
+// =============================================================================
+// Detailed vector search — visibility exclusion + escalation (VSEARCH-TRUST-HARDENING (b).1)
+// =============================================================================
+
+/**
+ * Shared query-vector compatibility guard — model consistency (W1) + dimension-vs-table
+ * validation, called by BOTH the production embed path and the eval-only precomputed-vector
+ * entry so the two can never diverge (design (e), T4-M4).
+ */
+function assertQueryVectorCompatible(db: Database, endpointModel: string, dim: number): void {
+  assertQueryEmbedModelConsistent(db, endpointModel);
+  const tableDim = getVecTableDim(db);
+  if (tableDim !== null && tableDim !== dim) throw new VecDimensionMismatchError(tableDim, dim);
+}
+
+export interface VecSearchDetailedOpts {
+  collectionId?: number;
+  collections?: string[];
+  excludeCollections?: string[];
+  dateRange?: { start: string; end: string };
+  deadlineMs?: number;
+  /** Override the hard MATCH-depth cap (default 4096). Primarily for tests. */
+  escalationCap?: number;
+  /** WHY observation lane (v0.32.0): restrict candidates to `_clawmem` observation documents
+   * (path 'observations/%' + observation_type set) inside the hydration SQL, so the escalation
+   * loop fills `limit` with eligible observations by construction. */
+  observationsOnly?: boolean;
+}
+
+export interface VecSearchDetailedResult {
+  results: SearchResult[];
+  degraded: boolean;
+  degradedReason?: "excluded-dominant" | "cap-truncation";
+  scannedFragments: number;
+  excludedDocsSeen: number;
+}
+
+// Hard MATCH-depth cap for exclusion escalation. Exhausting a 60k+ table per query is a
+// hot-path perf cliff; past this the result carries an explicit degraded marker instead.
+const VEC_ESCALATION_HARD_CAP = 4096;
+
+// Hydration + visibility classification for one escalation round. Include-collections and
+// dateRange are SQL predicates (a row failing them was never a candidate); EXCLUSION is
+// classified in JS because the excluded-doc count is part of the degraded contract (T5-M2).
+function hydrateVecResultsClassified(
+  db: Database,
+  vecResults: { hash_seq: string; distance: number }[],
+  limit: number,
+  opts: VecSearchDetailedOpts,
+  exclude: Set<string>
+): { results: SearchResult[]; allowedDocs: number; excludedDocsSeen: number } {
+  if (vecResults.length === 0) return { results: [], allowedDocs: 0, excludedDocsSeen: 0 };
+
+  const hashSeqs = vecResults.map(r => r.hash_seq);
+  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
+  const placeholders = hashSeqs.map(() => '?').join(',');
+  let docSql = `
+    SELECT
+      cv.hash || '_' || cv.seq as hash_seq,
+      cv.hash,
+      cv.pos,
+      cv.fragment_type,
+      cv.fragment_label,
+      d.collection,
+      'clawmem://' || d.collection || '/' || d.path as filepath,
+      d.collection || '/' || d.path as display_path,
+      d.title,
+      d.modified_at,
+      content.doc as body
+    FROM content_vectors cv
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL
+    JOIN content ON content.hash = d.hash
+    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+  `;
+  const params: string[] = [...hashSeqs];
+
+  if (opts.collections && opts.collections.length > 0) {
+    const colPlaceholders = opts.collections.map(() => '?').join(',');
+    docSql += ` AND d.collection IN (${colPlaceholders})`;
+    params.push(...opts.collections);
+  } else if (opts.collectionId) {
+    docSql += ` AND d.collection = ?`;
+    params.push(String(opts.collectionId));
+  }
+  if (opts.dateRange) {
+    // §51.1: content-time predicate — authorship when known, filing time otherwise.
+    docSql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
+    params.push(opts.dateRange.start, opts.dateRange.end);
+  }
+  if (opts.observationsOnly) {
+    docSql += ` AND d.path LIKE 'observations/%' AND d.observation_type IS NOT NULL`;
+  }
+
+  const docRows = db.prepare(docSql).all(...params) as {
+    hash_seq: string; hash: string; pos: number; collection: string; filepath: string;
+    display_path: string; title: string; body: string; modified_at: string;
+    fragment_type: string | null; fragment_label: string | null;
+  }[];
+
+  const excludedDocs = new Set<string>();
+  const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
+  for (const row of docRows) {
+    if (exclude.has(row.collection)) {
+      excludedDocs.add(row.filepath);
+      continue;
+    }
+    const distance = distanceMap.get(row.hash_seq) ?? 1;
+    const existing = seen.get(row.filepath);
+    if (!existing || distance < existing.bestDist) {
+      seen.set(row.filepath, { row, bestDist: distance });
+    }
+  }
+
+  const results = Array.from(seen.values())
+    .sort((a, b) => a.bestDist - b.bestDist)
+    .slice(0, limit)
+    .map(({ row, bestDist }) => ({
+      filepath: row.filepath,
+      displayPath: row.display_path,
+      title: row.title,
+      hash: row.hash,
+      docid: getDocid(row.hash),
+      collectionName: row.collection,
+      modifiedAt: row.modified_at || "",
+      bodyLength: row.body.length,
+      body: row.body,
+      context: getContextForFile(db, row.filepath),
+      score: 1 - bestDist,
+      source: "vec" as const,
+      chunkPos: row.pos,
+      fragmentType: row.fragment_type ?? undefined,
+      fragmentLabel: row.fragment_label ?? undefined,
+    }));
+
+  return { results, allowedDocs: seen.size, excludedDocsSeen: excludedDocs.size };
+}
+
+/**
+ * Eval-only + internal core: detailed vector search from a PRECOMPUTED query vector.
+ * Runs the SAME shared compatibility guard as the production path (T3-M2/T4-M4) — the
+ * endpointModel MUST come from the actual embed response that produced the vector.
+ * Synchronous (MATCH + hydration only); writes nothing.
+ */
+export function searchVecDetailedWithVector(
+  db: Database,
+  queryVec: { embedding: Float32Array; endpointModel: string },
+  limit: number = 20,
+  opts: VecSearchDetailedOpts = {}
+): VecSearchDetailedResult {
+  const empty: VecSearchDetailedResult = { results: [], degraded: false, scannedFragments: 0, excludedDocsSeen: 0 };
+  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!tableExists) return empty;
+
+  assertQueryVectorCompatible(db, queryVec.endpointModel, queryVec.embedding.length);
+
+  const exclude = new Set(opts.excludeCollections ?? []);
+  const tableRows = (db.prepare(`SELECT count(*) as c FROM vectors_vec`).get() as { c: number }).c;
+  if (tableRows === 0) return empty;
+  const hardCap = opts.escalationCap ?? VEC_ESCALATION_HARD_CAP;
+  const effectiveCap = Math.min(hardCap, tableRows);
+
+  const matchStmt = db.prepare(`SELECT hash_seq, distance FROM vectors_vec WHERE embedding MATCH ? AND k = ?`);
+
+  let k = Math.min(limit * 3, effectiveCap);
+  let raw: { hash_seq: string; distance: number }[] = [];
+  let classified: ReturnType<typeof hydrateVecResultsClassified> = { results: [], allowedDocs: 0, excludedDocsSeen: 0 };
+
+  // Escalation loop (filtering callers only): grow MATCH depth x3 until `limit` allowed
+  // DOCUMENTS (post-dedup) hydrate, the effective cap is hit, or the deadline passes.
+  // `observationsOnly` filters in the hydration SQL exactly like a collection exclusion does,
+  // so it engages the same escalation — otherwise nearer non-observation internals could
+  // starve the observation lane out of its first limit*3 raw candidates. Without any
+  // filtering this runs exactly once at limit*3 — today's semantics.
+  const filteringActive = exclude.size > 0 || !!opts.observationsOnly;
+  for (;;) {
+    raw = matchStmt.all(queryVec.embedding, k) as { hash_seq: string; distance: number }[];
+    classified = hydrateVecResultsClassified(db, raw, limit, opts, exclude);
+    const done =
+      !filteringActive ||
+      classified.allowedDocs >= limit ||
+      k >= effectiveCap ||
+      raw.length < k || // MATCH returned fewer than requested: table exhausted below k
+      (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs);
+    if (done) break;
+    k = Math.min(k * 3, effectiveCap);
+  }
+
+  // Degraded contract (T4-M1 + T5-M2): only the HARD cap preventing an exhaustive scan
+  // counts — scanning the whole (sub-cap) table is ordinary corpus exhaustion, no marker.
+  const scannedFragments = raw.length;
+  let degraded = false;
+  let degradedReason: VecSearchDetailedResult["degradedReason"];
+  const underfilled = classified.allowedDocs < limit;
+  const hardCapPreventedExhaustion = tableRows > hardCap && k >= hardCap;
+  if (filteringActive && underfilled && hardCapPreventedExhaustion) {
+    degraded = true;
+    degradedReason = classified.excludedDocsSeen >= (limit - classified.allowedDocs)
+      ? "excluded-dominant"
+      : "cap-truncation";
+  }
+
+  return {
+    results: classified.results,
+    degraded,
+    degradedReason,
+    scannedFragments,
+    excludedDocsSeen: classified.excludedDocsSeen,
+  };
+}
+
+/**
+ * Detailed vector search — embeds the query, then delegates to the precomputed-vector core.
+ * The entry for every exclusion-enabled caller; carries the FULL searchVec parameter surface
+ * (collections / collectionId / dateRange / deadlineMs) so temporal RRF is never contaminated
+ * by dropped filters (T6-H2).
+ */
+export async function searchVecDetailed(
+  db: Database,
+  query: string,
+  model: string,
+  limit: number = 20,
+  opts: VecSearchDetailedOpts = {}
+): Promise<VecSearchDetailedResult> {
+  const empty: VecSearchDetailedResult = { results: [], degraded: false, scannedFragments: 0, excludedDocsSeen: 0 };
+  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!tableExists) return empty;
+
+  const embedResult = await getEmbedding(query, model, true, opts.deadlineMs);
+  if (!embedResult) return empty;
+  if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
+
+  return searchVecDetailedWithVector(
+    db,
+    { embedding: new Float32Array(embedResult.embedding), endpointModel: embedResult.model },
+    limit,
+    opts
+  );
+}
+
 // =============================================================================
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, deadlineMs?: number): Promise<{ embedding: number[]; model: string } | null> {
   const llm = getDefaultLlamaCpp();
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
-  const result = await llm.embed(formattedText, { model, isQuery });
-  return result?.embedding || null;
+  // B4: bound the remote embed fetch + its 429 backoff to the caller's wall-clock
+  // deadline. Under the context-surfacing hook's Promise.race the abandoned embed
+  // promise otherwise keeps its fetch + retry sleeps running; AbortSignal.timeout
+  // actually cancels them, so a slow/rate-limited embed can no longer outlive the
+  // hook budget.
+  let signal: AbortSignal | undefined;
+  if (deadlineMs !== undefined) {
+    const remaining = deadlineMs - Date.now();
+    if (remaining <= 0) return null; // deadline already elapsed — skip the embed entirely
+    signal = AbortSignal.timeout(remaining);
+  }
+  const result = await llm.embed(formattedText, { model, isQuery, signal });
+  if (!result?.embedding) return null;
+  return { embedding: result.embedding, model: result.model };
 }
 
 /**
@@ -3710,17 +4690,25 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
   // Also retry docs left 'pending' (crash mid-doc) or 'failed' (partial fragment failure) so partial
   // embeds are not permanently silent — bounded by embed_attempts < 3. The OR-branch is parenthesized
   // so embed_attempts < 3 and d.active = 1 always apply to every selected row (SQL precedence).
+  // The (collection, path, title) tuple must be ONE REAL document row (T9-M1): independent
+  // MIN() per column can synthesize a tuple belonging to no document, which then produces a
+  // canonicalDocId that matches nothing at doctor time. min(collection||'/'||path) picks a
+  // deterministic real alias; the correlated join recovers that row's actual columns.
   return db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path, MIN(d.title) as title, MIN(d.collection) as collection,
-           MIN(d.description) as description
-    FROM documents d
-    JOIN content c ON d.hash = c.hash
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.fragment_type IS NOT NULL
-    LEFT JOIN content_vectors v0 ON d.hash = v0.hash AND v0.seq = 0
-    WHERE d.active = 1
-      AND COALESCE(d.embed_attempts, 0) < 3
-      AND ((v.hash IS NULL OR v0.hash IS NULL) OR d.embed_state IN ('pending', 'failed'))
-    GROUP BY d.hash
+    SELECT g.hash, c.doc as body, d.path as path, d.title as title, d.collection as collection,
+           d.description as description
+    FROM (
+      SELECT dd.hash, MIN(dd.collection || '/' || dd.path) as canon_key
+      FROM documents dd
+      LEFT JOIN content_vectors v ON dd.hash = v.hash AND v.fragment_type IS NOT NULL
+      LEFT JOIN content_vectors v0 ON dd.hash = v0.hash AND v0.seq = 0
+      WHERE dd.active = 1
+        AND COALESCE(dd.embed_attempts, 0) < 3
+        AND ((v.hash IS NULL OR v0.hash IS NULL) OR dd.embed_state IN ('pending', 'failed'))
+      GROUP BY dd.hash
+    ) g
+    JOIN documents d ON d.hash = g.hash AND d.active = 1 AND (d.collection || '/' || d.path) = g.canon_key
+    JOIN content c ON g.hash = c.hash
   `).all() as { hash: string; body: string; path: string; title: string; collection: string; description: string | null }[];
 }
 
@@ -3792,7 +4780,8 @@ export function insertEmbedding(
   fragmentType?: string,
   fragmentLabel?: string,
   canonicalId?: string,
-  leaseGuard?: LeaseGuard
+  leaseGuard?: LeaseGuard,
+  embedInputFp?: string
 ): void {
   const hashSeq = `${hash}_${seq}`;
   // Atomic vec0 + metadata write: the DELETE (vec0's "upsert" — no INSERT OR
@@ -3813,8 +4802,8 @@ export function insertEmbedding(
     db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run(hashSeq);
     db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(hashSeq, embedding);
     db.prepare(
-      `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(hash, seq, pos, model, embeddedAt, fragmentType ?? null, fragmentLabel ?? null, canonicalId ?? null);
+      `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id, embed_input_fp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(hash, seq, pos, model, embeddedAt, fragmentType ?? null, fragmentLabel ?? null, canonicalId ?? null, embedInputFp ?? null);
   }).immediate(); // immediate write lock: the lease assert reads under the lock, so a lost-lease write can't slip through
 }
 
@@ -3828,6 +4817,8 @@ export type EmbeddingWrite = {
   fragmentType?: string;
   fragmentLabel?: string;
   canonicalId?: string;
+  /** SHA-256 over the UTF-8 bytes of the exact formatted embed input (v0.21 (d).4 / T5-L1). */
+  embedInputFp?: string;
 };
 
 /**
@@ -3848,7 +4839,7 @@ export function insertEmbeddingsBatch(db: Database, writes: EmbeddingWrite[], le
   const deleteVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
   const insertVec = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
   const upsertContent = db.prepare(
-    `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id, embed_input_fp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   db.transaction(() => {
     assertLeaseHeld(db, leaseGuard);
@@ -3858,7 +4849,7 @@ export function insertEmbeddingsBatch(db: Database, writes: EmbeddingWrite[], le
       insertVec.run(hashSeq, w.embedding);
       upsertContent.run(
         w.hash, w.seq, w.pos, w.model, w.embeddedAt,
-        w.fragmentType ?? null, w.fragmentLabel ?? null, w.canonicalId ?? null
+        w.fragmentType ?? null, w.fragmentLabel ?? null, w.canonicalId ?? null, w.embedInputFp ?? null
       );
     }
   }).immediate(); // immediate write lock: lease assert reads under the lock (see insertEmbedding)
@@ -3892,14 +4883,24 @@ export type ExpandedQuery = {
 const EXPAND_CACHE_VERSION = "v3-qmd-terse-typed";
 const EXPAND_PROVIDER_FINGERPRINT = "qmd-terse";
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<ExpandedQuery[]> {
-  // Typed-JSON cache. Versioned key (include intent + provider fingerprint).
-  const cacheKey = getCacheKey(`expandQuery:${EXPAND_CACHE_VERSION}`, {
+/**
+ * The EXACT llm_cache key expandQuery(query, model, intent) reads and writes.
+ * Exported for eval harnesses (S49.3 freeze protocol): delete/verify expansion
+ * cache rows without replicating the private key construction — the version and
+ * provider fingerprint stay in one place.
+ */
+export function expandQueryCacheKey(query: string, model: string = DEFAULT_QUERY_MODEL, intent?: string): string {
+  return getCacheKey(`expandQuery:${EXPAND_CACHE_VERSION}`, {
     query,
     model,
     provider: EXPAND_PROVIDER_FINGERPRINT,
     ...(intent && { intent }),
   });
+}
+
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<ExpandedQuery[]> {
+  // Typed-JSON cache. Versioned key (include intent + provider fingerprint).
+  const cacheKey = expandQueryCacheKey(query, model, intent);
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
@@ -3952,9 +4953,49 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string): Promise<{ file: string; score: number }[]> {
+/** Options for the reranker health probe. Production query/hook callers omit all of these. */
+export type RerankProbeOptions = {
+  /** Skip the rerank cache entirely — forces a live endpoint call (health probes). */
+  noCache?: boolean;
+  /** Throw RerankCoverageError if any input doc was not scored by the reranker (checked before zero-fill). */
+  requireLiveCoverage?: boolean;
+  /** Abort signal for the remote fetch. */
+  signal?: AbortSignal;
+  /** Convenience: derive AbortSignal.timeout(timeoutMs) for the remote fetch when no signal is given. */
+  timeoutMs?: number;
+};
+
+/** Thrown by rerank() when requireLiveCoverage is set and the reranker did not score every input doc. */
+export class RerankCoverageError extends Error {
+  constructor(public readonly missing: string[]) {
+    super(`rerank coverage incomplete: ${missing.length} document(s) not scored by the reranker`);
+    this.name = "RerankCoverageError";
+  }
+}
+
+/**
+ * Thrown by rerank() when requireLiveCoverage is set and the reranker's raw response violates the
+ * coverage contract: wrong result count, duplicate/out-of-range index, or a non-finite score. A
+ * malformed-but-responding reranker is exactly the failure a health probe must catch — it must not
+ * be silently accepted (and a duplicate index can otherwise leave a doc unscored, or an out-of-range
+ * index can crash the score apply).
+ */
+export class RerankMalformedResponseError extends Error {
+  constructor(public readonly problems: string[]) {
+    super(`rerank response malformed: ${problems.join("; ")}`);
+    this.name = "RerankMalformedResponseError";
+  }
+}
+
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, options?: RerankProbeOptions): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
+  const noCache = options?.noCache === true;
+  // Health probes thread a timeout to the remote fetch (the production path is otherwise untimed).
+  // 1d1fn: default the remote fetch deadline (CLAWMEM_REMOTE_FETCH_TIMEOUT_MS, 60s) so a hung/
+  // unreachable reranker fails fast instead of riding Bun's unbounded connect/idle wait. Probes
+  // may still pass an explicit signal/timeoutMs, which wins.
+  const fetchSignal = options?.signal ?? AbortSignal.timeout(options?.timeoutMs ?? REMOTE_RERANK_FETCH_TIMEOUT_MS);
 
   // Backend URL for this call, read ONCE up front so it can namespace the rerank cache key
   // (master-harness d0hz / ADR-0059 cache-key pitfall). The SAME (query,file,model) reranked
@@ -3981,16 +5022,22 @@ export async function rerank(query: string, documents: { file: string; text: str
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
 
-  // Check cache for each unique document
-  for (const doc of uniqueDocs) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model, rerankUrl });
-    const cached = getCachedResult(db, cacheKey);
-    if (cached !== null) {
-      const score = parseFloat(cached);
-      // Apply score to all files sharing this text
-      for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, score);
-    } else {
-      uncachedDocs.push({ file: doc.file, text: doc.text });
+  // Check cache for each unique document. noCache (health probes) skips the cache entirely so the
+  // call always exercises the live endpoint — a cached probe would mask an endpoint silently
+  // reverted to a broken reranker.
+  if (noCache) {
+    for (const doc of uniqueDocs) uncachedDocs.push({ file: doc.file, text: doc.text });
+  } else {
+    for (const doc of uniqueDocs) {
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model, rerankUrl });
+      const cached = getCachedResult(db, cacheKey);
+      if (cached !== null) {
+        const score = parseFloat(cached);
+        // Apply score to all files sharing this text
+        for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, score);
+      } else {
+        uncachedDocs.push({ file: doc.file, text: doc.text });
+      }
     }
   }
 
@@ -3998,31 +5045,72 @@ export async function rerank(query: string, documents: { file: string; text: str
   // Cap parallelism at 4 to prevent VRAM exhaustion
   if (uncachedDocs.length > 0) {
     // rerankUrl hoisted to function scope above (d0hz) so it namespaces the cache key.
+    const rerankApiKey = Bun.env.CLAWMEM_RERANK_API_KEY;
     let scored = false;
 
     // Try remote GPU reranker first
     // Truncate to ~400 chars per doc to fit within server's 512-token context
     // (query + document must fit in one pair; ~2 chars/token for mixed content)
     if (rerankUrl) {
+      // Independent of the embed/LLM keys — the rerank endpoint may be a different
+      // authenticated host. Sent as Authorization: Bearer when CLAWMEM_RERANK_API_KEY is set.
+      const rerankHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      if (rerankApiKey) rerankHeaders["Authorization"] = `Bearer ${rerankApiKey}`;
       try {
         // Process in batches of 4 to prevent VRAM exhaustion
         for (let i = 0; i < uncachedDocs.length; i += 4) {
           const batch = uncachedDocs.slice(i, i + 4);
           const resp = await fetch(`${rerankUrl}/v1/rerank`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: rerankHeaders,
             body: JSON.stringify({
               query: rerankQuery,
               documents: batch.map(d => d.text.slice(0, 400)),
             }),
-            signal: AbortSignal.timeout(REMOTE_RERANK_FETCH_TIMEOUT_MS),
+            signal: fetchSignal,
           });
           if (resp.ok) {
-            const data = await resp.json() as { results: { index: number; relevance_score: number }[] };
-            for (const r of data.results) {
-              const doc = batch[r.index]!;
-              const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model, rerankUrl });
-              setCachedResult(db, cacheKey, r.relevance_score.toString());
+            let data: { results: { index: number; relevance_score: number }[] };
+            try {
+              data = await resp.json() as { results: { index: number; relevance_score: number }[] };
+            } catch {
+              // Invalid JSON from a 200 response. For a probe this is a malformed remote → surface it;
+              // for production treat it like a transport failure and fall through to local.
+              if (options?.requireLiveCoverage) throw new RerankMalformedResponseError(["response body is not valid JSON"]);
+              break;
+            }
+            // Strict contract for health probes: a results array of exactly batch.length, each with a
+            // unique in-range integer index and a finite numeric score. A malformed-but-responding
+            // reranker (including a null/primitive body) must surface, not be silently accepted.
+            if (options?.requireLiveCoverage) {
+              const problems: string[] = [];
+              if (data === null || typeof data !== "object" || !Array.isArray(data.results)) {
+                problems.push("response is not an object with a results array");
+              } else {
+                if (data.results.length !== batch.length) {
+                  problems.push(`batch expected ${batch.length} results, got ${data.results.length}`);
+                }
+                const seen = new Set<number>();
+                for (const r of data.results) {
+                  if (!Number.isInteger(r?.index) || r.index < 0 || r.index >= batch.length) problems.push(`index ${r?.index} out of range`);
+                  else if (seen.has(r.index)) problems.push(`duplicate index ${r.index}`);
+                  else seen.add(r.index);
+                  if (typeof r?.relevance_score !== "number" || !Number.isFinite(r.relevance_score)) problems.push(`non-finite score at index ${r?.index}`);
+                }
+              }
+              if (problems.length > 0) throw new RerankMalformedResponseError(problems);
+            }
+            // Defensive (all callers): guard a non-array body, and skip out-of-range/non-finite entries
+            // so a malformed response can never crash the score apply or store garbage. Under
+            // requireLiveCoverage the strict check above has already thrown; here a skipped entry just
+            // leaves the doc unscored (→ coverage error for probes, → zero-fill for production).
+            for (const r of (Array.isArray(data?.results) ? data.results : [])) {
+              const doc = batch[r.index];
+              if (!doc || typeof r.relevance_score !== "number" || !Number.isFinite(r.relevance_score)) continue;
+              if (!noCache) {
+                const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model, rerankUrl });
+                setCachedResult(db, cacheKey, r.relevance_score.toString());
+              }
               // Apply score to all files sharing this text
               for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, r.relevance_score);
             }
@@ -4031,8 +5119,11 @@ export async function rerank(query: string, documents: { file: string; text: str
           }
         }
         scored = cachedResults.size > 0;
-      } catch {
-        // Remote failed, fall through to local
+      } catch (e) {
+        // Network/transport failure → fall through to local. But a malformed-response error (only
+        // raised under requireLiveCoverage) is a probe FINDING about the remote endpoint — propagate
+        // it instead of masking it with the local fallback.
+        if (e instanceof RerankMalformedResponseError) throw e;
       }
     }
 
@@ -4044,8 +5135,10 @@ export async function rerank(query: string, documents: { file: string; text: str
         const rerankResult = await llm.rerank(rerankQuery, remaining, { model });
         for (const result of rerankResult.results) {
           const doc = remaining.find(d => d.file === result.file);
-          const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: result.file, model, rerankUrl });
-          setCachedResult(db, cacheKey, result.score.toString());
+          if (!noCache) {
+            const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: result.file, model, rerankUrl });
+            setCachedResult(db, cacheKey, result.score.toString());
+          }
           // Apply score to all files sharing this text
           if (doc) {
             for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, result.score);
@@ -4055,6 +5148,14 @@ export async function rerank(query: string, documents: { file: string; text: str
         }
       }
     }
+  }
+
+  // Coverage check BEFORE the zero-fill below (health probes only, via requireLiveCoverage).
+  // After the map, an omitted score and a true 0 are indistinguishable, so a partial endpoint
+  // would otherwise look fully covered. See RERANKER-HEALTH-GUARD-DESIGN.md §5 (H1/M4).
+  if (options?.requireLiveCoverage) {
+    const missing = documents.filter(doc => !cachedResults.has(doc.file)).map(doc => doc.file);
+    if (missing.length > 0) throw new RerankCoverageError(missing);
   }
 
   // Return all results sorted by score
@@ -4623,7 +5724,7 @@ function markUsageReferencedFn(db: Database, id: number): void {
 // SAME: Document Metadata Operations
 // =============================================================================
 
-function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }): void {
+function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number; authored_at?: string | null }): void {
   const sets: string[] = [];
   const vals: (string | number | null)[] = [];
   if (meta.domain !== undefined) { sets.push("domain = ?"); vals.push(meta.domain); }
@@ -4634,6 +5735,9 @@ function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: stri
   if (meta.review_by !== undefined) { sets.push("review_by = ?"); vals.push(meta.review_by); }
   if (meta.confidence !== undefined) { sets.push("confidence = ?"); vals.push(meta.confidence); }
   if (meta.quality_score !== undefined) { sets.push("quality_score = ?"); vals.push(meta.quality_score); }
+  // §51.1: undefined = leave untouched; explicit null = CLEAR (file-backed
+  // frontmatter is authoritative — a removed/invalid authored_at clears the row).
+  if (meta.authored_at !== undefined) { sets.push("authored_at = ?"); vals.push(meta.authored_at); }
   if (sets.length === 0) return;
   vals.push(docId);
   db.prepare(`UPDATE documents SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
@@ -4661,16 +5765,24 @@ function incrementAccessCountFn(db: Database, paths: string[]): void {
   `).run(now, ...paths);
 }
 
-function getDocumentsByTypeFn(db: Database, contentType: string, limit: number = 10): DocumentRow[] {
+function getDocumentsByTypeFn(db: Database, contentType: string, limit: number = 10, opts?: { orderBy?: "operational" | "effective" }): DocumentRow[] {
+  // §51.1 D13: "effective" orders/limits by content time (authorship when known).
+  // Content-currency callers must use the returned effectiveAt — not modifiedAt —
+  // for ordering, cutoff filtering, and displayed dates. Default stays operational.
+  const orderExpr = opts?.orderBy === "effective"
+    ? "COALESCE(d.authored_at, d.modified_at)"
+    : "d.modified_at";
   return db.prepare(`
     SELECT d.id, d.collection, d.path, d.title, d.hash, d.modified_at as modifiedAt,
+           d.authored_at as authoredAt,
+           COALESCE(d.authored_at, d.modified_at) as effectiveAt,
            d.domain, d.workstream, d.tags, d.content_type as contentType,
            d.review_by as reviewBy, d.confidence, d.access_count as accessCount,
            LENGTH(c.doc) as bodyLength, d.pinned
     FROM documents d
     JOIN content c ON c.hash = d.hash
     WHERE d.active = 1 AND d.content_type = ?
-    ORDER BY d.modified_at DESC
+    ORDER BY ${orderExpr} DESC
     LIMIT ?
   `).all(contentType, limit) as DocumentRow[];
 }
@@ -4698,8 +5810,12 @@ function updateObservationFieldsFn(
 }
 
 function getStaleDocumentsFn(db: Database, beforeDate: string): DocumentRow[] {
+  // Staleness review stays on operational time (§51.1) — authoredAt/effectiveAt
+  // are hydrated only so the returned rows satisfy the DocumentRow contract.
   return db.prepare(`
     SELECT d.id, d.collection, d.path, d.title, d.hash, d.modified_at as modifiedAt,
+           d.authored_at as authoredAt,
+           COALESCE(d.authored_at, d.modified_at) as effectiveAt,
            d.domain, d.workstream, d.tags, d.content_type as contentType,
            d.review_by as reviewBy, d.confidence, d.access_count as accessCount,
            LENGTH(c.doc) as bodyLength
@@ -4861,6 +5977,26 @@ export { detectBeadsProject };
  * Build temporal backbone - connect documents in chronological order.
  * Returns number of edges created.
  */
+/**
+ * Count edges of one relation type whose BOTH endpoints are still active.
+ *
+ * The graph builders only ever operate on active documents, so a raw `COUNT(*)` over
+ * `memory_relations` reports edges the live graph no longer contains — deactivating one
+ * endpoint left the reported total unchanged while the active graph had shrunk. Counting the
+ * same population the builders work on is what makes "N new, M total" internally consistent.
+ *
+ * Lives here rather than inline at each caller so the MCP tool and the REST endpoint cannot
+ * drift apart: they previously carried separate copies of this query.
+ */
+export function countActiveRelations(db: Database, relationType: string): number {
+  return (db.prepare(
+    `SELECT COUNT(*) c FROM memory_relations r
+       JOIN documents src ON src.id = r.source_id AND src.active = 1
+       JOIN documents tgt ON tgt.id = r.target_id AND tgt.active = 1
+     WHERE r.relation_type = ?`,
+  ).get(relationType) as { c: number }).c;
+}
+
 export function buildTemporalBackbone(db: Database): number {
   // Get all documents ordered by creation time
   const docs = db.prepare(`
@@ -4877,12 +6013,12 @@ export function buildTemporalBackbone(db: Database): number {
     const prev = docs[i - 1]!;
     const curr = docs[i]!;
 
-    db.prepare(`
+    // Count rows SQLite actually wrote — `INSERT OR IGNORE` suppresses conflicts,
+    // so an attempt counter reports edges that were never persisted.
+    edges += db.prepare(`
       INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
       VALUES (?, ?, 'temporal', 1.0, ?)
-    `).run(prev.id, curr.id, new Date().toISOString());
-
-    edges++;
+    `).run(prev.id, curr.id, new Date().toISOString()).changes;
   }
 
   return edges;
@@ -4928,11 +6064,12 @@ export async function buildSemanticGraph(
 
     for (const sim of similar) {
       const similarity = 1 - sim.distance;
-      db.prepare(`
+      // Count rows SQLite actually wrote, matching buildTemporalBackbone — the two
+      // counters feed one `build_graphs` response and must report the same unit.
+      edges += db.prepare(`
         INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
         VALUES (?, ?, 'semantic', ?, ?)
-      `).run(doc1.id, sim.target_id, similarity, new Date().toISOString());
-      edges++;
+      `).run(doc1.id, sim.target_id, similarity, new Date().toISOString()).changes;
     }
   }
 
@@ -4943,110 +6080,340 @@ export async function buildSemanticGraph(
 // A-MEM: Causal Graph Traversal
 // =============================================================================
 
-export type CausalLink = {
+/** One projected fact-pair witness on a causal edge (s342). Legacy witnesses
+ *  (ordinals = -1) carry pre-cut evidence whose fact ordinals are unknowable. */
+export type CausalWitness = {
+  sourceFactOrdinal: number;
+  targetFactOrdinal: number;
+  sourceFact: string | null;
+  targetFact: string | null;
+  reasoning: string;
+  confidence: number;
+  /** created_at of the max-confidence sighting for this ordinal pair. */
+  strongestAt: string;
+  /** most recent sighting created_at for this ordinal pair — distinct from strongestAt. */
+  lastSeenAt: string;
+  legacy: boolean;
+};
+
+/** Directed causal edge record: invariant physical edge identity
+ *  (sourceDocId → targetDocId) with traversal provenance kept SEPARATE
+ *  (predecessorDocId/depth/direction) — consumers never invert fields. */
+export type CausalEdgeRecord = {
+  sourceDocId: number;
+  targetDocId: number;
+  /** The far endpoint this hop reached (== targetDocId outbound, sourceDocId inbound). */
   docId: number;
   title: string;
   filepath: string;
+  predecessorDocId: number;
   depth: number;
+  direction: 'causes' | 'caused_by';
   weight: number;
-  reasoning: string | null;
+  /** Distinct ordinal-pair witnesses on this edge (witnesses lists the top 3). */
+  evidenceCount: number;
+  witnesses: CausalWitness[];
+  /** true when witnesses were synthesized in-memory from pre-cut edge metadata. */
+  legacy: boolean;
 };
 
+export type CausalEdgesResult = { edges: CausalEdgeRecord[]; truncated: boolean };
+
+/** Combined budget across BOTH directions; the reader fetches budget+1 per
+ *  direction as an overflow probe so `truncated` is truthful. */
+export const CAUSAL_READER_MAX_EDGES = 50;
+export const CAUSAL_READER_MAX_WITNESSES = 3;
+
+type RawEdge = {
+  sourceDocId: number;
+  targetDocId: number;
+  docId: number;
+  title: string;
+  filepath: string;
+  predecessorDocId: number;
+  depth: number;
+  direction: 'causes' | 'caused_by';
+  weight: number;
+  metadata: string | null;
+  edgeCreatedAt: string | null;
+};
+
+/** Deterministic total order for results AND truncation:
+ *  (depth, weight DESC, sourceDocId, targetDocId, direction). */
+function compareCausalEdges(a: RawEdge, b: RawEdge): number {
+  return a.depth - b.depth
+    || b.weight - a.weight
+    || a.sourceDocId - b.sourceDocId
+    || a.targetDocId - b.targetDocId
+    || a.direction.localeCompare(b.direction);
+}
+
+/** Iterative bounded traversal, level-synchronous across BOTH directions so the
+ *  retained set is the globally-first `probeLimit` edges under the reader's
+ *  total order — (depth, weight DESC, sourceDocId, targetDocId, direction) —
+ *  never an ID-arrival-order sample of one direction. Per level, each
+ *  direction's SQL contributes its top `remaining` edges by weight (sufficient:
+ *  the global top-R at one depth needs at most R from either direction), the
+ *  level competes as one pool, and only KEPT edges extend the next frontier —
+ *  a dropped edge never sponsors deeper traversal it wouldn't explain.
+ *
+ *  Eligibility (`active = 1 AND invalidated_at IS NULL`) is enforced on EVERY
+ *  expansion, so an invalidated document stops traversal through it — never
+ *  just hidden from output. Each node expands at most once per direction
+ *  (cycle-safe); distinct edges all surface, so diamond paths keep every real
+ *  edge. Titles are display-bounded so base responses stay under the wire
+ *  ceiling by construction. */
+function collectCausalEdges(
+  db: Database,
+  anchorId: number,
+  dirs: Array<'causes' | 'caused_by'>,
+  maxDepth: number,
+  probeLimit: number,
+): RawEdge[] {
+  const edges: RawEdge[] = [];
+  const seen = new Set<string>();
+  const state = dirs.map(dir => ({
+    dir,
+    frontier: [anchorId] as number[],
+    expanded: new Set<number>([anchorId]),
+  }));
+
+  for (let depth = 1; depth <= maxDepth && edges.length < probeLimit; depth++) {
+    const remaining = probeLimit - edges.length;
+    const level: RawEdge[] = [];
+    for (const st of state) {
+      if (st.frontier.length === 0) continue;
+      const outbound = st.dir === 'causes';
+      const nearCol = outbound ? 'source_id' : 'target_id';
+      const farCol = outbound ? 'target_id' : 'source_id';
+      const placeholders = st.frontier.map(() => '?').join(',');
+      const rows = db.prepare(
+        `SELECT mr.source_id, mr.target_id, mr.weight, mr.metadata,
+                mr.created_at AS edge_created_at,
+                d.title, d.collection || '/' || d.path AS filepath
+         FROM memory_relations mr
+         JOIN documents d ON d.id = mr.${farCol}
+         WHERE mr.${nearCol} IN (${placeholders})
+           AND mr.relation_type = 'causal'
+           AND d.active = 1 AND d.invalidated_at IS NULL
+         ORDER BY COALESCE(mr.weight, 1.0) DESC, mr.source_id, mr.target_id
+         LIMIT ?`,
+      ).all(...st.frontier, remaining) as Array<{
+        source_id: number; target_id: number; weight: number | null;
+        metadata: string | null; edge_created_at: string | null;
+        title: string; filepath: string;
+      }>;
+      for (const row of rows) {
+        const far = outbound ? row.target_id : row.source_id;
+        const near = outbound ? row.source_id : row.target_id;
+        level.push({
+          sourceDocId: row.source_id,
+          targetDocId: row.target_id,
+          docId: far,
+          title: row.title.slice(0, 300),
+          filepath: row.filepath,
+          predecessorDocId: near,
+          depth,
+          direction: st.dir,
+          weight: row.weight ?? 1.0,
+          metadata: row.metadata,
+          edgeCreatedAt: row.edge_created_at,
+        });
+      }
+    }
+
+    // One pool per level: both directions compete under the total order.
+    level.sort(compareCausalEdges);
+    const kept: RawEdge[] = [];
+    for (const e of level) {
+      if (edges.length + kept.length >= probeLimit) break;
+      const key = `${e.sourceDocId}:${e.targetDocId}:${e.direction}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      kept.push(e);
+    }
+    edges.push(...kept);
+
+    let anyFrontier = false;
+    for (const st of state) {
+      const next: number[] = [];
+      for (const e of kept) {
+        if (e.direction !== st.dir) continue;
+        if (!st.expanded.has(e.docId)) {
+          st.expanded.add(e.docId);
+          next.push(e.docId);
+        }
+      }
+      next.sort((a, b) => a - b);
+      st.frontier = next;
+      if (next.length > 0) anyFrontier = true;
+    }
+    if (!anyFrontier) break;
+  }
+  return edges;
+}
+
+type ProjectedWitnessRow = {
+  source_id: number; target_id: number;
+  source_fact_ordinal: number; target_fact_ordinal: number;
+  source_fact: string | null; target_fact: string | null;
+  reasoning: string; confidence: number; legacy: number;
+  created_at: string; last_seen_at: string;
+  pair_rank: number; evidence_count: number;
+};
+
+/** SQL-side witness projection: per ordinal pair the max-confidence sighting
+ *  wins (tie → latest created_at, then highest id), pairs rank by projected
+ *  confidence, and only the top CAUSAL_READER_MAX_WITNESSES rows per edge —
+ *  plus an honest per-edge evidence_count — cross into JS. Sightings are
+ *  append-only forever (recurrence appends by design), so the reader must
+ *  never hydrate an edge's complete history into memory. */
+function projectedWitnessSql(edgeTupleCount: number): string {
+  const valueTuples = Array.from({ length: edgeTupleCount }, () => '(?, ?)').join(',');
+  return `
+    WITH pair_proj AS (
+      SELECT source_id, target_id, source_fact_ordinal, target_fact_ordinal,
+             source_fact, target_fact, reasoning, confidence, legacy, created_at,
+             ROW_NUMBER() OVER (
+               PARTITION BY source_id, target_id, source_fact_ordinal, target_fact_ordinal
+               ORDER BY confidence DESC, created_at DESC, id DESC) AS rn,
+             MAX(created_at) OVER (
+               PARTITION BY source_id, target_id, source_fact_ordinal, target_fact_ordinal) AS last_seen_at
+      FROM causal_witness_sightings
+      WHERE (source_id, target_id) IN (VALUES ${valueTuples})
+    ),
+    ranked AS (
+      SELECT *,
+             ROW_NUMBER() OVER (
+               PARTITION BY source_id, target_id
+               ORDER BY confidence DESC, source_fact_ordinal, target_fact_ordinal) AS pair_rank,
+             COUNT(*) OVER (PARTITION BY source_id, target_id) AS evidence_count
+      FROM pair_proj WHERE rn = 1
+    )
+    SELECT source_id, target_id, source_fact_ordinal, target_fact_ordinal,
+           source_fact, target_fact, reasoning, confidence, legacy, created_at,
+           last_seen_at, pair_rank, evidence_count
+    FROM ranked WHERE pair_rank <= ${CAUSAL_READER_MAX_WITNESSES}`;
+}
+
+/** Lazy read-through for untouched pre-cut edges: synthesize one legacy display
+ *  witness — via the SAME validity rule the writer and census apply
+ *  (`parseLegacyEdgeWitness`), so no surface calls an edge valid that another
+ *  refuses. Never written; invalid evidence yields NO witness. */
+function synthesizeLegacyWitness(edge: RawEdge): CausalWitness | null {
+  const parsed = parseLegacyEdgeWitness({ weight: edge.weight, metadata: edge.metadata });
+  if (!parsed) return null;
+  return {
+    sourceFactOrdinal: -1,
+    targetFactOrdinal: -1,
+    sourceFact: parsed.sourceFact,
+    targetFact: parsed.targetFact,
+    reasoning: parsed.reasoning,
+    confidence: parsed.confidence,
+    strongestAt: edge.edgeCreatedAt ?? '',
+    lastSeenAt: edge.edgeCreatedAt ?? '',
+    legacy: true,
+  };
+}
+
+/**
+ * s342 causal reader: evidence-preserving directed edge traversal.
+ *
+ * Returns directed edge records — invariant sourceDocId/targetDocId with
+ * traversal predecessor/depth/direction separate — each carrying up to
+ * CAUSAL_READER_MAX_WITNESSES projected fact-pair witnesses. One combined
+ * CAUSAL_READER_MAX_EDGES budget spans both directions, with an overflow probe
+ * for a truthful `truncated` flag. Multi-hop CHAIN quality is explicitly
+ * experimental (canon fence): depth > 1 records are per-edge evidence, never a
+ * verified chain.
+ */
 export function findCausalLinks(
   db: Database,
   docId: number,
   direction: 'causes' | 'caused_by' | 'both' = 'both',
   maxDepth: number = 5
-): CausalLink[] {
+): CausalEdgesResult {
   if (maxDepth < 1) maxDepth = 1;
   if (maxDepth > 10) maxDepth = 10;
 
-  let query: string;
+  // Anchor eligibility: an inactive or invalidated anchor yields nothing.
+  const anchor = db.prepare(
+    `SELECT 1 FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL`,
+  ).get(docId);
+  if (!anchor) return { edges: [], truncated: false };
 
-  if (direction === 'causes') {
-    // Outbound: documents this one causes
-    query = `
-      WITH RECURSIVE causal_chain(doc_id, depth, path) AS (
-        -- Base case: immediate causal links outbound
-        SELECT target_id, 1, json_array(?)
-        FROM memory_relations
-        WHERE source_id = ? AND relation_type = 'causal'
+  const probeLimit = CAUSAL_READER_MAX_EDGES + 1;
+  const dirs: Array<'causes' | 'caused_by'> =
+    direction === 'both' ? ['causes', 'caused_by'] : [direction];
 
-        UNION ALL
+  const collected = collectCausalEdges(db, docId, dirs, maxDepth, probeLimit);
+  collected.sort(compareCausalEdges);
+  const truncated = collected.length > CAUSAL_READER_MAX_EDGES;
+  const kept = truncated ? collected.slice(0, CAUSAL_READER_MAX_EDGES) : collected;
 
-        -- Recursive case: follow the chain
-        SELECT mr.target_id, cc.depth + 1, json_insert(cc.path, '$[#]', cc.doc_id)
-        FROM memory_relations mr
-        JOIN causal_chain cc ON mr.source_id = cc.doc_id
-        WHERE cc.depth < ?
-          AND mr.relation_type = 'causal'
-          AND mr.target_id NOT IN (SELECT value FROM json_each(cc.path))
-      )
-      SELECT DISTINCT
-        cc.doc_id as docId,
-        d.title,
-        d.collection || '/' || d.path as filepath,
-        cc.depth,
-        COALESCE(mr.weight, 1.0) as weight,
-        json_extract(mr.metadata, '$.reasoning') as reasoning
-      FROM causal_chain cc
-      JOIN documents d ON d.id = cc.doc_id
-      LEFT JOIN memory_relations mr ON (mr.source_id = ? AND mr.target_id = cc.doc_id AND mr.relation_type = 'causal')
-      WHERE d.active = 1
-      ORDER BY cc.depth, weight DESC
-    `;
-    return db.prepare(query).all(docId, docId, maxDepth, docId) as CausalLink[];
-  } else if (direction === 'caused_by') {
-    // Inbound: documents that cause this one
-    query = `
-      WITH RECURSIVE causal_chain(doc_id, depth, path) AS (
-        -- Base case: immediate causal links inbound
-        SELECT source_id, 1, json_array(?)
-        FROM memory_relations
-        WHERE target_id = ? AND relation_type = 'causal'
-
-        UNION ALL
-
-        -- Recursive case: follow the chain
-        SELECT mr.source_id, cc.depth + 1, json_insert(cc.path, '$[#]', cc.doc_id)
-        FROM memory_relations mr
-        JOIN causal_chain cc ON mr.target_id = cc.doc_id
-        WHERE cc.depth < ?
-          AND mr.relation_type = 'causal'
-          AND mr.source_id NOT IN (SELECT value FROM json_each(cc.path))
-      )
-      SELECT DISTINCT
-        cc.doc_id as docId,
-        d.title,
-        d.collection || '/' || d.path as filepath,
-        cc.depth,
-        COALESCE(mr.weight, 1.0) as weight,
-        json_extract(mr.metadata, '$.reasoning') as reasoning
-      FROM causal_chain cc
-      JOIN documents d ON d.id = cc.doc_id
-      LEFT JOIN memory_relations mr ON (mr.target_id = ? AND mr.source_id = cc.doc_id AND mr.relation_type = 'causal')
-      WHERE d.active = 1
-      ORDER BY cc.depth, weight DESC
-    `;
-    return db.prepare(query).all(docId, docId, maxDepth, docId) as CausalLink[];
-  } else {
-    // Both directions
-    const outbound = findCausalLinks(db, docId, 'causes', maxDepth);
-    const inbound = findCausalLinks(db, docId, 'caused_by', maxDepth);
-
-    // Merge and deduplicate
-    const seen = new Set<number>();
-    const merged: CausalLink[] = [];
-
-    for (const link of [...outbound, ...inbound]) {
-      if (!seen.has(link.docId)) {
-        seen.add(link.docId);
-        merged.push(link);
-      }
+  // Witness hydration: ONE query over the retained edge set, projected in SQL —
+  // at most CAUSAL_READER_MAX_WITNESSES rows per edge reach JS regardless of
+  // how many sightings history has accumulated.
+  const witnessesByEdge = new Map<string, ProjectedWitnessRow[]>();
+  const distinctEdges = [...new Map(kept.map(e => [`${e.sourceDocId}:${e.targetDocId}`, e])).values()];
+  if (distinctEdges.length > 0) {
+    const params = distinctEdges.flatMap(e => [e.sourceDocId, e.targetDocId]);
+    const rows = db.prepare(projectedWitnessSql(distinctEdges.length)).all(...params) as ProjectedWitnessRow[];
+    for (const row of rows) {
+      const key = `${row.source_id}:${row.target_id}`;
+      const list = witnessesByEdge.get(key) ?? [];
+      list.push(row);
+      witnessesByEdge.set(key, list);
     }
-
-    return merged.sort((a, b) => a.depth - b.depth || b.weight - a.weight);
   }
+
+  const edges: CausalEdgeRecord[] = kept.map(edge => {
+    const projected = witnessesByEdge.get(`${edge.sourceDocId}:${edge.targetDocId}`);
+    if (projected && projected.length > 0) {
+      projected.sort((a, b) => a.pair_rank - b.pair_rank);
+      return {
+        sourceDocId: edge.sourceDocId,
+        targetDocId: edge.targetDocId,
+        docId: edge.docId,
+        title: edge.title,
+        filepath: edge.filepath,
+        predecessorDocId: edge.predecessorDocId,
+        depth: edge.depth,
+        direction: edge.direction,
+        weight: edge.weight,
+        evidenceCount: projected[0]!.evidence_count,
+        witnesses: projected.map(w => ({
+          sourceFactOrdinal: w.source_fact_ordinal,
+          targetFactOrdinal: w.target_fact_ordinal,
+          sourceFact: w.source_fact,
+          targetFact: w.target_fact,
+          reasoning: w.reasoning,
+          confidence: w.confidence,
+          strongestAt: w.created_at,
+          lastSeenAt: w.last_seen_at,
+          legacy: w.legacy === 1,
+        })),
+        legacy: false,
+      };
+    }
+    const synthesized = synthesizeLegacyWitness(edge);
+    return {
+      sourceDocId: edge.sourceDocId,
+      targetDocId: edge.targetDocId,
+      docId: edge.docId,
+      title: edge.title,
+      filepath: edge.filepath,
+      predecessorDocId: edge.predecessorDocId,
+      depth: edge.depth,
+      direction: edge.direction,
+      weight: edge.weight,
+      evidenceCount: synthesized ? 1 : 0,
+      witnesses: synthesized ? [synthesized] : [],
+      legacy: true,
+    };
+  });
+
+  return { edges, truncated };
 }
 
 // =============================================================================
@@ -5188,34 +6555,47 @@ function restoreArchivedDocumentsFn(
   db: Database,
   filter: { ids?: number[]; collection?: string; sinceDate?: string }
 ): number {
-  let sql = "UPDATE documents SET active = 1, archived_at = NULL WHERE active = 0 AND archived_at IS NOT NULL";
+  let where = "WHERE active = 0 AND archived_at IS NOT NULL";
   const params: any[] = [];
 
   if (filter.ids?.length) {
     const placeholders = filter.ids.map(() => "?").join(",");
-    sql += ` AND id IN (${placeholders})`;
+    where += ` AND id IN (${placeholders})`;
     params.push(...filter.ids);
   }
   if (filter.collection) {
-    sql += " AND collection = ?";
+    where += " AND collection = ?";
     params.push(filter.collection);
   }
   if (filter.sinceDate) {
-    sql += " AND archived_at >= ?";
+    where += " AND archived_at >= ?";
     params.push(filter.sinceDate);
   }
 
-  return db.prepare(sql).run(...params).changes;
+  // Same trigger-inflation problem as archiveDocuments: `.changes` counts the
+  // `documents_fts` shadow writes too. Count the matching rows explicitly instead.
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT COUNT(*) AS n FROM documents ${where}`)
+      .get(...params) as { n: number } | undefined;
+    db.prepare(`UPDATE documents SET active = 1, archived_at = NULL, deactivated_reason = NULL ${where}`).run(...params);
+    return row?.n ?? 0;
+  })();
 }
 
-function purgeArchivedDocumentsFn(db: Database, olderThanDays: number): number {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - olderThanDays);
-  const result = db.prepare(`
-    DELETE FROM documents WHERE active = 0 AND archived_at IS NOT NULL AND archived_at <= ?
-  `).run(cutoff.toISOString());
-  return result.changes;
-}
+// NOTE: `purgeArchivedDocumentsFn` was removed in v0.30.0. It ran
+// `DELETE FROM documents WHERE active = 0 AND archived_at <= ?` — the only operation in
+// ClawMem that destroyed a row rather than deactivating it, and therefore the only one
+// with no restore path. It was reachable from an agent-invoked MCP tool, from an
+// unattended SessionStart hook, and from the CLI.
+//
+// ClawMem no longer physically deletes document rows from ANY code path. Retention is
+// archival, which `restoreArchivedDocuments` reverses. Reclaiming disk space is an
+// out-of-band operator action on the SQLite file, explicitly outside ClawMem's mutation
+// contract — deliberately NOT an affordance this package offers, because any in-process
+// or CLI credential is equally available to the coding agent the package serves.
+//
+// A supported retention design (reversible quarantine with a protected window) is tracked
+// separately. Do not reintroduce a hard delete here without it.
 
 function getLifecycleStatsFn(db: Database): {
   active: number; archived: number; forgotten: number;

@@ -4,6 +4,920 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.0 — the ranking pipeline and vault lifecycle become inspectable
+
+Two read-only diagnostic MCP tools. Composite ranking and lifecycle state were
+previously observable only from the outside: you saw the final ordering and the final
+counts, and answering "why did this doc outrank that one" or "how do this collection's
+rows distribute across origin, activity, and age" meant re-deriving scorer behaviour by
+hand.
+
+### memory_stats — lifecycle + ranking-metadata aggregates
+
+Deterministic SQL aggregates per collection: counts by active state, origin×active
+cross-tabs (`fs` / `api` / legacy-`NULL` rows from the v0.34.0 ownership model), pinned
+counts, accrual (7d/30d) and created-at span, deactivation reasons, and
+mean/median/min/max distributions over `access_count`, `confidence`, `quality_score`,
+and effective-time age (`authored_at ?? modified_at` — the same axis recency ranking
+decays on since v0.27.0). Counts and cross-tabs cover all rows; distributions cover
+ACTIVE rows only, since ranking never sees inactive rows. Complements `index_stats`
+(embedding coverage / content types); nothing is filtered — system collections
+included. Fail-loud by contract: a stats tool that silently dropped a section would
+report a smaller vault as if it were the whole truth.
+
+### memory_rank — composite ranking explanation
+
+Runs the real FTS + composite pipeline for a query and returns each result's
+per-factor breakdown — weights applied (`default` | `query` profile, with the
+recency-intent override behaving exactly as in production), recency and
+blended-confidence inputs, quality/length/frequency/canonical multipliers, signed pin
+delta, co-activation — plus raw-vs-composite rank shifts.
+
+The details that matter:
+
+- **The breakdown is captured inside the scorer, never recomputed.** The recorded
+  factors reproduce `compositeScore` exactly, and `explain` changes no score and no
+  ordering — the diagnostic cannot drift from the thing it explains.
+- **Raw ordering is production's** — `search`'s non-recency regime including its
+  pin → legacy-composite → path tie contract — not a re-sort of the composite-ordered
+  array, which would let exact raw ties inherit composite order and make the
+  diagnostic circular.
+- **Output is the union of the composite top-N and the raw top-N.** A raw winner the
+  composite ordering demoted below the cutoff stays visible (`demotedRawWinner`,
+  `⚠ demoted raw winner` marker) with its true composite rank — the exact signature a
+  ranking investigation looks for, and the one a composite-only view would hide.
+- **The pin cap is reported truthfully.** On composite surfaces the pin boost is
+  `min(1.0, score + 0.3)` — and quality (×1.3), frequency (×1.10), and canonical
+  (×1.14) multipliers can push a pre-pin composite above 1.0, so the cap can CLAMP a
+  pinned doc below its unpinned twin. `memory_rank` renders that as a negative `pinΔ`
+  rather than hiding it. Known defect, queued behind a judged golden set; scoring
+  behaviour is deliberately unchanged in this release.
+- Ranks are keyed by filepath — docids are content-hash prefixes, so identical-content
+  documents at different paths share a docid and would otherwise overwrite each
+  other's rank.
+- Both tools return structured errors carrying the available list on unknown
+  `collection` or `vault` names. `memory_rank` joins the default-`_clawmem`-filtered
+  tools (`includeInternal: true` reaches system memory); `memory_stats` filters
+  nothing.
+- `memory_rank` candidates are FTS-only — no vector or LLM stage; deterministic and
+  cheap enough to run casually.
+- No schema change, no migration, no reindex, no re-embed.
+
+## v0.35.0 — secondary-vault surfacing is now opt-in
+
+Multi-vault deployments: the `context-surfacing` hook used to merge results from a
+configured secondary vault into every prompt's injected context, unconditionally. Anything
+indexed into that vault could surface in any session — vault separation held for explicit
+queries but not for the automatic feed, and there was no switch.
+
+Automatic cross-vault surfacing is now a config gate, **default OFF**: out of the box the
+hook reads only the general vault, and a configured secondary vault stays isolated unless
+deliberately queried (a `vault`-parameter MCP call) or deliberately opted back in:
+
+```yaml
+# ~/.config/clawmem/config.yaml            # or env, which wins:
+retrieval:                                 # CLAWMEM_SURFACE_SECONDARY_VAULTS=true
+  surface_secondary_vaults: true
+```
+
+The details that matter:
+
+- The automatic secondary lane is the configured named `skill` vault (the same one the
+  recall mirror attributes usage to); the knob does not fan out across every named vault.
+- The gate governs the automatic hook feed only. Explicit `vault` MCP calls, `list_vaults`,
+  `vault_sync`, and Stop-hook usage attribution are unchanged.
+- Opted in, behaviour is exactly the old one — including best-effort fail-open when the
+  secondary vault is unavailable.
+- One gate, one producer: every downstream secondary-vault path in the hook keys off the
+  tag the gated block sets, so OFF starves them all — including the recall mirror, which
+  then writes nothing into the secondary vault.
+- Config is process-cached: restart long-lived processes (watcher, MCP server) after
+  changing it; hooks are per-event processes and pick it up on their next run.
+- If secondary-vault content *also* reaches the general vault as an ordinary indexed
+  collection, that is a separate route this gate does not touch — remove the collection
+  from the general config if full isolation is the goal.
+- No schema migration, no reindex, no re-embed. Only the literal `true` (env) / boolean
+  `true` (yaml) enables.
+
+## v0.34.0 — origin-aware reconciliation: DB-born memories survive filesystem indexing
+
+The filesystem absence reconciler treated every active row in a collection as
+filesystem-owned: any stored path missing from disk was deactivated `absent` on every pass.
+Rows created directly in the database — hook observations, `saveMemory` output, beads sync,
+REST writes — have no backing file BY DESIGN, so sharing a collection with indexed files
+destroyed them wholesale (measured in one production vault: 2,430 of 2,437 DB-born rows
+inactive). Every document row now records its lifecycle owner, and reconciliation only ever
+touches rows the indexer actually owns.
+
+### The ownership model
+
+A new `documents.origin` column: `fs` (created/maintained by the filesystem indexer;
+reconciled against disk), `api` (DB-born; absence on disk means nothing), `NULL` (ambiguous
+legacy row — exempt). Ownership is DECLARED by writers or ADOPTED on first touch, never
+inferred: the indexer stamps `fs` on every path it takes — insert, update, reactivation, and
+the unchanged short-circuit — while `saveMemory` and `insertDocument` default-stamp `api`.
+There is deliberately no migration backfill: `content_hash` proves nothing about ownership
+(mined imports write it through the same pipeline), so legacy rows heal only when a writer
+touches them. On a pre-migration schema the reconciler enumerates nothing at all —
+fail-closed, reported by an open-time warning — and any other enumeration error propagates
+instead of widening the enumeration.
+
+### Ownership boundaries, both directions
+
+A path collision across origins is rejected visibly, never resolved by silent takeover.
+`saveMemory` preflights the requested path before ANY write: an active filesystem-owned path
+throws, and an inactive row at the path throws too — lifecycle decisions are not overwritten,
+per the v0.31.0 rules. Its write phase is transactional, so a mid-flight indexer claim rolls
+the whole write back rather than leaking orphaned content, and dedup only counts against
+API-claimable candidates through an ownership-conditional atomic update, so a concurrent
+claim is never overwritten. Symmetrically, the indexer skips (and warns about) a file
+appearing at an API-owned path — active or inactive — instead of adopting it.
+
+### `clawmem mine` is additive now
+
+Mine imports run in a new `importMode`: rows are stamped `api` on every write path, and
+absence reconciliation is skipped entirely — the staging snapshot is transient, so a later
+mine into the same collection no longer deactivates earlier batches.
+
+### Upgrading
+
+The `origin` column is added automatically on first open; no action is required. Two
+behaviour changes to know about: a row whose file was already deleted BEFORE upgrading is no
+longer auto-deactivated (nothing proves the indexer owned it — retire it with `memory_forget`
+or a lifecycle sweep if unwanted), and a `saveMemory` write to a path occupied by a
+filesystem-owned or inactive document now fails loudly instead of silently overwriting.
+
+## v0.33.0 — the causal writer returns, evidence-first
+
+v0.32.0 rebuilt causal *reading* and noted that restoring causal *inference* was a separate,
+future piece of work. This is that piece. A new causal witness writer runs inside the
+`decision-extractor` Stop hook — off by default, shadow-first — and the causal graph it builds
+is evidence-preserving end to end: documents are the nodes, and every edge carries the specific
+fact pair that justified it.
+
+### The causal witness writer
+
+When enabled (`CLAWMEM_CAUSAL_WRITER=shadow|on`), each Stop-hook invocation considers this
+session's new observation documents against a small temporal window of recent ones
+(`CLAWMEM_CAUSAL_WINDOW`, default 5, effective-time ordered) and makes ONE strict single-shot
+model call proposing causal pairs. Admission is unforgiving: every proposed pair must cite fact
+ordinals that exist in the *persisted* documents (caller arrays are never trusted), must include
+at least one endpoint from this invocation (history is never re-inferred), and self-pairs,
+duplicates, out-of-range ordinals, and sub-threshold confidences are each rejected with their own
+audit event. What survives is written append-only as **fact-pair witness sightings** — repeat
+observations of the same causal claim accumulate instead of being dropped — and the edge weight
+is derived (`MAX` of witness confidences) in the same transaction. Placeholder reasoning is
+rejected, so every edge a reader sees can show *why* it exists.
+
+Every invocation in shadow/on mode writes a durable run record (`causal_runs` /
+`causal_run_events`) — including early exits, skipped phases, and invalid configuration — with
+retention mirroring the judge audit (90 days / 10k runs; sightings survive pruning). Inspect it
+with the new `clawmem causal-audit` CLI. Shadow mode runs the full pipeline and audits everything
+while writing zero graph state: run it for a while and read the audit before arming `on`.
+
+### Pre-cut edges: preflight, resolve, restore
+
+Causal edges written by the pre-v0.30 writer carry old-format metadata. The reader synthesizes
+witness evidence from the valid ones in memory for display (nothing is written on read); the
+armed writer materializes that evidence durably the first time it touches such an edge; edges
+whose metadata cannot yield a valid witness make the writer fail closed rather than guess. `clawmem migrate causal-witnesses --preflight` reports a
+census and emits a binding manifest; `--resolve-unmaterializable keep-weight|retire-edge` acts
+only on explicitly selected edges whose full row image still matches the manifest fingerprint;
+retirement is archive-style and reversible (`--restore-edge`, fail-closed: a restore never
+overwrites an occupied key). CLI audit rows are born terminal-pessimistic — a crash mid-operation
+can leave an honest `cli_error`, never a stranded `in_progress` or a fabricated success.
+
+### The Stop hook now runs to a deadline
+
+`CLAWMEM_STOP_BUDGET_MS` (default 25000) is a whole-handler deadline captured at entry. Every
+model-bearing phase — observation extraction, contradiction candidate retrieval *including its
+embedding call*, the contradiction judge, dedup embeddings, and the causal step — checks
+remaining budget before starting and is skipped (audited, loudly logged) rather than started
+unbounded. Previously a slow inference server could push the hook past the host's timeout, losing
+the entire extraction; now the hook degrades phase by phase and always reaches persistence.
+
+### Security: document-id lookups are structurally validated
+
+Found by this release's boundary tests: docid resolution used its input in a SQL `LIKE` pattern
+without escaping, so the wildcards `_` and `%` matched **arbitrary documents** through every
+docid surface — including the destructive REST `/documents/{docid}/forget`, where a single `_`
+deactivated whichever document the pattern happened to match first. Docids are now validated
+against `^[0-9a-fA-F]{6,64}$` (after `#` strip) before any query; wildcards, non-hex, and
+undersized prefixes return not-found everywhere. Oversized docids no longer throw. If you expose
+the REST API beyond localhost, upgrade for this alone.
+
+### `find_causal_links` returns evidence, not just links
+
+The tool (MCP + REST `/causal-links`) now returns directed **edge records**: invariant
+source/target, traversal provenance (predecessor, depth, direction), and up to 3 fact-pair
+witnesses per edge with reasoning, confidence, and sighting counts — projected in SQL, capped by
+a byte ceiling (64 KiB) that drops whole edges from the tail rather than truncating mid-record.
+Traversal is level-synchronous and returns the globally strongest 50 edges under a total order,
+not the first 50 found. Depth > 1 remains per-edge evidence, not a verified chain.
+
+### Migration
+
+Automatic on first open, additive only: four new tables (`causal_runs`, `causal_run_events`,
+`causal_witness_sightings`, `retired_causal_edges`) with their indexes. No data backfill, no
+manual step. The writer defaults to `off`, so nothing changes in write behavior until you arm it
+— and before setting `on`, run the preflight (above).
+
+### Verification
+
+Cross-model adversarial pass (codex / GPT-5.x), both gates in one pinned session: the design was
+reviewed to zero remaining findings across seven turns (13→9→9→8→3→2→0), then the implementation
+against that contract across seven more (13→5→4→6→3→1→0). Production-boundary tests drive the
+real CLI subprocesses (conflict, whole-run lock, rejected finalization), the real MCP handlers,
+and the real REST server (docid injection attempts, byte-ceiling overflow, destructive-route
+validation). Full suite at clearance: 1977 tests, 0 failures.
+
+### What didn't change
+
+The v0.32.0 reader pipeline (shared causal retrieval, observation lane, one-hop traversal) is
+untouched. `includeInternal` semantics are unchanged. With `CLAWMEM_CAUSAL_WRITER=off` (the
+default) the Stop hook makes no causal model call and writes no causal rows — the only new
+default-on behaviors are the budget deadline and the docid validation.
+
+---
+
+## v0.32.0 — causal answers reach their reasoning
+
+Three defects found while reviewing the causal layer's foundations: the recommended causal
+retrieval route could not reach the documents causal edges actually connect; the four causal
+surfaces had drifted into four different pipelines; and the SPO knowledge graph wrote evidence it
+never showed while silently dropping repeat sightings.
+
+### One causal pipeline behind every causal surface
+
+`memory_retrieve`'s causal mode, `intent_search`, `query_plan`'s graph clauses, and REST
+`/retrieve`'s causal mode were four independent implementations of "intent-classified retrieval
+plus graph expansion", each missing different stages — the documented claim that causal queries
+route to `intent_search`'s pipeline was true of none of them. They now share one implementation
+and differ only in declared stages and visibility policy, so parity holds by construction. REST's
+causal route gains graph traversal (it was anchor-only RRF), and the REST classifier now
+recognizes the same causal phrasings as MCP — "why were" and "because we" never routed causal
+over REST before. `intent_search` keeps its documented unfiltered contract verbatim, and its
+`enable_graph_traversal: false` now disables every graph stage, including the new one-hop step.
+
+### WHY queries reach observation documents — and can walk a causal edge backward
+
+The default-filtered routes excluded the `_clawmem` collection categorically, and every causal
+edge endpoint lives there — so causal graph structure was reachable by nobody through the
+recommended default route. Independently, neither traversal engine could follow a causal edge
+backward (inbound edges were restricted to semantic/entity), so "why did B happen?" anchored at B
+could never reach cause A.
+
+WHY-classified queries on the filtered routes now anchor into `_clawmem` **observation documents
+specifically** — never handoffs or deductions — and follow causal edges one bounded hop in both
+directions (at most 3 per anchor, 10 total), with each hit labeled `cause` or `effect` relative
+to its anchor. Candidate eligibility (active, non-invalidated, inside any effective-time window,
+collection policy) is now enforced inside every anchor, traversal, and MPFP query — previously an
+inactive or invalidated document could still consume beam slots and steer expansion even though it
+was hidden from output. Entity co-occurrence expansion cannot honor row-level eligibility (its
+aggregates carry no source-document provenance) and is therefore confined to direct
+`intent_search`, its only shipped home, with the limitation documented.
+
+### The knowledge graph shows its evidence
+
+`entity_triples` recorded `source_doc_id` and `source_fact` on first sighting, but no query
+surfaced either — and a repeat sighting of a known fact was dropped entirely, so corroboration
+accumulated nowhere. A new `entity_triple_provenance` table now accumulates unique evidence
+sources per fact, written in the same transaction as the fact itself. `kg_query` reports
+`evidenceCount` plus up to 5 most-recent sources per fact (evidence with no source document
+renders as `unattributed`). Provenance in `queryEntityTriples` is opt-in, so the prompt-hook path
+pays nothing new.
+
+**Migration** (automatic, on first open): one evidence row is backfilled per existing triple that
+carries inline evidence. The backfill is idempotent and read-guarded — steady-state opens perform
+no writes.
+
+### Verification
+
+Cross-model adversarial pass (codex / GPT-5.x): the remediation design was reviewed to zero
+remaining findings across five turns before implementation, and the implementation reviewed to
+zero remaining findings against it. Production-boundary tests drive the real MCP handlers and the
+real REST server: backward one-hop retrieval, decision-typed observation endpoints, lane
+exclusions for handoffs/deductions, breadth caps, the graph master switch, REST classifier parity,
+evidence dedup/ordering/atomicity, and migration idempotence across reopen.
+
+### What didn't change
+
+The causal *writer* — batching, edge schema, per-edge witnesses — is untouched; restoring causal
+inference itself is a separate, future piece of work. Direct `intent_search` remains unfiltered by
+design; REST remains unfiltered in every mode; `includeInternal` semantics are unchanged;
+`confidence` does not move on repeat sightings; hooks issue no new queries.
+
+### Upgrading
+
+No manual migration step — the provenance backfill runs on first open, idempotent and
+read-guarded. The v0.31.0 mixed-version caution applies unchanged: when long-lived writers run
+concurrently, restart daemons and reconnect open agent sessions together, so no old-code process
+keeps writing after the vault has migrated. A stale writer inserts facts without evidence rows —
+repaired by a later open's backfill — and keeps dropping repeat sightings outright, which is not
+recoverable: the evidence row is simply never written.
+
+---
+
+## v0.31.0 — forget stays forgotten
+
+Three defects on the indexing boundary, all of which destroyed or reversed memory silently. Each
+was found by observing the database rather than by reading call sites, and each is fixed by making
+the affected write refuse rather than by adding a confirmation step.
+
+### `memory_forget` was undone by the next reindex
+
+Forgetting a document that has a file behind it did not stick. The indexer reactivated **any**
+inactive row it found at a path present on disk, without asking why that row was inactive — and
+`active` is written by three unrelated owners: absence reconciliation, `memory_forget`, and
+lifecycle archival. On a machine running `clawmem watch`, a forget therefore survived only until
+the next `.md` change anywhere in that collection. Archived documents came back too, still carrying
+`archived_at`, leaving them simultaneously active and archived.
+
+Documents now record **why** they were deactivated (`deactivated_reason`), and only what was
+deactivated for absence can be revived automatically. A forgotten or archived document stays that
+way, and its file is skipped rather than re-inserted — re-inserting would have left the row
+forgotten while making its content live again under a new id. The generic reactivation helper
+enforces the same rule, so automatic profile regeneration during `clawmem update` no longer revives
+a forgotten profile either. Restoring an archived document remains `lifecycle_restore`'s job.
+
+**Migration** (automatic, on first open): existing archived rows are backfilled as `'archive'`, and
+any row a previous version left in the inconsistent active-and-archived state is restored to
+archived, with a count reported on stderr. Use `lifecycle_restore` to bring any of those back.
+Legacy rows deactivated by forget before this release are indistinguishable from absence and remain
+reactivatable once; from this release forward, forget is durable.
+
+### `clawmem reindex --force` orphaned every database-created memory
+
+`--force` began with a blanket `UPDATE documents SET active = 0` across the entire vault, then
+rebuilt only the *configured* collections. Observations, handoffs, and deductions live in
+`_clawmem` and have no file behind them, so nothing ever brought them back. The deactivation set no
+`archived_at`, which meant `lifecycle_restore` could not see them either — they were invisible to
+the only supported restore path.
+
+`--force` now does what its name implies: it re-reads and rewrites every file, bypassing the
+content-hash short-circuit that normally skips unchanged documents. It no longer deactivates
+anything up front; documents still absent from disk are deactivated by the ordinary reconciliation
+pass, one collection at a time, exactly as they are without the flag. Separately, `_clawmem` is now refused by the indexer outright — database-created
+memory has no filesystem source and cannot be reconciled against one, by any caller.
+
+### A failed enrichment blanked learned A-MEM notes
+
+`constructMemoryNote` fails open to an empty note when the inference endpoint is unavailable, and
+the note was then stored unconditionally. A transient outage during a routine reindex therefore
+blanked `amem_keywords`, `amem_tags`, and `amem_context` on every document it touched. Writing an
+empty note over a *never-enriched* row was quieter but no better: it made a failure
+indistinguishable from completed enrichment, so backfill never retried that document.
+
+An empty note is now never written, whatever the row holds — including a note whose entries are
+only whitespace, which carries no information but would still have masked the row from backfill.
+The store reports whether the note actually landed, and both callers honour that: the enrichment
+log distinguishes a refused write from a completed one, and the consolidation backfill skips the
+link pass and leaves the document eligible for a later retry. `NULL` is preserved as the retryable
+"not enriched yet" state.
+
+### Upgrading
+
+No manual migration step. The migration runs on open, is idempotent, and performs its count and
+repair in one transaction so concurrent opens cannot double-report. If it cannot run — a locked
+database, for instance — it says so on stderr and is retried on the next open rather than failing
+silently. If it reports repaired documents, those were archived rows a previous version had
+incorrectly reactivated.
+
+One operational requirement when long-lived writers run concurrently — the watcher,
+`clawmem serve`, or an MCP server in an agent session that stays open across the upgrade:
+restart them together (daemons restarted; open sessions reconnected via `/mcp` or closed), so no
+old-code process keeps writing after the first new-code open has migrated the vault. An old-code
+writer records no deactivation reason, and the new indexer deliberately treats reason-less
+deactivation as legacy absence — a forget issued through a stale session can be reactivated by
+the next re-index, which is this release's bug reintroduced by the stale process. A
+single-session setup with no daemons needs nothing.
+
+---
+
+## v0.30.0 — ClawMem stops deleting rows
+
+ClawMem's governing rule for agent-mediated memory mutation is that nothing an agent does should be unrecoverable. Every mutation surface honored that except one: `purgeArchivedDocuments` physically `DELETE`d rows. This release removes physical deletion from the package entirely rather than gating it, because a gate cannot work here — see below.
+
+### Why removal rather than an administrator gate
+
+The obvious fix is to keep purge and require administrator authority for it. That fix does not hold, and the reasoning is worth stating because it generalizes: **ClawMem's primary consumer is a coding agent with shell access.** Any credential expressible in-process or on the command line — an env var, a confirmation flag, an interactive prompt — is equally available to that agent, which can type an opt-in env var and a `--purge` flag as readily as a human can. A gate like that only relabels the operation; it does not remove it from agent authority. (No such flag or variable exists in this release — that design was built, reviewed, and rejected for this reason.) A longer confirmation boundary also satisfies neither "immutable prior revision" nor "supported restore": once the row is gone there is nothing left to restore.
+
+So the capability is not offered. Reclaiming disk space is an out-of-band operator action on the SQLite file, explicitly outside ClawMem's mutation contract. A supported retention design — reversible quarantine with a protected window — is planned separately.
+
+### What was removed (`src/store.ts`)
+
+- **`purgeArchivedDocuments`** — ran `DELETE FROM documents WHERE active = 0 AND archived_at <= ?`. Reachable from three call sites, below.
+- **`deleteInactiveDocuments`** — ran `DELETE FROM documents WHERE active = 0`: strictly broader, destroying every inactive row (archived *and* forgotten) with no age bound and no authorization. It had no callers but sat on the public `Store` interface.
+- **the store-level `removeCollection`** — ran `DELETE FROM documents WHERE collection = ?`, an unauthorized hard delete of an entire collection. Also callerless; `clawmem collection remove` goes through `collections.ts` (YAML config only), which remains the reversible path.
+
+No code path now issues a `DELETE` against `documents`.
+
+### The three purge call sites, and the one that mattered most
+
+- **`lifecycle_sweep` (MCP)** — a non-dry-run sweep archived, then deleted every archived row past `purge_after_days`. That set was **never previewed**: the dry-run branch reported `Would archive N document(s)` and said nothing about deletion, and the deleted population was different from the previewed candidates entirely. The preview was not weakly binding — it was silent.
+- **`staleness-check` (SessionStart hook)** — the worst host of the three: unattended, no model and no operator in the loop, the purge count discarded, all of it inside a `catch {}` documented as "lifecycle errors never block the hook", so a failed delete was silent too. Auto-**archival** here is unchanged and remains reversible.
+- **`clawmem lifecycle sweep` (CLI)** — archives only, and says so when it sees `purge_after_days` set.
+
+### Count reporting was wrong (`src/store.ts`)
+
+`archiveDocuments` and `restoreArchivedDocuments` returned SQLite's `changes`, which counts the `documents_fts` trigger writes as well — archiving 3 documents reported **16**. Every "archived N" / "restored N" ClawMem has printed was inflated. Both now count the affected documents explicitly inside the same transaction. The mutations were always correct; only the reported numbers were wrong. Found by writing the first behavioral test of this path.
+
+### Behavior changes to expect
+
+- `purge_after_days` is **inert**. It is still parsed so existing configs load, but only a positive finite value is accepted — a negative value previously produced a *future* cutoff that deleted every archived row, including ones archived moments earlier.
+- `lifecycle_sweep` reports `archived N document(s). Nothing was deleted.` The tool description no longer advertises purge.
+- Archive/restore counts are now accurate, and smaller than before.
+
+Test coverage: `tests/unit/no-hard-delete.test.ts` — the invariant that no path destroys a row, the real SessionStart hook exercised end to end, and the count regression. There was previously **no test of the purge path at all**, which is part of why this survived.
+
+---
+
+## v0.29.0 — the contradiction judge: opt-in model override, judge-gated analysis, durable audit
+
+v0.28.0 repaired the contradiction write path; this release faces the model behind it. A live contract probe at the production seam showed the prescribed stock expansion model cannot meet the judge contract at all — it returns an object where the contract requires an array, echoes the schema's enum text back as a value, and fabricates confident relations between unrelated facts, deterministically. The same weak model sat in a *fail-open* position at the merge-time gate, where a parseable answer bypassed the deterministic heuristic and a missing confidence defaulted to exactly the actionable threshold. This release routes every contradiction decision through an explicitly configured **judge**, disables the analysis when none is configured, fixes the fail-open surfaces, and makes every evaluation durably auditable.
+
+### Judge-gated analysis — a behavior change (`src/judge.ts`, `src/hooks/decision-extractor.ts`)
+
+- **No judge configured ⇒ contradiction analysis is DISABLED**, as an audited no-op with one loud line per run — never a silent attempt on the stock model. This honors opt-in strictly: the reshaped prompt (below) could have made the stock model start clearing admission, activating erosion for users who never chose it.
+- **Migration note:** the evidence that "no verdict ever applied" holds for stock deployments. If you had pointed the *global* `CLAWMEM_LLM_URL`/`CLAWMEM_LLM_MODEL` at a larger or cloud model, real verdicts may have been applying — the judge no longer rides the global vars, so set `CLAWMEM_JUDGE_*` to keep that behavior. ClawMem deliberately never auto-adopts the global endpoint as a judge: the judge vars are also the data-egress consent (new decisions + retrieved snippets go to the judge you configure). `clawmem doctor` warns when it can detect this situation; [docs/guides/upgrading.md](docs/guides/upgrading.md) is the authoritative notice.
+- **Three lanes**, one strict contract: any OpenAI-compatible endpoint (`CLAWMEM_JUDGE_URL` + `_MODEL` + `_API_KEY`), the Anthropic Messages API (`CLAWMEM_JUDGE_PROVIDER=anthropic`, default model `claude-haiku-4-5` — the recommended default), or a sandboxed headless `claude -p` on a Claude Code subscription (`claude-cli`: `--safe-mode`, no tools, no MCP, no session persistence, untrusted payload over stdin only, recursion-guarded). The judge never runs local inference and never auto-downloads a model. The Haiku recommendation is backed by a shipped, passing capability-evaluation artifact; `claude-sonnet-5` is an **unverified** upgrade candidate — its preserved CLI-lane artifact shows zero fabrication with contradiction recall 3/4 and long-input 0/2 (borderline label + spawn-budget timeouts), and no API-lane artifact exists yet.
+
+### The merge-time gate had two fail-opens (`src/merge-guards.ts`, `src/consolidation.ts`)
+
+- **The LLM layer bypassed the heuristic whenever its answer parsed**, and a missing `confidence` defaulted to `0.5` — the exact actionable threshold. With a fabricating model that could block valid merges or, under `supersede`, deactivate rows. The legacy object contract, permissive extraction, and confidence-defaulting are all removed: the gate now speaks the same strict relation-array contract as the hook judge, and a missing confidence is an invalid entry, never a default.
+- **The deterministic heuristic scores a disjoint-number pair at exactly the default threshold** ("supports protocol version 1" vs "version 2" is actionable). Heuristic-only operation is therefore constrained to the non-deactivating `link` policy: **`supersede` requires a configured judge.** A configured-but-blocked `supersede` is loud — a runtime warning, a `merge_supersede_blocked` audit event per occurrence, and a `clawmem doctor` report that the policy is presently inactive. The effective policy is resolved once upstream and passed into the mutation helper as a parameter; mutation code no longer reads the policy env at all.
+- Phase-2 `link` sets the old consolidated row's `invalidated_by` **backlink** — it never inserted a `contradicts` edge; three docs that claimed otherwise are corrected (Phase 3 deductive synthesis is the edge writer).
+
+### Strict judge extraction (`src/judge.ts`)
+
+- The shared LLM-JSON extractor repairs a truncated array by keeping the complete elements — fine for enrichment, **fail-open for a mutation consumer**: token truncation silently applied a partial verdict batch. The judge path uses its own extractor: fence- and prose-tolerant, but a truncated JSON value is a typed reject, never a repair. Provider-reported truncation (`stop_reason`/`finish_reason`) is rejected before extraction even runs.
+
+### Prompt reshape + injection fencing (`src/judge.ts`)
+
+- The old prompt's example row was **invalid JSON** (`"confidence": 0.0-1.0`, `"relation": "update|contradiction|same"`) — placeholder-echo bait for weak models, noise for strong ones. The reshaped prompt states the schema in prose, shows a *valid* example, and instructs that unrelated pairs — the common case — return exactly `[]`.
+- Instructions and data are role-separated. Vault-derived content travels JSON-encoded inside per-request CSPRNG-nonce markers and is declared data-under-analysis, never instructions. Fencing is a mitigation with tests (collision, marker imitation, nested instructions), not a proof — the strict admission pipeline, thresholds, bounded erosion, and the audit below remain the backstops.
+- Consumer-specific thresholds: the decision-erosion prompt states `0.7` (its mutation threshold); merge prompts state your resolved `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` — the prompt never overrides an operator setting.
+
+### Durable audit: `judge_runs` / `judge_events` (`src/judge-audit.ts`, `src/store.ts`)
+
+- Interactive hosts do not persist successful hook stderr, which made the previous release's shadow output unreachable exactly where calibration needed it. Every judge evaluation now writes durable rows: a run (consumer, lane, model, endpoint, prompt version, response hash, outcome, admission counts) plus per-verdict / per-reject / per-error events with scores, namespaced targets, and reason codes mirroring the real validator verdicts.
+- **Mutation-authorizing evaluations commit audit and mutation in one transaction** — an audit failure rolls the mutation back (Phase-3 deductive checks commit a precondition audit first; non-mutating outcomes write standalone best-effort rows). That is a deliberate fail-closed trade: an unauditable erosion is this feature's original defect, and audit coupling intentionally expands the set of errors that fail the feature closed — same-store transactions keep that trade cheap, not free. A judge failure that falls back to the deterministic heuristic records BOTH runs, linked, so neither the failed lane's identity nor the actually-deciding classifier is ever lost. Caller cancellation (`aborted`) is terminal: audited, no heuristic, no mutation.
+- **Calibration is now audit-based on every host** — including hosts that discard hook stderr. The previous guidance that shadow calibration was impossible under OpenClaw is reversed; query the audit rows instead.
+
+### `clawmem doctor` (`src/clawmem.ts`, `bin/clawmem`)
+
+- New judge check: a three-scenario **smoke test** against the configured judge — a designed contradiction must yield exactly one `(0,0,"contradiction")` verdict at ≥ 0.7, an unrelated control must come back exactly empty (any verdict there is fabrication), and the merge single-pair contract must be actionable. An installation check, never capability certification. Unconfigured ⇒ the capability-floor note, the migration warning (provenance-aware — the wrapper marks its own stock default URL so stock installs never false-positive), and the inactive-`supersede` report. Plus audit row counts.
+
+Full suite 1,821/0 (92 new tests, including the truncation-repair regression, the audit-rollback fail-closed pin, the argv-content invariant for the subscription lane, pair-linkage retention, and a production-boundary integration suite driving the real Phase-2 gate with live judge lanes). The design went through a nine-turn cross-model adversarial DESIGN review (codex / GPT-5.x) to verbatim "Zero remaining findings." before implementation — thirty-three findings absorbed across the turns, including the merge-gate fail-open, the truncation-repair fail-open, and the accidental-activation hazard that forced the symmetric disable — and the implementation went through further adversarial CODE review rounds whose findings (among them: a failed-over heuristic could authorize `supersede`; a dirty response wrapping one valid verdict could decide) are all folded and regression-pinned.
+
+---
+
+## v0.28.0 — hook write-path contracts: extraction guards, honest counters
+
+Two Stop-hook write paths — A-MEM causal inference and contradiction detection — reported success while persisting nothing. Instrumentation counted *attempts* against `INSERT OR IGNORE`, so a total write failure was indistinguishable from a healthy run. This release makes the reporting truthful, hardens the validation ahead of every mutation, and repairs the two contract defects that left contradiction detection unable to apply a classification at all. The terminal mutation that repair unblocks — invalidation — ships **shadowed behind an opt-in flag**, not armed.
+
+### Counters report outcomes, not attempts (`src/amem.ts`, `src/store.ts`, `src/mcp.ts`, `src/server.ts`)
+
+- **`inferCausalLinks` sums `.changes`** from each insert instead of incrementing per candidate, and warns when candidates clear every filter but no row lands (the signature of silent `INSERT OR IGNORE` suppression). The summary line now reports proposed / passed-filters / placeholder-rejected / range-rejected rather than a single fabricated success count.
+- **Both graph builders** (`buildTemporalBackbone`, `buildSemanticGraph`) count inserted rows the same way — the two feed one response and previously reported in different units.
+- **`build_graphs` reports standing totals** alongside the delta, on the MCP tool *and* the REST endpoint: `N new edge(s), M total`. An idempotent rebuild legitimately writes 0 new edges, which read as "the graph is empty" without the total. **Response-shape change** — see below.
+- **Totals count the ACTIVE graph.** Only edges whose *both* endpoints are active are counted, matching the population the builders operate on; a raw count reported edges the live graph no longer contained. Shared via `store.countActiveRelations()` so the two surfaces cannot drift.
+
+### Validation ahead of every mutation (`src/hooks/decision-extractor.ts`, `src/schema-placeholder.ts`)
+
+- **`validateContradictionEntry`** is a pure, exported, typed-verdict validator applied to every classifier entry before any document is mutated: exact relation-enum membership, strict `typeof reasoning === "string"` (coercion was a fail-open on every JSON-valid non-string), finite `[0,1]` confidence, and *both* index bounds.
+- **Array-level admission** (`admitContradictionEntries`, exported and pure). Only repeats identical across the fields that can drive a mutation (relation, confidence, reasoning) are collapsed; a pair the classifier answered more than one way — differing label, confidence, or reasoning — is dropped whole. Repeats compounded the confidence penalty on a single document and could cross the invalidation floor a single classification never reaches, and a first-wins collapse would have made the outcome depend on array order. Whether several *distinct* new facts may penalize one old document repeatedly is a separate open question, unchanged here.
+- **The shared anti-parrot guard normalizes before matching.** Residue comparison folds NFKC, drops `Default_Ignorable_Code_Point` characters, lowercases, collapses whitespace runs, and strips outer punctuation — so a doubled space, a newline, fullwidth text, a trailing period, or an invisible zero-width character inside a word no longer walks past the guard. Internal punctuation is deliberately *not* normalized: doing so mapped plausible identifiers like `canonical_entity_name` onto blocklist entries. Marker detection folds NFKC, drops invisibles, removes every template marker, and asks whether any letter or digit remains — so arbitrary punctuation envelopes (`**{{x}}**`, `- {{x}}`, `|{{x}}|`, `【{{x}}】`, fullwidth `｛｛x｝｝`) and multi-line markers are all caught without enumerating wrapper characters. A value whose every letter and digit sits inside a marker is filtered as carrying no assertable content, whether it is echoed residue or a bare code fragment; content that merely *contains* a marker, like `"${HOME} is the user home directory"`, is untouched. **That applies to claim fields only.** Identifier fields — conversation-synthesis aliases and link targets, SPO subjects and objects — are names, not assertions, so no marker shape is rejected there on shape alone (`${HOME}` is a legitimate object of `uses`; `{{user.name}}` is a Handlebars path). Their residue is caught by consumer-scoped sets naming the exact skeleton that field's own prompt emits. Link targets were previously unguarded entirely despite their prompt carrying a copyable skeleton. Residue sets stay consumer-scoped — a memory *about* this defect is legitimate content, not residue.
+- **The contradiction parse gate reports instead of returning silently**, emitting response shape, length, content hash and served model identity. Raw model text stays opt-in behind `CLAWMEM_DEBUG_LLM_RAW` — the prompt carries transcript-derived material, so logging it by default would be a content-exposure path.
+- **`/no_think` is applied idempotently** — six prompts already carry the token inline for the local fallback and were being sent a doubled control token.
+
+### Contradiction detection could never apply a classification (`src/hooks/decision-extractor.ts`)
+
+Two independent defects sat between a valid classification and any effect on the vault. Both are model-independent, and both failed silently.
+
+- **The document lookup was handed a URI where it expected a path.** `SearchResult.filepath` is a *virtual* path — `clawmem://<collection>/<path>`, assembled in the store's projection — while `findActiveDocument` matches the bare `documents.path` column. The hook passed the URI straight through, so no candidate could ever resolve to a row, and the miss exited through a bare `continue`. Every classification that survived the parse gate and every validation above it died there without mutating anything. The path is now resolved with `parseVirtualPath` before lookup, and a target that still fails to resolve increments a counter and warns rather than disappearing.
+- **The parse gate rejected the deployed model's response shape.** The model wraps its array in an object (`{"result": [...]}`). `parseLinkGenerationFromLLM` in `amem.ts` has unwrapped that form since it was written; this path never did, so structurally valid responses were counted as malformed. Both forms are accepted now.
+
+Taken together these are why contradiction detection had no observable effect on any vault regardless of what its logs reported. Precisely: the hook ran, called the model, and parsed a verdict — but no verdict could ever be *applied*, and no document was mutated, in any version shipping this implementation. Read it as newly-effective, not as newly-fixed.
+
+### Invalidation ships shadowed — `CLAWMEM_CONTRADICTION_INVALIDATE`
+
+Repairing the lookup made the soft-invalidation branch reachable for the first time, so it is gated rather than simply switched on. The two mutations behind a contradiction are not symmetrical:
+
+- **Confidence erosion** (`-0.25`, floored at `0.2`) is a ranking signal — 25% of the default composite. A degraded document ranks lower and stays fully retrievable. **Live.**
+- **Invalidation** sets `invalidated_at`, which is a hard predicate on the FTS join and both vector joins. An invalidated document leaves retrieval entirely, with no query-time signal that anything was suppressed. **Off unless `CLAWMEM_CONTRADICTION_INVALIDATE=true`.**
+
+Unarmed, the hook logs `WOULD invalidate "<collection>/<path>"` per suppressed write plus per-session summaries, so precision can be adjudicated against real traffic before anything is removed.
+
+**Shadow mode reports exactly what arming would remove — no more.** Candidates are selected by *pathname* (`decisions/`, `observations/`), but the armed writer only touches `content_type='observation'`: on the reference vault, roughly three times as many candidates as eligible rows. Eligibility is now asked once and gates the shadow log and the armed write identically, so calibration cannot be aimed at a population two thirds of which could never have been invalidated. Documents that reach the floor while ineligible are reported separately, and the armed write checks `.changes` rather than discarding its result — a swallowed outcome is how the original defect stayed invisible.
+
+Exposure is vault-specific along five axes: the eligible population's confidence distribution (`(0.95, 1.0]` needs four classifications to reach the floor, `(0.70, 0.95]` three, `(0.45, 0.70]` two, `<= 0.45` one), content-type mix, the classifier model, corpus semantics, and classification opportunity (only the top 5 search results per session are ever classified, from a pool that changes when the vector leg falls back to FTS). The [contradiction invalidation guide](docs/guides/contradiction-invalidation.md) has the measurement queries, the adjudication procedure, and the restore statements.
+
+**Eligibility is `content_type='observation'` only.** A superseded *decision* is eroded but never retired — decision records are outside the writer's reach by design. **Shadow output is not reachable under OpenClaw**, where the plugin surfaces hook stderr only on a non-zero exit and a successful shadow run exits zero; this flag should not be armed on that host, and calibrating under Claude Code is not an equivalent substitute because exposure is host-dependent. No shipped systemd unit runs this hook — `clawmem-watcher.service` is the indexer.
+
+### Upgrade note — `build_graphs` response shape
+
+Additive, but a contract change. Both surfaces gain `temporalTotal` / `semanticTotal`, and the MCP text line changes from `Temporal graph: N edges` to `Temporal graph: N new edge(s), M total`. Anything parsing that text should be updated. The REST endpoint continues to emit all four keys unconditionally (its pre-existing shape); the MCP tool continues to include only the graph types requested.
+
+### Quality gates
+
+Full suite 1,775/0. Cross-model adversarial passes (codex / GPT-5.6) throughout — seventeen turns, including successive fail-opens in the same validator, a duplicate-entry defect that compounded mutations on one document, and a round in which the newly-added regression tests were shown not to exercise the guard they were written for.
+
+## v0.27.0 — authorship time: memories rank by when they were written
+
+Fixes a confirmed recency-contamination defect: ClawMem had exactly one time axis per document (filing/update time), so a 2025 conversation mined today ranked — and filtered, and injected — as if written today. Worst under recency intent, where recency carries 70% of the composite weight. Documents now carry a second, nullable axis: `authored_at`, when the content was originally written.
+
+### Authorship capture end-to-end (`src/normalize.ts`, `src/clawmem.ts`, `src/indexer.ts`, `src/store.ts`)
+
+- **Mining extracts message timestamps** from all supported formats through strict per-format adapters — RFC3339-with-explicit-offset for Claude Code / codex / Claude.ai (timezone-less values are rejected, never host-interpreted; impossible dates are rejected, not normalized), epoch-seconds for ChatGPT / Slack with range guards. Each exchange chunk is stamped with the max timestamp *within that exchange only* — never a transcript-level fallback (privacy exports flatten multiple conversations into one stream, so a transcript max would cross conversation boundaries).
+- **Synthesized facts inherit** their source conversation's authorship; the shared `saveMemory` API advances `authored_at` monotonically (a newer repeated assertion moves it forward; reprocessing older evidence never regresses it; NULL-safe).
+- **Any vault file can declare `authored_at:` in frontmatter** — full timestamp or date-only `YYYY-MM-DD` (UTC midnight), quoted or unquoted. Frontmatter is authoritative: removing the line clears the stored date on the next content change.
+- **Re-mining an existing vault dates documents without churn**: a body-identical re-index whose only change is `authored_at` takes a metadata-only "dated" transition — `modified_at` preserved, stored confidence untouched, no re-enrichment queued.
+- **`clawmem mine <dir> -c <collection> --backfill-dates [--apply]`**: recoverable-only backfill for already-mined vaults. Dry-run report by default; the apply phase is transactional and re-asserts the validated content hash on every row, so a concurrent change can never receive a mismatched date; documents whose content no longer matches the source are skipped, never guessed.
+- **Colliding transcript names no longer overwrite each other**: sources that sanitize to the same staging name (`a/b.jsonl` vs `a_b.jsonl`) previously clobbered each other silently; they now mine under distinct hash-suffixed identities, decided once per source and stable across re-runs (non-colliding sources keep their existing names — zero path churn).
+
+### Effective time in ranking and retrieval (`src/memory.ts`, `src/mcp.ts`, callers)
+
+- **Composite recency ages documents by `authored_at ?? modified_at`**, and the confidence signal's internal recency uses the same effective date (the access-pattern sentinel stays on filing time). Documents without authorship behave exactly as before.
+- **Temporal filters and the temporal-proximity channel** ("what did we plan in March") select, order, and score by effective time on both the FTS and vector legs.
+- **Recent-content windows** — postcompact recent decisions/antipatterns, session-bootstrap current focus, `clawmem reflect`, directory context, profile — apply their cutoffs and display their dates on effective time, so a freshly-mined historical decision no longer masquerades as this week's work. Operational clocks (the dedup window, lifecycle sweeps, staleness review, session log) intentionally keep filing/update time.
+- **Result metadata**: compact search results now carry `authored_at` (null = unknown).
+
+### Entity-edge IDF population fix (`src/entity.ts`)
+
+Completes the v0.25.0 hub-bias fix: the enrichment/edge-creation path computed IDF with an active-only numerator over an all-documents denominator, letting archived history deflate specificity (below zero in the extreme) and suppress edges for entities that are specific among the live corpus — and could create edges toward archived documents. Both populations are now active-only and archived candidates are excluded, matching the neighbor path. Bug-first tests demonstrate the pre-fix failure.
+
+### Quality gates
+
+Full suite 1,681/0 (62 new tests, including direct caller-level pins for every recency window and a live CLI backfill lane). The authorship design was adversarially design-reviewed before any code (6 turns, 29 findings absorbed — including the two-axes consumer classification, the confidence-lane uniformity rule, and set-independent mine identity), then the implementation was reviewed to verbatim "Zero remaining findings — ship as is." in 3 turns (7 findings, among them a year-0000–0099 date-construction bug and a backfill validation race); the entity fix cleared in 1 turn. Cross-model adversarial passes (codex / GPT-5.6) throughout.
+
+## v0.26.0 — offline eval harness (evidence-overlap replay) + short memory-query gate fix
+
+Retrieval quality becomes measurable: a gold-labeled replay harness scores the real `query` pipeline against hand-labeled evidence, ending the era of ranking/extraction changes shipping un-measured. Plus a gate-ordering bug fix that was dropping short explicit memory questions.
+
+### Offline eval harness (`src/eval/`, `clawmem eval run`)
+
+An offline, CLI-only evaluation subsystem (pattern extracted from the HORMA paper's evidence-grounded reward, re-authored for ClawMem's deterministic on-device substrate):
+
+- **Replays the real pipeline, never a mirror.** `clawmem eval run --gold <file.jsonl>` drives the actual registered `query` MCP tool handler over an in-memory transport — expansion, RRF fusion, rerank blending, composite scoring, and MMR diversity at their tool defaults — so the number measures the product, not a copy that drifts.
+- **Doc-level evidence-overlap metrics**: Jaccard `|C∩E|/|C∪E|` between retrieved and gold document sets, plus precision@k, recall@k, hit@k, and MRR; per-tag slices; p95 latency. Artifacts: `run.json` (machine) + `report.md` (hand-audit companion).
+- **Gold sets are strict, hand-labeled JSONL** (any path via `--gold`, so private labels can live outside the repo): unknown fields, malformed lines, and duplicate ids are hard errors; an example with any evidence ref that doesn't resolve to an active document is excluded from scoring — regardless of its replay mode — and fails the run's trust gate, so partial or stale gold can never inflate recall.
+- **Trust gate, machine-visible**: enough scored examples (`--min-examples`, default 30), zero unresolved refs, and an explicit `--audited` attestation that a 10–20% hand-audit of the labels passed. A completed run with a failing gate exits `1` (artifacts still written) so automation can't mistake an untrusted number for a trusted one.
+- **Identity integrity**: retrieved results map back to document ids by inverting the `collection/path` display path; zero or multiple matches (a collection name containing `/` colliding with a sibling) hard-fail the run instead of guessing or silently dropping — either would corrupt the metric.
+- **State-safe**: the replay writes no retrieval, lifecycle, or telemetry state (`context_usage` / `recall_events` / `memory_relations` untouched, regression-pinned); normal inference caches may populate as in any live query. `--db <snapshot>` points the whole run at a `VACUUM INTO` copy for corpus-frozen A/B comparisons between checkouts.
+- First build ships the `query` replay profile; `intent`/`context` replay, benchmark adapters, and provenance are follow-on phases. Guide: [docs/guides/eval-harness.md](docs/guides/eval-harness.md).
+
+### Short memory-intent queries now reach retrieval (`src/hooks/context-surfacing.ts`, `src/retrieval-gate.ts`)
+
+The retrieval gate's `FORCE_RETRIEVE_PATTERNS` (memory verbs, temporal refs, personal-data queries) carry the explicit contract "(checked before skip)" — but the context-surfacing hook returned on `prompt.length < 20` before the gate ever ran, so short explicit memory questions ("what did I say?", 15 chars) got an empty `<vault-context>` in violation of the gate's own contract. The force check is now consulted before the length early-return (new `hasForceRetrieveIntent` export, shared with `shouldSkipRetrieval` so there is one source of truth). Empty prompts, short non-memory prompts, slash commands, heartbeat suppression, duplicate dedupe, and the query-text privacy split (pre-retrieval skips never persist prompt text) are all unchanged.
+
+### Quality gates
+
+Full suite 1,619/0 (42 new tests). Each item independently reviewed by a cross-model adversarial pass (codex / GPT-5.6) to verbatim "Zero remaining findings — ship as is.": the eval harness in 3 turns, the gate-ordering fix in 1.
+
+### What didn't change
+
+No schema changes, no migrations, no re-embed. All runtime retrieval surfaces (hooks beyond the gate ordering, `query`, `intent_search`, `search`, `vsearch`, `memory_retrieve`, REST) score and rank exactly as in v0.25.0. No MCP tool was added — the eval harness is CLI-only.
+
+---
+
+## v0.25.0 — extraction retry-with-error-feedback + decision half-life + entity-neighbor hub-bias fix
+
+Three independently reviewed items from the strategic queue (§13.1, §36.11, BL-001) — the first queue burndown since the ranking was locked. Three files, three pipelines, no shared invariants.
+
+### §13.1 — retry-with-error-feedback on every LLM extraction path (`src/llm-retry.ts`)
+
+ClawMem's extraction surfaces were single-shot: one `generate()` attempt, and any malformed/empty response failed open to `[]`/`null` with no signal to the model about what went wrong — invisible data loss on every transient formatting miss. All eight extraction call sites now ride `withRetryAndFeedback` (pattern re-authored from Volt's llm-map validation loop):
+
+- **Stateless corrective retries** (default 3 attempts): each retry is a fresh `generate()` call with a reconstructed prompt — original prompt + the parse error + a 500-char excerpt of the previous response — never a conversation continuation.
+- **Hard wall-clock deadline** shared across all attempts: no attempt starts past the deadline, and an in-flight `generate()` is raced against it — a backend that ignores the abort signal cannot hold the helper past the budget.
+- **Fail-open on exhaustion** (null → the same `[]`/`null` callers already handled), now with a terminal `[llm-retry] <label>: exhausted…` warning naming the call site.
+- Call sites: observer `extractObservations`/`extractSummary`, conversation-synthesis `extractFactsFromConversation`, A-MEM `constructMemoryNote`/`generateMemoryLinks`/`evolveMemories`/`inferCausalLinks`, entity `extractEntities`. Parse closures own whole-response STRUCTURAL validation (so a malformed payload triggers a corrective retry instead of a silent post-loop drop — including integer-validated causal-link indexes, closing a partial-write path); semantic/domain filtering stays outside the loop.
+- Accounting change: a transient failure that recovers on retry no longer counts as an LLM failure in `mine --synthesize` stats; only terminal exhaustion does.
+
+### §36.11 — decision ranking half-life: ∞ → 180 days (`src/memory.ts`)
+
+`HALF_LIVES.decision = Infinity` pinned recency at 1.0 forever, so a silently-abandoned decision ("we'll use X" → quietly moved to Y, with no contradictory write to trigger supersession) kept winning ranking indefinitely. Decisions now decay on a 180-day half-life. **Ranking durability only:** `decision` keeps its attention-decay exemption, nothing is deleted or archived (lifecycle policy is separate), the access-frequency extension still stretches frequently-resurfaced decisions toward 3×, and `deductive`/`preference`/`hub`/`antipattern` stay infinite. An unaccessed 180-day-old decision drops to recency 0.5 — still fully searchable, just no longer permanently ahead of fresher material.
+
+### BL-001 — `getEntityGraphNeighbors` hub-bias fix (`src/entity.ts`)
+
+The entity-neighbor path ranked by raw co-occurrence count — reintroducing exactly the hub bias the edge-creation path's IDF suppression exists to prevent (one path suppressed hubs, the other reinforced them). Neighbor ranking now blends count with IDF specificity (`min(1, log1p(count)/5) × clamp(idf/3.0)`, sharing the edge path's 3.0 threshold via `ENTITY_IDF_SPECIFICITY_THRESHOLD`):
+
+- **Score-before-limit:** every co-occurring candidate is scored, THEN the pool is capped at 30 — a specific neighbor at raw-count rank 31+ can now surface (the old SQL `ORDER BY count DESC LIMIT 30` excluded it before scoring).
+- **Best-path-per-doc:** candidates are traversed in blended-score order, so a document reachable via both a hub and a specific entity keeps the specific path's score and `viaEntity`.
+- **Active-only IDF + hydration:** IDF populations are active-documents-only (archived mentions can no longer distort specificity), archived-only candidates are dropped from the pool, and hydration excludes archived documents before its per-entity LIMIT. One grouped CTE query supplies counts and active doc-frequency together (no N+1).
+
+### Quality gates
+
+Full suite 1,577/0. Each item independently reviewed by a cross-model adversarial pass (codex / GPT-5.6) to verbatim "Zero remaining findings — ship as is.": §13.1 in 3 turns, §36.11 in 2, BL-001 in 3 (bug-first — the failing hub-bias test predates the fix).
+
+---
+
+## v0.24.0 — raw-BM25-primary ranking for `search` (judged keyword eval) + bypass A/B toolkit
+
+v0.23.0 made the FTS relevance signal real and deliberately deferred any ranking-contract change to a judged eval. That eval ran: 43 judged keyword targets (23 discovery + 20 family-disjoint held-out) with objectively-labeled fairness shapes (14 raw-favorable "exact-old", 22 composite-favorable "fresh-among-many"), frozen floors and decision rules pre-registered before any comparison was computed. **Raw-BM25-primary beat the shipping composite decisively**: combined MRR 0.848 vs 0.415, hit@1 33 vs 6; held-out 0.875/16-at-#1 vs 0.335/zero-at-#1 (the composite missed the absolute floors outright); composite lost even on its OWN favorable shape (fresh-among-many 0.348 vs 0.801) — the recency/quality/co-activation multipliers bury keyword relevance rather than refine it. One paired regression (one position) in 43 cases; controls clean in both arms.
+
+### Behavior changes
+
+- **`search` ranks non-recency queries by the RAW BM25 transform** (`|bm25|/(1+|bm25|)`), mirroring the v0.22.0 vector-route pattern. Metadata — including pin — participates only inside groups of exactly-equal raw scores (deterministic tie order: pinned, then legacy composite, then path). `structuredContent` carries `scoreBasis: "fts-bm25"`. FTS-transform values and vector cosines remain independent, non-comparable channels.
+- **`minScore` on `search`** now filters the raw score for non-recency queries and has NO default — omitted means no filter, an explicit `0` is honored. Recency-intent queries ("latest…", "recent…") keep the composite regime with the previous default-0 floor and report `scoreBasis: "composite"`.
+- **Unchanged surfaces:** hooks/context-surfacing, `query`, `query_plan`, `intent_search`, `memory_retrieve`'s composite modes, the CLI `search` command, and the REST API keep their existing scoring. The change is scoped to the MCP `search` tool, exactly as evaluated.
+- **Bypass ops escape hatch:** `CLAWMEM_DISABLE_FTS_BYPASS=true` forces the full expansion path at both strong-signal-bypass consumers (MCP `query` pipeline + CLI `query`) — built for the 49.3 A/B harness, kept as an operational kill switch.
+- **`expandQueryCacheKey` exported** — the exact `llm_cache` key `expandQuery` reads/writes, so eval harnesses can delete/verify expansion cache rows without replicating private key construction.
+- **Bypass characterization (49.3, frozen census):** on a frozen 127-query census (51 judged keyword cases + 76 firing-hunt probes) over the frozen production snapshot, the strong-signal bypass fired on THREE — 3/51 on the judged set, 0/76 among the probes — all lone-or-near-lone pools, all with the correct top document. Frozen-corpus characterization only: the probes were selected to hunt firings, so these rates say nothing about production firing prevalence (unmeasured), and the firing set is snapshot-relative — one probe term began firing on the live index hours later as new documents mentioned it. On this frozen snapshot/census the gap ≥ 0.15 condition fired rarely — sibling documents suppress the gap on this corpus. Eval tooling: `scripts/eval-keyword-acceptance.ts` (freeze/run, FTS-only) and `scripts/eval-bypass-ab.ts` (freeze/run, live-service A/B with a verified expansion-cache freeze and census integrity re-execution).
+- **Bypass A/B verdict (49.3):** on the frozen census's complete fired population (3 natural cases; pre-registered zero-allowance gates; run gated on frozen service identity + an embed-geometry canary drift-check + rerank health), the bypass lost nothing — zero dropouts, zero hard regressions, bypass-arm MRR +0.038 higher — and saves ~56% wall time where it fires (1.9 s vs 4.3 s with a warm expansion cache). Verdict: `SAFE ON FROZEN CENSUS (n=3 fired; zero-allowance gates); population risk unvalidated` — thresholds 0.85/0.15 stand on this census; no tuning proposed.
+
+---
+
+## v0.23.0 — monotonic BM25 exposed score (the FTS relevance signal was a constant)
+
+The v0.22.0 design gate discovered that `searchFTS`'s exposed score was computed as `1 / (1 + Math.max(0, bm25))` — but FTS5's `bm25()` is negative-is-better and ≤ 0 for every match (0/4,962 positive rows measured on a production vault), so **every FTS result carried the identical score 1.0**. SQL ordering was correct; everything downstream of the exposed score was not: composite ranking on FTS surfaces (`search`, REST keyword, CLI, `memory_retrieve` keyword and its semantic-mode FTS fallback, hook FTS lanes) was effectively metadata-only, the `query` pipeline's strong-signal bypass could never fire on multi-hit queries yet always fired on single-hit ones, hook injection systematically preferred FTS-sourced docs over vector-sourced ones (1.0 vs cosine), and every score-threshold gate was vacuous.
+
+### Behavior changes
+
+- **Exposed FTS score is now `|bm25|/(1+|bm25|)`** (`ftsScoreFromBm25`, exported): monotonic in match strength, bounded [0,1), per-row stable, clamps a hypothetical positive input to 0.
+- **`search` keeps the composite regime** (a regime change is gated on the 49.2 judged keyword eval) — but its searchScore input is now real, so keyword relevance finally contributes ordering. Observed `score`/`compositeScore` values shift accordingly; `minScore` semantics are unchanged. Compact results report the composite; non-compact carry both `score` (raw transform) and `compositeScore`.
+- **Strong-signal bypass is functional**: fires only on a strong (≥ 0.85 ⇔ |bm25| ≥ 5.67), clearly separated (gap ≥ 0.15) top hit; a lone weak match no longer triggers it. One shared helper (`hasStrongFtsSignal`) now backs both the MCP `query` pipeline and the CLI `query` command (previously a drifted duplicate).
+- **`memory_forget` targeting is stricter and safer**: the confidence gate (`score ≥ 0.7`, or a ≥ 0.2 gap when 2+ candidates exist) is live — previously every FTS candidate scored 1.0 and was auto-selected, including a lone garbage match. Weak matches now return the candidate list for disambiguation. Non-destructive pin/snooze behavior is unchanged.
+- **`query_plan`'s graph clause now carries RRF-fused scores into graph traversal** (parity with the causal and `intent_search` paths, via a shared `attachRrfScores` helper) — traversal seed mass was previously anchored on raw single-channel scores.
+- **Consolidation dup-gate and curator BM25 probe are live**: the `score ≥ 0.7` duplicate filter and the `> 0.3` retrieval probe actually discriminate now. A near-empty vault may honestly report a degraded BM25 probe where it previously passed vacuously.
+- **Scale honesty**: FTS-transform scores and vector cosines are independent monotonic signals, not a calibrated common scale. Mixed-channel merge points (REST hybrid max-merge, hook dedup) are no longer degenerate, but cross-channel calibration remains future, eval-gated work.
+
+Follow-on work: BACKLOG 49.2 (judged keyword eval → `search` regime recommendation; reports bypass firings) and 49.3 (query-pipeline A/B before any bypass-threshold tuning).
+
+---
+
+## v0.22.0 — raw-similarity-primary ranking for the direct vector routes
+
+v0.21.0 removed the system-internal junk from the direct tools' results; the direct-pipeline eval it mandated then showed the composite scoring layer itself was the remaining defect on those routes: on a judged set against the live vault, pure raw cosine ranked 16/19 targets #1 (MRR 0.912) while the shipping composite ranked 1/19 (MRR 0.307), filtered 14/19 correct answers below the old `minScore` floor, and got WORSE with deeper candidate pools. Attribution was measured per stage: length normalization caused the floor kills; the pin +0.3 additive made one pinned, heavily-accessed hub document top-1 for nearly every query including nonsense controls; re-mixing the weights could not help because every multiplier is larger than the 0.03–0.10 raw margins that separate right answers from wrong ones in the compressed-high band of modern embedding models.
+
+### Behavior change: raw ordering on the evidenced vector routes
+
+- **`vsearch` and `memory_retrieve` semantic/discovery modes** rank non-recency queries by RAW vector cosine. Document metadata — including pin — participates only inside groups of exactly-equal raw scores (deterministic tie order: pinned, then legacy composite, then path). `structuredContent` carries `scoreBasis: "vector-cosine"`; raw cosine is embedding-model-specific and not comparable to composite values.
+- **`minScore` on `vsearch`** now filters the raw score for non-recency queries and has NO default — omitted means no filter, an explicit `0` is honored (nullish handling). Recency-intent queries keep the composite regime with its 0.3 default floor and report `scoreBasis: "composite"`.
+- **Recency-intent queries are unchanged everywhere** (RECENCY_WEIGHTS composite, newest-first behavior, contentType priority sort), selected through one centralized regime function. The semantic/discovery FTS *fallback* (vector leg unavailable) also keeps composite — its scores are not cosine.
+- **Unchanged routes:** `search` (BM25), `query`, `query_plan`, `intent_search`, hooks/context-surfacing, and `memory_retrieve` keyword/hybrid/causal/complex. `find_similar` was already raw-ranked and is untouched (docs now say so). A BM25 ranking eval is backlogged separately — its exposed score is currently non-monotonic (`Math.max(0, bm25)` flattens FTS5's negative-is-better scores), a pre-existing issue this release documents but does not change.
+- **Pin re-documented:** pin = lifecycle retention + prioritization among relevance-equivalent results. On composite surfaces it keeps the +0.3 boost; on the raw routes it breaks exact ties only. "Persistent surfacing" — a pinned document floating above more relevant ones on every query — was the measured hub defect, not a feature.
+- **`retrieval.mcp_direct_tuned_weights` is superseded and has no effect.** Its own gate evidence (the direct-pipeline eval) measured tuned weights at 1/19 hit@1. The key is still parsed; setting it logs a once-per-process warning.
+
+### Verification
+
+`bun test` → 1504 pass / 0 fail (new: constructed-tie units — pin wins inside an exact-score tie group and never crosses a boundary; regime selection; no-default-floor + explicit-zero `minScore` handling; route-level raw-ordering regressions including the incident fixture, which now proves the inversion cannot recur even with `includeInternal: true`). A frozen, deterministic acceptance gate (`scripts/eval-acceptance.ts`: vault snapshot + frozen `asOf` clock + per-case frozen query vectors through the guarded precomputed-vector path) passed all predeclared criteria: pin-invariance rank identity on non-recency cases; exact match to the frozen composite baseline on recency cases; no control-query hub dominance and no pinned top-1; discovery set 23/23 in-pool, hit@1 18/23, MRR 0.870; held-out family-disjoint set hit@1 17/20, hit@5 19/20, MRR 0.879 against floors of 12/20, 17/20, and 0.75 declared before the set was authored. Design and implementation adversarially reviewed cross-model to explicit clearance (5-turn DESIGN gate, 14 findings folded).
+
+## v0.21.0 — vsearch trust hardening: internal-collection exclusion, geometry canary, embed survivability
+
+A live incident exposed a stacked failure: an embedding server silently producing non-discriminating vectors for the vault's dominant register (a last-token model whose GGUF conversion lost its EOS-append flag), amplified by composite scoring floating system-internal docs over true matches — while every existing health check passed. The server-side cause is an operator fix; this release closes the client-side amplification and the detection gaps, and hardens the embed run that the remediation itself crashed.
+
+### Behavior change: `_clawmem` excluded from MCP retrieval by default
+
+`search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` no longer return the system-internal `_clawmem` collection (observations/deductions/handoffs) unless asked: pass `includeInternal: true`, or name `_clawmem` in an explicit `collection` filter. `find_similar` auto-includes internal neighbors when the reference document is itself internal. `intent_search` / `find_causal_links` / `kg_query` / `session_log` / `timeline` are unfiltered by design — system memory is their substrate. Exclusion happens at the store layer (SQL predicate for BM25; escalating MATCH depth for vectors) and inside graph traversal (excluded nodes are pruned before beam selection and score normalization), so internal docs neither appear NOR consume candidate/beam budget.
+
+Vector-side contract: under exclusion the scan escalates depth until `limit` allowed documents hydrate, capped at 4,096 fragments. Cap-limited under-fills carry an explicit `degraded: true` + `degradedReason` (`excluded-dominant` when distinct excluded docs account for the shortfall, `cap-truncation` when fragment dedup drives it); multi-leg routes aggregate `any(leg)` with per-leg reasons in `structuredContent.degradedLegs`. Plain small-vault exhaustion returns a normal short list with no marker.
+
+### Embedding-geometry canary (preflight + doctor)
+
+- `clawmem embed` now runs a pair-separation probe battery BEFORE any destructive step — a broken-geometry server aborts the run before `--force` clears anything (override: `--force-geometry`). The battery uses the production embed templates and includes terminus + truncation controls that catch unanchored last-token readouts; self-similarity alone cannot (stored-vs-fresh stayed 0.999 through the entire incident).
+- Baselines are stored per (probe-version, model, dimension) profile in a new `embed_canary` table as **first-healthy calibrations** — healthy runs never roll the reference; `clawmem embed --force --recalibrate-canary` is the explicit replacement operation (intrinsic sanity floors govern its gate, since the old baseline is exactly what it replaces). Margins alert relative to the calibrated baseline (< 50%) with an absolute backstop, and drift (stored-vs-fresh probe cos < 0.98) flags a changed serving stack behind an unchanged model name. Mixed dimensions/models across one battery (a flapping endpoint) are a hard failure, and a `--force` clear never proceeds on an UNVALIDATED endpoint. Mid-run drift, an unverifiable run end, or a no-preflight override persists a durable `embed_geometry_taint` flag (lease-fenced) that keeps `doctor` nonzero until a verified full rebuild clears it.
+- `clawmem doctor` gains the canary (section 10) and a sampled persisted-vs-fresh check on real index rows (section 11): fragments are reconstructed through the production parse/split/format pipeline and compared to their stored vectors. New vectors persist an `embed_input_fp` (SHA-256 of the exact embed input) enabling full validation; pre-0.21.0 rows validate structurally with title provenance flagged unavailable until their next re-embed. Definitive failures (fingerprint mismatch = stale input; fingerprint match + low cosine = corruption) exit nonzero immediately — sampling coverage can never mask them.
+
+### Embed-run survivability
+
+The incident's remediation run died on a transient `SQLITE_BUSY`: the failure-marker write itself crashed a `--force` rebuild at doc 344/4,995 with the index already cleared. Now: the embed connection runs a 10s busy timeout (set on the ACTIVE connection, covering `update --embed`'s cached store; kept short so synchronous waits cannot starve the 30s lease heartbeat), retries are asynchronous and bounded with a lease-loss abort between attempts, `markEmbedStart/Synced/Failed` are lease-fenced in-transaction, a marker that still fails logs-and-continues instead of killing the run, and `--force` skips the post-clear stale-embedding cleanup (a no-op that could only add a die-after-clear window).
+
+### Also
+
+- `latest` now routes to recency intent (`RECENCY_PATTERNS`) — "latest decisions" was scoring under non-recency weights.
+- Config knob `retrieval.mcp_direct_tuned_weights` (default **false**; env `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS`): opt-in to score the MCP direct tools' non-recency queries with the retrieval-tuned `query`-tool weights. The default flip is gated on a direct-pipeline eval — the existing n=199 evidence covered only the hybrid `query` pipeline.
+- Read-only template A/B evaluator (`scripts/eval-query-template.ts`): ranks known-target queries under query-template / doc-template / raw formatting against the live index through the same model+dimension guards as production, writing nothing. Measured post-incident: a doc-templated query ranked the true target #1 where the query template ranked it #383 — a query-side-only template change needs no re-embed.
+- Production vector search now runs an explicit pre-MATCH dimension check via a shared query-vector compatibility guard (previously model-consistency only).
+- Docs: the zembed-1 launch line ships with `--pooling last --override-kv tokenizer.ggml.add_eos_token=bool:true` (the missing flags seeded the incident); troubleshooting's claim that a re-embed is "not required" after a pooling fix is corrected (it IS required — same-dimension geometries are incompatible); the missing-EOS-anchor signature, shared-suffix diagnostic confound, compressed-high similarity bands, and watcher/`tee` operational notes are documented.
+
+### Verification
+
+`bun test` → 1492 pass / 0 fail (45 new regressions: escalation fill / cap-exhaustion markers / dedup-collapse / mixed-cause truthfulness / small-vault no-marker; traversal beam parity; shared-guard model+dimension; canary healthy/collapsed/drift/unavailable/mixed-endpoint; fail-closed preflight gate matrix; first-healthy baseline calibration; sampled-validation tiers incl. definitive-failure non-maskability, canonical-alias dedup, and hard attempt caps; busy-retry semantics; lease-fenced markers; `latest` routing; route-level MCP tests over an in-memory transport for all six retrieval tools incl. the incident composite-ranking fixture). Design adversarially reviewed to explicit clearance in a 7-turn cross-model DESIGN gate (34 findings folded); implementation review findings (fail-open canary gate, unbounded sampling, canonical-identity blindness, rolling baselines, taint persistence, and route coverage) folded before ship.
+
+## v0.20.2 — Beads sync hardening: argument-safe exec, telemetry-off spawns
+
+`runBd` assembled a shell string and ran it through `execSync`, leaving argument interpolation to the shell, and bd v1.1.0 upstream turned on anonymous usage metrics by default with a remote reporting endpoint and a spawned flush sender — so every bd invocation ClawMem makes during a sync would have phoned home on upgraded installs.
+
+- **`execFileSync` replaces the shell string** (`src/beads.ts`): arguments pass as an array with no shell interpolation; same timeout, cwd, and error handling.
+- **Telemetry is disabled for ClawMem-spawned bd calls only.** The spawn env forces `BD_DISABLE_METRICS=1` and `BD_DISABLE_EVENT_FLUSH=1`. Older bd releases ignore the unknown variables (verified on v0.58.0); a user's own interactive bd keeps whatever metrics preference they chose — automated sync calls would only have skewed it.
+
+### Verification
+
+`bun test` → 1447 pass / 0 fail. Empirical matrix on both ends of the supported bd range: v0.58.0 and v1.1.0 return identical rows with and without the env pair. The exec seam was flagged in an independent cross-model adversarial review (codex / GPT-5.5).
+
+### What didn't change
+
+The parse schema, sync semantics, dep-type bridging, and document shape are untouched. v0.20.2 is byte-identical in behavior to v0.20.1 except for the exec mechanism and the spawned-call env.
+
+## v0.20.1 — Beads sync against bd v1.1.0: full-backlog list, dead field dropped, claim leases surfaced
+
+An upstream delta survey of beads v1.0.5 → v1.1.0 (`gastownhall/beads`, formerly `steveyegge/beads`) found three drift points in the sync:
+
+- **The 50-issue silent truncation is gone.** `queryBeadsList` inherited `bd list`'s default cap, so backlogs past 50 issues silently synced a prefix. The query now passes `--limit 0` (unlimited) — verified live against bd v0.58.0 and v1.1.0, so the fix does not raise the version floor.
+- **`quality_score` dropped from the parse** (`src/beads.ts` interface, normalizer, and formatter). Upstream removed the field at v0.62.0; it was `omitempty` even before, so real `bd list --json` output stopped carrying it long ago. This is bd's per-issue field — ClawMem's own indexing-time quality scoring is a different mechanism and is untouched.
+- **Claim leases surfaced.** bd v1.1.0 issues can carry `lease_expires_at` / `heartbeat_at`; the sync now parses both and renders a `**Claim Lease**: expires …` line when present, so agent-claimed work is visible in indexed memory. Absent on older bd → the line is skipped.
+
+### Verification
+
+`bun test` → 1447 pass / 0 fail. No ClawMem consumer references the dropped field (`store.ts` / `mcp.ts` / CLI checked). `--limit 0` and field behavior exercised against live databases on bd v0.58.0 and v1.1.0.
+
+### What didn't change
+
+Dependency-type bridging is untouched — the new upstream dep types (`tracks`, `until`, `authored-by`, `assigned-to`, `approved-by`, `attests`) fall to the existing `semantic` default exactly as unmapped types always have. Watcher behavior, `.beads/` discovery, and document format are unchanged apart from the two field-level items above.
+
+## v0.20.0 — Vector-query daemon: a hard cap on the cold synchronous MATCH
+
+v0.16.0 and v0.17.0 bounded the `context-surfacing` hook's vector leg with wall-clock deadlines and kept the sqlite-vec payload warm with a watcher prewarm, but those are probability reductions: a synchronous `bun:sqlite` MATCH exposes no interrupt, so once a cold scan on a large vault is in flight it blocks the hook's event loop past the 8-15s budget and the in-thread `Promise.race` timer cannot fire. v0.17.0 tracked the true hard cap — moving the scan off the hook's event loop — as deferred. This release ships it.
+
+- **Vector-query daemon, hosted by the watcher (opt-in, a pure optimization layer).** `clawmem watch` now runs a per-vault unix-domain socket daemon. The `context-surfacing` hook sends only the query string; the daemon runs Step 1 — the embed plus the blocking sqlite-vec MATCH — in its own process and returns the raw `{hash_seq, distance}` matches, which the hook hydrates locally (Step 2). With the blocking scan off the hook's event loop, the hook's real `setTimeout` finally fires: a cold scan that would have blocked the turn now times out fast and falls back to FTS with bounded latency. `searchVec` is split into `searchVecMatch` (Step 1) and `hydrateVecResults` (Step 2); the in-process `searchVec` composes them, so its contract is unchanged, and both hook vector legs — primary and deep-escalation — are bounded, not just the first.
+- **Strict graceful degradation — never a dependency.** When the watcher isn't running the socket is absent and the hook uses the in-process path exactly as before. When the daemon is busy or misbehaving the hook drops to FTS rather than re-running the scan in-process (which would reintroduce the block). A read-path model mismatch still surfaces as `VecReadModelMismatchError` (warned once) across the socket, preserving the v0.18.0 contract.
+- **Single-flight, deadline-on-receipt, and a private socket.** At most one scan runs per vault; a request arriving mid-scan gets an immediate `busy` (→ FTS) rather than queuing, and a request whose deadline already elapsed is dropped without scanning — so cold-scan pileups cannot starve the watcher. The socket lives under `$XDG_RUNTIME_DIR/clawmem/` (0700 dir, 0600 socket), is keyed per vault DB path, refuses to clobber a live daemon from another watcher, and is unlinked on shutdown. `CLAWMEM_VEC_TIMING=1` logs per-leg outcome and elapsed for attribution.
+
+### Verification
+
+`bun test` → 1447 pass / 0 fail — the project's release gate. New bug-first tests in `tests/unit/vector-daemon.test.ts` (16, deterministic under `--rerun-each 3`) cover the socket protocol (serve, malformed, oversized, teardown), single-flight and deadline-on-receipt, the per-vault socket derivation, and the client's full fail-open matrix (absent → in-process, busy/error → FTS, model-mismatch → typed rethrow); the Step-1 scan is dependency-injected so they run without an embedding server. A bare `tsc --noEmit` remains a non-gate for the reasons noted under v0.18.0; the new `src/vector-daemon.ts` and the split `src/store.ts` add no new type errors over that baseline. Reviewed by an independent cross-model adversarial pass (codex / GPT-5.5-high): a fresh DESIGN gate on the spec at build time, then code review to zero remaining findings.
+
+### What didn't change
+
+Retrieval quality, scoring, ranking, and the vault format are untouched — the daemon returns the same Step-1 matches the in-process path would, hydrated by the same Step-2 query. A deployment that does not run `clawmem watch` gets byte-identical behavior to v0.19.0. The daemon hosts the general vault only; skill-vault vector queries stay in-process (a far smaller surface, not the ~2 GB risk).
+
+## v0.19.0 — Priority-based transcript formatting for session extraction
+
+The `decision-extractor` and session-summary Stop hooks prepared their LLM input by walking the last N messages and truncating each to a per-role character cap until a flat budget ran out. Under that scheme a long run of mid-conversation tool output could exhaust the budget before the final assistant message (the actual outcome) was reached, and the original user request — the single most important anchor for extraction — carried the same weight as any other message. Extraction quality degraded on exactly the long, tool-heavy sessions where good observations matter most.
+
+- **Priority-based transcript assembly.** `prepareTranscript` now classifies each message before budgeting: P0 the first user message (the original request), P1 the last real assistant message (the final response, skipping trailing tool calls), P2 tool activity, P3 the remaining conversation, P4 system messages. The critical P0/P1 pair is always included (at a doubled per-role cap); tool activity and then conversation fill the remaining budget and are *truncated to fit* rather than dropped wholesale; the result is reassembled in chronological order so the LLM still sees a coherent sequence. Tool detection keys off the generic `[tool_use` / `[tool_result` markers, so a transcript that ends on a tool call correctly keeps the preceding assistant text as the final response instead of mislabeling the tool call as the outcome.
+
+### Verification
+
+`bun test` → 1431 pass / 0 fail — the project's release gate. New bug-first tests in `tests/unit/observer.test.ts` cover `classifyMessages` (P0–P4 assignment, plus the end-on-tool and all-tool edge cases where no P1 exists) and `prepareTranscript` (P0/P1 always present, chronological order preserved, tight-budget prioritization, and tool messages truncated-to-fit rather than dropped). A bare `tsc --noEmit` remains a non-gate for the reasons noted under v0.18.0; the changed `src/observer.ts` adds no new type errors over that baseline. Reviewed by an independent cross-model adversarial pass (codex / GPT-5.5-high) to zero remaining findings.
+
+### What didn't change
+
+Retrieval quality, scoring, the vault format, and every public API are untouched. The formatter keeps the same `TranscriptMessage[] → string` contract; only the selection and ordering of what survives truncation changed. A session short enough to fit the budget is formatted with the same content as before, now in guaranteed-chronological order.
+
+## v0.18.0 — Read-path embedding-model guard, extraction parrot-hardening, remote LLM/rerank auth
+
+Three independent hardenings gathered from a QMD-upstream survey. The first is a behavior change on the query path (a new fatal that replaces silently-wrong results) and drives the minor bump; the other two are additive.
+
+- **Read-path embedding-model consistency guard (contract change).** A vault embedded with one model and then queried after the active embedding endpoint switched to a *different model at the same dimension* silently matched the new query vector against the old stored vectors — cosine-meaningless results that `VecDimensionMismatchError` cannot catch (the dimension is unchanged). `searchVec` now compares the endpoint-returned model against the vault's stored model(s) after the query embed and throws `VecReadModelMismatchError` unless the vault holds exactly one model equal to the active one — a heterogeneous vault (more than one stored model) is rejected too, since the extra model's vectors still pollute the space. The comparison uses the endpoint's own reported model, not the caller's model alias, and is cached per connection keyed on SQLite's `data_version` so a cross-process `clawmem embed --force` invalidates a stale verdict. Explicit query paths (MCP tools, the REST server, the CLI) surface the error; the fail-open hooks (`context-surfacing`, the Stop-hook `decision-extractor`) warn once per process and degrade to BM25 rather than dropping the turn. Remedy: `clawmem embed --force`.
+- **Extraction prompts hardened against parroting.** The conversation-synthesis and deductive-synthesis prompts carried copyable few-shot examples with concrete, real-looking content; a weak local extraction model run out of distribution echoed them verbatim instead of extracting. Both examples are replaced with structure-only `{{...}}` skeletons, and a shared residue guard — extracted from the observer path into `src/schema-placeholder.ts` and now imported by all three extraction paths — rejects any output that echoes a schema placeholder or template marker. A new `placeholderRejects` counter surfaces echoed drafts in the deductive-synthesis stats. The guard deliberately does not blocklist the removed example text (plausible real facts like an OAuth decision would false-positive); it keys off the skeleton markers instead.
+- **Remote LLM + reranker authentication.** `generateRemote` (the remote LLM path) and the remote reranker path sent no `Authorization` header, so neither could point at an authenticated cloud endpoint. New independent env vars `CLAWMEM_LLM_API_KEY` and `CLAWMEM_RERANK_API_KEY` add a `Bearer` header when set, mirroring the existing `CLAWMEM_EMBED_API_KEY`. The three keys are independent (the services may sit behind different hosts). Additive and backward-compatible — no header is sent when a key is unset.
+
+### Verification
+
+`bun test` → 1228 unit + 131 integration + 35 hooks = 1394 pass / 0 fail — the project's release gate. (A bare `tsc --noEmit` is not a gate here: the root tsconfig pulls in a vendored example app whose deps aren't installed, and the tree carries pre-existing type-loose test idioms; the changed W1/W2/W3 source adds no new type errors over that baseline.) New and expanded bug-first tests: `tests/unit/embed-dimension-safety.test.ts` (read-path model mismatch, endpoint-model-vs-caller-arg discrimination, heterogeneous-vault rejection, cross-connection `data_version` invalidation, and the fatal-rethrow helper), `tests/unit/schema-placeholder.test.ts` (residue detection with an explicit false-positive boundary), `tests/unit/conversation-synthesis.test.ts` and `tests/integration/deductive-guardrails.integration.test.ts` (skeleton echoes rejected, residue filtered), and `tests/unit/llm-remote-config.test.ts` + `tests/unit/rerank-health.test.ts` (auth headers present when configured, absent when not, keys independent). Reviewed across all three workstreams by an independent cross-model adversarial pass (codex / GPT-5.5-high) to zero remaining findings.
+
+### What didn't change
+
+Retrieval quality, scoring, and the vault format are untouched. The read-path guard fires only on an actual model divergence — a correctly-embedded vault behaves exactly as in v0.17.0. When no auth keys are set, the LLM and reranker requests are byte-identical to before.
+
+## v0.17.0 — Harden the `context-surfacing` hook budget + cancellable embeds (follow-up to v0.16.0)
+
+v0.16.0 fixed the dominant `context-surfacing` hook-timeout causes (the unbounded synchronous vector leg and the init-backfill write lock). This release closes the residual write-contention and embed-cancellation gaps on the same hook path, and keeps the warm-cache guarantee alive on long-running hosts.
+
+- **Best-effort hook writes fail fast under contention.** The hook's own writes (the dedup UPSERT, `context_usage`, recall events, co-activations) are all best-effort, but the dedup UPSERT ran early and unguarded — a contended `SQLITE_BUSY` there aborted the whole hook before it could return context. It is now fail-open, and the `context-surfacing` hook process caps its own `busy_timeout` (1500ms) so a contended best-effort write fails fast instead of stalling the budget. The cap is scoped to that process only (the Stop hooks keep the 5000ms default), and the skill-vault opens on the hook path inherit the same cap.
+- **Cancellable embeds.** `embed()` now honors an `AbortSignal` end to end: the underlying fetch is cancellable, the 429 retry backoff aborts mid-sleep instead of sleeping through every retry, and an aborted embed is classified as cancellation — not a transport failure — so it no longer trips the 60s remote-down cooldown. `searchVec`/`getEmbedding` derive the signal from their wall-clock deadline, and a deadline also suppresses the unbounded local-model fallback so a hook embed cannot start a model load past its budget. The indexing batch-embed path is unchanged.
+- **Periodic vector prewarm.** The watcher's one-shot prewarm warms the OS page cache once; on a long-running host under memory pressure the kernel can evict the vector payload between hook calls, letting a cold synchronous scan creep back onto the hook path. The watcher now re-runs the embed-independent prewarm on an interval — `CLAWMEM_PREWARM_INTERVAL_MS`, default 10 minutes, `0` disables, values below a 60s floor are clamped up — to keep the payload resident. This is a probability reduction, not a hard cap: a true bound on the uninterruptible synchronous scan needs process isolation and is tracked as deferred.
+- **Two test-methodology fixes (source proven correct, not adjusted).** A pre-existing topic-boost fail-open test conflated the focus-topic variable with sequential recall-feedback state and read the real skill vault; it now uses two identically-seeded stores plus hermetic vault isolation, and the zero-match fail-open contract is proven byte-identical. A pre-existing watcher heavy-lane test set a `0..23` quiet-window believing it meant "any hour," but the window is end-exclusive, so the test failed during the 23:00 local hour; it now omits the window (always-open) and a hermetic unit guard pins the end-exclusive boundary.
+
+### Verification
+
+`bun test` → 1390 pass / 0 fail. New and expanded bug-first tests: `tests/unit/hook-timeout-fix.test.ts` (dedup fail-open under a held write lock, the named-vault `busy_timeout` cap, periodic prewarm firing + clean teardown, and the interval resolver's strict parse + floor) and `tests/unit/llm-fallback.test.ts` (embed `AbortSignal` across the fetch, the 429 backoff, the cooldown classification, and the local-fallback suppression). Each was guard-verified — it fails on the pre-fix source and passes after. Reviewed by an independent cross-model adversarial pass (GPT-5.5 high) to zero remaining findings.
+
+### What didn't change
+
+Retrieval quality, scoring, and the vault format are untouched. The `busy_timeout` cap is scoped to the `context-surfacing` hook process, so the Stop hooks and every other command keep the operational default. On any host that does not run the watcher, behavior is exactly as in v0.16.0 (the periodic prewarm lives only in the watcher).
+
+## v0.16.0 — Fix: `context-surfacing` UserPromptSubmit hook intermittently times out
+
+The `context-surfacing` hook could intermittently exceed its UserPromptSubmit budget ("hook timed out — output discarded"), especially on the first prompt after a fresh boot and across concurrent sessions. The dominant cause was **not** inference or host memory: the vector leg ran a *synchronous* `sqlite-vec` scan that the `Promise.race(vectorTimeout)` guard could not bound (a synchronous call blocks the event loop, so the timer never fires), and every writable hook open ran an unconditional backfill `UPDATE` that could wait out `busy_timeout` under writer contention.
+
+- **Bounded vector search on the hook path.** `searchVec` now takes a wall-clock deadline and self-aborts before the blocking `MATCH` if the budget elapsed during the async embed. Both the balanced and deep-escalation vector legs race the embed against the remaining budget and clear their timers, so a pending timer no longer keeps the hook process alive after results are in hand.
+- **No write lock on a healthy init.** The `last_accessed_at` backfill is read-guarded (skipped when nothing needs it) and `initializeDatabase`'s `busy_timeout` is capped to the caller's value, so a writable hook open no longer waits out the init `busy_timeout` under contention.
+- **Watcher-side vector prewarm.** A single embed-independent prewarm (a zero-vector `MATCH`) warms the sqlite-vec payload into the OS page cache on watcher startup so the first post-boot hook call isn't cold. It runs only in the watcher process (never per-session), reports success only when a scan actually ran, and never blocks startup.
+
+Cross-model reviewed (GPT-5.5, five rounds to zero findings). New tests: `tests/unit/hook-timeout-fix.test.ts`.
+
+## v0.15.1 — Fix: macOS bootstrap fails to load the sqlite-vec extension (Issue #20)
+
+On macOS, `clawmem bootstrap` (and `clawmem doctor`) failed at the database step with `This build of sqlite3 does not support dynamic extension loading`. Apple's built-in SQLite — which Bun uses by default — is compiled without extension-loading support, so the `sqlite-vec` vector extension cannot load. The prior macOS handling probed only the Apple-Silicon Homebrew path and swallowed the failure silently, so a fresh macOS install with no `brew install sqlite` (and Intel Macs, whose Homebrew prefix differs) hit the bare extension-loading error with no guidance. Yoloshii/ClawMem#20.
+
+What changed:
+
+- **Broader extension-capable SQLite detection** (`src/store.ts`): `setCustomSQLite()` now probes the Apple-Silicon (`/opt/homebrew`) *and* Intel (`/usr/local`) Homebrew prefixes, falling back to `brew --prefix sqlite` for non-standard prefixes (only when the standard paths are absent, so the common case pays no subprocess cost). Every candidate is existence-checked before use — `setCustomSQLite()` with an invalid path hard-crashes Bun (oven-sh/bun#18811), so the existence guard is load-bearing, not cosmetic.
+- **Actionable error instead of the cryptic one** (`src/store.ts`): both `sqlite-vec` load sites now route through a helper that, on macOS, rewrites the "does not support dynamic extension loading" failure into guidance to run `brew install sqlite` (naming the detected SQLite path, or noting none was found). `clawmem bootstrap` and `clawmem doctor` surface this message directly instead of the bare extension error.
+- **Troubleshooting entry** (`docs/troubleshooting.md` → "Bun runtime"): documents the symptom, the `brew install sqlite` fix, and the auto-detection behavior.
+
+### Verification
+
+`bun test tests/unit/` → 1183 pass / 0 fail. A new bug-first test (`tests/unit/store.macos-sqlite.test.ts`, 5 cases) asserts the error mapping: macOS + no Homebrew SQLite → `brew install sqlite` guidance; macOS + a detected-but-failing SQLite → `brew reinstall` + the path; non-macOS and unrelated errors pass through untouched. It fails on the pre-fix source (no mapping existed) and passes after.
+
+### What didn't change
+
+- No change to retrieval, scoring, the vault format, or any non-macOS code path — on Linux/Windows the macOS detection block is skipped entirely and `sqlite-vec` loads exactly as before. This is a macOS-only install fix.
+
+## v0.15.0 — Agent-instruction refactor (AGENTS.md as lean SSOT) + antipattern durability fix
+
+The agent-facing instruction surface was three overlapping copies — `CLAUDE.md` and `AGENTS.md` were byte-identical 72 KB / 800-line twins (2.2× over Codex's 32 KiB `AGENTS.md` cap, which truncates silently), and `SKILL.md` was an 830-line third copy. All three duplicated each other and the existing `docs/` tree. This release aligns to the convention — `AGENTS.md` is the lean root SSOT, `CLAUDE.md` imports it, `SKILL.md` is on-demand operational guidance, and the deep reference lives in `docs/`. It also fixes a latent scoring bug found during review: `antipattern` memories were decaying despite being documented and intended as durable.
+
+What changed:
+
+- **`AGENTS.md` is now a lean root SSOT** (72,637 → ~17.7 KB, under the 32 KiB cap). Keeps the agent-facing essentials — inference-at-a-glance, install, the 90/10 retrieval model + Tier-2 hook table, the 3-rule escalation gate, Tier-3 tool routing + MCP tool table, query-optimization levers, composite-scoring summary, indexing rules, lifecycle, anti-patterns, integrations — and points into `docs/` for everything deep, with a reference index at the foot.
+- **`CLAUDE.md` is now an `@AGENTS.md` import** (72,637 → 379 bytes), ending the byte-identical twin and its dual-maintenance drift. Claude Code reads `CLAUDE.md` natively, so the import bridges to the single SSOT.
+- **`SKILL.md` trimmed to an on-demand operational reference** (830 → ~267 lines, `version` 2.0.0): escalation gate, tool routing, the 4 query-optimization levers, pipeline behavior, composite scoring, lifecycle, gotchas — with repo-relative pointers. Setup / inference / config / internals deliberately live in `AGENTS.md` + `docs/`.
+- **New `docs/guides/inference-services.md`** consolidates the inference / model / server-setup content that was triplicated across `AGENTS.md`, the README "GPU Services" wall, and `cloud-embedding.md`, with a stack-decision matrix (QMD-native vs SOTA z-stack vs cloud embedding) up front.
+- **New `docs/reference/configuration.md`** — a complete environment-variable reference (every `CLAWMEM_*` var except the internal, process-set `CLAWMEM_STDIO_MODE`).
+- **README**: the "GPU Services" setup wall collapsed to a ~20-line decision callout linking the new guide (81.5 → 71.5 KB); the "Agent Instructions" file-roles table updated; `docs/guides/systemd-services.md` gained the scheduled `clawmem-rerank-health` unit (previously documented only in the old AGENTS.md).
+- **`package.json` `files[]` now includes `docs/`** so the relative `docs/` pointers in the shipped `AGENTS.md` / `CLAUDE.md` / `SKILL.md` resolve for npm consumers, not just git clones.
+- **Fix — `antipattern` memories are now durable** (`src/memory.ts`): `antipattern` was in `DECAY_EXEMPT_TYPES` and mapped to a `semantic` relation, but was **omitted from `HALF_LIVES` and `TYPE_BASELINES`**, so it fell through to the 60-day half-life / 0.5 baseline defaults — i.e. it decayed despite being documented as ∞ half-life / 0.75 baseline. Added `antipattern: Infinity` to `HALF_LIVES` and `antipattern: 0.75` to `TYPE_BASELINES` (matching the documented values). Accumulated negative patterns now persist as intended and rank with a durable baseline.
+
+### Verification
+
+`bun test tests/unit/` → 1178 pass / 0 fail. A new bug-first test (`tests/unit/memory.scoring.test.ts`) asserts `antipattern` durability — `recencyScore` returns 1.0 at one year old, `antipattern` confidence outranks `note` (exercising the 0.75 baseline), and the attention-decay exemption holds; it fails on the pre-fix source and passes after. Every relative link in the refactored files was resolved; `AGENTS.md` confirmed under 32 KiB; `CLAUDE.md` confirmed no longer a byte-twin. Reviewed by an independent cross-model adversarial pass (codex / GPT-5.5-high) across the refactor and the source fix to zero remaining findings.
+
+### What didn't change
+
+- **No retrieval-pipeline, scoring-formula, or vault-format change** beyond the `antipattern` durability fix. Documented facts, tool routing, hook behavior, and scoring weights are preserved — moved, condensed, or consolidated, not altered.
+- The only runtime behavior change is `antipattern` memories no longer decaying (and getting a 0.75 vs 0.5 baseline); every other content type's half-life and baseline is unchanged.
+
+## v0.14.0 — Reranker health guard: detect a silently-degenerate reranker (doctor + scheduled check + runtime emit)
+
+v0.11.3 deprecated the broken zerank-2 GGUF and shipped a faithful sidecar; v0.12.0 made the reranker the dominant ranking signal. Together they raised the stakes of a *silent* reranker failure: the broken GGUF returned HTTP 200 + valid JSON + finite positive ~1e-11 scores — passing every liveness check — yet contributed nothing at weight 0.9 and silently collapsed the final ranking to RRF. `blendRerank`'s usability check was `score > 0`, which those ~1e-11 scores passed, and `clawmem doctor` had no reranker probe at all. This release makes that failure mode impossible to miss.
+
+What changed:
+
+- **`blendRerank` degenerate-floor trip + visible fallback** (`src/search-utils.ts`): the usability check widened from `> 0` to `> RERANK_DEGENERATE_FLOOR` (1e-4) — above the broken regime's 8e-7 ceiling, far below the weakest working score (~0.1) — so a near-zero collapse now routes to the RRF fallback instead of blending in ~nothing. The 3rd arg accepts an options object `{ rerankWeight, degenerateFloor, onFallback }` (numeric back-compat preserved); the `query` caller (`src/mcp.ts`) passes an `onFallback` that emits a rate-limited (≤1/min) stderr warning + running count, so the previously-silent degrade is surfaced.
+- **`clawmem doctor` section 9 — reranker discrimination** (`src/clawmem.ts`): an active probe that asserts the reranker *discriminates*, not just responds. Runs a shipped golden set of same-topic (query, relevant, hard-negative) pairs (`src/health/rerank-golden.json`) through the live reranker, cache-bypassed, and checks coverage + a calibration band + a per-pair discrimination margin.
+- **`clawmem rerank-health` command + scheduled unit** (`src/clawmem.ts`; `CLAUDE.md`/`AGENTS.md`): the same probe as a standalone command that exits non-zero on degeneracy, for a systemd `OnFailure=` alert (`clawmem-rerank-health.{service,timer}`, documented) — proactive detection of an endpoint reverted to the broken GGUF, independent of query traffic.
+- **`store.rerank` probe seam** (`src/store.ts`): an additive `{ noCache, requireLiveCoverage, signal, timeoutMs }` options param. `noCache` bypasses the rerank cache (so a probe always exercises the live endpoint); `signal`/`timeoutMs` bounds the remote fetch; `requireLiveCoverage` enforces the full coverage contract — exactly `batch.length` results, unique in-range integer indices, finite numeric scores, a valid JSON object body — **before** the score-apply zero-fill (after which an omitted score and a true 0 are indistinguishable), throwing `RerankCoverageError` / `RerankMalformedResponseError`. A defensive skip in the apply loop also hardens the production path against an out-of-range index or non-array body (previously a latent crash).
+
+### Verification
+
+Thresholds were calibrated from a live `zerank-2-seq` baseline (8-pair golden set): relevant scores 0.92–0.97, hard-negative ≤ 0.31, minimum margin 0.64, 0/8 inverted — vs the broken GGUF regime's max-ever 8.03e-7 (a 5–6 order-of-magnitude separation). Locked: `CALIB_FLOOR 0.05`, `DISCRIM_MARGIN 0.25` (2.5× below the live minimum margin), `RERANK_DEGENERATE_FLOOR 1e-4`. 24 new unit tests (`tests/unit/rerank-health.test.ts`) pin the load-bearing contracts: the degenerate-floor trip + `onFallback`, the options-object overload + 2-arg back-compat, coverage-before-zero-fill, the malformed-response contract (duplicate / out-of-range / wrong-count / non-numeric / invalid-JSON / null-body), the defensive non-probe skip, and the calibration-band-passes-but-margin-fails (constant-output) case. Full suite: 1363 pass / 1 pre-existing unrelated failure; `tsc --noEmit` clean. Reviewed across the design and the implementation by an independent cross-model adversarial pass (codex / GPT-5.5-high) to zero remaining findings.
+
+### What didn't change
+
+- **The healthy hot path is untouched.** A working reranker scores ≫ 1e-4, so `blendRerank` behaves exactly as in v0.12.0; the degenerate floor only changes behavior when the reranker has already collapsed (where the old code silently produced RRF order anyway — now it is explicit and surfaced). `store.rerank`'s no-options path (the `query`, `intent_search`, and context-surfacing callers) is byte-identical to before.
+- No schema migration, no config/env-var change, no breaking API change — the `store.rerank` options param and the `blendRerank` options object are additive, and the new CLI command, `doctor` section, golden set, and systemd recipe are all additive. The default reranker stays qwen3-reranker-0.6B.
+
+## v0.13.0 — Query composite re-weight: search 0.70 for the `query` tool (the deferred lever from v0.12.0)
+
+v0.12.0 fixed the rerank blend but flagged a larger deferred lever: composite scoring's default `{search:0.50, recency:0.25, confidence:0.25}` puts half the weight on non-search signals, which caps how much the improved blend reaches the surfaced top-k. v0.12.0 deferred acting on it "pending a judged-relevance / recency-aware eval." This release runs that eval and acts on it — scoped to the `query` tool only.
+
+What changed:
+
+- **The `query` tool now scores with `QUERY_WEIGHTS = {search:0.70, recency:0.15, confidence:0.15}`** (`src/memory.ts`), replacing the 0.50/0.25/0.25 default for non-recency `query` calls. Implemented via an additive `{ weights, now, forceWeights }` options seam on `applyCompositeScoring`; the `query` call passes `{ weights: QUERY_WEIGHTS }` **without** `forceWeights`, so a recency-phrased query still switches to `RECENCY_WEIGHTS` (0.10/0.70/0.20) by construction. Scoped to the `query` tool — `search`, `vsearch`, `memory_retrieve`'s routed modes, `intent_search`, and the context-surfacing hook keep the 0.50/0.25/0.25 default (their pipelines weren't part of this eval).
+
+### Verification
+
+A held-out, judged-relevance eval — the recency-aware eval v0.12.0 asked for. Real `query`-shaped prompts (held-out n=279 → 199 usable after oracle-drop) were graded 0–3 by an LLM judge (GLM-5.2) over the full ~30-doc candidate pool per query, blind / order-shuffled / freeze-time-framed. The judge was calibrated against an independent annotator (quadratic-weighted κ=0.681) plus an order-perturbation self-consistency check (κ=0.77). A dev pilot (n=84) picked the candidate weight; a **pre-registered decision rule** (locked before the held-out judging) then chose between 0.70 and 0.80. Result: graded NDCG@10 vs the 0.50 control — **w_search 0.70 +0.064 (paired permutation p<1e-4)**, 0.80 +0.104, robust across precision / exploratory / temporal families. A dedicated **freshness guard** (does raising search weight demote the newest-correct version of an evolving doc?) was the tiebreaker: at 0.70 the newest-correct doc is never demoted (mean rank improves); at 0.80 it falls out of the top-10 in 2/19 supersession cases. So **0.70 captures the bulk of the gain with zero freshness regression**, while 0.80's extra NDCG came at a freshness cost in a work-memory vault full of evolving docs. Pinned- and revision-rank-stability guards are non-regressive at 0.70. Reviewed across design, dev results, hardening, and implementation by an independent cross-model adversarial pass (codex / GPT-5.5-high) to zero remaining findings.
+
+### What didn't change
+
+- **`RECENCY_WEIGHTS` and the recency-intent switch** — a recency-phrased query ("latest", "recent", "last session", …) is scored exactly as before. The freshness guarantee the eval relied on holds by construction (`forceWeights` is never set).
+- `search`, `vsearch`, `memory_retrieve` routed modes, `intent_search`, and the context-surfacing hook — all keep the 0.50/0.25/0.25 default. The seam's no-options path is byte-identical to prior behavior.
+- No schema migration, no config/env-var change, no API-shape change. **`query` result ordering shifts**, and the **composite-score distribution** shifts upward for search-dominated hits — threshold consumers of the returned `compositeScore` (e.g. `minScore`) may see changed inclusion near the boundary. Scores remain `[0,1]`-scaled.
+
+## v0.12.0 — Query reranking: blend the cross-encoder as the dominant signal (fixes the immovable RRF #1)
+
+The `query` tool fused the cross-encoder reranker into the final ranking with a position-aware blend — `rrfWeight·(1/rrfRank) + (1-rrfWeight)·rerankScore`, with `rrfWeight` 0.75 / 0.60 / 0.40 by RRF rank. Because reranker scores are in `[0,1]`, RRF rank-1's floor (`0.75·(1/1)` = 0.750) exceeds RRF rank-2's ceiling (`0.75·(1/2) + 0.25·1` = 0.625): **RRF #1 was mathematically immovable by the reranker.** A strong reranker could reorder the tail but could never promote the best document to the top. With the now-faithful zerank-2 seq-cls reranker (v0.11.3), that ceiling was discarding the reranker's single largest win.
+
+What changed:
+
+- **New `blendRerank` blend** (`src/search-utils.ts`): `0.1·normalizedRRF + 0.9·rerank`. The cross-encoder is the dominant relevance signal; normalized RRF is a thin tiebreaker — so a strong rerank score *can* promote a document over RRF #1. It maps over the candidate set (so partial rerank coverage can never drop a candidate) and **falls back to pure RRF order** when the reranker is unavailable or returns no usable signal (empty / all-zero — e.g. a total remote+local failure, now also caught by a try/catch around the rerank call). Scoped to the `query` tool; `intent_search` is unchanged (its blend uses actual upstream scores, a different shape, measured separately).
+
+### Verification
+
+Harness-validated against known-item recall over two eval sets (NL n=45, KW n=50) on a frozen 3,743-doc snapshot with the live reranker, faithfully replicating the production query path (the harness's pre-rerank ranking reproduces the prior pipeline's exactly). At the blend stage the reranker lifts recall@1 from 0.22 (RRF alone) to 0.62 — and the old blend discarded all of it (blend@1 equalled RRF@1 to three decimals). The shipped 0.1/0.9 blend improves final recall@1–5 and MRR@10 on both eval sets with no material pooled recall@10 regression (NL @10 +0.044, KW @10 −0.04, pooled tie). New unit tests (`tests/unit/search-utils.blend.test.ts`) pin the two load-bearing contracts: a strong rerank score promotes above RRF #1, and empty/all-zero rerank preserves RRF order. Reviewed across design, results, and implementation by an independent cross-model adversarial pass (codex / GPT-5.5-high) to zero remaining findings.
+
+### What didn't change
+
+- `intent_search`, `search`, `vsearch`, the context-surfacing hook's deep-profile rerank blend, composite scoring, and MMR are unchanged — only the `query` tool's rerank/RRF blend. No schema migration, no config/env-var change, no API-shape change (result ordering for `query` shifts; scores remain `[0,1]`-scaled as before).
+- A separate, larger lever surfaced by this work — composite scoring's 50% non-search weighting, which caps how much the improved blend reaches the surfaced top-k — is **deferred** to a future release pending a judged-relevance / recency-aware eval (known-item recall alone can't adjudicate it). MMR was measured to be a near-no-op here and is left untouched.
+
+## v0.11.3 — Reranker: deprecate the broken zerank-2 GGUF; ship the zerank-2 seq-cls sidecar (SOTA, non-commercial)
+
+The "SOTA upgrade" reranker — `zerank-2-Q4_K_M.gguf` served under `llama-server --reranking` — was silently broken. This release deprecates it across the docs and ships a working replacement as an opt-in recipe.
+
+Root cause: zerank-2 is a `Qwen3ForCausalLM` that scores a (query, document) pair on the logit of a single relevance token ("Yes", id 9454) via a sentence-transformers `LogitScore` head. llama.cpp's `convert_hf_to_gguf.py` only synthesizes a rerank head when the model card contains the literal string `# Qwen3-Reranker`; zerank-2's card lacks it, so the previously-recommended GGUF — and any built by the current/standard llama.cpp converter — is a **headless causal LM**. Served with `--reranking` it returns near-zero, uninformative scores → reranking degrades to an inert RRF-dominated passthrough, with no error.
+
+What changed:
+
+- **New opt-in recipe** at `extras/rerankers/zerank-2-seq/` — converts `zeroentropy/zerank-2-reranker` to a `Qwen3ForSequenceClassification` (`num_labels=1`) whose score head is the tied-embedding row 9454, so the relevance logit is **identical by construction** to the native causal score. Served as a small transformers sidecar (`/v1/rerank`, `batch=1`, applies zerank's chat template, returns `sigmoid(logit/5)`) behind the existing `CLAWMEM_RERANK_URL` contract — drop-in, no ClawMem code change.
+- **Reproducible correctness gate** (`build_and_verify.py`) — the convert step refuses to finish unless it proves: fp32 score-head weight-equality (bf16 preserved, no fp16 downcast); served-tokenizer == source-tokenizer (including the truncation path); the assistant-generation prefix survives near-`MAXLEN` inputs; and the seq-cls logit equals the causal token-9454 logit bit-exactly over the real served path (including batched right-padded pooling and empty/whitespace-doc edges).
+- **Docs corrected** — `README.md`, `CLAUDE.md`/`AGENTS.md`, `SKILL.md`, `docs/quickstart.md`, `docs/introduction.md`, and `docs/guides/cloud-embedding.md` now point the SOTA reranker at the sidecar and explain the GGUF deprecation; `docs/guides/upgrading.md` gains a migration section. Full-SOTA-stack VRAM guidance moves 12GB → 16GB (the bf16 reranker is ~9GB).
+
+### Verification
+
+The conversion's correctness is enforced by `build_and_verify.py`, which the convert step runs before serving and which exits non-zero unless every gate passes: fp32 score-head weight-equality (bf16 preserved, no fp16 downcast); served-tokenizer == source-tokenizer identity (including the truncation path); assistant-prefix preservation under near-`MAXLEN` inputs; and seq-cls-vs-causal token-9454 logit equivalence over the real served path (batched right-padded pooling + empty/whitespace-doc edges). Verified live after deploy: relevant vs. irrelevant scores 0.96 / 0.08, matching the gate.
+
+### What didn't change
+
+- **zembed-1** (SOTA embedding) and **qwen3-reranker-0.6B** (default reranker) are unchanged — only the zerank-2 *reranker GGUF* is deprecated.
+- No `src/` change, no schema migration, no config/env-var change, no public API change. ClawMem's default reranker stays the permissively-licensed qwen3-reranker-0.6B; the sidecar is an opt-in upgrade. zerank-2 weights are **CC-BY-NC-4.0** (non-commercial) and are never bundled — the recipe downloads them for your own use.
+
 ## v0.11.2 — Packaging: `bin` path so `npm install -g` registers the `clawmem` command on npm 11
 
 v0.11.2 is a packaging-only fix. The `bin` map declared `"clawmem": "./bin/clawmem"`; npm 11's publish path rejects the `./`-prefixed form and **drops the bin entry from the tarball** (older npm silently rewrote it — the live v0.11.0 ships `bin/clawmem`), so a global install would land the files but expose no `clawmem` command. Changed to `"clawmem": "bin/clawmem"`, verified with `npm publish --dry-run` (no warning; the bin survives in the packed `package.json`).
@@ -28,7 +942,7 @@ What changed:
 
 ### Verification
 
-`tsc` clean on the touched files; full unit suite green (187 pass). Live end-to-end against the running expansion server: typed shape, zero echo, zero template-junk, correct per-type routing, cache round-trip. Validated under a fresh GPT-5.5 high-reasoning adversarial review via `codex exec` (impl-review session `019ef534`, separate from the design session `019eefbe`): Turn 1 surfaced three real findings — a leaked llm-level fallback being cached, partial acceptance of a malformed typed-cache entry, and CLI expansion-only candidates dropped after RRF — each fixed and re-verified to verbatim "zero remaining findings."
+`tsc` clean on the touched files; full unit suite green (187 pass). Live end-to-end against the running expansion server: typed shape, zero echo, zero template-junk, correct per-type routing, cache round-trip. Validated under a fresh GPT-5.5 high-reasoning adversarial review via `codex exec` (a separate impl-review session from the design session): Turn 1 surfaced three real findings — a leaked llm-level fallback being cached, partial acceptance of a malformed typed-cache entry, and CLI expansion-only candidates dropped after RRF — each fixed and re-verified to verbatim "zero remaining findings."
 
 ### What didn't change
 
@@ -52,7 +966,7 @@ What changed in the embedding write path:
 
 ### Verification
 
-Validated across a 9-turn GPT-5.5 high-reasoning adversarial review under `codex exec` (session `019eefbe`): a diagnosis pass, four design passes (which overturned an initial "defer the concurrency lease" decision by demonstrating that two same-dimension models can silently build a heterogeneous index), and four code-review passes that drove findings 6 → 4 → 3 → 2 → **0** ("vector-table mutations are now atomic, lease-fenced, and dimension/model consistent"). Ships with new unit tests covering throw-on-mismatch, `getVecTableDim` states, the lease fence on insert/clear, the hash-change trigger, attempt-budget resets, and `getVecModels` heterogeneity detection; full suite green except one pre-existing unrelated integration test.
+Validated across a 9-turn GPT-5.5 high-reasoning adversarial review under `codex exec`: a diagnosis pass, four design passes (which overturned an initial "defer the concurrency lease" decision by demonstrating that two same-dimension models can silently build a heterogeneous index), and four code-review passes that drove findings 6 → 4 → 3 → 2 → **0** ("vector-table mutations are now atomic, lease-fenced, and dimension/model consistent"). Ships with new unit tests covering throw-on-mismatch, `getVecTableDim` states, the lease fence on insert/clear, the hash-change trigger, attempt-budget resets, and `getVecModels` heterogeneity detection; full suite green except one pre-existing unrelated integration test.
 
 ### What didn't change
 
@@ -353,7 +1267,7 @@ The override repoints the cached `_session_id`, rebuilds `_transcript_path` for 
 
 ### Verification
 
-Validated across three turns of GPT-5.5 high-reasoning adversarial review under `codex exec`, session `019e46bc-0848-7540-a1ce-913000112da1`. Turn 1 (design) returned no-ship-as-written and caught two real bugs in the initial design — a reset-gated prefetch leak (stale recall crossing into `/resume` and `/branch` sessions) and an ABA race from resetting the prefetch generation to zero — and prescribed the snapshot-at-queue-time fix. Turn 2 verified the implemented design against a standalone behavioral test covering the switch / reset / compression / prefetch-race paths → verbatim "zero remaining design findings — can ship." Turn 3 re-cleared a final added assertion.
+Validated across three turns of GPT-5.5 high-reasoning adversarial review under `codex exec`. Turn 1 (design) returned no-ship-as-written and caught two real bugs in the initial design — a reset-gated prefetch leak (stale recall crossing into `/resume` and `/branch` sessions) and an ABA race from resetting the prefetch generation to zero — and prescribed the snapshot-at-queue-time fix. Turn 2 verified the implemented design against a standalone behavioral test covering the switch / reset / compression / prefetch-race paths → verbatim "zero remaining design findings — can ship." Turn 3 re-cleared a final added assertion.
 
 ### What didn't change
 
@@ -391,7 +1305,7 @@ The same `tokenizeForFTS5` is shared with the two `entities_fts` MATCH builders 
 
 ### Verification
 
-Validated across four turns of GPT-5.5 high-reasoning adversarial review under `codex exec`, session `019e4595-43b3-7b40-b8a0-bc684f22e2e6`. Turn 1 cleared the approach; Turn 2 confirmed the `documents_fts` fix correct + injection-safe but **caught the entity prefix-starvation regression**; Turn 3 rejected a 1-char-only band-aid (the same starvation hit short multi-char names like `Go`); Turn 4 cleared the exact-first fix verbatim "**zero remaining findings**" after re-running the repros (`C++` resolves, `Go` resolves, `clawme`→`ClawMem` recall holds).
+Validated across four turns of GPT-5.5 high-reasoning adversarial review under `codex exec`. Turn 1 cleared the approach; Turn 2 confirmed the `documents_fts` fix correct + injection-safe but **caught the entity prefix-starvation regression**; Turn 3 rejected a 1-char-only band-aid (the same starvation hit short multi-char names like `Go`); Turn 4 cleared the exact-first fix verbatim "**zero remaining findings**" after re-running the repros (`C++` resolves, `Go` resolves, `clawme`→`ClawMem` recall holds).
 
 Test coverage: 8 new bug-first tests in `tests/integration/store-search.test.ts` (compound, non-adjacent AND, slash-path via the filepath column, 1-char tokens, apostrophe behavior-lock, FTS5-specials no-throw, punctuation-only → empty) + 4 entity starvation regression tests in `tests/unit/entity.test.ts` (`C++` and `Go`, each across `resolveEntityCanonical` and `searchEntities`). Five of the store tests fail on the pre-fix code; all pass after. Full suite: 1298 pass / 0 fail. `tsc --noEmit` clean for the changed files.
 
@@ -403,7 +1317,7 @@ Test coverage: 8 new bug-first tests in `tests/integration/store-search.test.ts`
 
 ### Cross-references
 
-- Codex review session: `019e4595-43b3-7b40-b8a0-bc684f22e2e6` (4 turns; T2 caught the entity regression, T4 zero remaining findings)
+- Codex review: 4 turns (T2 caught the entity regression, T4 zero remaining findings)
 - Primary surfaces: `src/store.ts` (`tokenizeForFTS5`, `buildFTS5Query`), `src/entity.ts` (`gatherEntityFTSCandidates`, both `entities_fts` sites)
 
 ---
@@ -426,7 +1340,7 @@ The docstring in `initializeDatabase()` carries the rationale durably so a futur
 
 ### Verification
 
-The change set was validated against two turns of GPT-5.5 high-reasoning adversarial code review (cumulative ~401K tokens) under `codex exec`, session `019e2aeb-7995-74d0-b3f3-bbd32567eec2`. Turn 1 verdict was APPROVED WITH MODIFICATIONS — zero High, one Medium (soften the readonly-branch comment from "takes a brief write lock" to "can contend when switching/initializing WAL state"), one Low (mention BOTH `agent_end` AND `before_reset` parallel Stop-hook fan-outs). Both modifications applied. Turn 2 cleared verbatim "**Zero remaining findings on the Issue #13 fix. Ship as is. Ready to tag v0.10.5.**" Turn 2 also independently verified the skill-forge mirror byte-identical via `cmp -s` on all four changed files.
+The change set was validated against two turns of GPT-5.5 high-reasoning adversarial code review (cumulative ~401K tokens) under `codex exec`. Turn 1 verdict was APPROVED WITH MODIFICATIONS — zero High, one Medium (soften the readonly-branch comment from "takes a brief write lock" to "can contend when switching/initializing WAL state"), one Low (mention BOTH `agent_end` AND `before_reset` parallel Stop-hook fan-outs). Both modifications applied. Turn 2 cleared verbatim "**Zero remaining findings on the Issue #13 fix. Ship as is. Ready to tag v0.10.5.**" Turn 2 also independently verified the skill-forge mirror byte-identical via `cmp -s` on all four changed files.
 
 Test coverage: 3 new tests in `tests/integration/store-concurrent-init.test.ts` (NEW) + supporting `tests/helpers/concurrent-init-worker.ts` (NEW). Two source-text assertion gates (deterministic — catch the exact regression an accidental re-swap would introduce, anchored on the function body for `initializeDatabase` and on the `// Readonly:` comment marker for the readonly branch) plus one subprocess concurrent-init test (spawns 3 `bun run` worker processes against the same on-disk DB in `mkdtempSync(tmpdir())`, 60s timeout, asserts all 3 exit 0 without `SQLITE_BUSY` or "database is locked" in stderr).
 
@@ -453,9 +1367,9 @@ No runtime change. Standing "doc-line-refs ride the next release" pattern from p
 ### Cross-references
 
 - Issue: https://github.com/yoloshii/ClawMem/issues/13 (@jcgau, first-time contributor)
-- Codex review session: `019e2aeb-7995-74d0-b3f3-bbd32567eec2` (Turn 1 APPROVED WITH MODIFICATIONS, Turn 2 zero remaining findings)
+- Codex review: Turn 1 APPROVED WITH MODIFICATIONS, Turn 2 zero remaining findings
 - Parallel Stop-hook fan-out sites covered by this fix: `src/openclaw/engine.ts:449` (`handleAgentEnd`), `src/openclaw/engine.ts:576` (`handleBeforeReset`), `src/hermes/__init__.py:518` (Python thread fan-out)
-- Companion 2026-05-14 OpenClaw upstream-survey driving the doc-comment line-ref bump: `~/.claude/projects/-home-khitomer-Projects/memory/openclaw-v2026.4.x-analysis.md`
+- Companion 2026-05-14 OpenClaw upstream-survey driving the doc-comment line-ref bump: a local memory note (`memory/openclaw-v2026.4.x-analysis.md`)
 
 ---
 
@@ -702,7 +1616,7 @@ The packaging fix is co-resident with §14.3 because they are both in the same f
 - **`src/openclaw/package.json` is the new discovery manifest.** OpenClaw v2026.4.11's `discoverInDirectory` reads `package.json` and checks for the `openclaw.extensions: ["./index.ts"]` field before descending into a candidate plugin directory. Pre-v0.10.0 ClawMem shipped `openclaw.plugin.json` as the only manifest. That file is still shipped and still parsed at runtime, but it is not enough on its own for discovery on v2026.4.11+ — the plugin directory is silently skipped. v0.10.0 adds `package.json` to the plugin source tree and `clawmem setup openclaw` now verifies it is present before copying.
 - **`clawmem setup openclaw` defaults to recursive copy, not symlink.** OpenClaw v2026.4.11's discoverer walks the extensions directory with `readdirSync({ withFileTypes: true })` and uses `dirent.isDirectory()` to decide which entries to descend into. Symlinks to directories report `isDirectory() === false` on that API shape, so a symlinked plugin is silently skipped during discovery and never registers. Every ClawMem release since the OpenClaw plugin was introduced shipped a symlinked install — it worked on OpenClaw v2026.3.x but stopped working on v2026.4.11. `cmdSetupOpenClaw` now runs `cpSync(..., { recursive: true, dereference: true })` to install the plugin as a real directory. A new `--link` opt-in flag preserves the old symlink behavior for local dev workflows and for older OpenClaw versions, with a warning that v2026.4.11+ discovery will skip the symlink.
 - **Next-steps output uses `openclaw plugins enable clawmem`.** The setup command now prints `openclaw plugins enable clawmem` instead of `openclaw config set plugins.slots.memory clawmem`. The `enable` verb pre-validates that the plugin is in the discovered registry (so it only runs on a successful copy), switches the exclusive `memory` slot, and disables the previous occupant (`memory-core`, `memory-lancedb`) in a single command. The older `config set` pattern failed silently on v2026.4.11 because the slot validator rejected a plugin id that had not been discovered first.
-- **Multi-user ownership gotcha is documented.** OpenClaw v2026.4.11 enforces that plugin directories be owned by the current runtime user or root, rejecting foreign-owned directories with `suspicious ownership (uid=X, expected uid=Y or root)`. This is a security feature (it prevents a gateway running as a privileged system user from loading code a less-privileged user dropped into its extensions directory). On single-user installs where the gateway runs as your own user account, the ownership check passes automatically. On deployments where the gateway runs as a dedicated system user (e.g. `openclaw`) different from the installer user (e.g. `sciros`), you must `sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem` after running setup. Documented in `docs/guides/openclaw-plugin.md` Install section and `docs/troubleshooting.md` OpenClaw section.
+- **Multi-user ownership gotcha is documented.** OpenClaw v2026.4.11 enforces that plugin directories be owned by the current runtime user or root, rejecting foreign-owned directories with `suspicious ownership (uid=X, expected uid=Y or root)`. This is a security feature (it prevents a gateway running as a privileged system user from loading code a less-privileged user dropped into its extensions directory). On single-user installs where the gateway runs as your own user account, the ownership check passes automatically. On deployments where the gateway runs as a dedicated system user (e.g. `openclaw`) different from the installer user (e.g. `deploy-user`), you must `sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem` after running setup. Documented in `docs/guides/openclaw-plugin.md` Install section and `docs/troubleshooting.md` OpenClaw section.
 
 ### Test coverage
 
@@ -713,12 +1627,12 @@ The packaging fix is co-resident with §14.3 because they are both in the same f
 
 Public test suite: **1105 → 1107, zero regressions.** The one pre-existing assertion in the `Shipping Condition 2 — setup-time migration text is present` suite was updated from `"plugins.slots.memory clawmem"` to `"openclaw plugins enable clawmem"` to match the new next-steps output shape.
 
-### VM 202 end-to-end validation
+### Multi-user end-to-end validation
 
-Captured on a representative multi-user install (VM 202: OpenClaw gateway runs as system user `openclaw`, ClawMem installed by admin user `sciros`, separate from `himadmin`):
+Captured on a representative multi-user install (OpenClaw gateway runs as system user `openclaw`, ClawMem installed by a separate admin user):
 
 ```
-[plugins] clawmem: plugin registered (kind=memory, bin=/home/sciros/clawmem/bin/clawmem, profile=balanced, budget=800)
+[plugins] clawmem: plugin registered (kind=memory, bin=/home/<user>/clawmem/bin/clawmem, profile=balanced, budget=800)
 [plugins] clawmem: registered 5 agent tools
 [gateway] ready (7 plugins: acpx, browser, clawmem, device-pair, phone-control, talk-voice, telegram; 11.3s)
 ```
@@ -727,7 +1641,7 @@ The runtime registration log line explicitly emits `kind=memory`, which is the �
 
 ### Codex review
 
-GPT 5.4 High, session `019d72d5` (continues the session chain used from v0.7.1 through v0.9.0, now cumulative across 20+ turns). The §14.3 implementation reached zero remaining findings before the v2026.4.11 packaging gap was discovered. Codex was re-engaged with the packaging compat delta (new `package.json`, copy-default `cmdSetupOpenClaw`, next-steps rewrite, +2 regression gates, VM 202 e2e evidence) for a final pre-ship pass, same session.
+GPT 5.4 High, session `019d72d5` (continues the session chain used from v0.7.1 through v0.9.0, now cumulative across 20+ turns). The §14.3 implementation reached zero remaining findings before the v2026.4.11 packaging gap was discovered. Codex was re-engaged with the packaging compat delta (new `package.json`, copy-default `cmdSetupOpenClaw`, next-steps rewrite, +2 regression gates, multi-user e2e evidence) for a final pre-ship pass, same session.
 
 ### External credit
 
@@ -747,9 +1661,9 @@ Two context-surfacing upgrades. §11.1 adds a `<vault-facts>` SPO-triple injecti
 
 ### §11.1 — `<vault-facts>` knowledge-graph injection
 
-- **Three-path prompt-only entity extraction** — the seed set for `<vault-facts>` comes from the raw prompt ONLY, via three independent paths: (a) a canonical `vault:type:slug` regex (e.g. `default:project:clawmem`), (b) proper-noun extraction validated via exact-match `resolveEntityTypeExact` that skips ambiguous names resolving to multiple types, and (c) a longer-first n-gram scan (3-gram > 2-gram > 1-gram, cased + lowercased) for technical vocabulary like `forge-stack`, `oauth2`, `vm 202`. Prompt-only is a HARD CONSTRAINT — entity seeds never come from `surfacedDocs[i].body` or any retrieval-phase field, so a topic-boosted off-topic doc from §11.4 cannot pollute the facts block with facts about unrelated entities.
+- **Three-path prompt-only entity extraction** — the seed set for `<vault-facts>` comes from the raw prompt ONLY, via three independent paths: (a) a canonical `vault:type:slug` regex (e.g. `default:project:clawmem`), (b) proper-noun extraction validated via exact-match `resolveEntityTypeExact` that skips ambiguous names resolving to multiple types, and (c) a longer-first n-gram scan (3-gram > 2-gram > 1-gram, cased + lowercased) for technical vocabulary like `vector-store`, `oauth2`, `gpu node`. Prompt-only is a HARD CONSTRAINT — entity seeds never come from `surfacedDocs[i].body` or any retrieval-phase field, so a topic-boosted off-topic doc from §11.4 cannot pollute the facts block with facts about unrelated entities.
 - **Validate-then-count candidate ordering (Codex §11.1 Turn 5 invariant)** — per-path, candidates are validated against the entity index BEFORE counting against the 100-candidate cap. Without this ordering, a long prompt dominated by unvalidated capitalized noise (path b raw extraction) would starve the lowercase/hyphenated n-gram lane (path c) and the technical-vocabulary recall would silently drop. The cap also preserves prompt order as a tiebreaker so the first mentioned entities win under pressure.
-- **Cross-path entity-id dedup + longer-n-gram tie-breaker** — if the same entity resolves via multiple paths (e.g. "ClawMem" as a proper noun AND "clawmem" as a 1-gram), the cross-path dedup collapses it to one `entity_id` and the sourcePath from the first-matching path wins. For n-gram ties, longer n-grams outrank shorter ones (`forge-stack` as a 1-gram compound beats `forge` + `stack` as separate tokens).
+- **Cross-path entity-id dedup + longer-n-gram tie-breaker** — if the same entity resolves via multiple paths (e.g. "ClawMem" as a proper noun AND "clawmem" as a 1-gram), the cross-path dedup collapses it to one `entity_id` and the sourcePath from the first-matching path wins. For n-gram ties, longer n-grams outrank shorter ones (`vector-store` as a 1-gram compound beats `vector` + `store` as separate tokens).
 - **Cross-entity triple dedup (Codex §11.1 Turn 1 fix)** — when both endpoints of a triple are seeded from the prompt (e.g. the prompt mentions both `ClawMem` and `Bun`, and the graph has `ClawMem depends_on Bun`), `store.queryEntityTriples` returns the triple from both sides (outgoing from ClawMem, incoming to Bun). `buildVaultFactsBlock` now dedupes by a stable `${subject}\u0000${predicate}\u0000${object}` key before budgeting so the same fact isn't emitted twice and budget isn't spent twice. Per-entity `maxTriplesPerEntity` cap still applies BEFORE dedup (anti-monopoly is enforced per entity first, then dedup collapses cross-entity duplicates).
 - **Profile-gated `factsTokens` sub-budget** — a new `ProfileConfig.factsTokens` field gives `<vault-facts>` a dedicated token allowance that cannot steal from the existing `<facts>` / `<relationships>` budget. `speed`=0 disables the stage entirely (zero overhead on the fast profile). `balanced`=200 tokens (~50 triples at default 4-char/token estimate). `deep`=250 tokens. Truncation always at the triple boundary, never mid-triple, never emits an empty block. If `OVERHEAD >= budgetTokens` the block is dropped — established blocks take priority.
 - **Schema migration — `idx_entity_nodes_lower_name`** — `store.ts` adds `CREATE INDEX IF NOT EXISTS idx_entity_nodes_lower_name ON entity_nodes(LOWER(name), vault)` on first open. This expression index backs the new `batchLookupNames` query (`WHERE LOWER(name) IN (...) AND vault = ?`) which would otherwise degenerate to a full scan on large vaults. Idempotent, runs once, harmless if the binary is later rolled back to v0.8.5 (SQLite ignores the unused index).
@@ -804,7 +1718,7 @@ v0.9.0 is **safe to drop in** — the only behavior change on existing code path
 
 Fixes a bug cluster (BACKLOG.md §1.6) where `entity_triples` was stuck at zero rows on production vaults regardless of activity, making `kg_query` return empty for every entity and silently hollowing out the WHY / ENTITY graph-traversal paths in `intent_search`. Nine bugs across the decision-extractor → observer → entity-resolution → triple-storage pipeline were traced and fixed across four Codex review turns. The fix is entirely additive and strictly improves pre-v0.8.5 behavior — no schema changes, no API breaks, no required migration steps.
 
-- **LLM-based SPO extraction replaces the old regex path** — the observer LLM now emits structured `<triples>` blocks alongside `<facts>`, parsed and validated in `parseObservationXml` against a fixed predicate vocabulary. The pre-v0.8.5 regex-based `extractTripleFromFact` required `subject verb object` sentence shape, which rejected the majority of real observation facts (descriptive phrases like "ClawMem now deploys via systemd user units on VM 202"). The LLM path extracts relational claims without sentence-shape constraints. `VALID_PREDICATES` is a tight 13-predicate set — `adopted`, `migrated_to`, `deployed_to`, `runs_on`, `replaced`, `depends_on`, `integrates_with`, `uses`, `prefers`, `avoids`, `caused_by`, `resolved_by`, `owned_by` — and the parser rejects anything outside it. `LITERAL_PREDICATES` marks `prefers`/`avoids` as literal-object predicates (object is stored as a string, not resolved to an entity).
+- **LLM-based SPO extraction replaces the old regex path** — the observer LLM now emits structured `<triples>` blocks alongside `<facts>`, parsed and validated in `parseObservationXml` against a fixed predicate vocabulary. The pre-v0.8.5 regex-based `extractTripleFromFact` required `subject verb object` sentence shape, which rejected the majority of real observation facts (descriptive phrases like "ClawMem now deploys via systemd user units on a remote host"). The LLM path extracts relational claims without sentence-shape constraints. `VALID_PREDICATES` is a tight 13-predicate set — `adopted`, `migrated_to`, `deployed_to`, `runs_on`, `replaced`, `depends_on`, `integrates_with`, `uses`, `prefers`, `avoids`, `caused_by`, `resolved_by`, `owned_by` — and the parser rejects anything outside it. `LITERAL_PREDICATES` marks `prefers`/`avoids` as literal-object predicates (object is stored as a string, not resolved to an entity).
 - **Canonical A-MEM entity IDs end-to-end via `ensureEntityCanonical`** — the old path minted `entity_nodes` rows with `entity_type='auto'` (not a valid compatibility bucket, so those entities never resolved via `kg_query` — a major root cause of the empty KG). The new helper in `src/entity.ts` resolves to a canonical `vault:type:slug` entity ID shared with the rest of A-MEM, never writes `'auto'`, and — unlike `upsertEntity` — does NOT bump `mention_count`, so SPO triple references don't inflate A-MEM's doc-mention counter. `INSERT OR IGNORE` + deterministic `makeEntityId` handles concurrent-insert races correctly.
 - **Ambiguity-safe type inheritance via `resolveEntityTypeExact`** — when the observer emits a bare entity name, the helper inherits its `entity_type` from `entity_nodes` only if exactly one entity in the vault matches. Zero matches return null (caller defaults to `concept`); multiple matches across buckets (e.g., "Alice" as `person` AND as `project`) also return null instead of arbitrarily picking. `SELECT DISTINCT entity_type ... WHERE LOWER(name) = LOWER(?)` — exact-match-only, no fuzzy fallback, fails closed on ambiguity.
 - **Observation type gate widened to `{decision, preference, milestone, problem, discovery, feature}`** — the pre-v0.8.5 gate rejected roughly 77% of real observations in production vaults because it only accepted `decision`/`preference`/`milestone`/`problem` while the majority of observer output was `discovery`. The new `SPO_ELIGIBLE_OBSERVATION_TYPES` set includes `discovery` and `feature` (the two most common types for product-development work) while still excluding `refactor`/`bugfix`/`change` (noisy types that would dilute the KG).

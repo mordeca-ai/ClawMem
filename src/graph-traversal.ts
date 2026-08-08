@@ -13,12 +13,45 @@ import { getIntentWeights } from "./intent.ts";
 // Types
 // =============================================================================
 
+/**
+ * Candidate-eligibility policy (v0.32.0). Collection scoping and the effective-time window are
+ * caller-supplied; the CORE predicates — active = 1, invalidated_at IS NULL, and the
+ * COALESCE(authored_at, modified_at) effective-time axis for any time window — are baked into
+ * every traversal SQL and cannot be waived by any caller. Ineligible rows are pruned in the
+ * neighbor/edge queries themselves — BEFORE beam selection, per-node top-k, and mass
+ * normalization — so they can neither crowd out nor demote eligible nodes.
+ */
+export interface CandidateEligibility {
+  allowCollections?: string[];
+  excludeCollections?: string[];
+  timeRange?: { start: string; end: string };
+}
+
+export function eligibilitySql(alias: string, e: CandidateEligibility | undefined): { sql: string; params: string[] } {
+  const clauses = [`${alias}.active = 1`, `${alias}.invalidated_at IS NULL`];
+  const params: string[] = [];
+  if (e?.allowCollections && e.allowCollections.length > 0) {
+    clauses.push(`${alias}.collection IN (${e.allowCollections.map(() => "?").join(",")})`);
+    params.push(...e.allowCollections);
+  }
+  if (e?.excludeCollections && e.excludeCollections.length > 0) {
+    clauses.push(`${alias}.collection NOT IN (${e.excludeCollections.map(() => "?").join(",")})`);
+    params.push(...e.excludeCollections);
+  }
+  if (e?.timeRange) {
+    clauses.push(`COALESCE(${alias}.authored_at, ${alias}.modified_at) >= ? AND COALESCE(${alias}.authored_at, ${alias}.modified_at) <= ?`);
+    params.push(e.timeRange.start, e.timeRange.end);
+  }
+  return { sql: clauses.join(" AND "), params };
+}
+
 export interface TraversalOptions {
   maxDepth: number;           // 2-3 hops
   beamWidth: number;          // 5-10 nodes per level
   budget: number;             // Max total nodes (20-50)
   intent: IntentType;
   queryEmbedding: number[];
+  eligibility?: CandidateEligibility;
 }
 
 export interface TraversalNode {
@@ -120,10 +153,29 @@ export function adaptiveTraversal(
       anchorNodes.push({ docId, score: anchor.score });
     }
   }
-  const { maxDepth, beamWidth, budget, intent, queryEmbedding } = options;
+  const { maxDepth, beamWidth, budget, intent, queryEmbedding, eligibility } = options;
 
   // Intent-specific weights for structural alignment
   const weights = getIntentWeights(intent);
+
+  // Neighbor-selection query — eligibility lives IN the SQL, always: the core predicates
+  // (active/invalidated, plus any time window) apply even for callers with no collection
+  // policy, so ineligible nodes never enter `candidates` (no beam consumption, no
+  // normalization skew).
+  const elig = eligibilitySql("d", eligibility);
+  const neighborStmt = db.prepare(`
+        SELECT r.target_id as docId, r.relation_type, r.weight
+        FROM memory_relations r
+        JOIN documents d ON d.id = r.target_id
+        WHERE r.source_id = ? AND ${elig.sql}
+
+        UNION
+
+        SELECT r.source_id as docId, r.relation_type, r.weight
+        FROM memory_relations r
+        JOIN documents d ON d.id = r.source_id
+        WHERE r.target_id = ? AND r.relation_type IN ('semantic', 'entity') AND ${elig.sql}
+      `);
 
   const visited = new Map<number, TraversalNode>();
   let currentFrontier: TraversalNode[] = anchorNodes.map(a => ({
@@ -143,18 +195,10 @@ export function adaptiveTraversal(
     const candidates: TraversalNode[] = [];
 
     for (const u of currentFrontier) {
-      // Get all neighbors via any relation type
-      const neighbors = db.prepare(`
-        SELECT target_id as docId, relation_type, weight
-        FROM memory_relations
-        WHERE source_id = ?
-
-        UNION
-
-        SELECT source_id as docId, relation_type, weight
-        FROM memory_relations
-        WHERE target_id = ? AND relation_type IN ('semantic', 'entity')
-      `).all(u.docId, u.docId) as { docId: number; relation_type: string; weight: number }[];
+      // Get all neighbors via any relation type (eligibility enforced in the statement)
+      const neighbors = neighborStmt.all(
+        u.docId, ...elig.params, u.docId, ...elig.params
+      ) as { docId: number; relation_type: string; weight: number }[];
 
       for (const neighbor of neighbors) {
         if (visited.has(neighbor.docId)) continue;
@@ -256,9 +300,12 @@ function batchLoadEdges(
   nodeIds: number[],
   edgeType: string,
   edgeCache: EdgeCache,
-  topK: number = 10
+  topK: number = 10,
+  eligibility?: CandidateEligibility
 ): void {
-  // Only load nodes not already cached for this edge type
+  // Only load nodes not already cached for this edge type.
+  // The cache is created per-mpfpTraversal call, so one eligibility policy governs its
+  // whole lifetime — entries never leak across policies.
   const uncached = nodeIds.filter(id => {
     const cached = edgeCache.get(id);
     return !cached || !cached.has(edgeType);
@@ -267,24 +314,28 @@ function batchLoadEdges(
   if (uncached.length === 0) return;
 
   const placeholders = uncached.map(() => '?').join(',');
+  const elig = eligibilitySql("d", eligibility);
 
-  // Outbound edges (source → target)
+  // Outbound edges (source → target) — destination must be eligible, checked here so
+  // ineligible rows never receive propagated mass or occupy a top-k slot
   const outbound = db.prepare(`
-    SELECT source_id, target_id as docId, weight
-    FROM memory_relations
-    WHERE source_id IN (${placeholders}) AND relation_type = ?
-    ORDER BY weight DESC
-  `).all(...uncached, edgeType) as { source_id: number; docId: number; weight: number }[];
+    SELECT r.source_id, r.target_id as docId, r.weight
+    FROM memory_relations r
+    JOIN documents d ON d.id = r.target_id
+    WHERE r.source_id IN (${placeholders}) AND r.relation_type = ? AND ${elig.sql}
+    ORDER BY r.weight DESC
+  `).all(...uncached, edgeType, ...elig.params) as { source_id: number; docId: number; weight: number }[];
 
   // Inbound edges for symmetric types (semantic, entity)
   let inbound: { source_id: number; docId: number; weight: number }[] = [];
   if (edgeType === 'semantic' || edgeType === 'entity') {
     inbound = db.prepare(`
-      SELECT target_id as source_id, source_id as docId, weight
-      FROM memory_relations
-      WHERE target_id IN (${placeholders}) AND relation_type = ?
-      ORDER BY weight DESC
-    `).all(...uncached, edgeType) as typeof inbound;
+      SELECT r.target_id as source_id, r.source_id as docId, r.weight
+      FROM memory_relations r
+      JOIN documents d ON d.id = r.source_id
+      WHERE r.target_id IN (${placeholders}) AND r.relation_type = ? AND ${elig.sql}
+      ORDER BY r.weight DESC
+    `).all(...uncached, edgeType, ...elig.params) as typeof inbound;
   }
 
   // Populate cache (top-k per node)
@@ -315,7 +366,8 @@ function executeMetaPath(
   metaPath: MetaPath,
   edgeCache: EdgeCache,
   alpha: number = 0.15,
-  threshold: number = 1e-4
+  threshold: number = 1e-4,
+  eligibility?: CandidateEligibility
 ): TraversalNode[] {
   const results = new Map<number, number>(); // docId → accumulated score
 
@@ -334,7 +386,7 @@ function executeMetaPath(
 
     // Batch-load edges for this hop (shared cache)
     const nodeIds = activeNodes.map(([id]) => id);
-    batchLoadEdges(db, nodeIds, edgeType, edgeCache);
+    batchLoadEdges(db, nodeIds, edgeType, edgeCache, 10, eligibility);
 
     const nextResidual = new Map<number, number>();
 
@@ -389,7 +441,8 @@ export function mpfpTraversal(
   db: Database,
   anchors: { hash: string; score: number }[],
   intent: IntentType,
-  budget: number = 30
+  budget: number = 30,
+  eligibility?: CandidateEligibility
 ): TraversalNode[] {
   // Convert hashes to IDs
   const anchorNodes: { docId: number; score: number }[] = [];
@@ -407,7 +460,7 @@ export function mpfpTraversal(
 
   // Execute all meta-paths (synchronous — SQLite is single-threaded anyway)
   const pathResults: TraversalNode[][] = metaPaths.map(path =>
-    executeMetaPath(db, anchorNodes, path, edgeCache)
+    executeMetaPath(db, anchorNodes, path, edgeCache, 0.15, 1e-4, eligibility)
   );
 
   // Fuse results via max-score (not RRF): Forward Push produces absolute propagation mass

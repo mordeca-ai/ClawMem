@@ -57,12 +57,14 @@ Modes: `auto`, `keyword`, `semantic`, `hybrid`.
 
 Modes: `auto`, `keyword`, `semantic`, `causal`, `timeline`, `hybrid`.
 
-Auto-routing classifies the query:
-- Causal queries → intent-aware RRF (boosts vector for WHY, BM25 for WHEN)
+Auto-routing classifies the query (shared signal set with the MCP classifier since v0.32.0 — phrasings like "why were" and "because we" route causal on both surfaces):
+- Causal queries → the shared intent-aware causal pipeline: intent-weighted RRF anchors, a bounded one-hop causal traversal in both directions, adaptive graph traversal, MPFP, and reranking (through v0.31.0 this route was anchor-only RRF)
 - Timeline queries → session history
 - Short keyword queries → BM25
 - Conceptual queries → vector
 - Everything else → hybrid
+
+The REST surface filters nothing internally: `/retrieve` returns `_clawmem` system documents in every mode, including graph-discovered ones on the causal route. Entity co-occurrence expansion does not run on REST (its only home is the MCP `intent_search` tool). A REST-wide visibility option may arrive in a later release.
 
 ```bash
 # Example: causal query
@@ -104,21 +106,53 @@ curl http://localhost:7438/sessions?limit=5
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/graph/causal/:docid` | Causal chain traversal |
+| GET | `/graph/causal/:docid` | Directed causal edge records with fact-pair witnesses |
 | GET | `/graph/similar/:docid` | k-NN semantic neighbors |
 | GET | `/graph/evolution/:docid` | Document evolution timeline |
+| POST | `/graphs/build` | Build temporal backbone and/or semantic graph |
 
 ```bash
 curl http://localhost:7438/graph/causal/a1b2c3?direction=both&depth=3
 curl http://localhost:7438/graph/similar/a1b2c3?limit=5
 ```
 
+**GET /graph/causal/:docid** returns `{ docid, direction, depth, count, truncated,
+links }` where each link is a directed edge record: invariant
+`sourceDocId`/`targetDocId`, separate traversal provenance
+(`predecessorDocId`/`depth`/`direction`), `weight`, `evidenceCount`, and up to 3
+fact-pair `witnesses` (ordinals, fact snapshots, reasoning, confidence,
+`strongestAt`/`lastSeenAt`, `legacy`). One combined 50-edge budget spans both
+directions, and the complete JSON body is capped at 64 KiB with whole-edge
+truncation (`truncated: true`). Multi-hop chain quality is experimental — depth
+> 1 records are per-edge evidence, not a verified chain.
+
+**POST /graphs/build**
+
+```json
+{ "graph_types": ["all"], "semantic_threshold": 0.7 }
+```
+
+Response (v0.28.0+):
+
+```json
+{ "temporal": 12, "semantic": 43, "temporalTotal": 541, "semanticTotal": 3878 }
+```
+
+`temporal` / `semantic` are edges **newly written by this call** — inserts are idempotent, so a
+rebuild over an unchanged corpus correctly returns `0`. `temporalTotal` / `semanticTotal` are
+edges of that type **currently in the active graph** (both endpoints active). `0 new` does not
+mean the graph is empty; read the total.
+
+Unlike the MCP `build_graphs` tool, which returns only the graph types you requested, this
+endpoint always emits all four keys — that is its pre-existing shape, kept so existing callers
+do not break.
+
 ### Lifecycle
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/lifecycle/status` | Active/archived/pinned/snoozed counts |
-| POST | `/lifecycle/sweep` | Archive stale docs (dry_run default) |
+| POST | `/lifecycle/sweep` | Archive stale docs (dry_run default). Archives only — never deletes |
 | POST | `/lifecycle/restore` | Restore archived docs |
 
 ### Document mutations

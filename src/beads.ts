@@ -9,7 +9,7 @@
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 
 // =============================================================================
 // Types (matches bd list --json output: IssueWithCounts)
@@ -43,7 +43,8 @@ export interface BeadsIssue {
   metadata?: Record<string, unknown>;
   labels?: string[];
   dependencies?: BeadsDependency[];
-  quality_score?: number;
+  lease_expires_at?: string;
+  heartbeat_at?: string;
   // Computed counts from bd list --json
   dependency_count?: number;
   dependent_count?: number;
@@ -92,11 +93,13 @@ function runBd(projectDir: string, args: string[], timeoutMs = 10000): string | 
   }
 
   try {
-    return execSync(`${bd} ${args.join(" ")}`, {
+    return execFileSync(bd, args, {
       cwd: projectDir,
       encoding: "utf-8",
       timeout: timeoutMs,
-      env: { ...process.env },
+      // No shell interpolation of args; bd usage metrics + event flush stay off
+      // (default-on with a remote endpoint as of bd 1.1.0).
+      env: { ...process.env, BD_DISABLE_METRICS: "1", BD_DISABLE_EVENT_FLUSH: "1" },
       stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (err: any) {
@@ -114,7 +117,7 @@ function runBd(projectDir: string, args: string[], timeoutMs = 10000): string | 
  * Returns parsed issues with labels and dependencies populated.
  */
 export function queryBeadsList(projectDir: string): BeadsIssue[] {
-  const output = runBd(projectDir, ["list", "--json"]);
+  const output = runBd(projectDir, ["list", "--json", "--limit", "0"]);
   if (!output) return [];
 
   try {
@@ -158,7 +161,8 @@ function normalizeBeadsIssue(raw: any): BeadsIssue {
     metadata: raw.metadata,
     labels: raw.labels || [],
     dependencies: deps,
-    quality_score: raw.quality_score,
+    lease_expires_at: raw.lease_expires_at,
+    heartbeat_at: raw.heartbeat_at,
     dependency_count: raw.dependency_count,
     dependent_count: raw.dependent_count,
     comment_count: raw.comment_count,
@@ -213,7 +217,7 @@ export function formatBeadsIssueAsMarkdown(issue: BeadsIssue): string {
   }
   if (issue.blocks && issue.blocks.length > 0) lines.push(`**Blocks**: ${issue.blocks.join(", ")}`);
   if (issue.external_ref) lines.push(`**External Ref**: ${issue.external_ref}`);
-  if (issue.quality_score != null) lines.push(`**Quality Score**: ${issue.quality_score}`);
+  if (issue.lease_expires_at) lines.push(`**Claim Lease**: expires ${issue.lease_expires_at}`);
 
   if (issue.description) {
     lines.push("", "## Description", "", issue.description);

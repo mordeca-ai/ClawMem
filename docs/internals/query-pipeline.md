@@ -43,13 +43,17 @@ Cross-Encoder Reranking
   │ Batch cap = 4
   │
   ▼
-Position-Aware Blending
-  │ α = 0.75 (top 3), 0.60 (mid), 0.40 (tail)
-  │ Blends original + reranked scores
+Rerank / RRF Blend (blendRerank)
+  │ 0.9 · reranker + 0.1 · normalized-RRF tiebreaker
+  │ Reranker is the dominant signal; can promote a doc over RRF #1
+  │ Falls back to pure RRF order if the reranker is unavailable / degenerate
+  │ (no score above RERANK_DEGENERATE_FLOOR ≈ 1e-4); emits a rate-limited warning on fallback
+  │ (the reranker-health guard surfaces this — see `clawmem doctor` / `clawmem rerank-health`)
   │
   ▼
 Composite Scoring
-  │ (relevance * 0.50 + recency * 0.25 + confidence * 0.25)
+  │ (relevance * 0.70 + recency * 0.15 + confidence * 0.15)   ← query-tuned weights (v0.13.0)
+  │ recency-intent queries instead use 0.10 / 0.70 / 0.20
   │ × quality multiplier × co-activation boost
   │
   ▼
@@ -74,6 +78,10 @@ Results
 When the top BM25 hit scores >= 0.85 and the gap to the second hit is >= 0.15, the pipeline skips query expansion entirely. This is a fast path for queries with obvious keyword matches.
 
 The bypass is disabled when `intent` is provided — intent implies the query is ambiguous, so keyword confidence alone is insufficient.
+
+Functional as of v0.23.0: through v0.22.0 a clamp bug flattened every FTS score to a constant 1.0, so with two or more hits the gap was always 0 (the bypass never fired) and with exactly one hit the gap was always 1.0 (it fired even on a garbage match). The scores are now the monotonic `|bm25|/(1+|bm25|)` transform — 0.85 corresponds to |bm25| ≥ 5.67 — and the check itself lives in one shared helper (`hasStrongFtsSignal`) used by both this pipeline and the CLI `query` command. Threshold tuning is deliberately deferred to a judged query-pipeline A/B (BACKLOG 49.3).
+
+Ops escape hatch (v0.24.0): `CLAWMEM_DISABLE_FTS_BYPASS=true` forces the full expansion path on every query at BOTH consumers (the MCP pipeline and the CLI `query`), via the shared `ftsBypassEnabled()` read in `search-utils.ts`. Intended for A/B harnesses and incident triage; `hasStrongFtsSignal` itself stays pure.
 
 ## Query expansion
 

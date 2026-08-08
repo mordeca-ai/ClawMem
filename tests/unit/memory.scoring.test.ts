@@ -24,8 +24,17 @@ describe("recencyScore", () => {
   test("returns 1.0 for infinite half-life types", () => {
     const now = new Date();
     const yearAgo = new Date(now.getTime() - 365 * 86400000);
-    expect(recencyScore(yearAgo, "decision", now)).toBe(1.0);
+    expect(recencyScore(yearAgo, "preference", now)).toBe(1.0);
     expect(recencyScore(yearAgo, "hub", now)).toBe(1.0);
+    expect(recencyScore(yearAgo, "antipattern", now)).toBe(1.0);
+  });
+
+  test("decision decays on its 180-day half-life (§36.11 — no longer infinite)", () => {
+    const now = new Date();
+    const yearAgo = new Date(now.getTime() - 365 * 86400000);
+    const score = recencyScore(yearAgo, "decision", now);
+    expect(score).toBeLessThan(1.0);
+    expect(score).toBeCloseTo(Math.pow(0.5, 365 / 180), 2);
   });
 
   test("handles string date input", () => {
@@ -111,5 +120,22 @@ describe("confidenceScore", () => {
     const score = confidenceScore("note", now, Infinity, now);
     expect(Number.isFinite(score)).toBe(true);
     expect(score).toBeLessThanOrEqual(1.0);
+  });
+
+  test("antipattern is durable — 0.75 baseline + attention-decay exempt", () => {
+    const now = new Date();
+    const yearAgo = new Date(now.getTime() - 365 * 86400000);
+    // TYPE_BASELINES: antipattern (0.75) outranks note (0.50) when all else is equal.
+    expect(confidenceScore("antipattern", now, 0, now, now)).toBeGreaterThan(
+      confidenceScore("note", now, 0, now, now)
+    );
+    // DECAY_EXEMPT_TYPES: an old last-access does NOT erode antipattern confidence...
+    const antiFresh = confidenceScore("antipattern", now, 0, now, now);
+    const antiOld = confidenceScore("antipattern", now, 0, now, yearAgo);
+    expect(antiOld).toBeCloseTo(antiFresh, 5);
+    // ...whereas a non-durable type (note) loses confidence to attention decay.
+    const noteFresh = confidenceScore("note", now, 0, now, now);
+    const noteOld = confidenceScore("note", now, 0, now, yearAgo);
+    expect(noteOld).toBeLessThan(noteFresh);
   });
 });

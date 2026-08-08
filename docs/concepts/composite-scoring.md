@@ -1,6 +1,6 @@
 # Composite Scoring
 
-Every search result in ClawMem is scored using a composite formula that blends multiple signals beyond raw search relevance.
+Composite scoring blends multiple signals beyond raw search relevance. **It applies to the hook pipeline (context surfacing), the `query` hybrid pipeline, and `memory_retrieve`'s keyword/hybrid/causal/complex modes.** The direct retrieval routes do NOT use it for non-recency queries: since v0.22.0 MCP `vsearch` and `memory_retrieve` semantic/discovery rank by raw vector cosine (`scoreBasis: "vector-cosine"`), and since v0.24.0 MCP `search` ranks by the raw BM25 transform (`scoreBasis: "fts-bm25"`) — metadata (including pin) breaks exact score ties only on all of them. Both splits are measured, not aesthetic: on judged sets against the live vault, raw cosine ranked 16/19 targets #1 (MRR 0.912) vs composite 1/19 (MRR 0.307, 14/19 pushed below the old minScore floor), and raw-FTS ranked 33/43 keyword targets #1 (MRR 0.848) vs composite 6/43 (MRR 0.415) — composite lost even on the fresh-doc-favorable slice (0.348 vs 0.801), so the multipliers below bury keyword relevance rather than refine it. Recency-intent queries keep composite (the Recency column) on every route that had it.
 
 ## Formula
 
@@ -9,15 +9,21 @@ compositeScore = (w_search * searchScore + w_recency * recencyScore + w_confiden
                  * qualityMultiplier * coActivationBoost
 ```
 
-### Default weights
+### Weights
 
-| Signal | Normal | Recency intent |
-|--------|--------|---------------|
-| searchScore | 0.50 | 0.10 |
-| recencyScore | 0.25 | 0.70 |
-| confidenceScore | 0.25 | 0.20 |
+| Signal | Normal (default) | `query` tool | Recency intent |
+|--------|------------------|--------------|----------------|
+| searchScore | 0.50 | 0.70 | 0.10 |
+| recencyScore | 0.25 | 0.15 | 0.70 |
+| confidenceScore | 0.25 | 0.15 | 0.20 |
 
-Recency intent is detected automatically when queries contain "latest", "recent", "last session", etc.
+Recency intent is detected automatically when queries contain "latest", "recent", "last session", etc. — and **takes precedence over the `query`-tool weights**: a recency-phrased `query` call still uses the Recency-intent column.
+
+The **`query` tool** uses retrieval-tuned weights (search 0.70) derived from a held-out judged-relevance eval (v0.13.0) — more weight on topical relevance measurably improves graded NDCG@10 without demoting the newest-correct version of evolving docs. The composite `memory_retrieve` modes, the context-surfacing hook, and `search`'s recency branch **keep the Normal column**. The v0.21.0 `retrieval.mcp_direct_tuned_weights` knob is **superseded as of v0.22.0 and has no effect** — the direct-pipeline eval it was gated on measured tuned weights at 1/19 hit@1, and the direct routes moved to raw ordering instead. The key is still parsed (a once-per-process warning is logged if set) so existing configs don't break.
+
+Threshold note: EOS-anchored last-token embedding models (e.g. zembed-1 served correctly) produce a **compressed-high similarity band** — unrelated pairs sit near ~0.4 rather than ~0.2. Relative ordering is what matters; treat absolute `minScore` cutoffs as model-dependent rather than universal.
+
+`searchScore` provenance (v0.23.0): on FTS/BM25 surfaces the input is the monotonic transform `|bm25|/(1+|bm25|)` of FTS5's negative-is-better `bm25()` (through v0.22.0 a clamp bug flattened it to a constant 1.0, which made composite ranking on those surfaces metadata-only); on vector surfaces it is the raw cosine. The two are independent monotonic signals on an uncalibrated common range — composite blends them where pools mix (hooks, REST hybrid), which removes the old unconditional FTS-over-vector dominance but does not make the channels numerically comparable.
 
 ## Signal breakdown
 
@@ -27,12 +33,13 @@ Raw relevance from the search backend — BM25, vector cosine similarity, or RRF
 
 ### Recency score (0.0 - 1.0)
 
-Exponential decay based on document age and content type half-life:
+Exponential decay based on document age and content type half-life. **Age is measured on effective time (v0.27.0): `authored_at` — when the content was originally written — when known, `modified_at` otherwise.** Mined conversations and synthesized facts carry `authored_at` from their source transcripts, and any vault file can declare it in frontmatter, so historical content ranks by its true age instead of its filing date. The confidence signal's internal recency uses the same effective date; all operational clocks (the dedup window, lifecycle sweeps, the attention-decay access sentinel) stay on filing/update time.
 
 | Content type | Half-life | Behavior |
 |-------------|-----------|----------|
-| decision, deductive, preference, hub | Infinite | Never decay |
+| deductive, preference, hub | Infinite | Never decay |
 | antipattern | Infinite | Never decay |
+| decision | 180 days | Very slow decay — silently-abandoned decisions stop winning ranking (§36.11); still attention-decay-exempt; this ranking decay does not delete or archive (lifecycle policy is separate) |
 | project | 120 days | Slow decay |
 | research | 90 days | Moderate decay |
 | problem, milestone, note | 60 days | Default |
@@ -45,7 +52,7 @@ Half-lives extend up to 3x for frequently-accessed memories (access reinforcemen
 
 Starts at 0.5 for new documents. Adjusted by:
 
-- **Contradiction detection** — when `decision-extractor` finds a new decision contradicting an old one, the old decision's confidence is lowered. The consolidation worker applies an additional merge-time contradiction gate (v0.7.1): before merging a new pattern into an existing consolidated observation, it checks for contradictions via a deterministic heuristic plus an LLM confirmation. Contradictory merges are blocked and either linked via a `contradicts` edge (default) or supersede the old row with `status='inactive'` (see [consolidation safety](architecture.md#consolidation-safety-v071)).
+- **Contradiction detection** (judge-gated since v0.29.0 — requires `CLAWMEM_JUDGE_*`) — when `decision-extractor` finds a new decision contradicting an old one, the old decision's confidence is lowered. The consolidation worker applies an additional merge-time contradiction gate (v0.7.1): before merging a new pattern into an existing consolidated observation, it checks for contradictions via the configured judge (deterministic heuristic only, `link`-constrained, without one). Contradictory merges are blocked and either linked via the old row's `invalidated_by` backlink (default) or supersede the old row with `status='inactive'` (judge required; see [consolidation safety](architecture.md#consolidation-safety-v071)).
 - **Feedback loop** — referenced notes get confidence boosts
 - **Attention decay** — non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access. Decision, deductive, preference, hub, research, and antipattern types are exempt.
 
@@ -88,13 +95,15 @@ coActivationBoost = 1 + min(coCount / 10, 0.15)
 
 Documents frequently surfaced together in the same session get up to 15% boost.
 
-**Where co-activation is applied depends on the caller.** MCP tools (`query`, `search`, `vsearch`) pass a co-activation function into `applyCompositeScoring()`, so the boost is part of the composite score used for ranking and `minScore` filtering. The context-surfacing hook does NOT pass co-activation into composite scoring — instead it applies a separate spreading-activation step *after* adaptive threshold filtering. This means the hook's threshold decisions are based on scores without co-activation, and co-activation only boosts results that already passed the threshold. This is intentional: it prevents relationship boosts from rescuing otherwise-weak results into the surfaced set.
+**Where co-activation is applied depends on the caller.** The composite MCP surfaces (`query`, plus `search` and `vsearch` on recency-intent queries only) pass a co-activation function into `applyCompositeScoring()`, so the boost is part of the composite score used for ranking and — on `vsearch` and `search`, the tools that expose `minScore` — for `minScore` filtering. On the non-recency (raw) regimes of `vsearch` (v0.22.0) and `search` (v0.24.0), co-activation contributes only to the exact-tie key, never to ranking or filtering. The context-surfacing hook does NOT pass co-activation into composite scoring — instead it applies a separate spreading-activation step *after* adaptive threshold filtering. This means the hook's threshold decisions are based on scores without co-activation, and co-activation only boosts results that already passed the threshold. This is intentional: it prevents relationship boosts from rescuing otherwise-weak results into the surfaced set.
 
 ## Additional modifiers
 
 ### Pin boost
 
-Pinned documents receive +0.3 additive boost (capped at 1.0 total).
+On composite surfaces, pinned documents receive a +0.3 additive boost (capped at 1.0 total). Pin's contract is **lifecycle retention + prioritization among relevance-equivalent results** — on the raw routes (the vector tools since v0.22.0, and non-recency `search` since v0.24.0) it therefore breaks exact raw-score ties only and never lifts a document over a more relevant one.
+
+**Known cap inversion (v0.36.0 finding):** the 1.0 cap can bind. Quality (×1.3), frequency (×1.10), and canonical (×1.14) multipliers can push a pre-pin composite above 1.0, and `min(1.0, score + 0.3)` then CLAMPS the pinned document DOWN — an unpinned twin with the same signals would outrank it. (Co-activation applies after the cap, so a co-activated pinned doc can still exceed 1.0.) `memory_rank` reports this truthfully as a negative `pinΔ`. A fix is queued behind a judged golden set; until then, treat pins on very-high-scoring documents as retention guarantees, not ranking guarantees.
 
 ### Length normalization
 
@@ -129,3 +138,7 @@ Absolute composite scores vary across vaults due to several factors:
 Context-surfacing handles this with adaptive ratio-based thresholds instead of fixed absolute values. The hook computes the best composite score in the result set, then keeps results within a percentage of that best score (e.g., 55% for balanced). An activation floor prevents surfacing when even the best result is too weak. See [profiles](hooks-vs-mcp.md#adaptive-thresholds) for the specific values per profile.
 
 MCP tools use fixed absolute `minScore` thresholds since agents control those limits directly.
+
+## Inspecting a live ranking
+
+Since v0.36.0 the `memory_rank` MCP tool runs the real FTS + composite pipeline for a query and returns every factor on this page as numbers — the weights applied, recency and blended-confidence inputs, quality/length/frequency/canonical multipliers, signed pin delta, and co-activation — plus each result's raw-vs-composite rank shift, with raw winners the composite ordering demoted kept visible. The factors are captured inside the scorer (they reproduce the composite score exactly), so the explanation cannot drift from the implementation. See [mcp-tools.md](../reference/mcp-tools.md#memory_rank).

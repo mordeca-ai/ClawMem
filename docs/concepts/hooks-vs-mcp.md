@@ -12,7 +12,7 @@ Hooks fire on Claude Code lifecycle events with zero agent effort:
 | `postcompact-inject` | SessionStart (after compact) | 1200 tokens | Re-injects authoritative state after context window compaction. |
 | `curator-nudge` | SessionStart | 200 tokens | Surfaces maintenance suggestions from the curator report. |
 | `precompact-extract` | PreCompact | — | Extracts decisions, file paths, and open questions before compaction. Writes `precompact-state.md`. |
-| `decision-extractor` | Stop | — | LLM extracts observations from the conversation. Infers causal links. Detects contradictions with prior decisions. Extracts SPO triples from decision/preference/milestone/problem facts. |
+| `decision-extractor` | Stop | — | LLM extracts observations from the conversation. Infers causal links. Detects contradictions with prior decisions (judge-gated — requires `CLAWMEM_JUDGE_*`, v0.29.0). Extracts SPO triples from decision/preference/milestone/problem facts. |
 | `handoff-generator` | Stop | — | LLM summarizes the session for cross-session continuity. |
 | `feedback-loop` | Stop | — | Tracks which notes were referenced. Boosts their confidence. Per-turn recall attribution marks which surfaced docs were actually cited. |
 

@@ -27,7 +27,9 @@
 
 import type { Store } from "./store.ts";
 import type { LlamaCpp } from "./llm.ts";
+import { withRetryAndFeedback } from "./llm-retry.ts";
 import { extractJsonFromLLM } from "./amem.ts";
+import { isSchemaPlaceholder, ALIAS_RESIDUE, LINK_TARGET_RESIDUE } from "./schema-placeholder.ts";
 import type { ContentType } from "./memory.ts";
 
 // =============================================================================
@@ -179,7 +181,7 @@ For each fact provide:
 - contentType: one of [decision, preference, milestone, problem]
 - narrative: 1-3 sentence description of the fact in context
 - facts: optional array of supporting fact strings (evidence)
-- aliases: optional alternative titles for linking (e.g., ["OAuth choice"] for "Use OAuth 2.0")
+- aliases: optional alternative titles for linking (help match this fact to related ones)
 - links: optional array of cross-fact references. Each link is
   {targetTitle, relationType, weight}
   - targetTitle may refer to another fact extracted from this conversation OR from
@@ -189,18 +191,20 @@ For each fact provide:
   - weight is 0.0-1.0 (default 0.6)
 
 Only extract facts the conversation clearly supports. Do NOT fabricate.
+Never copy the {{...}} tokens or any schema text below into your output — replace every {{...}}
+with real content drawn from the conversation. Emit only real extracted facts.
 Return ONLY valid JSON array. Return empty array [] if no structured facts found.
 
-Example output:
+Shape (structure only — not example content):
 [
   {
-    "title": "Use OAuth 2.0 with PKCE",
-    "contentType": "decision",
-    "narrative": "Team decided to use OAuth 2.0 with PKCE for user authentication, replacing session cookies.",
-    "facts": ["PKCE chosen for mobile support", "Legacy session auth to be deprecated Q2"],
-    "aliases": ["OAuth decision", "switch to OAuth"],
+    "title": "{{concise 3-8 word title}}",
+    "contentType": "{{one of: decision, preference, milestone, problem}}",
+    "narrative": "{{1-3 sentence description of the fact in context}}",
+    "facts": ["{{supporting evidence string}}"],
+    "aliases": ["{{optional alternative title}}"],
     "links": [
-      { "targetTitle": "Deprecate session auth", "relationType": "causal", "weight": 0.8 }
+      { "targetTitle": "{{target fact title}}", "relationType": "{{one of: semantic, supporting, contradicts, causal, temporal, entity}}", "weight": 0.6 }
     ]
   }
 ]`;
@@ -219,6 +223,8 @@ function normalizeExtractedFact(
 
   const title = typeof obj.title === "string" ? obj.title.trim() : "";
   if (!title) return null;
+  // Anti-parrot: reject a fact whose title is echoed schema/skeleton residue.
+  if (isSchemaPlaceholder(title)) return null;
 
   const contentType = obj.contentType;
   if (typeof contentType !== "string") return null;
@@ -226,13 +232,14 @@ function normalizeExtractedFact(
 
   const narrative = typeof obj.narrative === "string" ? obj.narrative.trim() : "";
   if (!narrative) return null;
+  if (isSchemaPlaceholder(narrative)) return null;
 
   const facts: string[] = Array.isArray(obj.facts)
-    ? obj.facts.filter((f): f is string => typeof f === "string" && f.trim().length > 0)
+    ? obj.facts.filter((f): f is string => typeof f === "string" && f.trim().length > 0 && !isSchemaPlaceholder(f))
     : [];
 
   const aliases: string[] = Array.isArray(obj.aliases)
-    ? obj.aliases.filter((a): a is string => typeof a === "string" && a.trim().length > 0)
+    ? obj.aliases.filter((a): a is string => typeof a === "string" && a.trim().length > 0 && !isSchemaPlaceholder(a, ALIAS_RESIDUE, "identifier"))
     : [];
 
   const links: ExtractedFactLink[] = Array.isArray(obj.links)
@@ -245,6 +252,10 @@ function normalizeExtractedFact(
           const relationType =
             typeof link.relationType === "string" ? link.relationType : "";
           if (!targetTitle || !VALID_RELATION_TYPES.has(relationType)) return null;
+          // Identifier scope: a link target is a NAME used for resolution, so no marker shape
+          // is rejected — but this prompt emits a copyable `{{target fact title}}` skeleton,
+          // which would otherwise cross normalization and could resolve against legacy content.
+          if (isSchemaPlaceholder(targetTitle, LINK_TARGET_RESIDUE, "identifier")) return null;
           const weight =
             typeof link.weight === "number" && Number.isFinite(link.weight)
               ? Math.max(0, Math.min(1, link.weight))
@@ -284,21 +295,24 @@ export async function extractFactsFromConversation(
 ): Promise<ExtractedFact[] | null> {
   const prompt = buildExtractionPrompt(conversationText);
 
-  let result;
-  try {
-    result = await llm.generate(prompt, {
-      temperature: LLM_TEMPERATURE,
-      maxTokens: LLM_MAX_TOKENS,
-    });
-  } catch (err) {
-    console.log(`[synthesis] LLM generate threw for doc ${sourceDocId}:`, err);
-    return null;
-  }
-
-  if (!result || typeof result.text !== "string") return null;
-
-  const parsed = extractJsonFromLLM(result.text);
-  if (!Array.isArray(parsed)) return null;
+  const parsed = await withRetryAndFeedback<unknown[]>({
+    initialPrompt: prompt,
+    llm,
+    maxTokens: LLM_MAX_TOKENS,
+    temperature: LLM_TEMPERATURE,
+    label: `synthesis.extractFacts(doc ${sourceDocId})`,
+    parse: (text) => {
+      const value = extractJsonFromLLM(text);
+      if (!Array.isArray(value)) {
+        return {
+          ok: false,
+          error: "Response was not a JSON array of fact objects. Return ONLY the JSON array.",
+        };
+      }
+      return { ok: true, value };
+    },
+  });
+  if (parsed === null) return null;
 
   const facts: ExtractedFact[] = [];
   for (const raw of parsed) {
@@ -459,12 +473,12 @@ export async function runConversationSynthesis(
     return result;
   }
 
-  let docs: Array<{ id: number; title: string; body: string }>;
+  let docs: Array<{ id: number; title: string; body: string; authoredAt: string | null }>;
   try {
     const placeholders = contentTypeFilter.map(() => "?").join(",");
     docs = store.db
       .prepare(
-        `SELECT d.id, d.title, c.doc as body
+        `SELECT d.id, d.title, c.doc as body, d.authored_at as authoredAt
          FROM documents d
          JOIN content c ON c.hash = d.hash
          WHERE d.collection = ?
@@ -477,6 +491,7 @@ export async function runConversationSynthesis(
       id: number;
       title: string;
       body: string;
+      authoredAt: string | null;
     }>;
   } catch (err) {
     console.log(`[synthesis] Query failed for collection '${collection}':`, err);
@@ -534,6 +549,8 @@ export async function runConversationSynthesis(
           confidence: DEFAULT_CONFIDENCE,
           qualityScore: DEFAULT_QUALITY_SCORE,
           semanticPayload: `${fact.title}\n${fact.narrative}`,
+          // §51.1 D7: a synthesized fact inherits its source doc's authorship
+          authoredAt: doc.authoredAt ?? undefined,
         });
 
         if (!saveResult.docId || saveResult.docId < 0) continue;

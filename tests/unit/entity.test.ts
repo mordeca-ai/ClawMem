@@ -246,6 +246,339 @@ describe("entity graph neighbors", () => {
     expect(neighbors.length).toBeGreaterThan(0);
     expect(neighbors.some(n => n.docId === doc2!)).toBe(true);
   });
+
+  // BL-001 — the neighbor ordering must not reintroduce the hub bias that the
+  // edge-creation path's IDF suppression exists to prevent: a ubiquitous hub
+  // entity with a high raw co-occurrence count must NOT outrank a specific,
+  // low-frequency neighbor.
+  it("ranks a specific low-frequency neighbor above a ubiquitous hub (BL-001)", () => {
+    // 15 active docs total: 1 seed + 12 hub-mention docs + 2 specific-mention docs.
+    const [seedDoc] = seedDocuments(store, [
+      { path: "seed.md", title: "Seed", body: "seed doc" },
+    ]);
+    const hubDocs = seedDocuments(
+      store,
+      Array.from({ length: 12 }, (_, i) => ({
+        path: `hub-${i}.md`,
+        title: `Hub ${i}`,
+        body: "hub-heavy doc",
+      }))
+    );
+    const specificDocs = seedDocuments(store, [
+      { path: "rare-1.md", title: "Rare 1", body: "specific doc" },
+      { path: "rare-2.md", title: "Rare 2", body: "specific doc" },
+    ]);
+
+    const seedEntity = upsertEntity(store.db, "SeedTopic", "project", "default");
+    recordEntityMention(store.db, seedEntity, seedDoc!, "SeedTopic");
+
+    // Hub: mentioned in 12 of 15 docs (low IDF), co-occurs with seed 10 times.
+    const hubEntity = upsertEntity(store.db, "HubEverywhere", "tool", "default");
+    for (const d of hubDocs) recordEntityMention(store.db, hubEntity, d, "HubEverywhere");
+    for (let i = 0; i < 10; i++) trackCoOccurrences(store.db, [seedEntity, hubEntity]);
+
+    // Specific: mentioned in 2 of 15 docs (high IDF), co-occurs with seed twice.
+    const specificEntity = upsertEntity(store.db, "RareGem", "tool", "default");
+    for (const d of specificDocs) recordEntityMention(store.db, specificEntity, d, "RareGem");
+    for (let i = 0; i < 2; i++) trackCoOccurrences(store.db, [seedEntity, specificEntity]);
+
+    const neighbors = getEntityGraphNeighbors(store.db, [seedDoc!]);
+
+    // Both entity families must be represented…
+    expect(neighbors.some(n => n.viaEntity === specificEntity)).toBe(true);
+    expect(neighbors.some(n => n.viaEntity === hubEntity)).toBe(true);
+    // …but the specific neighbor outranks the hub despite the 10-vs-2 raw count.
+    expect(neighbors[0]!.viaEntity).toBe(specificEntity);
+    const firstHubIdx = neighbors.findIndex(n => n.viaEntity === hubEntity);
+    const firstSpecificIdx = neighbors.findIndex(n => n.viaEntity === specificEntity);
+    expect(firstSpecificIdx).toBeLessThan(firstHubIdx);
+  });
+
+  // BL-001 turn-2 regression: archived mentions must not suppress current
+  // specificity or push scores negative — IDF populations are active-only.
+  it("archived mentions do not suppress specificity into negative scores (BL-001)", () => {
+    const [seedDoc, activeDoc] = seedDocuments(store, [
+      { path: "seed.md", title: "Seed", body: "seed doc" },
+      { path: "active-rare.md", title: "Active Rare", body: "current doc" },
+    ]);
+    const archivedDocs = seedDocuments(
+      store,
+      Array.from({ length: 9 }, (_, i) => ({
+        path: `old-${i}.md`,
+        title: `Old ${i}`,
+        body: "historical doc",
+      }))
+    );
+
+    const seedEntity = upsertEntity(store.db, "SeedTopic", "project", "default");
+    recordEntityMention(store.db, seedEntity, seedDoc!, "SeedTopic");
+
+    // Entity mentioned in 10 docs — but 9 are archived. Active docFreq = 1.
+    const entity = upsertEntity(store.db, "OnceCommon", "tool", "default");
+    recordEntityMention(store.db, entity, activeDoc!, "OnceCommon");
+    for (const d of archivedDocs) recordEntityMention(store.db, entity, d, "OnceCommon");
+    const archiveStmt = store.db.prepare("UPDATE documents SET active = 0 WHERE id = ?");
+    for (const d of archivedDocs) archiveStmt.run(d);
+
+    trackCoOccurrences(store.db, [seedEntity, entity]);
+    trackCoOccurrences(store.db, [seedEntity, entity]);
+
+    const neighbors = getEntityGraphNeighbors(store.db, [seedDoc!]);
+    const activeEntry = neighbors.find(n => n.docId === activeDoc!);
+    // With all-mentions docFreq (10) vs active totalDocs (2+seed), IDF went
+    // negative and this score was negative. Active-only docFreq = 1 keeps it
+    // positive.
+    expect(activeEntry).toBeDefined();
+    expect(activeEntry!.score).toBeGreaterThan(0);
+  });
+
+  // BL-001 turn-2 regression: the candidate pool must be scored BEFORE any
+  // limit — a specific neighbor ranked below 30 hubs on raw count must still
+  // surface (the old SQL `ORDER BY count DESC LIMIT 30` excluded it).
+  it("a specific neighbor beyond raw-count rank 30 still surfaces and wins (BL-001)", () => {
+    const [seedDoc] = seedDocuments(store, [
+      { path: "seed.md", title: "Seed", body: "seed doc" },
+    ]);
+    const hubDocs = seedDocuments(
+      store,
+      Array.from({ length: 12 }, (_, i) => ({
+        path: `hub-${i}.md`,
+        title: `Hub ${i}`,
+        body: "hub-heavy doc",
+      }))
+    );
+    const specificDocs = seedDocuments(store, [
+      { path: "rare-1.md", title: "Rare 1", body: "specific doc" },
+      { path: "rare-2.md", title: "Rare 2", body: "specific doc" },
+    ]);
+
+    const seedEntity = upsertEntity(store.db, "SeedTopic", "project", "default");
+    recordEntityMention(store.db, seedEntity, seedDoc!, "SeedTopic");
+
+    // 31 hub entities, each mentioned in all 12 hub docs (low IDF) and each
+    // co-occurring with the seed at count 10 (fixture shortcut: direct insert
+    // with the canonical sorted pair, matching trackCoOccurrences key order).
+    const coocStmt = store.db.prepare(
+      "INSERT INTO entity_cooccurrences (entity_a, entity_b, count, last_cooccurred) VALUES (?, ?, ?, datetime('now'))"
+    );
+    for (let h = 0; h < 31; h++) {
+      const hubId = upsertEntity(store.db, `Hub${h}Everywhere`, "tool", "default");
+      for (const d of hubDocs) recordEntityMention(store.db, hubId, d, `Hub${h}Everywhere`);
+      const pair = [seedEntity, hubId].sort();
+      coocStmt.run(pair[0]!, pair[1]!, 10);
+    }
+
+    // The specific entity: 2 docs, co-occurrence count 2 — raw rank 32nd.
+    const specificEntity = upsertEntity(store.db, "RareGem", "tool", "default");
+    for (const d of specificDocs) recordEntityMention(store.db, specificEntity, d, "RareGem");
+    const pair = [seedEntity, specificEntity].sort();
+    coocStmt.run(pair[0]!, pair[1]!, 2);
+
+    const neighbors = getEntityGraphNeighbors(store.db, [seedDoc!], 50);
+    expect(neighbors.some(n => n.viaEntity === specificEntity)).toBe(true);
+    expect(neighbors[0]!.viaEntity).toBe(specificEntity);
+  });
+
+  // BL-001 turn-2 regression: a document reachable via BOTH a hub and a
+  // specific entity must keep the specific (best) path's score and viaEntity,
+  // not the first-traversed hub path.
+  it("a doc reachable via hub AND specific entity keeps the specific path (BL-001)", () => {
+    const [seedDoc, sharedDoc] = seedDocuments(store, [
+      { path: "seed.md", title: "Seed", body: "seed doc" },
+      { path: "shared.md", title: "Shared", body: "reachable both ways" },
+    ]);
+    const hubDocs = seedDocuments(
+      store,
+      Array.from({ length: 11 }, (_, i) => ({
+        path: `hub-${i}.md`,
+        title: `Hub ${i}`,
+        body: "hub-heavy doc",
+      }))
+    );
+    const [rareDoc] = seedDocuments(store, [
+      { path: "rare-1.md", title: "Rare 1", body: "specific doc" },
+    ]);
+
+    const seedEntity = upsertEntity(store.db, "SeedTopic", "project", "default");
+    recordEntityMention(store.db, seedEntity, seedDoc!, "SeedTopic");
+
+    // Hub: 12 docs (11 hub docs + the shared doc), count 10 with seed.
+    const hubEntity = upsertEntity(store.db, "HubEverywhere", "tool", "default");
+    for (const d of hubDocs) recordEntityMention(store.db, hubEntity, d, "HubEverywhere");
+    recordEntityMention(store.db, hubEntity, sharedDoc!, "HubEverywhere");
+    for (let i = 0; i < 10; i++) trackCoOccurrences(store.db, [seedEntity, hubEntity]);
+
+    // Specific: 2 docs (rare doc + the shared doc), count 2 with seed.
+    const specificEntity = upsertEntity(store.db, "RareGem", "tool", "default");
+    recordEntityMention(store.db, specificEntity, rareDoc!, "RareGem");
+    recordEntityMention(store.db, specificEntity, sharedDoc!, "RareGem");
+    for (let i = 0; i < 2; i++) trackCoOccurrences(store.db, [seedEntity, specificEntity]);
+
+    const neighbors = getEntityGraphNeighbors(store.db, [seedDoc!]);
+    const shared = neighbors.find(n => n.docId === sharedDoc!);
+    expect(shared).toBeDefined();
+    expect(shared!.viaEntity).toBe(specificEntity);
+  });
+
+  // BL-001 turn-3 regression: an entity whose mentions are ALL archived must
+  // be dropped from the candidate pool entirely — zero active docFreq would
+  // otherwise grant it MAXIMUM specificity and let it crowd the cap while
+  // hydrating archived doc IDs.
+  it("excludes archived-only candidates from the pool and the results (BL-001)", () => {
+    const [seedDoc, rareDoc] = seedDocuments(store, [
+      { path: "seed.md", title: "Seed", body: "seed doc" },
+      { path: "rare-1.md", title: "Rare 1", body: "specific doc" },
+    ]);
+    const deadDocs = seedDocuments(
+      store,
+      Array.from({ length: 5 }, (_, i) => ({
+        path: `dead-${i}.md`,
+        title: `Dead ${i}`,
+        body: "archived doc",
+      }))
+    );
+
+    const seedEntity = upsertEntity(store.db, "SeedTopic", "project", "default");
+    recordEntityMention(store.db, seedEntity, seedDoc!, "SeedTopic");
+
+    // Archived-only entity: high co-occurrence count, every mention archived.
+    const ghostEntity = upsertEntity(store.db, "GhostEntity", "tool", "default");
+    for (const d of deadDocs) recordEntityMention(store.db, ghostEntity, d, "GhostEntity");
+    for (let i = 0; i < 10; i++) trackCoOccurrences(store.db, [seedEntity, ghostEntity]);
+    const archiveStmt = store.db.prepare("UPDATE documents SET active = 0 WHERE id = ?");
+    for (const d of deadDocs) archiveStmt.run(d);
+
+    // Live specific entity with a modest count.
+    const specificEntity = upsertEntity(store.db, "RareGem", "tool", "default");
+    recordEntityMention(store.db, specificEntity, rareDoc!, "RareGem");
+    for (let i = 0; i < 2; i++) trackCoOccurrences(store.db, [seedEntity, specificEntity]);
+
+    const neighbors = getEntityGraphNeighbors(store.db, [seedDoc!]);
+    expect(neighbors.some(n => n.viaEntity === specificEntity)).toBe(true);
+    expect(neighbors.every(n => n.viaEntity !== ghostEntity)).toBe(true);
+    for (const d of deadDocs) {
+      expect(neighbors.some(n => n.docId === d)).toBe(false);
+    }
+  });
+
+  // BL-001 turn-3 regression: the hydration active-guard must sit BEFORE the
+  // per-entity LIMIT — with >10 archived mentions inserted ahead of an active
+  // one, an after-the-fact filter would return only archived rows and miss
+  // the active doc.
+  it("hydrates the active doc even when >10 archived mentions precede it (BL-001)", () => {
+    const [seedDoc] = seedDocuments(store, [
+      { path: "seed.md", title: "Seed", body: "seed doc" },
+    ]);
+    const oldDocs = seedDocuments(
+      store,
+      Array.from({ length: 12 }, (_, i) => ({
+        path: `old-${i}.md`,
+        title: `Old ${i}`,
+        body: "archived doc",
+      }))
+    );
+    const [liveDoc] = seedDocuments(store, [
+      { path: "live.md", title: "Live", body: "active doc" },
+    ]);
+
+    const seedEntity = upsertEntity(store.db, "SeedTopic", "project", "default");
+    recordEntityMention(store.db, seedEntity, seedDoc!, "SeedTopic");
+
+    // 12 archived mentions recorded BEFORE the single active mention.
+    const entity = upsertEntity(store.db, "MostlyArchived", "tool", "default");
+    for (const d of oldDocs) recordEntityMention(store.db, entity, d, "MostlyArchived");
+    recordEntityMention(store.db, entity, liveDoc!, "MostlyArchived");
+    const archiveStmt = store.db.prepare("UPDATE documents SET active = 0 WHERE id = ?");
+    for (const d of oldDocs) archiveStmt.run(d);
+
+    trackCoOccurrences(store.db, [seedEntity, entity]);
+    trackCoOccurrences(store.db, [seedEntity, entity]);
+
+    const neighbors = getEntityGraphNeighbors(store.db, [seedDoc!]);
+    expect(neighbors.some(n => n.docId === liveDoc!)).toBe(true);
+    for (const d of oldDocs) {
+      expect(neighbors.some(n => n.docId === d)).toBe(false);
+    }
+  });
+});
+
+// =============================================================================
+// BL-001 residual — enrichment/edge-creation IDF population mismatch
+// =============================================================================
+//
+// The v0.25.0 BL-001 fix aligned the NEIGHBOR path's IDF populations
+// (active-only numerator AND denominator). The enrichment path had the same
+// mismatch: totalDocs counted active docs while doc_freq counted mentions in
+// ALL docs, so archived history deflated specificity (IDF could go negative)
+// and suppressed edges for entities specific among the LIVE corpus; candidates
+// could also be archived docs. Bug-first: both tests fail on the pre-fix SQL.
+// =============================================================================
+
+describe("enrichment IDF active-vs-all population (BL-001 residual)", () => {
+  const ENTITY_JSON = JSON.stringify([{ name: "ZanzibarProtocol", type: "project" }]);
+
+  function seedActivePool(n: number): number[] {
+    return seedDocuments(store, Array.from({ length: n }, (_, i) => ({
+      path: `pool-${i}.md`, title: `Pool ${i}`, body: `filler content ${i}`,
+    }))) as number[];
+  }
+
+  function archiveDoc(id: number): void {
+    store.db.prepare(`UPDATE documents SET active = 0 WHERE id = ?`).run(id);
+  }
+
+  it("archived mentions must not deflate specificity below the edge gate", async () => {
+    // 70 active docs. The entity is mentioned in ONE active partner doc (+ the
+    // enriched doc itself during enrichment) and TWO archived docs.
+    // Active-only IDF: ln(71/3) ≈ 3.16 ≥ 3.0 → edge. All-docs denominator
+    // (pre-fix): ln(71/5) ≈ 2.65 < 3.0 → wrongly suppressed.
+    const pool = seedActivePool(70);
+    const targetDoc = pool[0]!;
+    const enrichedDoc = pool[1]!;
+    const [arch1, arch2] = seedDocuments(store, [
+      { path: "arch-1.md", title: "Arch 1", body: "old mention one" },
+      { path: "arch-2.md", title: "Arch 2", body: "old mention two" },
+    ]);
+    archiveDoc(arch1!);
+    archiveDoc(arch2!);
+
+    const entityId = upsertEntity(store.db, "ZanzibarProtocol", "project", "default");
+    recordEntityMention(store.db, entityId, targetDoc, "ZanzibarProtocol");
+    recordEntityMention(store.db, entityId, arch1!, "ZanzibarProtocol");
+    recordEntityMention(store.db, entityId, arch2!, "ZanzibarProtocol");
+
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValue({ text: ENTITY_JSON, model: "mock", done: true });
+    await enrichDocumentEntities(store.db as any, llm as any, enrichedDoc);
+
+    const edge = store.db.prepare(
+      `SELECT 1 FROM memory_relations WHERE source_id = ? AND target_id = ? AND relation_type = 'entity'`
+    ).get(enrichedDoc, targetDoc);
+    expect(edge).not.toBeNull();
+  });
+
+  it("edges are never created toward archived documents", async () => {
+    // Entity shared ONLY with an archived doc, and specific enough that the
+    // pre-fix code (which admitted archived candidates) would have linked it.
+    const pool = seedActivePool(70);
+    const enrichedDoc = pool[1]!;
+    const [archOnly] = seedDocuments(store, [
+      { path: "arch-only.md", title: "Arch Only", body: "sole other mention" },
+    ]);
+    archiveDoc(archOnly!);
+
+    const entityId = upsertEntity(store.db, "ZanzibarProtocol", "project", "default");
+    recordEntityMention(store.db, entityId, archOnly!, "ZanzibarProtocol");
+
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValue({ text: ENTITY_JSON, model: "mock", done: true });
+    await enrichDocumentEntities(store.db as any, llm as any, enrichedDoc);
+
+    const edge = store.db.prepare(
+      `SELECT 1 FROM memory_relations WHERE source_id = ? AND target_id = ?`
+    ).get(enrichedDoc, archOnly!);
+    expect(edge ?? null).toBeNull();
+  });
 });
 
 // =============================================================================
@@ -493,5 +826,63 @@ describe("extractEntities content-type-aware cap (§1.5)", () => {
       const [renderedPrompt] = calls[0] as [string, unknown];
       expect(renderedPrompt).toContain("0-15 entities");
     });
+  });
+});
+
+// §13.1 — extractEntities rides withRetryAndFeedback: a transient malformed
+// response gets a corrective retry instead of silently losing the entities.
+describe("extractEntities retry-with-error-feedback (§13.1)", () => {
+  const VALID_RESPONSE = JSON.stringify([
+    { name: "Widget0Factory", type: "tool" },
+    { name: "Widget1Factory", type: "tool" },
+  ]);
+
+  it("recovers entities when a malformed response is followed by a valid retry", async () => {
+    const llm = createMockLLM();
+    llm.generate
+      .mockResolvedValueOnce({ text: "no json here at all", model: "mock", done: true })
+      .mockResolvedValueOnce({ text: VALID_RESPONSE, model: "mock", done: true });
+
+    const result = await extractEntities(llm, "Doc", "content body");
+
+    expect(result.map((e) => e.name)).toEqual(["Widget0Factory", "Widget1Factory"]);
+    expect(llm.generate).toHaveBeenCalledTimes(2);
+    const retryPrompt = llm.generate.mock.calls[1]?.[0] as string;
+    expect(retryPrompt).toContain("did not match the expected structure");
+  });
+
+  it("retries when entries are structurally invalid, then accepts the corrected array", async () => {
+    const llm = createMockLLM();
+    llm.generate
+      .mockResolvedValueOnce({ text: '[{"name": 42, "type": "tool"}]', model: "mock", done: true })
+      .mockResolvedValueOnce({ text: VALID_RESPONSE, model: "mock", done: true });
+
+    const result = await extractEntities(llm, "Doc", "content body");
+
+    expect(result).toHaveLength(2);
+    expect(llm.generate).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns [] after terminal failure (all attempts malformed)", async () => {
+    const llm = createMockLLM();
+    llm.generate
+      .mockResolvedValueOnce({ text: "still not json", model: "mock", done: true })
+      .mockResolvedValueOnce({ text: "nope", model: "mock", done: true })
+      .mockResolvedValueOnce({ text: "not even close", model: "mock", done: true });
+
+    const result = await extractEntities(llm, "Doc", "content body");
+
+    expect(result).toEqual([]);
+    expect(llm.generate).toHaveBeenCalledTimes(3);
+  });
+
+  it("treats an empty [] response as valid — no retry burned on it", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockResolvedValueOnce({ text: "[]", model: "mock", done: true });
+
+    const result = await extractEntities(llm, "Doc", "content body");
+
+    expect(result).toEqual([]);
+    expect(llm.generate).toHaveBeenCalledTimes(1);
   });
 });

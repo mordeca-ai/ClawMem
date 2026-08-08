@@ -6,7 +6,7 @@ import {
 } from "../../src/consolidation.ts";
 import { createTestStore, seedDocuments } from "../helpers/test-store.ts";
 import type { Store } from "../../src/store.ts";
-import type { ContradictionResult } from "../../src/merge-guards.ts";
+import { resolveContradictionPolicy, type ContradictionResult } from "../../src/merge-guards.ts";
 
 /**
  * Integration test for Ext 2 — Contradiction-aware merge gate
@@ -72,7 +72,8 @@ describe("applyContradictoryConsolidation — policy routing", () => {
       "migration completed on Thursday",
       [seedIds[1]!],
       TEST_COLLECTION,
-      MOCK_CONTRADICTION
+      MOCK_CONTRADICTION,
+      resolveContradictionPolicy()
     );
 
     expect(policy).toBe("link");
@@ -120,7 +121,8 @@ describe("applyContradictoryConsolidation — policy routing", () => {
       "version 2 shipped",
       [seedIds[1]!],
       TEST_COLLECTION,
-      MOCK_CONTRADICTION
+      MOCK_CONTRADICTION,
+      resolveContradictionPolicy()
     );
 
     expect(policy).toBe("supersede");
@@ -160,7 +162,8 @@ describe("applyContradictoryConsolidation — policy routing", () => {
       "new different text",
       [seedIds[1]!, seedIds[2]!],
       TEST_COLLECTION,
-      MOCK_CONTRADICTION
+      MOCK_CONTRADICTION,
+      resolveContradictionPolicy()
     );
 
     const newRow = store.db
@@ -195,7 +198,8 @@ describe("operator query acceptance", () => {
       "beta (contradicts alpha)",
       [seedIds[1]!],
       TEST_COLLECTION,
-      MOCK_CONTRADICTION
+      MOCK_CONTRADICTION,
+      resolveContradictionPolicy()
     );
 
     const linked = store.db
@@ -225,7 +229,8 @@ describe("operator query acceptance", () => {
       "delta (supersedes gamma)",
       [seedIds[1]!],
       TEST_COLLECTION,
-      MOCK_CONTRADICTION
+      MOCK_CONTRADICTION,
+      resolveContradictionPolicy()
     );
 
     const invalidated = store.db
@@ -394,7 +399,8 @@ describe("supersede invariant — old row must stop surfacing", () => {
       "shared observation text about the engineering team and the sprint work, with a CORRECTION",
       [seedIds[1]!],
       TEST_COLLECTION,
-      MOCK_CONTRADICTION
+      MOCK_CONTRADICTION,
+      resolveContradictionPolicy()
     );
 
     // Now a third candidate that is Jaccard-close to BOTH rows should
@@ -439,7 +445,8 @@ describe("supersede invariant — old row must stop surfacing", () => {
       "new observation",
       [seedIds[1]!],
       TEST_COLLECTION,
-      MOCK_CONTRADICTION
+      MOCK_CONTRADICTION,
+      resolveContradictionPolicy()
     );
 
     const active = getConsolidatedObservations(store, { collection: TEST_COLLECTION });
@@ -468,7 +475,8 @@ describe("supersede invariant — old row must stop surfacing", () => {
       "link-policy new",
       [seedIds[1]!],
       TEST_COLLECTION,
-      MOCK_CONTRADICTION
+      MOCK_CONTRADICTION,
+      resolveContradictionPolicy()
     );
 
     const active = getConsolidatedObservations(store, { collection: TEST_COLLECTION });
@@ -526,7 +534,8 @@ describe("applyContradictoryConsolidation transaction safety", () => {
       "contradictory new",
       [seedIds[1]!],
       TEST_COLLECTION,
-      MOCK_CONTRADICTION
+      MOCK_CONTRADICTION,
+      resolveContradictionPolicy()
     );
 
     const after = store.db
@@ -575,7 +584,8 @@ describe("applyContradictoryConsolidation transaction safety", () => {
         "would-be new row",
         [seedIds[1]!],
         TEST_COLLECTION,
-        MOCK_CONTRADICTION
+        MOCK_CONTRADICTION,
+        resolveContradictionPolicy()
       );
     } catch {
       threw = true;

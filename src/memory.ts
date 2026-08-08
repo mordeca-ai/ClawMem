@@ -28,9 +28,14 @@ export const HALF_LIVES: Record<string, number> = {
   research: 90,
   project: 120,
   preference: Infinity,
-  decision: Infinity,
+  // §36.11: long-finite so silently-abandoned decisions stop winning ranking
+  // (supersession only fires on an explicit contradictory write). Ranking
+  // durability only — no deletion/archival; access-freq extension still
+  // stretches frequently-resurfaced decisions toward 3×.
+  decision: 180,
   deductive: Infinity,
   hub: Infinity,
+  antipattern: Infinity,
 };
 
 // =============================================================================
@@ -42,6 +47,7 @@ export const TYPE_BASELINES: Record<string, number> = {
   deductive: 0.85,
   preference: 0.80,
   hub: 0.80,
+  antipattern: 0.75,
   problem: 0.75,
   research: 0.70,
   milestone: 0.70,
@@ -148,13 +154,23 @@ export function recencyScore(
 
 export function confidenceScore(
   contentType: string,
-  modifiedAt: Date | string,
+  decayAt: Date | string,
   accessCount: number,
   now: Date = new Date(),
-  lastAccessedAt?: Date | string | null
+  lastAccessedAt?: Date | string | null,
+  modifiedAtForBackfill?: Date | string
 ): number {
+  // §51.1 D8 — three time inputs with distinct roles:
+  //   decayAt              — content/effective time (authoredAt ?? modifiedAt); drives ONLY the
+  //                          internal recency term. Index-time callers pass mtime (stored
+  //                          confidence stays operational in every lane).
+  //   lastAccessedAt       — operational; attention-decay elapsed time (unchanged).
+  //   modifiedAtForBackfill — operational filing time; used ONLY by the backfilled-sentinel
+  //                          comparison below (last_accessed_at is backfilled FROM modified_at,
+  //                          so the sentinel must compare against filing time, never decayAt).
+  //                          Defaults to decayAt for callers with no separate axis.
   const baseline = TYPE_BASELINES[contentType] ?? 0.5;
-  const recency = recencyScore(modifiedAt, contentType, now);
+  const recency = recencyScore(decayAt, contentType, now);
   const safeAccess = Number.isFinite(accessCount) && accessCount >= 0 ? accessCount : 0;
   const accessBoost = Math.min(1.5, 1 + Math.log2(1 + safeAccess) * 0.1);
 
@@ -165,7 +181,8 @@ export function confidenceScore(
   let attentionDecay = 1.0;
   if (lastAccessedAt && !DECAY_EXEMPT_TYPES.has(contentType)) {
     const lastAccess = typeof lastAccessedAt === "string" ? new Date(lastAccessedAt) : lastAccessedAt;
-    const modified = typeof modifiedAt === "string" ? new Date(modifiedAt) : modifiedAt;
+    const backfillRef = modifiedAtForBackfill ?? decayAt;
+    const modified = typeof backfillRef === "string" ? new Date(backfillRef) : backfillRef;
     if (!isNaN(lastAccess.getTime())) {
       // Skip decay if last_accessed_at == modified_at (backfilled, no real access)
       const isBackfilled = Math.abs(lastAccess.getTime() - modified.getTime()) < 1000;
@@ -194,9 +211,19 @@ export type CompositeWeights = {
 
 export const DEFAULT_WEIGHTS: CompositeWeights = { search: 0.5, recency: 0.25, confidence: 0.25 };
 export const RECENCY_WEIGHTS: CompositeWeights = { search: 0.1, recency: 0.7, confidence: 0.2 };
+// Query-tool retrieval weights (Phase B, 2026-06-25). A held-out judged eval (n=199, GLM-5.2 judge,
+// quadratic-weighted κ=0.681 vs an independent annotator) showed the default 0.50 search weight
+// under-weights topical relevance for a work-memory vault: w_search 0.70 lifts graded NDCG@10 by +0.064
+// (paired permutation p<1e-4, robust across precision/exploratory/temporal families) with ZERO freshness regression —
+// the newest-correct doc is never demoted in the supersession guard (demotionRate 0), whereas 0.80
+// demotes it out of the top-10 in 2/19 cases. Applied ONLY by the `query` tool's full hybrid+rerank
+// pipeline (the path the eval mirrored). NOT applied under recency intent — RECENCY_WEIGHTS wins by
+// construction in applyCompositeScoring. See BLEND-COMPOSITE-REBALANCE-DESIGN.md §11.12.
+export const QUERY_WEIGHTS: CompositeWeights = { search: 0.7, recency: 0.15, confidence: 0.15 };
 
 const RECENCY_PATTERNS = [
   /\brecent(ly)?\b/i,
+  /\blatest\b/i,
   /\blast\s+(session|time|week|month|few\s+days)\b/i,
   /\bleft\s+off\b/i,
   /\bwhere\s+(was|were)\s+(we|i)\b/i,
@@ -237,6 +264,7 @@ export type EnrichedResult = {
   body?: string;
   contentType: string;
   modifiedAt: string;
+  authoredAt?: string | null;  // §51.1: authorship time; null/absent = unknown → modifiedAt
   accessCount: number;
   confidence: number;
   qualityScore: number;
@@ -260,9 +288,56 @@ export type EnrichedResult = {
   revisionCount: number;
 };
 
+/**
+ * Per-factor decomposition of one result's composite score (the `memory_rank`
+ * explain surface, v0.36.0). Every field is captured from the SAME computation
+ * that produced `compositeScore` — never recomputed — so the identity
+ *   (weightedBlend × qualityMultiplier × lengthFactor × frequencyBoostMultiplier
+ *    × canonicalMultiplier + pinBoost) × coActivationMultiplier === finalComposite
+ * holds exactly: `lengthFactor` already reflects the 0.3 floor, and `pinBoost` is
+ * the delta actually applied after the 1.0 cap (0 when unpinned).
+ */
+export type RankBreakdown = {
+  weights: CompositeWeights;
+  recencyIntent: boolean;
+  searchScore: number;
+  recencyScore: number;
+  computedConfidence: number;
+  storedConfidence: number;
+  blendedConfidence: number;
+  /** weights.search·search + weights.recency·recency + weights.confidence·confidence */
+  weightedBlend: number;
+  qualityMultiplier: number;
+  /** The length multiplier max() ACTUALLY selected: 0.3 when the floor branch won,
+   *  else 1/(1+0.5·log2(len/500)). For negative pre-length scores the selection flips
+   *  relative to the sign-positive reading — the recorded factor always reproduces the
+   *  applied result exactly. */
+  lengthFactor: number;
+  lengthFloorApplied: boolean;
+  frequencyBoostMultiplier: number;
+  canonicalMultiplier: number;
+  /** Additive pin delta actually applied (post-cap); 0 when unpinned. NEGATIVE when
+   *  the 1.0 cap clamps an above-1.0 pre-pin score down — for such docs the pin
+   *  branch acts as clamp-to-1.0, not a boost (quality/frequency/canonical
+   *  multipliers can push the pre-pin composite to ~1.63). */
+  pinBoost: number;
+  /** Filled during the co-activation stage; 1 when no boost applied */
+  coActivationMultiplier: number;
+  /** Recency-intent queries additionally resort handoff/decision/progress first —
+   *  an ORDERING effect on the result list, not a score change */
+  typePriorityResort: boolean;
+  /** Equals the result's compositeScore (kept in sync through co-activation) */
+  finalComposite: number;
+  /** Fork (ADR-0112 inv.3 / 4vhh): un-promoted agent-observation down-weight actually
+   *  applied (1 when not an un-promoted observation or the knob is 1). Part of the
+   *  multiplicative identity. */
+  unpromotedObservationMultiplier?: number;
+};
+
 export type ScoredResult = EnrichedResult & {
   compositeScore: number;
   recencyScore: number;
+  rankBreakdown?: RankBreakdown;
 };
 
 export type CoActivationFn = (path: string) => { path: string; count: number }[];
@@ -287,21 +362,46 @@ function canonicalMemoryMultiplier(path: string, contentType: string, query: str
   return 1.0;
 }
 
+export type CompositeScoringOptions = {
+  /** Query-scoped weights override. Replaces DEFAULT_WEIGHTS; NOT applied under recency intent unless forceWeights. */
+  weights?: CompositeWeights;
+  /** Injected clock for deterministic scoring (tests/eval). Defaults to new Date(). */
+  now?: Date;
+  /** Test/experiment only: apply `weights` even under recency intent (bypass the RECENCY_WEIGHTS switch). */
+  forceWeights?: boolean;
+  /** Attach a per-factor RankBreakdown to each result (memory_rank). Zero scoring change. */
+  explain?: boolean;
+  /** Fork (9jyc0): skip the ADR-0112 inv.3 un-promoted-observation down-weight. Set by
+   *  deliberately-unfiltered system-memory surfaces (intent_search) whose substrate IS
+   *  _clawmem observations — burying them there contradicts the surface's own contract
+   *  (and upstream v0.32's guarantee that causal retrieval reaches observation docs). */
+  suppressUnpromotedObservationPenalty?: boolean;
+};
+
 export function applyCompositeScoring(
   results: EnrichedResult[],
   query: string,
-  coActivationFn?: CoActivationFn
+  coActivationFn?: CoActivationFn,
+  options?: CompositeScoringOptions
 ): ScoredResult[] {
-  const weights = hasRecencyIntent(query) ? RECENCY_WEIGHTS : DEFAULT_WEIGHTS;
-  const now = new Date();
+  const recencyIntent = hasRecencyIntent(query);
+  // Recency intent keeps RECENCY_WEIGHTS (production contract) unless forceWeights overrides (experiments).
+  // A query-scoped `weights` override otherwise replaces DEFAULT_WEIGHTS; absent options => exact prior behavior.
+  const weights = (recencyIntent && !options?.forceWeights)
+    ? RECENCY_WEIGHTS
+    : (options?.weights ?? (recencyIntent ? RECENCY_WEIGHTS : DEFAULT_WEIGHTS));
+  const now = options?.now ?? new Date();
 
   // ADR-0112 invariant 3 (master-harness-4vhh): read the un-promoted-observation
   // down-weight once per scoring pass (env-driven; default 0.5). 1.0 = disabled.
   const unpromotedObsWeight = getUnpromotedObservationWeight();
 
   const scored = results.map(r => {
-    const recency = recencyScore(r.modifiedAt, r.contentType, now, r.accessCount, r.lastAccessedAt);
-    const computed = confidenceScore(r.contentType, r.modifiedAt, r.accessCount, now, r.lastAccessedAt);
+    // §51.1: rank recency by content time — authorship when known, filing time
+    // otherwise. modifiedAt still rides along for the backfill sentinel.
+    const effectiveAt = r.authoredAt ?? r.modifiedAt;
+    const recency = recencyScore(effectiveAt, r.contentType, now, r.accessCount, r.lastAccessedAt);
+    const computed = confidenceScore(r.contentType, effectiveAt, r.accessCount, now, r.lastAccessedAt, r.modifiedAt);
     // Blend stored confidence (from contradiction lowering, feedback boosts) with computed.
     // Default stored=0.5 → 100% computed. Stored deviations shift the result proportionally.
     const storedConf = r.confidence ?? 0.5;
@@ -319,14 +419,21 @@ export function applyCompositeScoring(
     // bounded fragment (≤ MAX_FRAGMENT_CHARS), not the whole document — penalizing by
     // whole-doc length buries large reference docs (movelists, frame-data tables)
     // behind short hub docs even when the fragment match is far stronger. Cap the
-    // effective length at the fragment bound in that case.
+    // effective length at the fragment bound in that case (fork 9554def).
     const isFragmentVecHit = r.source === "vec" && !!r.fragmentType && r.fragmentType !== "full";
     const effectiveLength = isFragmentVecHit
       ? Math.min(r.bodyLength || 500, MAX_FRAGMENT_CHARS)
       : (r.bodyLength || 500);
+    // The two branches are computed explicitly so explain can record the factor max()
+    // ACTUALLY selected — for a negative pre-length score (unconstrained stored
+    // confidence can drive the blend negative) the selection flips relative to the
+    // sign-positive reading, and recording max(0.3, lenFactor) would break the identity.
     const lenRatio = Math.log2(Math.max(effectiveLength / 500, 1));
     const lenFactor = 1 / (1 + 0.5 * lenRatio);
-    adjusted = Math.max(adjusted * 0.3, adjusted * lenFactor);
+    const lenFloorBranch = adjusted * 0.3;
+    const lenScaledBranch = adjusted * lenFactor;
+    const lenFloorSelected = lenFloorBranch > lenScaledBranch;
+    adjusted = Math.max(lenFloorBranch, lenScaledBranch);
 
     // Engram integration: revision durability signal (Phase 3)
     // revision_count is weighted more heavily than duplicate_count (evolution vs noise).
@@ -337,9 +444,11 @@ export function applyCompositeScoring(
     const freqBoost = freqSignal > 0 ? Math.min(0.10, Math.log1p(freqSignal) * 0.03) : 0;
     adjusted *= (1 + freqBoost);
 
-    adjusted *= canonicalMemoryMultiplier(r.displayPath, r.contentType, query);
+    const canonicalMult = canonicalMemoryMultiplier(r.displayPath, r.contentType, query);
+    adjusted *= canonicalMult;
 
     // Pin boost: +0.3 additive, capped at 1.0
+    const prePin = adjusted;
     if (r.pinned) {
       adjusted = Math.min(1.0, adjusted + 0.3);
     }
@@ -357,18 +466,43 @@ export function applyCompositeScoring(
     // penalize WHEN is_agent_generated_observation AND NOT pinned AND active=1
     //   AND invalidated_at IS NULL  (active=1 holds by construction — enrichResults
     //   only joins active rows; an invalidated observation is left alone, not buried).
-    if (unpromotedObsWeight < 1 && !r.pinned) {
+    let unpromotedObsMult = 1;
+    if (unpromotedObsWeight < 1 && !r.pinned && !options?.suppressUnpromotedObservationPenalty) {
       const isAgentObservation =
         r.contentType === "observation" ||
         (r.observationType != null && r.observationType !== "") ||
         OBSERVATION_COLLECTIONS.has(r.collectionName);
       const isInvalidated = r.invalidatedAt != null && r.invalidatedAt !== "";
       if (isAgentObservation && !isInvalidated) {
-        adjusted *= unpromotedObsWeight;
+        unpromotedObsMult = unpromotedObsWeight;
+        adjusted *= unpromotedObsMult;
       }
     }
 
-    return { ...r, compositeScore: adjusted, recencyScore: recency };
+    const scoredResult: ScoredResult = { ...r, compositeScore: adjusted, recencyScore: recency };
+    if (options?.explain) {
+      scoredResult.rankBreakdown = {
+        weights,
+        recencyIntent,
+        searchScore: r.score,
+        recencyScore: recency,
+        computedConfidence: computed,
+        storedConfidence: storedConf,
+        blendedConfidence: conf,
+        weightedBlend: composite,
+        qualityMultiplier,
+        lengthFactor: lenFloorSelected ? 0.3 : lenFactor,
+        lengthFloorApplied: lenFloorSelected,
+        frequencyBoostMultiplier: 1 + freqBoost,
+        canonicalMultiplier: canonicalMult,
+        pinBoost: adjusted - prePin,
+        coActivationMultiplier: 1,
+        typePriorityResort: recencyIntent,
+        finalComposite: adjusted,
+      };
+      scoredResult.rankBreakdown.unpromotedObservationMultiplier = unpromotedObsMult;
+    }
+    return scoredResult;
   });
 
   // Co-activation boost: docs frequently accessed alongside top results get a boost
@@ -395,7 +529,12 @@ export function applyCompositeScoring(
         const coCount = coActivatedCounts.get(stripPrefix(r.filepath));
         if (coCount) {
           // Boost capped at 15% to prevent runaway amplification
-          r.compositeScore *= 1 + Math.min(coCount / 10, 0.15);
+          const coMult = 1 + Math.min(coCount / 10, 0.15);
+          r.compositeScore *= coMult;
+          if (r.rankBreakdown) {
+            r.rankBreakdown.coActivationMultiplier = coMult;
+            r.rankBreakdown.finalComposite = r.compositeScore;
+          }
         }
       }
     }

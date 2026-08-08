@@ -144,6 +144,15 @@ describe("buildExtractionPrompt", () => {
     const prompt = buildExtractionPrompt("sample");
     expect(prompt).toMatch(/do not fabricate/i);
   });
+
+  it("uses a structure-only skeleton, not a copyable real-content example (anti-parrot)", () => {
+    // The former "Example output" carried a concrete OAuth fact a weak model parroted verbatim.
+    // It is replaced by {{...}} skeleton tokens the residue guard catches if echoed.
+    const prompt = buildExtractionPrompt("sample");
+    expect(prompt).not.toContain("Use OAuth 2.0 with PKCE");
+    expect(prompt).not.toContain("Example output:");
+    expect(prompt).toContain("{{"); // skeleton tokens present
+  });
 });
 
 // =============================================================================
@@ -254,6 +263,40 @@ describe("extractFactsFromConversation", () => {
     );
     const facts = await extractFactsFromConversation(llm as any, "x", 1);
     expect(facts).toEqual([]);
+  });
+
+  it("rejects a fact that echoes the prompt's {{...}} skeleton placeholders (anti-parrot)", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockImplementation(
+      mockGenerateReturning([
+        {
+          title: "{{concise 3-8 word title}}",
+          contentType: "decision",
+          narrative: "{{1-3 sentence description of the fact in context}}",
+        },
+      ]),
+    );
+    const facts = await extractFactsFromConversation(llm as any, "x", 1);
+    expect(facts).toEqual([]); // skeleton residue must never become a persisted fact
+  });
+
+  it("filters placeholder residue out of a real fact's facts/aliases arrays", async () => {
+    const llm = createMockLLM();
+    llm.generate.mockImplementation(
+      mockGenerateReturning([
+        {
+          title: "Adopt Bun test runner",
+          contentType: "decision",
+          narrative: "Switched the suite to bun test for speed.",
+          facts: ["{{supporting evidence string}}", "3x faster CI"],
+          aliases: ["{{optional alternative title}}", "bun migration"],
+        },
+      ]),
+    );
+    const facts = await extractFactsFromConversation(llm as any, "x", 1);
+    expect(facts).toHaveLength(1);
+    expect(facts[0]!.facts).toEqual(["3x faster CI"]);
+    expect(facts[0]!.aliases).toEqual(["bun migration"]);
   });
 
   it("extracts a well-formed fact with all fields", async () => {
@@ -694,7 +737,9 @@ describe("runConversationSynthesis — end-to-end", () => {
     let call = 0;
     llm.generate.mockImplementation(async () => {
       call++;
-      if (call === 1) return null;
+      // Doc A: attempts 1-3 all null — terminal failure after retry
+      // exhaustion (§13.1). Doc B: first attempt succeeds.
+      if (call <= 3) return null;
       return {
         text: JSON.stringify([
           {
@@ -718,6 +763,33 @@ describe("runConversationSynthesis — end-to-end", () => {
     expect(result.factsSaved).toBe(1);
   });
 
+  it("retries a transient null response and recovers it (§13.1 — no llmFailure counted)", async () => {
+    seedConversation(store, "conv/a.md", "A", "x");
+
+    const llm = createMockLLM();
+    let call = 0;
+    llm.generate.mockImplementation(async () => {
+      call++;
+      if (call === 1) return null; // transient — retry recovers on attempt 2
+      return {
+        text: JSON.stringify([
+          { title: "Recovered", contentType: "decision", narrative: "n" },
+        ]),
+        model: "mock",
+        done: true,
+      };
+    });
+
+    const result = await runConversationSynthesis(store, llm as any, {
+      collection: COLLECTION,
+    });
+    expect(result.docsScanned).toBe(1);
+    expect(result.llmFailures).toBe(0);
+    expect(result.factsExtracted).toBe(1);
+    expect(result.factsSaved).toBe(1);
+    expect(call).toBe(2);
+  });
+
   it("distinguishes llmFailures from docsWithNoFacts (valid empty extraction)", async () => {
     seedConversation(store, "conv/a.md", "A", "x");
     seedConversation(store, "conv/b.md", "B", "y");
@@ -727,11 +799,14 @@ describe("runConversationSynthesis — end-to-end", () => {
     let call = 0;
     llm.generate.mockImplementation(async () => {
       call++;
-      if (call === 1) return null; // LLM failure
-      if (call === 2) {
-        // Valid empty extraction — not an LLM failure, just "no facts here"
+      // Doc A: attempts 1-3 null — terminal LLM failure after retries (§13.1)
+      if (call <= 3) return null;
+      if (call === 4) {
+        // Doc B: valid empty extraction — not an LLM failure, just "no facts
+        // here" (a well-formed [] is NOT retried)
         return { text: "[]", model: "mock", done: true };
       }
+      // Doc C: valid extraction
       return {
         text: JSON.stringify([
           { title: "OK fact", contentType: "decision", narrative: "n" },

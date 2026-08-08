@@ -12,6 +12,15 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - If both snap bun (`/snap/bin/bun`) and native bun (`~/.bun/bin/bun`) are installed, `which bun` may return the snap version. Direct `bun -e` or `bun run` commands will use the wrong binary.
 - Fix: The `bin/clawmem` wrapper handles this automatically. For manual commands, use `~/.bun/bin/bun` explicitly or add `~/.bun/bin` to PATH before `/snap/bin`.
 
+**macOS: `bootstrap` / `doctor` fails with "does not support dynamic extension loading" (sqlite-vec on macOS)**
+- `clawmem bootstrap` (or `clawmem doctor`) fails at the database step because macOS's built-in SQLite — which Bun uses by default — is compiled without extension-loading support, so the `sqlite-vec` vector extension cannot load. Symptom: `✗ Database: ... This build of sqlite3 does not support dynamic extension loading`. Yoloshii/ClawMem#20.
+- Fix: install an extension-capable SQLite via Homebrew, then re-run bootstrap:
+  ```bash
+  brew install sqlite
+  clawmem bootstrap ~/notes --name notes
+  ```
+- ClawMem auto-detects Homebrew's SQLite at the standard prefixes (`/opt/homebrew` on Apple Silicon, `/usr/local` on Intel) and at `brew --prefix sqlite` for non-standard prefixes — installing it is all that's required, no env var or config. If it still fails after `brew install sqlite`, run `brew reinstall sqlite` and confirm `ls $(brew --prefix sqlite)/lib/libsqlite3.dylib` resolves.
+
 ## Embedding & GPU
 
 **"Local model download blocked" error**
@@ -66,23 +75,49 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 ## Search & retrieval
 
+**Historical/mined conversations rank as if they were written today**
+- Fixed in v0.27.0: ranking recency, temporal filters, and the recent-decision windows run on **effective time** (`authored_at` when known, `modified_at` otherwise). New mines capture authorship automatically.
+- For vaults mined before v0.27.0: re-run `clawmem mine` over the same export directory (metadata-only "dated" transition — no re-enrichment/re-embed), or `clawmem mine <dir> -c <collection> --backfill-dates` (dry-run) then `--apply`.
+- Documents that still lack `authored_at` (source transcripts without timestamps, plain-text imports) keep filing-time behavior by design.
+
 **context-surfacing hook returns empty**
-- Prompt too short (< 20 chars), starts with `/`, or no docs score above threshold.
+- Prompt too short (< 20 chars — short memory-intent queries like "what did I say?" are exempt and force retrieval), starts with `/`, or no docs score above threshold.
 - Fix: Check `clawmem status` for doc counts. Check `clawmem embed` for embedding coverage.
 
 **intent_search returns weak results for WHY/ENTITY**
 - Graph may be sparse (few A-MEM edges).
 - Fix: Run `build_graphs` to add temporal backbone + semantic edges.
 
+### `build_graphs` reports 0 new edges
+
+Expected on a rebuild. Inserts are idempotent, so a second call over an unchanged corpus writes
+nothing and correctly reports `0 new`. Read the accompanying total (`N new edge(s), M total`) —
+if the total is non-zero the graph is populated and there is nothing to fix.
+
+Before v0.28.0 these counters reported insert *attempts* rather than rows written, so a call
+that persisted nothing could still report a healthy-looking count. If you are on an older
+version, a non-zero count is not evidence that edges landed.
+
+Totals count only edges whose **both endpoints are active**, matching the population the
+builders operate on — so archiving documents legitimately lowers the total.
+
 **search returns results but query returns nothing**
 - `query` applies stricter scoring (composite + MMR + expansion). If expansion LLM is down, the pipeline may return empty.
 - Fix: Check GPU connectivity. Use `search` or `vsearch` as a fallback.
 
+**`clawmem doctor` reports "Reranker: degenerate / not discriminating" (or `query` results feel keyword-only / RRF-like)**
+- The reranker endpoint responds but its scores do not discriminate — the classic cause is the deprecated **zerank-2 GGUF** (llama.cpp drops its score head → near-zero, uninformative scores), so the rerank stage contributes nothing and the final ranking collapses to RRF. The guard catches this: `blendRerank` falls back to RRF when no score clears `RERANK_DEGENERATE_FLOOR` (1e-4) and emits a rate-limited `[clawmem] reranker degraded → RRF fallback` warning; `clawmem doctor` section 9 (and `clawmem rerank-health`) probe it directly with a golden hard-pair set.
+- Diagnose: `clawmem rerank-health` (add `--json` for the raw coverage / max-score / min-margin numbers). A healthy reranker shows coverage N/N, max score ≥ 0.05, and a minimum per-pair margin ≥ 0.25; a degenerate one shows a near-zero max score or ~0 margins.
+- Fix: re-deploy a working reranker — the **zerank-2 seq-cls sidecar** (`extras/rerankers/zerank-2-seq/`, see CLAUDE.md "SOTA upgrade") or the default `qwen3-reranker-0.6B` — and confirm `CLAWMEM_RERANK_URL` points at it. Re-run `clawmem rerank-health`; it should exit 0. For remote-sidecar setups, schedule `clawmem-rerank-health.timer` (CLAUDE.md → Background Services) so a future silent reversion pages you.
+
 **Vector search returns weak or irrelevant results even though embeddings exist**
-- BM25/keyword search works and `doctor` shows vectors present + consistent, but `vsearch`/`find_similar` (and the vector half of `query`) return loosely-related results, or "the same few docs regardless of query." This is an embedding-**quality** problem, not a ClawMem index problem: the model is producing poorly-discriminating vectors. The most common cause is a **server-side pooling/normalization misconfiguration** — e.g. serving a last-token model (Qwen3-Embedding family) without `--pooling last`, or without L2 normalization. Mean-pooling a last-token model gives usable self-retrieval but collapsed semantic separation (paraphrases score ~0.5 instead of ~0.85).
-- Diagnose: embed two paraphrases and one unrelated sentence through your endpoint and compare cosine similarity. A healthy model scores the paraphrase pair > 0.75 and the unrelated pair < 0.45. If paraphrases score ~0.5 with weak separation, the model/serving is the problem, not ClawMem.
-- Fix: launch the embedding `llama-server` with the pooling its model requires (`--pooling last` for Qwen3-Embedding / last-token models) and ensure outputs are L2-normalized. Re-run the diagnostic; once separation is healthy, retrieval recovers. A re-embed is not required if the dimension is unchanged, though `clawmem embed --force` after the fix guarantees a clean rebuild.
-- Aside: auto-generated `_clawmem/` system docs (observations/deductions) sit near the embedding centroid and can dominate pure-vector tools when discrimination is weak — fixing the model is the real remedy, not filtering.
+- BM25/keyword search works and `doctor` shows vectors present + consistent, but `vsearch`/`find_similar` (and the vector half of `query`) return loosely-related results, or "the same few docs regardless of query." This is an embedding-**quality** problem, not a ClawMem index problem: the model is producing poorly-discriminating vectors. Two common causes, both server-side:
+  - **Pooling misconfiguration** — serving a last-token model (Qwen3-Embedding family) without `--pooling last`, or without L2 normalization. Mean-pooling a last-token model gives usable self-retrieval but collapsed semantic separation (paraphrases score ~0.5 instead of ~0.85).
+  - **Missing EOS anchor** — a last-token model whose GGUF conversion lost `tokenizer.ggml.add_eos_token`: the server never appends the terminator the model reads its embedding from, so last-token pooling reads an arbitrary final text token. Signature: similarity tracks how texts END, not what they mean — identical-vocabulary pairs score low; similarity swings with the truncation point; texts sharing a final word score deceptively high; self-similarity stays ~1.0 (so stored-vs-fresh checks pass). Verified real-world: this exact failure served an entire vault ~0.33 on echo pairs while basic-English probes looked healthy.
+- Diagnose: embed two paraphrases and one unrelated sentence through your endpoint and compare cosine similarity. A healthy model scores the paraphrase pair > 0.75 and the unrelated pair < 0.45. Also test a near-identical pair differing only in the final word — it must score HIGH; low means an unanchored last-token readout. Beware the shared-suffix confound when testing terminators by hand: appending ANY common suffix to both texts inflates similarity by last-token identity — only genuine semantic separation (related high AND unrelated low) proves the fix. `clawmem doctor` runs this battery automatically (geometry canary), and `clawmem embed` refuses to build against a failing geometry (override: `--force-geometry`).
+- Fix: launch the embedding `llama-server` with the pooling its model requires (`--pooling last` for Qwen3-Embedding / last-token models), restore the EOS append when the GGUF lost it (`--override-kv tokenizer.ggml.add_eos_token=bool:true` — a no-op when the metadata is already correct), and ensure outputs are L2-normalized. **A full `clawmem embed --force` is REQUIRED after any serving-side pooling/normalization/EOS change**: the old vectors are faithful to the old geometry, and two geometries at the same dimension are mutually incompatible — fresh queries against stale vectors are cosine-meaningless.
+- Note on `_clawmem/` system docs (observations/deductions): since v0.21.0 the MCP retrieval tools exclude the `_clawmem` collection by default (pass `includeInternal: true` to include it; an explicit `collection` filter naming `_clawmem` also overrides). If internal docs dominate results even with a HEALTHY model, that is the composite-scoring floor (system docs carry high confidence and non-decaying recency), not geometry — the default exclusion is the remedy there.
+- Operational: don't run `embed --force` while the file watcher is indexing bulk changes — stop the watcher or expect write contention (the run now survives transient `SQLITE_BUSY`, but contention still slows it). If you pipe embed output through `tee`, remember the pipeline exit code is `tee`'s — check `PIPESTATUS[0]` for the embed's own status.
 
 **kg_query returns empty for every entity**
 - `entity_triples` is populated by the decision-extractor Stop hook from observer-emitted `<triples>` blocks. Zero rows typically means either (a) the Stop hook has never fired in this vault, or (b) the observer LLM is not emitting `<triples>` blocks.
@@ -122,6 +157,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - If the error persists after v0.1.8: restart the watcher to clear accumulated state (`systemctl --user restart clawmem-watcher.service`). Check `systemctl --user status clawmem-watcher.service` for memory usage — healthy is under 100MB, bloated is 400MB+.
 - **v0.2.4 fix:** Hook's SQLite `busy_timeout` was 500ms — too tight. During A-MEM enrichment or heavy indexing, the watcher can hold write locks for 500ms+, causing the hook's DB open to fail with SQLITE_BUSY. Raised to 5000ms (matches MCP server). The hook's 8s outer timeout still leaves 3s for actual work after a 5s busy wait.
 - **v0.3.1 fix:** Shell `timeout` wrappers (e.g., `timeout 8 clawmem hook context-surfacing`) kill the process with exit 124 and no stderr — Claude Code reports "Failed with non-blocking status code: No stderr output". This affects all hook events (UserPromptSubmit, Stop, SessionStart, PreCompact), not just Stop hooks. Fix: Remove shell `timeout` from all hook commands and use Claude Code's native `timeout` property instead. Run `clawmem setup hooks` to reinstall with correct config (v0.3.1+), or manually update `~/.claude/settings.json` — see [setup-hooks](guides/setup-hooks.md).
+- **Large vault + intermittent hook timeout (`timed out after 8s`) — FIXED in v0.16.0.** Earlier this was diagnosed as pure cold-start (fresh Bun process, opening a large `index.sqlite`, re-reading evicted index pages) with "give the host more RAM" as the durable fix — but the dominant causes were two code-level defects: (1) the `context-surfacing` vector leg ran a *synchronous* `sqlite-vec` scan that the `Promise.race(vectorTimeout)` guard could not bound (a synchronous call blocks the event loop, so the timer never fires), and (2) every writable hook open ran an unconditional backfill `UPDATE` that could wait out `busy_timeout` under writer contention. **v0.16.0 fixes both:** `searchVec` takes a real wall-clock deadline and self-aborts before the blocking scan; both vector legs race the embed against the remaining budget and clear their timers; the init backfill is read-guarded and the init `busy_timeout` is capped to the caller's value; and the watcher prewarms the sqlite-vec payload into the page cache on startup (embed-independent, watcher-only). A cold page cache still adds latency to the genuine first post-boot call, so host RAM headroom + the prewarm help the margin — but on a large vault the scan cost, not RAM, was the trigger. A modest `timeout` bump (see the tradeoffs table under *Hooks slow or near timeout*) remains a secondary margin. The `deep` profile additionally reranks (extra remote round-trips), widening the cold-call window; `balanced` (default) does not rerank. **v0.20.0** adds the true hard cap: run `clawmem watch` and the hook sends the query to the watcher, which runs the blocking scan off the hook's event loop and returns the raw matches for local hydration — a cold scan then times out fast and falls back to FTS instead of blocking the turn. It is a pure optimization layer: when the watcher isn't running the hook uses the in-process, deadline-bounded path unchanged.
 
 **Watcher memory bloat (400MB+)**
 - The watcher accumulates memory when processing high-frequency file change events. The most common trigger was Claude Code session transcript `.jsonl` files changing on every keystroke during active conversations. Each event opened the database briefly, and over hours of active use, memory grew to 400-800MB.
@@ -181,7 +217,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 | Cloud embedding (`CLAWMEM_EMBED_API_KEY` set) | ~500ms | HTTP call to cloud provider, no `node-llama-cpp` needed. |
 
 - **Fix by setup type:**
-  - **Best:** Run `llama-server` locally — even on the same machine, a persistent server eliminates the per-invocation import. See [GPU Services](../README.md#gpu-services) for setup. This is what most users will do in practice.
+  - **Best:** Run `llama-server` locally — even on the same machine, a persistent server eliminates the per-invocation import. See [the inference services guide](guides/inference-services.md) for setup. This is what most users will do in practice.
   - **Quick:** Set `CLAWMEM_PROFILE=speed` — disables vector search in hooks entirely, pure BM25, never loads `node-llama-cpp`. Hooks complete in under 500ms.
   - **Cloud:** Set `CLAWMEM_EMBED_API_KEY` + `CLAWMEM_EMBED_URL` + `CLAWMEM_EMBED_MODEL` — query embedding via cloud API, no local models needed in the hook path.
   - **Fail-fast:** Set `CLAWMEM_NO_LOCAL_MODELS=true` — prevents `node-llama-cpp` from loading at all. Hooks degrade to BM25-only when GPU servers are unreachable, instead of blocking for 3.5s on a fallback import.
@@ -207,6 +243,8 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
   The timeout applies per invocation. A slow first prompt (cold start) doesn't mean subsequent prompts will be slow — Bun caches modules after the first load, and `node-llama-cpp` model files are cached on disk after the first download. Subsequent prompts in the same session are typically faster.
 
+  **Exception — large vaults (intermittent, pre-v0.16.0):** before v0.16.0 the hook could time out on *certain* turns (not just the first) because of an unbounded synchronous `sqlite-vec` scan plus an init-time write-lock wait — see *"UserPromptSubmit hook error" (intermittent)* above. **Upgrade to v0.16.0**, which bounds the scan and the init path and prewarms the cache (v0.20.0 adds the vector-query daemon — a true hard cap on the cold scan when the watcher runs). Host RAM headroom + the watcher prewarm still help the genuine cold-call margin, but they were not the root cause.
+
   **Stop hooks** (`decision-extractor`, `handoff-generator`, `feedback-loop`) default to 30s (v0.3.1+, was 10s prior) because they run LLM inference (observer model). These run at session end, so latency doesn't block the user.
 
 **"Stop hook error: Failed with non-blocking status code: No stderr output"**
@@ -230,7 +268,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 **Hook fires but returns empty context**
 - The context-surfacing hook filters aggressively. Common causes:
-  - Prompt too short (< 20 chars), starts with `/`, or matches the heartbeat/greeting filter
+  - Prompt too short (< 20 chars; short memory-intent queries are exempt and force retrieval), starts with `/`, or matches the heartbeat/greeting filter
   - Duplicate prompt within the 600-second dedup window (SHA-256 hash match)
   - Vector search silently failed (dimension mismatch, server down) and BM25-only results scored too low after composite scoring
   - All results fell below the profile's minimum composite score threshold after recency decay, confidence weighting, and quality multiplier were applied
@@ -244,7 +282,40 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 - The `saveMemory()` API enforces a 30-minute normalized content hash dedup window.
 - If duplicates still appear: check that the dedup window hasn't been bypassed by large time gaps or content variations.
 
+**`[decision-extractor] contradiction: N invalidation(s) suppressed by shadow mode`**
+- Not an error. Contradiction invalidation ships unarmed (v0.28.0+): the hook eroded a document's confidence to the `0.2` floor, which is the point at which it *would* set `invalidated_at` and drop the document out of FTS and vector retrieval. It logged the intent and wrote nothing.
+- The preceding `WOULD invalidate "<collection>/<path>"` lines name each affected document, and name **only documents the armed writer could actually remove** — candidates are selected by pathname but only `content_type='observation'` is invalidation-eligible, so the two populations differ substantially — on a reference vault, roughly 3x more candidates than eligible rows. Confidence erosion still applied — that half is live, bounded, and reversible.
+- A companion line reports documents that **reached the floor but are not eligible**. Those are informational: erosion has bottomed out there and arming the flag would not touch them.
+- To act on it: read the named documents and decide whether removing them from retrieval would have been correct, then arm with `CLAWMEM_CONTRADICTION_INVALIDATE=true`. Exposure depends on your vault — see [contradiction invalidation](guides/contradiction-invalidation.md) for the measurement queries and the full procedure.
+- **Stderr visibility no longer gates calibration (v0.29.0)**: every judge evaluation writes durable `judge_runs`/`judge_events` rows in the vault database, so hosts that discard hook stderr (OpenClaw surfaces it only on non-zero exits) calibrate from the audit rows instead — see the queries in [contradiction invalidation](guides/contradiction-invalidation.md).
+- If the proposals are frequent and look wrong, that is a judge-precision signal (check `CLAWMEM_JUDGE_MODEL` and the `judge_runs` rows for that model), not a logging problem. The docs' recommended default is `claude-haiku-4-5`; upgrading the judge is a one-variable change.
+
+**A memory stopped appearing in search but is still in the vault**
+- `invalidated_at IS NULL` is a hard predicate on the FTS join and both vector joins, so an invalidated document is absent from `search`, `vsearch`, `query`, and context-surfacing with no query-time signal. `get`/`multi_get` by path still return it, which is the usual way this gets noticed.
+- Diagnose: `sqlite3 ~/.cache/clawmem/index.sqlite "SELECT id, path, content_type, invalidated_at, invalidated_by FROM documents WHERE invalidated_at IS NOT NULL ORDER BY invalidated_at DESC;"`
+- On the `documents` table, **contradiction invalidation is the only writer of this column**, and only when armed via `CLAWMEM_CONTRADICTION_INVALIDATE=true` (and only on `content_type='observation'`). Grepping the source turns up a second `invalidated_at` writer in `consolidation.ts` — that one targets a *different table*, `consolidated_observations`, whose superseded rows are filtered by `status='inactive'` rather than by the joins above. The two are unrelated; do not diagnose one from the other.
+- Restore one document **by numeric `id`**, which the audit query above returns: `sqlite3 ~/.cache/clawmem/index.sqlite "UPDATE documents SET invalidated_at=NULL, invalidated_by=NULL WHERE id=<id>;"`. Do not match on the logged path — the hook logs `collection/path` while the table stores the bare `path`, so a `WHERE path=` clause usually matches nothing, and a bare path can collide across collections. Retrieval resumes immediately; the body and its vectors were never touched, so no re-index or re-embed is needed.
+- The restore deliberately leaves `confidence` alone — the document returns at whatever erosion left it (usually `0.2`), retrievable but ranking low. Raise it separately if you judge the erosion itself was wrong: `UPDATE documents SET confidence=0.8 WHERE id=<id>;`.
+- If contradiction invalidation is the cause and you want it off, remove `CLAWMEM_CONTRADICTION_INVALIDATE` from wherever the hook's environment is configured (a shell `unset` will not affect a value set in your hook config or plugin host); a bulk restore scoped `WHERE invalidated_at IS NOT NULL AND content_type='observation'` covers exactly what that path can have written. Full procedure: [contradiction invalidation](guides/contradiction-invalidation.md).
+
+**A memory is gone from the vault entirely — not merely absent from search (pre-v0.30.0 only)**
+- Check this first, because the entry above will mislead you: if the row was *deleted* rather than invalidated, the `invalidated_at` query returns nothing and there is no document to restore. Confirm which case you are in: `sqlite3 ~/.cache/clawmem/index.sqlite "SELECT id, active, archived_at FROM documents WHERE path LIKE '%<filename>%';"` — no row at all means deletion, not invalidation.
+- **Cause, on v0.29.0 and earlier:** a configured `lifecycle.purge_after_days` permanently deleted every archived document past that window. It fired from a non-dry-run `lifecycle_sweep` (MCP) and from the `staleness-check` SessionStart hook, and neither reported it — the MCP dry-run preview listed only what would be *archived*, and the hook discarded the count inside a catch. If `purge_after_days` was null (the default), this never happened to you.
+- **Fixed in v0.30.0: ClawMem physically deletes no document row on any code path**, and `purge_after_days` is inert. Retention is archival, reversed by `lifecycle_restore`. Upgrading stops any ongoing loss.
+- **Already-deleted rows are unrecoverable from the vault** — the row, not just its retrieval flag, is gone. Recover from a backup of `index.sqlite` if you keep one, or re-index the source files: for file-backed collections the markdown on disk was never touched, so `clawmem update --embed` re-indexes it. Only vault-native content with no file behind it (mined conversations, synthesized facts, `_clawmem` observations) is genuinely lost.
+- Verify your current exposure: `grep -A6 '^lifecycle:' ~/.config/clawmem/config.yaml`. On v0.30.0+ a sweep that sees `purge_after_days` set says so explicitly and deletes nothing.
+
 ## OpenClaw
+
+**MCP stdio server "dies" after the first call — every later call fails with "Connection closed" / "transport closed" until the client reconnects (gateway hosts)**
+- Symptom: the first `tools/call` on a `clawmem mcp` stdio server succeeds; every subsequent call in the same session fails client-side with `MCP error -32000: Connection closed` or `bundle-mcp server "clawmem" is disconnected: mcp transport closed`. Reported as yoloshii/ClawMem#22.
+- What it is not: a one-shot server. `clawmem mcp` is a long-lived stdio process (`StdioServerTransport` from the official MCP SDK) that exits only on stdin EOF or SIGINT/SIGTERM. Measured on v0.29.0 and v0.33.0 under scripted stdio sessions: multi-call sequences, calls returning real results and performing writes (`memory_pin`), 90s and 150s idle gaps between calls, and hostile input (garbage lines, truncated JSON, JSON-RPC batch arrays, repeated `initialize`, 1 MB requests). The process survives all of it and exits 0 only when the client closes stdin. The same sequences pass when the server is spawned exactly the way OpenClaw spawns it: through the `/bin/sh` shim that sets `oom_score_adj=1000` before exec, detached, with the SDK's minimal inherited env, launching `bin/clawmem`. The child ran at `oom_score_adj=1000` throughout those runs.
+- What actually happened: the host killed the server process. Gateway clients (OpenClaw's `bundle-mcp` session layer) mark the session disconnected when the child process exits and surface the error above on every later call rather than respawning inside the live session, which makes a killed server look one-shot from the agent's side.
+- Discriminate the killer from the gateway's stderr/journal:
+  1. `[mcp] Received SIGTERM, shutting down...` present: the host's own lifecycle tore the server down (OpenClaw's process teardown sends SIGTERM first). Investigate the gateway's session/catalog lifecycle, not ClawMem.
+  2. Silence with the process gone: a SIGKILL-class death, most commonly the kernel OOM killer. OpenClaw spawns MCP servers with `oom_score_adj=1000`, the maximum OOM preference, so they are the kernel's first victim under any memory pressure (openclaw/openclaw@cc9dcd3d69e, April 2026, present in current releases; the wrap protects the gateway by sacrificing child processes). Verify: `cat /proc/$(pgrep -f "clawmem.ts mcp" | head -1)/oom_score_adj` prints `1000`, and `dmesg -T | grep -iE "oom|killed process"` shows the kill. Mitigation: set `OPENCLAW_CHILD_OOM_SCORE_ADJ=0` in the gateway's environment (OpenClaw's own opt-out) and/or add memory headroom.
+  3. A stack trace on stderr: a genuine server crash. Capture it and file it at yoloshii/ClawMem with the trace. This is the one case that is a ClawMem bug.
+- Note: the npm package's `clawmem` bin always execs bun (`engines: bun >=1.0.0`); Node is never the server runtime, so the host's Node version is not a variable here. When reporting, include `bun --version` and the OpenClaw version.
 
 **`clawmem setup openclaw` installs into the wrong profile / ignores `OPENCLAW_STATE_DIR` (ClawMem v0.10.0–v0.10.3)**
 - Symptom: running `OPENCLAW_STATE_DIR=~/.openclaw-dev clawmem setup openclaw` (or running ClawMem setup while OpenClaw is configured for a non-default profile via `--profile` / `OPENCLAW_STATE_DIR`) installs the plugin into `~/.openclaw/extensions/clawmem` instead of the profile-specific extensions directory. The default profile picks the plugin up; the active profile does not see it.
@@ -271,7 +342,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 **Gateway fails to start with "Missing config. Run `openclaw setup` or set gateway.mode=local"**
 - On system-service OpenClaw deployments where the gateway runs as a different user than the owner of `~/<gateway-user's-home>/.openclaw/`, the gateway cannot traverse into its own config directory if the directory is 700 (`drwx------`). The error is misleading — the config file itself is readable (correctly chowned by the systemd `ExecStartPre` step), but the parent directory has no group-execute bit, so the gateway user cannot even `cd` into it to open the file.
 - Verify: `sudo stat /home/<installer>/.openclaw | grep Access` — if it shows `(0700/drwx------)`, this is the cause.
-- Fix: `sudo chmod 750 /home/<installer>/.openclaw` (owner rwx, group rx). The gateway user must be a member of the owning group — check with `id <gateway-user>` and confirm `<installer-group>` is listed. On Debian-family systems with a `sciros:sciros`-owned home directory and an `openclaw:openclaw` gateway that is also in the `sciros` group, `chmod 750` is enough.
+- Fix: `sudo chmod 750 /home/<installer>/.openclaw` (owner rwx, group rx). The gateway user must be a member of the owning group — check with `id <gateway-user>` and confirm `<installer-group>` is listed. On Debian-family systems with an `appuser:appuser`-owned home directory and an `openclaw:openclaw` gateway that is also in the `appuser` group, `chmod 750` is enough.
 - Single-user installs are not affected — the gateway IS the home directory owner and has full access regardless of group perms.
 
 **"plugins.entries.clawmem: plugin not found (stale config entry ignored)"**

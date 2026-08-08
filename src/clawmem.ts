@@ -4,10 +4,16 @@
  */
 
 import { parseArgs } from "util";
-import { existsSync, mkdirSync, readFileSync } from "fs";
-import { resolve as pathResolve, basename } from "path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { resolve as pathResolve, basename, relative as pathRelative } from "path";
+import { createHash } from "crypto";
+import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
+import { retryOnBusyAsync, isSqliteBusyError } from "./busy-retry.ts";
 import {
   createStore,
+  prewarmVectors,
+  startPeriodicPrewarm,
+  resolvePrewarmIntervalMs,
   enableProductionMode,
   getDefaultDbPath,
   canonicalDocId,
@@ -24,6 +30,7 @@ import {
   VecModelMismatchError,
   EmbedLeaseLostError,
 } from "./store.ts";
+import { startVectorDaemon, type VectorDaemonHandle } from "./vector-daemon.ts";
 import {
   getDefaultLlamaCpp,
   setDefaultLlamaCpp,
@@ -48,12 +55,16 @@ import {
   getConfigPath,
 } from "./collections.ts";
 import { formatSearchResults, type OutputFormat } from "./formatter.ts";
-import { indexCollection } from "./indexer.ts";
+import { runEval, IMPLEMENTED_PROFILES, EvalIntegrityError, type EvalProfile, type RunEvalResult } from "./eval/run.ts";
+import { GoldFileError } from "./eval/gold.ts";
+import { indexCollection, parseDocument, hashContent } from "./indexer.ts";
+import type { Store as StoreType } from "./store.ts";
+import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, HALF_LIVES, type EnrichedResult } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, blendFusionAndRerank, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendFusionAndRerank, hasStrongFtsSignal, ftsBypassEnabled, type RankedResult } from "./search-utils.ts";
 import { splitDocument } from "./splitter.ts";
-import { getProfile, updateProfile, isProfileStale } from "./profile.ts";
+import { getProfile, updateProfile, isProfileStale, type ProfileUpdateOutcome } from "./profile.ts";
 import { regenerateAllDirectoryContexts } from "./directory-context.ts";
 import {
   startConsolidationWorker,
@@ -66,7 +77,10 @@ import {
 import { readHookInput, writeHookOutput, makeEmptyOutput, type HookOutput } from "./hooks.ts";
 import { contextSurfacing } from "./hooks/context-surfacing.ts";
 import { sessionBootstrap } from "./hooks/session-bootstrap.ts";
-import { decisionExtractor } from "./hooks/decision-extractor.ts";
+import { decisionExtractor, unwrapContradictionArray, admitContradictionEntries } from "./hooks/decision-extractor.ts";
+import { resolveJudge, buildContradictionPrompt, extractJudgeJson, JUDGE_VERDICT_SCHEMA } from "./judge.ts";
+import { evaluateMergeContradiction, isActionableContradiction, resolveContradictionPolicy } from "./merge-guards.ts";
+import { judgeAuditCounts } from "./judge-audit.ts";
 import { handoffGenerator } from "./hooks/handoff-generator.ts";
 import { feedbackLoop } from "./hooks/feedback-loop.ts";
 import { stalenessCheck } from "./hooks/staleness-check.ts";
@@ -96,9 +110,9 @@ enableProductionMode();
 
 let store: Store | null = null;
 
-function getStore(): Store {
+function getStore(busyTimeout: number = 5000): Store {
   if (!store) {
-    store = createStore(undefined, { busyTimeout: 5000 });
+    store = createStore(undefined, { busyTimeout });
   }
   return store;
 }
@@ -230,61 +244,6 @@ async function cmdCollectionRemove(args: string[]) {
   }
 }
 
-/**
- * Hard-delete a named collection's document/content/vector rows from the
- * index (master-harness-t5i0). This is the scoped-purge counterpart to
- * `collection remove` — `remove` only forgets the collection from
- * config.yaml (stops future indexing), it does NOT touch existing rows.
- * `purge` deletes the DB rows for exactly one named collection, active and
- * inactive, without risking any other collection's data — the operation a
- * disposable smoke-test / scratch collection teardown actually needs,
- * instead of reaching for the DB-wide cleanup commands.
- *
- * Destructive and irreversible (no lifecycle-restore path once purged), so
- * it requires --yes to actually execute; without it, prints a preview of
- * what would be deleted.
- */
-async function cmdCollectionPurge(args: string[]) {
-  const { values, positionals } = parseArgs({
-    args,
-    options: {
-      yes: { type: "boolean", default: false },
-    },
-    allowPositionals: true,
-  });
-
-  const name = positionals[0];
-  if (!name) die("Usage: clawmem collection purge <name> --yes");
-
-  const store = getStore();
-
-  const preview = store.db.prepare(`
-    SELECT
-      SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) as active,
-      SUM(CASE WHEN active = 0 THEN 1 ELSE 0 END) as inactive,
-      COUNT(*) as total
-    FROM documents WHERE collection = ?
-  `).get(name) as { active: number | null; inactive: number | null; total: number };
-
-  if (!preview.total) {
-    die(`No documents found for collection "${name}" — nothing to purge`);
-  }
-
-  if (!values.yes) {
-    console.log(`Would purge collection ${c.bold}${name}${c.reset}:`);
-    console.log(`  ${preview.active ?? 0} active, ${preview.inactive ?? 0} inactive document(s) (${preview.total} total)`);
-    console.log();
-    console.log(`${c.yellow}This is irreversible.${c.reset} Re-run with --yes to actually delete.`);
-    return;
-  }
-
-  const result = store.purgeCollection(name);
-  console.log(`${c.green}Purged collection '${name}'${c.reset}: ${result.documents} document(s), ${result.content} content row(s), ${result.vectors} vector row(s)`);
-  if (getCollection(name)) {
-    console.log(`${c.dim}Note: '${name}' is still configured in config.yaml — run 'clawmem collection remove ${name}' too if you don't want it re-indexed.${c.reset}`);
-  }
-}
-
 async function cmdUpdate(args: string[]) {
   const { values } = parseArgs({
     args,
@@ -326,9 +285,101 @@ async function cmdUpdate(args: string[]) {
 
   // Auto-rebuild profile if stale
   if (isProfileStale(s)) {
-    updateProfile(s);
-    console.log(`${c.dim}Profile auto-rebuilt (stale)${c.reset}`);
+    // §55.6 D9: a forgotten or archived profile is deliberately left alone — say so rather
+    // than reporting a rebuild that did not happen.
+    console.log(`${c.dim}${profileOutcomeMessage(updateProfile(s), true)}${c.reset}`);
   }
+}
+
+// =============================================================================
+// §51.1 D10 — mine/backfill shared identity derivation
+// =============================================================================
+
+/**
+ * One staging-content formatter for mine writes AND the backfill body-hash
+ * guard — a second formatter would drift and break the guard.
+ */
+function buildMineStagingContent(chunk: ConversationChunk): string {
+  const esc = (s: string) => s.replace(/"/g, '\\"');
+  return [
+    "---",
+    `title: "${esc(chunk.title)}"`,
+    `content_type: conversation`,
+    `source: "${esc(chunk.sourcePath)}"`,
+    ...(chunk.authoredAt ? [`authored_at: "${chunk.authoredAt}"`] : []),
+    "---",
+    "",
+    chunk.body,
+  ].join("\n");
+}
+
+/**
+ * Has this source ever produced suffixed chunks in the collection?
+ * Prepared prefix-range existence query over UNIQUE(collection, path) — NOT a
+ * raw LIKE (its % and _ wildcards would misread path characters). The probe
+ * prefix ends in "_" (0x5F); replacing that final character with backtick
+ * (0x60, its successor code point) gives exact bounds under SQLite binary text
+ * ordering. Active AND inactive rows both count: once suffixed, always suffixed.
+ */
+function suffixedPathExists(store: StoreType, collectionName: string, suffixedBase: string): boolean {
+  const lower = `${suffixedBase}_`;
+  const upper = `${suffixedBase}\``;
+  const row = store.db.prepare(
+    `SELECT 1 FROM documents WHERE collection = ? AND path >= ? AND path < ? LIMIT 1`
+  ).get(collectionName, lower, upper);
+  return row !== null && row !== undefined;
+}
+
+/**
+ * Decide each source's staging-name base ONCE per source, before any chunk name
+ * is derived. A source uses the suffixed scheme `<base>-h<8-hex sha256(relPosixPath)>`
+ * when (a) it collides with another source in the current batch after
+ * sanitization, or (b) any of its suffixed chunk paths already exist in the
+ * target collection — so group-membership changes (a collision partner removed,
+ * a transcript growing new chunks) can never flip an already-suffixed source
+ * back to the legacy namespace. Also fixes the pre-existing silent overwrite:
+ * two sources sanitizing to one staging name used to clobber each other's
+ * chunks via concurrent Bun.write.
+ */
+function deriveMineIdentity(
+  sourceRelPaths: string[],
+  store: StoreType,
+  collectionName: string
+): Map<string, { base: string; suffixed: boolean }> {
+  const norm = (p: string) => p.replace(/\\/g, "/");
+  const sanitize = (p: string) => p.replace(/[\/\\]/g, "_").replace(/\.[^.]+$/, "");
+
+  const bySafe = new Map<string, string[]>();
+  for (const rel of [...new Set(sourceRelPaths)]) {
+    const safe = sanitize(norm(rel));
+    const list = bySafe.get(safe) ?? [];
+    list.push(rel);
+    bySafe.set(safe, list);
+  }
+
+  const out = new Map<string, { base: string; suffixed: boolean }>();
+  for (const [safe, rels] of bySafe) {
+    for (const rel of rels) {
+      const relPosix = norm(rel);
+      const hash8 = new Bun.CryptoHasher("sha256").update(relPosix).digest("hex").slice(0, 8);
+      const suffixedBase = `${safe}-h${hash8}`;
+      const suffixed = rels.length > 1 || suffixedPathExists(store, collectionName, suffixedBase);
+      out.set(rel, { base: suffixed ? suffixedBase : safe, suffixed });
+    }
+  }
+
+  // Final output-name uniqueness assertion: an 8-hex hash collision (or a file
+  // literally named like another source's suffixed base) is a hard error —
+  // never a silent overwrite.
+  const seen = new Map<string, string>();
+  for (const [rel, id] of out) {
+    const prior = seen.get(id.base);
+    if (prior !== undefined) {
+      die(`mine: staging name collision between "${prior}" and "${rel}" (base "${id.base}") — cannot derive unique identities`);
+    }
+    seen.set(id.base, rel);
+  }
+  return out;
 }
 
 async function cmdMine(args: string[]) {
@@ -340,12 +391,14 @@ async function cmdMine(args: string[]) {
       "dry-run": { type: "boolean", default: false },
       synthesize: { type: "boolean", default: false },
       "synthesis-max-docs": { type: "string" },
+      "backfill-dates": { type: "boolean", default: false },
+      apply: { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
 
   const dir = positionals[0];
-  if (!dir) die("Usage: clawmem mine <directory> [-c collection-name] [--embed] [--dry-run] [--synthesize] [--synthesis-max-docs N]");
+  if (!dir) die("Usage: clawmem mine <directory> [-c collection-name] [--embed] [--dry-run] [--synthesize] [--synthesis-max-docs N] | --backfill-dates [--apply]");
   const absDir = pathResolve(dir);
   if (!existsSync(absDir)) die(`Directory not found: ${absDir}`);
 
@@ -359,7 +412,7 @@ async function cmdMine(args: string[]) {
   // Normalize and chunk
   let totalChunks = 0;
   let totalConversations = 0;
-  const allChunks: { title: string; body: string; sourcePath: string; chunkIndex: number }[] = [];
+  const allChunks: ConversationChunk[] = [];
 
   for (const file of files) {
     const conv = normalizeFile(file);
@@ -371,7 +424,9 @@ async function cmdMine(args: string[]) {
 
     console.log(`  ${c.green}✓${c.reset} ${conv.source} (${conv.format}, ${conv.messages.length} messages → ${chunks.length} chunks)`);
     for (const chunk of chunks) {
-      chunk.sourcePath = file.replace(absDir + "/", "");
+      // §51.1 D10: relative POSIX form — identity hashes must not depend on
+      // the machine's absolute path or separator style.
+      chunk.sourcePath = pathRelative(absDir, file).replace(/\\/g, "/");
     }
     allChunks.push(...chunks);
     totalChunks += chunks.length;
@@ -380,42 +435,49 @@ async function cmdMine(args: string[]) {
   if (totalConversations === 0) die("No conversation files could be parsed");
   console.log(`\n${c.bold}Parsed:${c.reset} ${totalConversations} conversations → ${totalChunks} exchange chunks`);
 
+  const collectionName = values.collection || "conversations";
+
+  // §51.1 D10 — exclusive backfill mode: derive authored_at for already-mined
+  // docs from their source transcripts. Metadata-only; dry-run by default.
+  if (values["backfill-dates"]) {
+    if (values.embed || values.synthesize || values["dry-run"] || values["synthesis-max-docs"]) {
+      die("--backfill-dates is an exclusive mode (dry-run by default; --apply executes) — it cannot combine with --embed, --synthesize, --dry-run, or --synthesis-max-docs");
+    }
+    runBackfillDates(allChunks, collectionName, values.apply as boolean);
+    return;
+  }
+  if (values.apply) die("--apply only applies to --backfill-dates");
+
   if (values["dry-run"]) {
     console.log(`${c.yellow}Dry run — no changes made${c.reset}`);
     return;
   }
 
   // Write chunks as markdown to a staging directory (outside source tree), then index
-  const collectionName = values.collection || "conversations";
   const { tmpdir } = await import("os");
   const stagingDir = pathResolve(tmpdir(), `clawmem-mine-${Date.now()}`);
   mkdirSync(stagingDir, { recursive: true });
 
   const { rmSync } = await import("fs");
+  const s = getStore();
+  // §51.1 D10: per-source identity decided before any chunk name is derived
+  const identity = deriveMineIdentity(allChunks.map(ch => ch.sourcePath), s, collectionName);
   try {
     const writePromises: Promise<number>[] = [];
     for (const chunk of allChunks) {
-      const safeSource = chunk.sourcePath.replace(/[\/\\]/g, "_").replace(/\.[^.]+$/, "");
-      const filename = `${safeSource}_${String(chunk.chunkIndex).padStart(4, "0")}.md`;
-      const esc = (s: string) => s.replace(/"/g, '\\"');
-      const frontmatter = [
-        "---",
-        `title: "${esc(chunk.title)}"`,
-        `content_type: conversation`,
-        `source: "${esc(chunk.sourcePath)}"`,
-        "---",
-        "",
-        chunk.body,
-      ].join("\n");
-      writePromises.push(Bun.write(pathResolve(stagingDir, filename), frontmatter));
+      const id = identity.get(chunk.sourcePath)!;
+      const filename = `${id.base}_${String(chunk.chunkIndex).padStart(4, "0")}.md`;
+      writePromises.push(Bun.write(pathResolve(stagingDir, filename), buildMineStagingContent(chunk)));
     }
     await Promise.all(writePromises);
 
-    // Index through existing pipeline
-    const s = getStore();
+    // Index through the existing pipeline in importMode: mined rows are DB-born ('api') and
+    // the staging root is transient, so absence reconciliation must not run — a later mine
+    // into the same collection would otherwise deactivate every earlier batch.
     console.log(`\n${c.cyan}Indexing ${totalChunks} conversation chunks${c.reset} as collection '${collectionName}'`);
-    const stats = await indexCollection(s, collectionName, stagingDir, "**/*.md");
-    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged`);
+    const stats = await indexCollection(s, collectionName, stagingDir, "**/*.md", { importMode: true });
+    const datedNote = stats.dated > 0 ? `, ${c.cyan}◷${stats.dated}${c.reset} dated` : "";
+    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged${datedNote}`);
 
     // Ext 4 — post-import conversation synthesis (opt-in via --synthesize)
     // Runs AFTER indexCollection has committed. Failure is non-fatal and never
@@ -518,6 +580,8 @@ export type BatchedEmbedOptions = {
   isLeaseLost?: () => boolean;
   /** Per-result (dim, model) binding check; throws FatalVectorError on drift. */
   validateResult?: (result: { embedding: number[] | Float32Array; model?: string }) => void;
+  /** v0.21 (f).4 contract: state markers must never kill the run — inject markSafeGlobal. */
+  markSafe?: (label: string, fn: () => void) => Promise<void>;
 };
 
 export type BatchedEmbedResult = {
@@ -567,7 +631,8 @@ export async function runBatchedEmbed(
     for (let seq = 0; seq < fragments.length; seq++) {
       const frag = fragments[seq]!;
       const label = frag.label || title;
-      queue.push({ docIdx, seq, text: formatDocForEmbedding(frag.content, label) });
+      const text = formatDocForEmbedding(frag.content, label);
+      queue.push({ docIdx, seq, text });
     }
   }
 
@@ -588,7 +653,9 @@ export async function runBatchedEmbed(
       const stats = perDoc[item.docIdx]!;
       if (!stats.started) {
         stats.started = true;
-        s.markEmbedStart(docTasks[item.docIdx]!.hash);
+        const h = docTasks[item.docIdx]!.hash;
+        if (opts.markSafe) await opts.markSafe("markEmbedStart", () => s.markEmbedStart(h, opts.leaseGuard));
+        else s.markEmbedStart(h, opts.leaseGuard);
       }
     }
 
@@ -641,6 +708,9 @@ export async function runBatchedEmbed(
           embedding: new Float32Array(result.embedding), model: result.model, embeddedAt,
           fragmentType: frag.type, fragmentLabel: frag.label ?? undefined,
           canonicalId: canonicalDocId(doc.collection, doc.path),
+          // Embed-input fingerprint ((d).4 / T5-L1): SHA-256 over the UTF-8 bytes of the
+          // exact formatted embed input, written in the same atomic batch transaction.
+          embedInputFp: createHash("sha256").update(item.text, "utf8").digest("hex"),
         });
         stats.ok++;
         totalFragments++;
@@ -654,8 +724,15 @@ export async function runBatchedEmbed(
     }
 
     if (writes.length > 0) {
-      s.ensureVecTable(writes[0]!.embedding.length, opts.leaseGuard);
-      s.insertEmbeddingsBatch(writes, opts.leaseGuard);
+      // SQLITE_BUSY-only async retry ((f).2/6): busy exhaustion throws (batch failure);
+      // FatalVectorError passes through untouched.
+      await retryOnBusyAsync(() => {
+        s.ensureVecTable(writes[0]!.embedding.length, opts.leaseGuard);
+        s.insertEmbeddingsBatch(writes, opts.leaseGuard);
+      }, "insertEmbeddingsBatch", () => opts.isLeaseLost?.() ?? false, {
+        onRetry: (l, attempt, delayMs) =>
+          console.error(`    ${l}: database busy — retrying in ${delayMs / 1000}s (${attempt}/3)`),
+      });
     }
 
     console.error(`  batch ${qStart + 1}-${qEnd}/${queue.length} frags (${writes.length} ok, ${chunk.length - writes.length} failed) ${reqMs}ms${tokensUsed ? ` ${tokensUsed} tok` : ""}`);
@@ -669,13 +746,16 @@ export async function runBatchedEmbed(
   for (let docIdx = 0; docIdx < docTasks.length; docIdx++) {
     const { hash, path } = docTasks[docIdx]!;
     const stats = perDoc[docIdx]!;
+    const mark = async (label: string, fn: () => void) => {
+      if (opts.markSafe) await opts.markSafe(label, fn); else fn();
+    };
     if (stats.seq0Ok && stats.fail === 0) {
-      s.markEmbedSynced(hash);
+      await mark("markEmbedSynced", () => s.markEmbedSynced(hash, opts.leaseGuard));
     } else if (!stats.seq0Ok) {
       // seq=0 failed (or every fragment did) — mark failed so seq=0 gets retried
-      s.markEmbedFailed(hash, stats.ok === 0 && stats.fail > 0 ? "all fragments failed" : "primary fragment (seq=0) failed");
+      await mark("markEmbedFailed", () => s.markEmbedFailed(hash, stats.ok === 0 && stats.fail > 0 ? "all fragments failed" : "primary fragment (seq=0) failed", opts.leaseGuard));
     } else {
-      s.markEmbedFailed(hash, `${stats.fail} fragment(s) failed`);
+      await mark("markEmbedFailed", () => s.markEmbedFailed(hash, `${stats.fail} fragment(s) failed`, opts.leaseGuard));
     }
     embedded++;
     console.error(`  [${docIdx + 1}/${docTasks.length}] ${basename(path)}: ${stats.ok} ok, ${stats.fail} failed`);
@@ -684,14 +764,108 @@ export async function runBatchedEmbed(
   return { embedded, totalFragments, failedFragments, requestCount };
 }
 
+/**
+ * §51.1 D10 — recoverable-only authored_at backfill.
+ *
+ * Matches already-mined documents to their re-derived chunks via the shared
+ * identity derivation, then applies a metadata-only UPDATE of authored_at.
+ * Guards (all mandatory): the naming rule's collision handling; body-hash
+ * equality (parser/chunker evolution can shift chunk indices while preserving
+ * filenames — a mismatched chunk is skipped, never guessed); exact
+ * collection+path match; idempotence. Never touches hash/content/modified_at/
+ * stored confidence/embeddings. Dry-run by default; one transaction on --apply.
+ */
+function runBackfillDates(allChunks: ConversationChunk[], collectionName: string, apply: boolean): void {
+  const s = getStore();
+  const identity = deriveMineIdentity(allChunks.map(ch => ch.sourcePath), s, collectionName);
+
+  const counts = { chunks: 0, noDate: 0, unmatched: 0, bodyMismatch: 0, unchanged: 0 };
+  const updates: { id: number; authoredAt: string; expectedHash: string; path: string }[] = [];
+
+  for (const chunk of allChunks) {
+    counts.chunks++;
+    if (!chunk.authoredAt) { counts.noDate++; continue; }
+    const id = identity.get(chunk.sourcePath)!;
+    const path = `${id.base}_${String(chunk.chunkIndex).padStart(4, "0")}.md`;
+    const row = s.db.prepare(
+      `SELECT id, hash, authored_at FROM documents WHERE collection = ? AND path = ? AND active = 1`
+    ).get(collectionName, path) as { id: number; hash: string; authored_at: string | null } | null;
+    if (!row) { counts.unmatched++; continue; }
+
+    // Body-hash equality guard — rebuild the staging content and parse it
+    // through the SAME pipeline the indexer used, so the comparison cannot
+    // drift from what was actually hashed at mine time.
+    const { body } = parseDocument(buildMineStagingContent(chunk), path);
+    const expectedHash = hashContent(body);
+    if (expectedHash !== row.hash) { counts.bodyMismatch++; continue; }
+
+    if (row.authored_at === chunk.authoredAt) { counts.unchanged++; continue; }
+    updates.push({ id: row.id, authoredAt: chunk.authoredAt, expectedHash, path });
+  }
+
+  console.log(`\n${c.bold}Backfill dates${c.reset} (collection '${collectionName}'${apply ? "" : ", DRY RUN"}):`);
+  console.log(`  ${counts.chunks} chunks scanned — ${c.green}${updates.length}${c.reset} to update, ${c.dim}${counts.unchanged} already set, ${counts.noDate} without source timestamps${c.reset}, ${c.yellow}${counts.unmatched} unmatched${c.reset}, ${c.red}${counts.bodyMismatch} body-mismatch skipped${c.reset}`);
+
+  if (!apply) {
+    if (updates.length > 0) console.log(`  Run again with ${c.cyan}--apply${c.reset} to write.`);
+    return;
+  }
+  if (updates.length === 0) { console.log("  Nothing to write."); return; }
+
+  // Guarded, transactional apply: the UPDATE re-asserts the validated hash and
+  // active state so a concurrent mine/index between validation and write can
+  // never attach a source timestamp to content that did not pass the guard.
+  // BEGIN IMMEDIATE takes the write lock up front.
+  let applied = 0;
+  s.db.exec("BEGIN IMMEDIATE");
+  try {
+    const stmt = s.db.prepare(
+      `UPDATE documents SET authored_at = ? WHERE id = ? AND hash = ? AND active = 1`
+    );
+    for (const u of updates) {
+      applied += stmt.run(u.authoredAt, u.id, u.expectedHash).changes;
+    }
+    s.db.exec("COMMIT");
+  } catch (err) {
+    s.db.exec("ROLLBACK");
+    throw err;
+  }
+  const raced = updates.length - applied;
+  console.log(`  ${c.green}✓${c.reset} ${applied} document(s) dated (metadata-only — modified_at/embeddings untouched)`);
+  if (raced > 0) console.log(`  ${c.yellow}⚠${c.reset} ${raced} document(s) changed concurrently and were skipped — re-run to reconcile`);
+}
+
+// SQLITE_BUSY retry helper lives in busy-retry.ts (testable — importing THIS module runs
+// the CLI). Console reporting is injected here so the helper stays I/O-free.
+const retryOnBusy = <T,>(fn: () => T, label: string, isLeaseLost: () => boolean): Promise<T> =>
+  retryOnBusyAsync(fn, label, isLeaseLost, {
+    onRetry: (l, attempt, delayMs) =>
+      console.error(`${c.yellow}    ${l}: database busy — retrying in ${delayMs / 1000}s (${attempt}/3)${c.reset}`),
+  });
+
 export async function cmdEmbed(args: string[]) {
   const { values } = parseArgs({
     args,
-    options: { force: { type: "boolean", short: "f", default: false } },
+    options: {
+      force: { type: "boolean", short: "f", default: false },
+      // Escape hatch for the geometry-canary preflight ((d).1): a failing battery
+      // aborts the run BEFORE any destructive step unless this is passed.
+      "force-geometry": { type: "boolean", default: false },
+      // Explicit baseline replacement (T8-M3): baselines are first-healthy calibrations
+      // and never roll on their own — this is the intentional recalibration operation.
+      "recalibrate-canary": { type: "boolean", default: false },
+    },
     allowPositionals: false,
   });
 
   const s = getStore();
+  // Embed runs race live hook/watcher writers. Set the operational busy timeout on the
+  // ACTIVE connection — `update --embed` constructs and caches the store before invoking
+  // this command, so a getStore()-time option could not cover it ((f).3 / T2-M1). Kept at
+  // 10s: a synchronous busy wait blocks the event loop, and the lease heartbeat below
+  // fires every 30s against a 60s TTL — waits must stay well under the renewal margin
+  // ((f).1 / T2-H4). Recovery beyond 10s is the ASYNC bounded retry, not a longer block.
+  s.db.exec(`PRAGMA busy_timeout = 10000`);
 
   // Embedding lease: serialize embed commands (manual / embed timer / update --embed)
   // so two embeds cannot run at once. It is RENEWABLE (token-fenced heartbeat), not a
@@ -716,6 +890,17 @@ export async function cmdEmbed(args: string[]) {
     if (!renewWorkerLease(s, LEASE_NAME, leaseToken, LEASE_TTL_MS)) leaseLost = true;
   }, Math.floor(LEASE_TTL_MS / 2));
 
+  // Run-level state-marker wrapper ((f).4 / T9-M4): busy-retried, lease-loss aborts, and
+  // a marker that STILL fails logs-and-continues — bookkeeping must never kill the run.
+  const markSafeGlobal = async (label: string, fn: () => void) => {
+    try { await retryOnBusy(fn, label, () => leaseLost); }
+    catch (err) {
+      if (err instanceof FatalVectorError) throw err; // incl. EmbedLeaseLostError
+      if (!isSqliteBusyError(err)) throw err;
+      console.error(`${c.yellow}Warning: ${label} still busy after retries — continuing${c.reset}`);
+    }
+  };
+
   try {
     const embedUrl = process.env.CLAWMEM_EMBED_URL;
     if (embedUrl) {
@@ -725,6 +910,85 @@ export async function cmdEmbed(args: string[]) {
       setDefaultLlamaCpp(new LlamaCpp({ inactivityTimeoutMs: 0 }));
     }
     const llm = getDefaultLlamaCpp();
+
+    // Geometry-canary PREFLIGHT ((d).1 / T3-H1): gate BEFORE any destructive step — a
+    // broken-geometry server must fail the run before clearAllEmbeddings, not after 60k
+    // writes. Runs on EVERY embed entry, including runs that turn out to be no-work
+    // (a healthy-looking idle run still validates the server). FAIL-CLOSED for --force
+    // (T8-H1): a destructive clear must never proceed on an UNVALIDATED endpoint — the
+    // dimension probe alone can pass a flaky server far enough to destroy the old index.
+    // Recalibration (T9-M3) evaluates INTRINSIC sanity only — the old baseline is exactly
+    // what a recalibration replaces — and requires --force: the baseline must describe the
+    // geometry the WHOLE vault was embedded with, which only a full rebuild guarantees.
+    const recalibrate = !!values["recalibrate-canary"];
+    if (recalibrate && !values.force) {
+      console.error(`${c.red}--recalibrate-canary requires --force: the new baseline must correspond to a full rebuild under the new geometry.${c.reset}`);
+      process.exitCode = 1;
+      return;
+    }
+    let canaryState: CanaryCheckResult | null = null;
+    {
+      const outcome = await runCanaryBattery(t => llm.embed(t), key => s.getCanaryBaseline(key), { ignoreBaseline: recalibrate });
+      if (!("unavailable" in outcome)) canaryState = outcome;
+      const gate = canaryGate(outcome, { force: !!values.force, forceGeometry: !!values["force-geometry"] });
+      if (gate.action === "abort") {
+        console.error(`${c.red}Embed aborted: ${gate.reason}${c.reset}`);
+        if (canaryState) {
+          for (const f of canaryState.failures) console.error(`  ${c.red}${f}${c.reset}`);
+          console.error(`${c.red}The server is producing non-discriminating or drifted vectors (pooling / EOS-anchor / quant misconfiguration?). Nothing was cleared or written. Fix the serving stack (see docs/troubleshooting.md → "Vector search returns weak or irrelevant results"), or override with --force-geometry.${c.reset}`);
+        }
+        process.exitCode = 1;
+        return;
+      }
+      if (gate.action === "warn") {
+        console.error(`${c.yellow}Geometry canary: ${gate.reason}${c.reset}`);
+        if (canaryState) for (const f of canaryState.failures) console.error(`  ${c.yellow}${f}${c.reset}`);
+      }
+    }
+
+    // Shared end-of-run finalization (T9-H1 + T10-M1): EVERY exit path that reaches a
+    // completed run — including the no-work early return — verifies the end state.
+    // Absent preflight vectors (canary unavailable, run proceeded) → persistent
+    // unverified taint + nonzero; baseline persist/recalibration happens ONLY after a
+    // successful same-dimension end probe. "Not verified" is never success (T8-M2).
+    const finalizeCanary = async (failedFragmentsCount: number) => {
+      const setTaint = (reason: string) =>
+        markSafeGlobal("setVaultFlag(taint)", () => s.setVaultFlag("embed_geometry_taint", reason, leaseGuard));
+      if (!canaryState) {
+        console.error(`${c.red}WARNING: this run had NO validated preflight geometry (canary unavailable). The vault state is UNVERIFIED — run 'clawmem embed --force' against a validated server to clear.${c.reset}`);
+        await setTaint(`no preflight validation at ${new Date().toISOString()}`);
+        process.exitCode = 1;
+        return;
+      }
+      let endDrift: number | null = null;
+      try {
+        const fresh = await llm.embed(canaryProbeInputs().get("rel_a")!);
+        const pre = canaryState.vectors.get("rel_a")!;
+        if (fresh && fresh.embedding.length === pre.length) {
+          endDrift = cosineSim(pre, fresh.embedding instanceof Float32Array ? fresh.embedding : new Float32Array(fresh.embedding));
+        }
+      } catch { /* endpoint gone at the very end — endDrift stays null → unverified */ }
+      if (endDrift === null) {
+        console.error(`${c.red}WARNING: end-of-run geometry verification FAILED (endpoint unreachable or dimension changed). This run is UNVERIFIED — treat the vault state as suspect. Re-run 'clawmem embed' once the server is stable.${c.reset}`);
+        await setTaint(`unverified end-of-run at ${new Date().toISOString()}`);
+        process.exitCode = 1;
+      } else if (endDrift < CANARY_DRIFT_FLOOR) {
+        console.error(`${c.red}WARNING: embedding-server geometry DRIFTED mid-run (probe self-sim ${endDrift.toFixed(4)} < ${CANARY_DRIFT_FLOOR}). This rebuild is TAINTED — the vault mixes two geometries. Stabilize the server, then run 'clawmem embed --force'.${c.reset}`);
+        await setTaint(`mid-run drift ${endDrift.toFixed(4)} at ${new Date().toISOString()}`);
+        process.exitCode = 1;
+      } else {
+        // Verified end. A FULL verified rebuild (--force) clears any standing taint —
+        // the mixed-geometry state the flag records has been rebuilt away (T8-M1).
+        // leaseLost is re-checked first: a reclaimed holder must not clear a
+        // successor's taint (T9-M4).
+        if (values.force && failedFragmentsCount === 0 && !leaseLost) {
+          await markSafeGlobal("clearVaultFlag(taint)", () => s.clearVaultFlag("embed_geometry_taint", leaseGuard));
+        }
+        if (canaryState.pass) {
+          persistCanaryBaselineIfFirst(s, canaryState, { recalibrate, leaseGuard });
+        }
+      }
+    };
 
     // Probe the live model's output dimension (+ model name). Returns null on ANY
     // failure so a down/flaky endpoint can NEVER trigger a destructive clear.
@@ -782,16 +1046,33 @@ export async function cmdEmbed(args: string[]) {
       }
     }
 
-    // Clean stale embeddings (orphaned hashes from updated/deleted documents)
-    const cleaned = s.cleanStaleEmbeddings(leaseGuard);
-    if (cleaned > 0) {
-      console.log(`${c.yellow}Cleaned ${cleaned} stale embedding(s) from orphaned documents${c.reset}`);
+    // Clean stale embeddings (orphaned hashes from updated/deleted documents).
+    // SKIPPED under --force ((f).7 / T2-H3): clearAllEmbeddings just emptied
+    // content_vectors, so no orphaned hashes can exist — running it only risks a
+    // SQLITE_BUSY dying AFTER the clear with the index freshly emptied.
+    if (!values.force) {
+      try {
+        const cleaned = await retryOnBusy(() => s.cleanStaleEmbeddings(leaseGuard), "cleanStaleEmbeddings", () => leaseLost);
+        if (cleaned > 0) {
+          console.log(`${c.yellow}Cleaned ${cleaned} stale embedding(s) from orphaned documents${c.reset}`);
+        }
+      } catch (err) {
+        if (err instanceof FatalVectorError) throw err; // incl. EmbedLeaseLostError
+        if (!isSqliteBusyError(err)) throw err;
+        // Busy after all retries: stale rows are inert (hydration JOINs active docs only) —
+        // log and continue; the next sweep retries.
+        console.error(`${c.yellow}Warning: stale-embedding cleanup still busy after retries — continuing${c.reset}`);
+      }
     }
 
     // Use fragment-based pipeline: split documents into semantic fragments and embed each
     const hashes = s.getHashesNeedingFragments();
     if (hashes.length === 0) {
+      // No-work run: routes through the SAME finalization as a working run (T10-M1) —
+      // it must not skip end verification, silently exit zero on an unvalidated
+      // endpoint, or persist/recalibrate a baseline without a verified end.
       console.log(`${c.green}All documents already embedded${c.reset}`);
+      await finalizeCanary(0);
       return;
     }
 
@@ -858,6 +1139,7 @@ export async function cmdEmbed(args: string[]) {
         leaseGuard,
         isLeaseLost: () => leaseLost,
         validateResult: bindAndValidate,
+        markSafe: markSafeGlobal,
       });
       embedded = result.embedded;
       totalFragments = result.totalFragments;
@@ -879,7 +1161,9 @@ export async function cmdEmbed(args: string[]) {
         // Mark the doc 'pending' and increment embed_attempts ONCE before its first
         // fragment, so a crash mid-document leaves it retryable (re-selected by
         // getHashesNeedingFragments). Completion setters below are state-only.
-        s.markEmbedStart(hash);
+        // A state MARKER must never kill the run ((f).4) — markSafeGlobal above.
+        const markSafe = markSafeGlobal;
+        await markSafe("markEmbedStart", () => s.markEmbedStart(hash, leaseGuard));
         console.error(`  [${docIdx + 1}/${docTasks.length}] ${basename(path)} (${fragments.length} frags)`);
 
         for (let seq = 0; seq < fragments.length; seq++) {
@@ -896,12 +1180,19 @@ export async function cmdEmbed(args: string[]) {
             const fragMs = Date.now() - fragStart;
             if (result) {
               bindAndValidate(result);
-              s.ensureVecTable(result.embedding.length, leaseGuard);
-              s.insertEmbedding(
-                hash, seq, frag.startLine, new Float32Array(result.embedding),
-                result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId,
-                leaseGuard
-              );
+              // Embed-input fingerprint ((d).4 / T5-L1): SHA-256 over the UTF-8 bytes of
+              // the exact formatted embed input, written in the same atomic transaction.
+              const embedInputFp = createHash("sha256").update(text, "utf8").digest("hex");
+              // SQLITE_BUSY-only async retry ((f).2/6): busy exhaustion throws to the
+              // per-fragment catch (fragment failure); FatalVectorError passes through.
+              await retryOnBusy(() => {
+                s.ensureVecTable(result.embedding.length, leaseGuard);
+                s.insertEmbedding(
+                  hash, seq, frag.startLine, new Float32Array(result.embedding),
+                  result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId,
+                  leaseGuard, embedInputFp
+                );
+              }, "insertEmbedding", () => leaseLost);
               totalFragments++;
               if (seq === 0) seq0Succeeded = true;
               if (seq === 0 || (seq + 1) % 5 === 0 || seq === fragments.length - 1) {
@@ -921,14 +1212,17 @@ export async function cmdEmbed(args: string[]) {
         // Embed-state completion: mark synced ONLY when the WHOLE document succeeded (no
         // failed fragments) — a partial embed must not be silently permanent. Any failure
         // → 'failed' (state-only; attempts already incremented at markEmbedStart) so the
-        // worklist retries it, bounded by embed_attempts < 3.
+        // worklist retries it, bounded by embed_attempts < 3. Markers are lease-fenced and
+        // busy-retried; a marker that STILL fails logs-and-continues — it must never kill
+        // the run (the 2026-07-10 incident: markEmbedFailed's own SQLITE_BUSY crashed a
+        // force rebuild at doc 344/4,995 with the index already cleared).
         const docFragsFail = failedFragments - prevFailedFragments;
         if (seq0Succeeded && docFragsFail === 0) {
-          s.markEmbedSynced(hash);
+          await markSafe("markEmbedSynced", () => s.markEmbedSynced(hash, leaseGuard));
         } else if (!seq0Succeeded) {
-          s.markEmbedFailed(hash, "primary fragment (seq=0) failed");
+          await markSafe("markEmbedFailed", () => s.markEmbedFailed(hash, "primary fragment (seq=0) failed", leaseGuard));
         } else {
-          s.markEmbedFailed(hash, `${docFragsFail} fragment(s) failed`);
+          await markSafe("markEmbedFailed", () => s.markEmbedFailed(hash, `${docFragsFail} fragment(s) failed`, leaseGuard));
         }
 
         embedded++;
@@ -941,6 +1235,9 @@ export async function cmdEmbed(args: string[]) {
     const totalSec = ((Date.now() - batchStart) / 1000).toFixed(1);
     console.log();
     console.log(`${c.green}Embedded ${embedded} documents (${totalFragments} fragments, ${failedFragments} failed) in ${totalSec}s${c.reset}`);
+
+    // End-of-run verification — shared finalization (T9-H1 + T10-M1); see finalizeCanary.
+    await finalizeCanary(failedFragments);
   } catch (err) {
     // Fatal aborts must NOT exit 0 — otherwise the embed timer / `update --embed`
     // cannot tell the run was incomplete. Set a nonzero exit code (cleanup still
@@ -1224,9 +1521,7 @@ async function cmdQuery(args: string[]) {
 
   // Step 1: BM25 for strong signal check
   const ftsResults = s.searchFTS(query, POOL, undefined, scopeCols);
-  const topScore = ftsResults[0]?.score ?? 0;
-  const secondScore = ftsResults[1]?.score ?? 0;
-  const strongSignal = topScore >= 0.85 && (topScore - secondScore) >= 0.15;
+  const strongSignal = ftsBypassEnabled() && hasStrongFtsSignal(ftsResults);
 
   // Step 2: Query expansion (skip if strong BM25 signal). expandQuery now returns
   // typed ExpandedQuery[] (lex/vec/hyde) — no more brittle string re-parsing, and
@@ -1345,20 +1640,138 @@ function printResults(results: Array<{ displayPath: string; title: string; compo
 }
 
 // =============================================================================
+// Offline eval harness (HORMA-1)
+// =============================================================================
+
+async function cmdEval(args: string[]) {
+  const usage = "Usage: clawmem eval run --gold <file.jsonl> [--profile query] [--limit N] [--min-examples N] [--audited] [--out <dir>] [--db <path>] [--json]";
+  const sub = args[0];
+  if (sub !== "run") die(usage);
+
+  const { values } = parseArgs({
+    args: args.slice(1),
+    options: {
+      gold: { type: "string" },
+      profile: { type: "string", default: "query" },
+      limit: { type: "string", default: "10" },
+      "min-examples": { type: "string", default: "30" },
+      audited: { type: "boolean", default: false },
+      out: { type: "string" },
+      db: { type: "string" },
+      json: { type: "boolean", default: false },
+    },
+  });
+
+  if (!values.gold) die(usage);
+  const profile = values.profile!;
+  if (!(IMPLEMENTED_PROFILES as readonly string[]).includes(profile)) {
+    die(`Profile "${profile}" is not implemented yet — the first build replays "query" only (intent/context/raw/structured are follow-on phases).`);
+  }
+  // Number() rejects trailing garbage ("10x" → NaN) and Number.isInteger
+  // rejects fractions ("1.5") — parseInt would silently accept both.
+  const limit = Number(values.limit);
+  const minExamples = Number(values["min-examples"]);
+  if (!Number.isInteger(limit) || limit < 1) die("--limit must be a positive integer");
+  if (!Number.isInteger(minExamples) || minExamples < 1) die("--min-examples must be a positive integer");
+
+  // Point BOTH the resolution store and the replay server at a snapshot DB
+  // (e.g. a VACUUM INTO copy) for frozen runs. Must land before any store
+  // opens — and must already exist as a file, or createStore would silently
+  // create an EMPTY vault at the typo'd path and score everything 0.
+  if (values.db) {
+    const dbPath = pathResolve(values.db);
+    if (!existsSync(dbPath) || !statSync(dbPath).isFile()) die(`--db snapshot not found (or not a file): ${dbPath}`);
+    process.env.INDEX_PATH = dbPath;
+  }
+
+  const goldPath = pathResolve(values.gold);
+  if (!existsSync(goldPath)) die(`Gold file not found: ${goldPath}`);
+
+  const s = getStore();
+  let result: RunEvalResult;
+  try {
+    result = await runEval({
+      goldPath,
+      profile: profile as EvalProfile,
+      limit,
+      minExamples,
+      audited: values.audited,
+      outDir: values.out ? pathResolve(values.out) : pathResolve(`eval-runs/${new Date().toISOString().replace(/[:.]/g, "-")}-${profile}`),
+      store: s,
+    });
+  } catch (e) {
+    if (e instanceof GoldFileError || e instanceof EvalIntegrityError) die(e.message);
+    throw e;
+  } finally {
+    await disposeDefaultLlamaCpp();
+  }
+
+  const { report, artifacts } = result;
+  if (values.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    const a = report.aggregate;
+    const n = (v: number | null, d = 3) => (v === null ? "—" : v.toFixed(d));
+    console.log(`${c.bold}eval run ${report.run_id}${c.reset} (profile ${report.profile}, k=${report.limit})`);
+    console.log(`  examples: ${report.examples_scored} scored / ${report.examples_total} total` +
+      (report.skipped.length ? ` · ${report.skipped.length} skipped` : "") +
+      (report.unresolved_gold.length ? ` · ${c.red}${report.unresolved_gold.length} unresolved${c.reset}` : ""));
+    console.log(`  J_doc ${c.cyan}${n(a.jaccard_mean)}${c.reset} · recall@k ${c.cyan}${n(a.recall_mean)}${c.reset} · precision@k ${n(a.precision_mean)} · hit@k ${n(a.hit_at_k)} · MRR ${c.cyan}${n(a.mrr)}${c.reset} · p95 ${n(a.elapsed_ms_p95, 0)}ms`);
+    console.log(`  gates: ${report.gates.pass ? `${c.green}PASS${c.reset}` : `${c.red}FAIL${c.reset} — ${report.gates.reasons.join("; ")}`}`);
+    if (artifacts) {
+      console.log(`  ${c.dim}wrote ${artifacts.runJsonPath}${c.reset}`);
+      console.log(`  ${c.dim}wrote ${artifacts.reportMdPath}${c.reset}`);
+    }
+  }
+
+  // A failed trust gate must be machine-visible, not just printed — automation
+  // treating exit 0 as "trustworthy number" is exactly what the gate prevents.
+  // exitCode (not exit()) so the dispatcher's finally/cleanup still runs.
+  if (!report.gates.pass) process.exitCode = 1;
+}
+
+// =============================================================================
 // Hook dispatch
 // =============================================================================
+
+// B3: the context-surfacing UserPromptSubmit hook runs under a tight budget
+// (8s repo default). Its OWN writes — dedup UPSERT, context_usage, recall
+// events, co-activations — are all best-effort/fail-open, but under writer
+// contention each could otherwise wait up to the store default busy_timeout
+// (5000ms) and blow the budget. Cap this process's busy_timeout so a contended
+// write fails fast (SQLITE_BUSY → skipped by the fail-open guards) instead of
+// stalling. Reads are unaffected (WAL readers never wait on the write lock).
+const CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS = 1500;
 
 async function cmdHook(args: string[]) {
   const hookName = args[0];
   if (!hookName) die("Usage: clawmem hook <name>");
 
+  // v0.29.0 judge recursion guard: a claude-cli judge spawn sets this marker in the
+  // child env. A nested session's ClawMem hooks must no-op BEFORE stdin is read or
+  // the store is opened — otherwise a judge call inside a Stop hook could recurse
+  // into another judge spawn. Central here so EVERY hook is covered.
+  if (process.env.CLAWMEM_JUDGE_SPAWN === "1") {
+    console.error(`[clawmem] hook ${hookName} skipped: running inside a judge spawn (CLAWMEM_JUDGE_SPAWN=1)`);
+    writeHookOutput(makeEmptyOutput(hookName));
+    return;
+  }
+
   const input = await readHookInput();
-  const s = getStore();
+  // Open the store capped from the START for the context-surfacing hook (not just after open via the
+  // PRAGMA below) so a contended init cannot wait the full 5000ms default before it is narrowed. Other
+  // hooks (Stop-lane, 30s budget) keep the 5000ms default.
+  const s = getStore(hookName === "context-surfacing" ? CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS : 5000);
   let output: HookOutput;
 
   try {
     switch (hookName) {
       case "context-surfacing":
+        // Scope the small busy_timeout to THIS process only. Each `clawmem
+        // hook` invocation runs exactly one hook, so the Stop hooks
+        // (decision-extractor / handoff-generator / feedback-loop, 30s budget)
+        // run in separate processes and keep the store default (5000ms).
+        try { s.db.exec(`PRAGMA busy_timeout = ${CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS}`); } catch { /* non-fatal */ }
         output = await contextSurfacing(s, input);
         break;
       case "session-bootstrap":
@@ -2108,6 +2521,8 @@ async function cmdWatch() {
   let stopHeavyLane: (() => Promise<void>) | null = null;
   let watcherHandle: { close: () => void } | null = null;
   let checkpointTimerHandle: Timer | null = null;
+  let prewarmTimerHandle: ReturnType<typeof setInterval> | null = null;
+  let vectorDaemonHandle: VectorDaemonHandle | null = null;
 
   // Graceful shutdown — stop workers, close watchers, then exit. SIGTERM
   // handling is critical for systemd `systemctl --user stop` to shut down
@@ -2116,6 +2531,19 @@ async function cmdWatch() {
   // its own withWorkerLease finally block before we close the store.
   const shutdown = async (signal: string) => {
     console.log(`\n${c.dim}[watch] Received ${signal}, shutting down...${c.reset}`);
+    // Clear the periodic prewarm FIRST — before the awaited worker drains below. The timer is
+    // unref'd but still fires while the loop is alive; a tick landing mid-drain would run the
+    // synchronous ~1.5 GB scan and delay shutdown. Clearing it here is the only guard against that.
+    if (prewarmTimerHandle) {
+      clearInterval(prewarmTimerHandle);
+      prewarmTimerHandle = null;
+    }
+    // Stop the vector daemon early — before the awaited worker drain below — so no new socket-driven
+    // scan starts mid-shutdown. close() stops the listener and unlinks the socket file.
+    if (vectorDaemonHandle) {
+      vectorDaemonHandle.close();
+      vectorDaemonHandle = null;
+    }
     if (stopHeavyLane) {
       await stopHeavyLane();
       stopHeavyLane = null;
@@ -2163,6 +2591,40 @@ async function cmdWatch() {
     console.log(`${c.dim}[watch] Starting heavy maintenance lane worker${c.reset}`);
     stopHeavyLane = startHeavyMaintenanceWorker(s, llm, cfg);
   }
+
+  // Prewarm the sqlite-vec chunks into OS page cache ONCE, in the single long-lived watcher
+  // process only (never in the per-session MCP processes — N concurrent cold scans would be an
+  // I/O storm). The context-surfacing UserPromptSubmit hook runs a SYNCHRONOUS sqlite-vec MATCH
+  // that cannot be time-bounded in-thread (bun:sqlite exposes no interrupt); a cold ~1.5 GB scan
+  // can blow the hook's 8-15s budget. A single warm scan here keeps the hook-path scan sub-second.
+  // Deferred + best-effort so it never delays watcher startup and never throws.
+  setTimeout(() => {
+    try {
+      // prewarmVectors is embed-independent and returns true ONLY when a scan actually ran,
+      // so we never log a false-positive "prewarmed" (embed down at boot / no vectors yet).
+      if (prewarmVectors(s.db)) console.log(`${c.dim}[watch] vector cache prewarmed${c.reset}`);
+    } catch { /* best-effort: unexpected SQL error */ }
+  }, 0);
+
+  // B5 Option C: keep the vector payload warm against OS page-cache eviction BETWEEN hook calls.
+  // The one-shot prewarm above warms once; on a long-running host under memory pressure the kernel
+  // can evict the payload and let a cold synchronous MATCH creep back into the context-surfacing
+  // hook path. Re-touching the pages on an interval biases the kernel LRU toward keeping them
+  // resident (a PROBABILITY reduction, not a hard cap — the hard cap is the deferred BACKLOG
+  // Source 46 daemon). Cleared FIRST in shutdown(); the handle is unref'd so it never keeps the
+  // process alive by itself. resolvePrewarmIntervalMs enforces a strict parse + 60s floor so a
+  // stray tiny value (e.g. "1", or "1e3" which parseInt would read as 1) cannot schedule a
+  // near-continuous scan loop. Set CLAWMEM_PREWARM_INTERVAL_MS=0 to disable. Default 10 min.
+  const prewarmIntervalMs = resolvePrewarmIntervalMs(Bun.env.CLAWMEM_PREWARM_INTERVAL_MS);
+  prewarmTimerHandle = startPeriodicPrewarm(s.db, prewarmIntervalMs);
+  if (prewarmTimerHandle) {
+    console.log(`${c.dim}[watch] periodic vector prewarm every ${Math.round(prewarmIntervalMs / 1000)}s${c.reset}`);
+  }
+
+  // BACKLOG Source 46: vector-query daemon — HARD cap on the cold synchronous MATCH. Runs Step 1 off
+  // the hook's event loop on this long-lived watcher; the hook connects only when the socket exists,
+  // so it is a pure optimization layer (null on bind failure → the hook keeps its in-process fallback).
+  vectorDaemonHandle = await startVectorDaemon(s, (msg) => console.log(`${c.dim}${msg}${c.reset}`));
 
   watcherHandle = startWatcher(dirs, {
     debounceMs: 2000,
@@ -2240,6 +2702,25 @@ async function cmdWatch() {
 // Reindex
 // =============================================================================
 
+/**
+ * Truthful one-liner for a profile rebuild outcome (§55.6 D9).
+ *
+ * A FORGOTTEN profile deliberately gets no "restore it first" advice: `lifecycle_restore` only
+ * reverses archival, so pointing a user at it would prescribe a capability that does not exist.
+ */
+function profileOutcomeMessage(outcome: ProfileUpdateOutcome, auto: boolean): string {
+  switch (outcome) {
+    case "rebuilt":
+      return auto ? "Profile auto-rebuilt (stale)" : "Profile rebuilt";
+    case "held-archive":
+      return "Profile not rebuilt — it is archived. Restore it (lifecycle_restore), then rebuild.";
+    case "held-forget":
+      return "Profile not rebuilt — it was forgotten, and ClawMem will not rebuild over a forgotten document. There is no supported restore for a forgotten document yet.";
+    case "failed":
+      return "Profile not rebuilt — the write failed.";
+  }
+}
+
 async function cmdReindex(args: string[]) {
   const force = args.includes("--force") || args.includes("-f");
   const enrich = args.includes("--enrich");
@@ -2252,9 +2733,12 @@ async function cmdReindex(args: string[]) {
   const s = getStore();
 
   if (force) {
-    // Delete all documents and re-scan
-    s.db.exec("UPDATE documents SET active = 0");
-    console.log(`${c.yellow}Force reindex: deactivated all documents${c.reset}`);
+    // §55.6 D7: `--force` re-parses and rewrites every file (see the `force` option threaded
+    // into indexCollection below). It NO LONGER blanket-deactivates the vault first — that
+    // `UPDATE documents SET active = 0` hit every collection, including `_clawmem`, whose
+    // database-created rows have no filesystem source and so were never reconstructed. It set
+    // no `archived_at`, so `lifecycle_restore` could not see them either.
+    console.log(`${c.yellow}Force reindex: re-reading every file (content-hash check bypassed)${c.reset}`);
   }
 
   if (enrich) {
@@ -2263,7 +2747,7 @@ async function cmdReindex(args: string[]) {
 
   for (const col of collections) {
     console.log(`Indexing ${c.bold}${col.name}${c.reset} (${col.path})...`);
-    const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich, defaultContentType: col.content_type });
+    const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich, force, defaultContentType: col.content_type });
     console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed`);
   }
 }
@@ -2471,6 +2955,232 @@ async function cmdDoctor() {
     // openclaw CLI unavailable — skip silently
   }
 
+  // 9. Reranker discrimination (active probe — asserts the reranker DISCRIMINATES, not just
+  //    responds). Liveness is worthless here: the broken zerank-2 GGUF returned HTTP 200 + valid
+  //    JSON + finite positive ~1e-11 scores and passed every other check while silently collapsing
+  //    the final ranking to RRF. This routes a golden hard-pair set through the live reranker
+  //    (cache-bypassed, coverage-enforced) and checks calibration + per-pair discrimination.
+  try {
+    const s = getStore();
+    const { probeRerankHealth } = await import("./health/rerank-health.ts");
+    const health = await probeRerankHealth(s, { timeoutMs: 8000 });
+    if (health.ok) {
+      console.log(`${c.green}✓${c.reset} Reranker: discriminates (coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min margin ${health.minMargin.toFixed(2)} ≥ ${health.thresholds.discrimMargin})`);
+    } else {
+      console.log(`${c.red}✗${c.reset} Reranker: degenerate / not discriminating (coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toExponential(1)}, min margin ${health.minMargin.toFixed(2)})`);
+      for (const f of health.failures.slice(0, 4)) console.log(`   ${c.dim}${f}${c.reset}`);
+      console.log(`   ${c.dim}Likely the deprecated zerank-2 GGUF (no score head) — re-deploy the seq-cls sidecar. See CLAUDE.md "SOTA upgrade".${c.reset}`);
+      issues++;
+    }
+  } catch (err) {
+    console.log(`${c.yellow}!${c.reset} Reranker: could not probe (${(err as Error).message})`);
+  }
+
+  // 10. Embedding-geometry canary (VSEARCH-TRUST-HARDENING (d)): pair-separation sanity
+  //     (catches WRONG-but-stable geometry — the 2026-07-10 class, invisible to
+  //     self-similarity) + drift vs the stored baseline (catches a changed serving stack —
+  //     the 2026-06-22 class — behind an unchanged model name). For a vault WITH vectors
+  //     this is a REQUIRED check: unavailability is incomplete/nonzero, not green (T8-M6).
+  //     A persisted taint flag from a bad rebuild stays red until a verified full rebuild
+  //     clears it (T8-M1).
+  {
+    const s = getStore();
+    const vaultHasVectors = !!s.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get()
+      && ((s.db.prepare(`SELECT count(*) as cnt FROM vectors_vec`).get() as { cnt: number })?.cnt ?? 0) > 0;
+    const taint = s.getVaultFlag("embed_geometry_taint");
+    if (taint) {
+      console.log(`${c.red}✗${c.reset} Geometry taint: a prior embed run was tainted/unverified (${taint}) — the vault may mix two geometries. Run 'clawmem embed --force' against a stable server to clear.`);
+      issues++;
+      process.exitCode = 1;
+    }
+    try {
+      const llm = getDefaultLlamaCpp();
+      const outcome = await runCanaryBattery(t => llm.embed(t), key => s.getCanaryBaseline(key));
+      if ("unavailable" in outcome) {
+        if (vaultHasVectors) {
+          console.log(`${c.red}✗${c.reset} Geometry canary: INCOMPLETE — required check could not run (${outcome.reason}). A vector vault without a validated server is unverified, not healthy.`);
+          issues++;
+          process.exitCode = 1;
+        } else {
+          console.log(`${c.yellow}!${c.reset} Geometry canary: skipped (${outcome.reason}; vault has no vectors)`);
+        }
+      } else if (outcome.pass) {
+        const m = outcome.margins;
+        console.log(`${c.green}✓${c.reset} Geometry canary: separation healthy (rel ${m.m_rel!.toFixed(2)}, echo ${m.m_echo!.toFixed(2)}, term ${m.m_term!.toFixed(2)}, trunc ${m.m_trunc!.toFixed(2)})${outcome.driftChecked ? " · drift vs baseline OK" : " · no baseline yet (absolute floors)"}`);
+      } else {
+        console.log(`${c.red}✗${c.reset} Geometry canary: FAILED — embedding server produces non-discriminating or drifted vectors`);
+        for (const f of outcome.failures.slice(0, 6)) console.log(`   ${c.dim}${f}${c.reset}`);
+        console.log(`   ${c.dim}Pooling / EOS-anchor / quant misconfiguration, or the server changed since the last embed. See docs/troubleshooting.md → "Vector search returns weak or irrelevant results". A geometry change requires 'clawmem embed --force'.${c.reset}`);
+        issues++;
+        process.exitCode = 1;
+      }
+    } catch (err) {
+      if (vaultHasVectors) {
+        console.log(`${c.red}✗${c.reset} Geometry canary: INCOMPLETE — required check errored (${(err as Error).message})`);
+        issues++;
+        process.exitCode = 1;
+      } else {
+        console.log(`${c.yellow}!${c.reset} Geometry canary: could not run (${(err as Error).message})`);
+      }
+    }
+  }
+
+  // 11. Sampled vector validation ((d).4): persisted-vs-fresh on REAL vectors_vec rows,
+  //     reconstructed through the production pipeline from the CANONICAL document
+  //     (T8-H3). Definitive fingerprint failures return immediately and are nonzero
+  //     regardless of coverage (T6-M2/T8-H2); attempts are hard-capped. Required check
+  //     for a vector vault — exceptions are incomplete/nonzero, not green (T8-M6).
+  try {
+    const s = getStore();
+    const llm = getDefaultLlamaCpp();
+    const summary = await runSampledVectorValidation(s, (t: string) => llm.embed(t));
+    if (summary.eligible === 0) {
+      console.log(`${c.yellow}!${c.reset} Sampled vectors: no eligible rows (no synced embedded documents)`);
+    } else if (summary.definitiveFailures.length > 0) {
+      console.log(`${c.red}✗${c.reset} Sampled vectors: DEFINITIVE failure after ${summary.attempts} attempt(s) (${summary.validated}/${summary.target} validated before stopping, ${summary.eligible} eligible)`);
+      for (const f of summary.definitiveFailures.slice(0, 4)) console.log(`   ${c.dim}${f}${c.reset}`);
+      console.log(`   ${c.dim}Stale-input rows need a re-embed; corruption/drift at matching fingerprints means the stored vector no longer matches its exact input.${c.reset}`);
+      issues++;
+      process.exitCode = 1;
+    } else if (summary.validated < summary.nMin || summary.validatedSeq0 < summary.seq0Target) {
+      const seq0Part = summary.validatedSeq0 < summary.seq0Target ? `; seq-0 quota UNMET (${summary.validatedSeq0}/${summary.seq0Target} validated — primary fragments are the surprisal/graph/health anchors)` : "";
+      console.log(`${c.red}✗${c.reset} Sampled vectors: DEGRADED — validation could not complete (${summary.validated}/${summary.target} validated, min ${summary.nMin}${seq0Part}; ${summary.unreconstructable} unreconstructable, ${summary.inconclusiveLegacy} legacy-inconclusive; ${summary.attempts} attempts over ${summary.eligible} eligible)`);
+      console.log(`   ${c.dim}Splitter/metadata drift or legacy rows below threshold — re-embed or investigate.${c.reset}`);
+      issues++;
+      process.exitCode = 1;
+    } else {
+      const legacyNote = summary.legacyTier > 0 ? ` (${summary.legacyTier} legacy-tier: structural only — title provenance unavailable until re-embed)` : "";
+      const seq0Note = summary.validatedSeq0 > 0 ? `, ${summary.validatedSeq0} seq-0` : "";
+      console.log(`${c.green}✓${c.reset} Sampled vectors: ${summary.validated}/${summary.target} validated (cos ≥ 0.98${seq0Note})${legacyNote}`);
+    }
+  } catch (err) {
+    const s = getStore();
+    const vaultHasVectors = !!s.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get()
+      && ((s.db.prepare(`SELECT count(*) as cnt FROM vectors_vec`).get() as { cnt: number })?.cnt ?? 0) > 0;
+    if (vaultHasVectors) {
+      console.log(`${c.red}✗${c.reset} Sampled vectors: INCOMPLETE — required check errored (${(err as Error).message})`);
+      issues++;
+      process.exitCode = 1;
+    } else {
+      console.log(`${c.yellow}!${c.reset} Sampled vectors: could not run (${(err as Error).message})`);
+    }
+  }
+
+  // 10. Contradiction judge (v0.29.0). A SMOKE TEST, never capability
+  // certification: three fixture scenarios through the configured judge, zero
+  // store involvement. Runs ONLY when a judge is configured — the default lane
+  // is never probed (no reliable non-downloading cache detector exists, and the
+  // stock model's verdict is established and documented).
+  try {
+    const resolution = resolveJudge();
+    const configuredPolicy = resolveContradictionPolicy();
+    if (resolution.status === "unconfigured") {
+      console.log(
+        `${c.yellow}!${c.reset} Contradiction judge: not configured — contradiction analysis is ` +
+        `DISABLED (the stock expansion model cannot meet the judge contract). ` +
+        `Set CLAWMEM_JUDGE_* to enable: docs/guides/inference-services.md`,
+      );
+      // Migration warning (§J1): a capable GLOBAL LLM may have produced real verdicts
+      // before v0.29.0 decoupled the judge from CLAWMEM_LLM_*. Provenance-aware — the
+      // wrapper marks its own stock default; a custom model served AT the stock
+      // endpoint is undetectable, so upgrading.md remains the authoritative notice.
+      const urlSource = process.env.CLAWMEM_LLM_URL_SOURCE;
+      const llmUrl = process.env.CLAWMEM_LLM_URL;
+      const llmModel = process.env.CLAWMEM_LLM_MODEL?.trim();
+      const userSuppliedUrl = !!llmUrl && urlSource !== "default" && llmUrl !== "http://localhost:8089";
+      const nonStockModel = !!llmModel && llmModel !== "qwen3";
+      if (userSuppliedUrl || nonStockModel) {
+        console.log(
+          `${c.yellow}!${c.reset} Migration: a custom global LLM is configured ` +
+          `(${userSuppliedUrl ? llmUrl : `model=${llmModel}`}) but no judge is. If it was doing ` +
+          `real contradiction analysis before v0.29.0, set CLAWMEM_JUDGE_* to keep it — the ` +
+          `judge no longer rides the global vars (docs/guides/upgrading.md).`,
+        );
+      }
+      if (configuredPolicy === "supersede") {
+        console.log(
+          `${c.yellow}!${c.reset} CLAWMEM_CONTRADICTION_POLICY=supersede is configured but ` +
+          `presently INACTIVE (no judge) — merge contradictions are constrained to ` +
+          `non-deactivating 'link'.`,
+        );
+      }
+    } else if (resolution.status === "invalid") {
+      console.log(`${c.red}✗${c.reset} Contradiction judge: misconfigured — ${resolution.error}`);
+      issues++;
+    } else {
+      const judge = resolution.judge;
+      const d = judge.descriptor;
+      const scenarioA = {
+        newFacts: ["Decided: the ingestion worker now writes directly to Postgres; the Redis queue layer is removed entirely."],
+        existing: ["Decided: all ingestion must go through the Redis queue; workers never write directly to Postgres."],
+      };
+      const scenarioB = {
+        newFacts: ["Decided: bump the frontend to Tailwind v4 in the next sprint."],
+        existing: ["Observation: the nightly backup cron runs at 03:00 and rotates 7 snapshots."],
+      };
+      const runPair = async (sc: { newFacts: string[]; existing: string[] }) => {
+        const prompt = buildContradictionPrompt({ newFacts: sc.newFacts, existingSnippets: sc.existing, minConfidence: 0.7 });
+        const res = await judge.judge({ system: prompt.system, user: prompt.user, schema: JUDGE_VERDICT_SCHEMA });
+        if (!res.ok) return { ok: false as const, detail: `${res.reason}: ${res.detail}` };
+        if (res.truncated) return { ok: false as const, detail: "response truncated" };
+        const parsed = unwrapContradictionArray(extractJudgeJson(res.text));
+        if (!Array.isArray(parsed)) return { ok: false as const, detail: "response is not a JSON array" };
+        const batch = admitContradictionEntries(parsed, sc.existing.length, sc.newFacts.length);
+        return { ok: true as const, parsed, batch };
+      };
+
+      const a = await runPair(scenarioA);
+      // A CLEAN response is required — one raw entry, one admitted, zero
+      // rejected/duplicate/inconsistent. A right answer wrapped in schema junk
+      // or repeats is not a passing judge (code-review t1 finding 5).
+      const aPass = a.ok && a.parsed.length === 1 && a.batch.accepted.length === 1 &&
+        a.batch.rejected === 0 && a.batch.duplicates === 0 && a.batch.inconsistent === 0 &&
+        a.batch.accepted[0].relation === "contradiction" &&
+        a.batch.accepted[0].new_idx === 0 && a.batch.accepted[0].old_idx === 0 &&
+        a.batch.accepted[0].confidence >= 0.7;
+      const b = await runPair(scenarioB);
+      // ANY verdict on unrelated facts — even a low-confidence `same` — is fabrication.
+      const bPass = b.ok && b.parsed.length === 0;
+      const cEval = await evaluateMergeContradiction(resolution, scenarioA.existing[0]!, scenarioA.newFacts[0]!);
+      const cRun = cEval.kind === "decided" ? cEval.runs[cEval.runs.length - 1] : undefined;
+      const cPass = cEval.kind === "decided" && cEval.result.source === "llm" &&
+        isActionableContradiction(cEval.result) &&
+        (cRun?.entriesAdmitted ?? 0) === 1 && (cRun?.entriesRejected ?? 1) === 0 &&
+        (cRun?.entriesDuplicate ?? 1) === 0 && (cRun?.entriesInconsistent ?? 1) === 0;
+
+      if (aPass && bPass && cPass) {
+        console.log(
+          `${c.green}✓${c.reset} Contradiction judge: ${d.lane}/${d.model} passed the smoke test ` +
+          `(designed contradiction detected, unrelated control clean, merge contract actionable). ` +
+          `${c.dim}Smoke test only — not capability certification.${c.reset}`,
+        );
+      } else {
+        const parts = [
+          aPass ? null : `scenario A (designed contradiction): ${a.ok ? 'no valid (0,0,"contradiction") verdict at ≥ 0.7' : a.detail}`,
+          bPass ? null : `scenario B (unrelated control): ${b.ok ? "fabricated a verdict on unrelated facts" : b.detail}`,
+          cPass ? null : `scenario C (merge single-pair): not actionable via the judge`,
+        ].filter(Boolean);
+        console.log(
+          `${c.red}✗${c.reset} Contradiction judge: ${d.lane}/${d.model} FAILED the smoke test — ` +
+          `${parts.join("; ")}. Rejects stay fail-closed, but this judge is not fit to rely on. ` +
+          `See docs/guides/inference-services.md.`,
+        );
+        issues++;
+      }
+      if (configuredPolicy === "supersede") {
+        console.log(`${c.dim}   supersede policy: ACTIVE (judge configured)${c.reset}`);
+      }
+    }
+    // Durable audit rows — the evidence calibration reads.
+    try {
+      const s = getStore();
+      const counts = judgeAuditCounts(s.db);
+      console.log(`${c.dim}   judge audit: ${counts.runs} run(s), ${counts.events} event(s)${counts.oldestTs ? `, oldest ${counts.oldestTs}` : ""}${c.reset}`);
+    } catch { /* audit tables absent on pre-0.29.0 vaults — non-fatal */ }
+  } catch (err) {
+    console.log(`${c.yellow}!${c.reset} Contradiction judge: could not probe (${(err as Error).message})`);
+  }
+
   console.log();
   if (issues > 0) {
     console.log(`${c.yellow}${issues} issue(s) found.${c.reset}`);
@@ -2478,6 +3188,43 @@ async function cmdDoctor() {
     console.log(`${c.green}All checks passed.${c.reset}`);
   }
 }
+
+
+// =============================================================================
+// Reranker health (scheduled-check CLI)
+// =============================================================================
+
+// Oneshot reranker discrimination probe. Exits non-zero on degeneracy so a systemd OnFailure= (or
+// any scheduled check) can alert — the standalone counterpart to doctor section 9. Routes through
+// the live, cache-bypassed, coverage-enforced probe (src/health/rerank-health.ts).
+async function cmdRerankHealth(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      json: { type: "boolean", default: false },
+      "timeout-ms": { type: "string" },
+    },
+    allowPositionals: false,
+  });
+  const timeoutMs = values["timeout-ms"] ? parseInt(values["timeout-ms"] as string, 10) : undefined;
+  const store = getStore();
+  const { probeRerankHealth } = await import("./health/rerank-health.ts");
+  const health = await probeRerankHealth(store, timeoutMs ? { timeoutMs } : {});
+
+  if (values.json) {
+    console.log(JSON.stringify(health));
+  } else if (health.ok) {
+    console.log(`${c.green}✓ Reranker healthy${c.reset} — coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min margin ${health.minMargin.toFixed(2)} ≥ ${health.thresholds.discrimMargin}`);
+  } else {
+    console.log(`${c.red}✗ Reranker degenerate / not discriminating${c.reset} — coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toExponential(1)}, min margin ${health.minMargin.toFixed(2)}`);
+    for (const f of health.failures) console.log(`  - ${f}`);
+    console.log(`Likely the deprecated zerank-2 GGUF (no score head) — re-deploy the seq-cls sidecar. See CLAUDE.md "SOTA upgrade".`);
+  }
+  // Non-zero exit on degeneracy so systemd OnFailure= / a scheduled check can alert. Use exitCode
+  // (not process.exit) so main()'s finally { closeStore() } still runs.
+  process.exitCode = health.ok ? 0 : 1;
+}
+
 
 // =============================================================================
 // Bootstrap
@@ -2622,8 +3369,9 @@ async function cmdProfile(args: string[]) {
   const s = getStore();
 
   if (args[0] === "rebuild") {
-    updateProfile(s);
-    console.log(`${c.green}Profile rebuilt${c.reset}`);
+    const outcome = updateProfile(s);
+    const colour = outcome === "rebuilt" ? c.green : c.yellow;
+    console.log(`${colour}${profileOutcomeMessage(outcome, false)}${c.reset}`);
     return;
   }
 
@@ -2754,7 +3502,6 @@ async function main() {
           case "add": await cmdCollectionAdd(subSubArgs); break;
           case "list": await cmdCollectionList(); break;
           case "remove": await cmdCollectionRemove(subSubArgs); break;
-          case "purge": await cmdCollectionPurge(subSubArgs); break;
           default: die("Usage: clawmem collection <add|list|remove|purge>");
         }
         break;
@@ -2782,6 +3529,9 @@ async function main() {
         break;
       case "query":
         await cmdQuery(subArgs);
+        break;
+      case "eval":
+        await cmdEval(subArgs);
         break;
       case "hook":
         await cmdHook(subArgs);
@@ -2812,6 +3562,9 @@ async function main() {
         break;
       case "backup":
         await cmdBackup(subArgs);
+        break;
+      case "rerank-health":
+        await cmdRerankHealth(subArgs);
         break;
       case "path":
         cmdPath();
@@ -2849,6 +3602,12 @@ async function main() {
       case "diary":
         await cmdDiary(subArgs);
         break;
+      case "migrate":
+        await cmdMigrate(subArgs);
+        break;
+      case "causal-audit":
+        await cmdCausalAudit(subArgs);
+        break;
       case "help":
       case "--help":
       case "-h":
@@ -2860,6 +3619,282 @@ async function main() {
     }
   } finally {
     closeStore();
+  }
+}
+
+// =============================================================================
+// migrate causal-witnesses — s342 legacy-evidence resolution (operator CLI)
+// =============================================================================
+
+function parseEdgeArg(raw: string): { sourceId: number; targetId: number } {
+  const m = raw.match(/^(\d+):(\d+)$/);
+  if (!m) die(`--edge expects <sourceDocId>:<targetDocId> (got "${raw}")`);
+  return { sourceId: Number(m[1]), targetId: Number(m[2]) };
+}
+
+/**
+ * `clawmem migrate causal-witnesses` — the operator surface for causal edges the
+ * writer refuses to touch (zero sightings + metadata that cannot yield a valid
+ * witness). Preflight is REQUIRED (or every unresolved edge resolved) before
+ * setting CLAWMEM_CAUSAL_WRITER=on. Application is explicit-selection only —
+ * bulk "resolve all qualifying" does not exist — and is bound to the preview by
+ * a version-tagged full-row fingerprint rechecked under the write lock.
+ */
+async function cmdMigrate(args: string[]) {
+  const sub = args[0];
+  if (sub !== "causal-witnesses") {
+    die("Usage: clawmem migrate causal-witnesses --preflight [--out <manifest.json>]\n" +
+        "       clawmem migrate causal-witnesses --resolve-unmaterializable keep-weight|retire-edge \\\n" +
+        "           --manifest <file> --edge <src>:<tgt> [--edge ...] [--note <text>] [--apply]\n" +
+        "       clawmem migrate causal-witnesses --restore-edge <src>:<tgt> [--apply]");
+  }
+  const rest = args.slice(1);
+  const {
+    causalWitnessCensus, buildResolutionManifest, applyResolution, restoreRetiredEdge,
+    insertCausalRun, finalizeCliCausalRun, CAUSAL_FINGERPRINT_VERSION,
+  } = await import("./causal-writer.ts");
+  const { randomUUID } = await import("node:crypto");
+
+  const flagValue = (name: string): string | null => {
+    const i = rest.indexOf(name);
+    if (i === -1) return null;
+    const v = rest[i + 1];
+    if (!v || v.startsWith("--")) die(`${name} requires a value`);
+    return v;
+  };
+  const edgeArgs: { sourceId: number; targetId: number }[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--edge") {
+      const v = rest[i + 1];
+      if (!v) die("--edge requires a value");
+      edgeArgs.push(parseEdgeArg(v));
+    }
+  }
+  const apply = rest.includes("--apply");
+  const s = getStore();
+
+  // --- restore-edge -----------------------------------------------------------
+  const restoreRaw = flagValue("--restore-edge");
+  if (restoreRaw) {
+    const edge = parseEdgeArg(restoreRaw);
+    const archived = s.db.prepare(
+      `SELECT weight, metadata, created_at, retired_at, operator_note FROM retired_causal_edges
+       WHERE source_id = ? AND target_id = ? AND relation_type = 'causal'`,
+    ).get(edge.sourceId, edge.targetId) as { weight: number | null; retired_at: string; operator_note: string | null } | undefined;
+    if (!archived) {
+      die(`No archived causal edge ${edge.sourceId}→${edge.targetId} in retired_causal_edges.`);
+    }
+    if (!apply) {
+      console.log(`${c.cyan}Would restore${c.reset} edge ${edge.sourceId}→${edge.targetId} ` +
+        `(weight ${archived.weight}, retired ${archived.retired_at}` +
+        `${archived.operator_note ? `, note: ${archived.operator_note}` : ""}). Re-run with --apply.`);
+      return;
+    }
+    const startedAtMs = Date.now();
+    const runKey = randomUUID();
+    // Pessimistic terminal outcome: the row is BORN cli_error and only a
+    // successful finalization flips it to cli_ok — a writer lock that kills
+    // both the operation and the finalization leaves an honest cli_error,
+    // never a stranded in_progress row.
+    const runId = insertCausalRun(s.db, { runKey, source: "cli_migrate", mode: "cli", outcome: "cli_error" });
+    let outcome: ReturnType<typeof restoreRetiredEdge>;
+    try {
+      outcome = restoreRetiredEdge(s.db, edge, { runKey, runId });
+    } catch (err) {
+      finalizeCliCausalRun(s.db, runId, "cli_error", startedAtMs);
+      throw err;
+    }
+    finalizeCliCausalRun(s.db, runId, outcome.status === "restored" ? "cli_ok" : "cli_error", startedAtMs);
+    if (outcome.status === "restored") {
+      console.log(`${c.green}Restored${c.reset} causal edge ${edge.sourceId}→${edge.targetId} from the archive.`);
+    } else if (outcome.status === "not_archived") {
+      die(`Edge ${edge.sourceId}→${edge.targetId} vanished from the archive before apply.`);
+    } else {
+      // Fail-closed: a key or foreign-key CONSTRAINT refused the plain INSERT —
+      // an active edge may occupy the composite key, or an endpoint document is
+      // missing. Either way nothing was replaced and the archive row is untouched.
+      die(`Restore REFUSED (fail-closed): ${outcome.reason}\n` +
+          `A key/FK constraint refused ${edge.sourceId}→${edge.targetId} (occupied key or missing endpoint); ` +
+          `the archive row is untouched.`);
+    }
+    return;
+  }
+
+  // --- preflight --------------------------------------------------------------
+  if (rest.includes("--preflight")) {
+    const entries = causalWitnessCensus(s.db);
+    const unresolved = entries.filter(e => !e.materializable);
+    const materializable = entries.filter(e => e.materializable);
+    console.log(`Causal witness census (observation-lane edges with zero sightings):`);
+    console.log(`  ${materializable.length} edge(s) with valid old-writer metadata — will materialize lazily on first live touch; no action needed.`);
+    console.log(`  ${unresolved.length} UNRESOLVED edge(s) — metadata cannot yield a valid witness; the writer fails closed on these until resolved:`);
+    for (const e of unresolved) {
+      const metaHead = (e.row.metadata ?? "<null>").slice(0, 80);
+      console.log(`    ${c.yellow}${e.row.source_id}→${e.row.target_id}${c.reset} weight=${e.row.weight} metadata=${JSON.stringify(metaHead)}`);
+    }
+    const outPath = flagValue("--out");
+    if (outPath) {
+      const manifest = buildResolutionManifest(entries);
+      writeFileSync(outPath, JSON.stringify(manifest, null, 2));
+      console.log(`\nManifest (${manifest.edges.length} edge(s), fingerprint ${CAUSAL_FINGERPRINT_VERSION}) written to ${outPath}.`);
+      console.log(`Resolve with: clawmem migrate causal-witnesses --resolve-unmaterializable keep-weight|retire-edge --manifest ${outPath} --edge <src>:<tgt> --apply`);
+    } else if (unresolved.length > 0) {
+      console.log(`\nRe-run with --out <manifest.json> to emit the binding manifest required by --apply.`);
+    }
+    if (unresolved.length === 0) {
+      console.log(`${c.green}Preflight clean${c.reset} — safe to set CLAWMEM_CAUSAL_WRITER=on.`);
+    }
+    return;
+  }
+
+  // --- resolve-unmaterializable ----------------------------------------------
+  const action = flagValue("--resolve-unmaterializable");
+  if (!action) {
+    die("Nothing to do: pass --preflight, --resolve-unmaterializable, or --restore-edge.");
+  }
+  if (action !== "keep-weight" && action !== "retire-edge") {
+    die(`--resolve-unmaterializable must be keep-weight or retire-edge (got "${action}")`);
+  }
+  // Bulk resolution is refused for unprovable-origin metadata: application acts
+  // only on edges EXPLICITLY SELECTED from the preview, never on "all qualifying".
+  if (edgeArgs.length === 0) {
+    die("Explicit selection required: pass one --edge <src>:<tgt> per edge from the preflight preview. Bulk resolution is not supported.");
+  }
+  const manifestPath = flagValue("--manifest");
+  if (!manifestPath) {
+    die("--manifest <file> (from --preflight --out) is required — application is bound to the previewed row images.");
+  }
+  let manifest: { version: string; edges: Array<{ sourceId: number; targetId: number; fingerprint: string; materializable: boolean }> };
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+  } catch (err) {
+    die(`Cannot read manifest ${manifestPath}: ${err}`);
+  }
+  const note = flagValue("--note");
+
+  if (!apply) {
+    for (const edge of edgeArgs) {
+      const entry = manifest.edges.find(e => e.sourceId === edge.sourceId && e.targetId === edge.targetId);
+      if (!entry) {
+        console.log(`${c.red}NOT IN MANIFEST${c.reset} ${edge.sourceId}→${edge.targetId} — regenerate the preflight preview.`);
+      } else if (entry.materializable) {
+        console.log(`${c.red}WOULD REFUSE${c.reset} ${edge.sourceId}→${edge.targetId}: materializable (valid old-writer metadata) — resolves itself lazily; no action needed.`);
+      } else {
+        console.log(`${c.cyan}Would ${action}${c.reset} ${edge.sourceId}→${edge.targetId} (fingerprint ${entry.fingerprint.slice(0, 12)}…).`);
+      }
+    }
+    console.log(`Re-run with --apply to execute.`);
+    return;
+  }
+
+  const startedAtMs = Date.now();
+  const runKey = randomUUID();
+  // Pessimistic terminal outcome (same discipline as restore): born cli_error,
+  // flipped to cli_ok only by successful finalization — failure representation
+  // never depends on a second successful write.
+  const runId = insertCausalRun(s.db, { runKey, source: "cli_migrate", mode: "cli", outcome: "cli_error" });
+  let failures = 0;
+  try {
+    for (const edge of edgeArgs) {
+      const entry = manifest.edges.find(e => e.sourceId === edge.sourceId && e.targetId === edge.targetId);
+      if (!entry) {
+        console.log(`${c.red}REFUSED${c.reset} ${edge.sourceId}→${edge.targetId}: not in the manifest — regenerate the preflight preview.`);
+        failures++;
+        continue;
+      }
+      // Resolution acts on UNRESOLVED edges only — an edge whose old-writer
+      // metadata is valid materializes lazily and must never be retired here.
+      if (entry.materializable) {
+        console.log(`${c.red}REFUSED${c.reset} ${edge.sourceId}→${edge.targetId}: materializable (valid old-writer metadata) — no resolution needed.`);
+        failures++;
+        continue;
+      }
+      const outcome = applyResolution(
+        s.db,
+        { sourceId: edge.sourceId, targetId: edge.targetId, fingerprint: entry.fingerprint, manifestVersion: manifest.version },
+        action,
+        { runKey, runId, operatorNote: note },
+      );
+      if (outcome.status === "resolved") {
+        console.log(`${c.green}${action === "keep-weight" ? "Materialized" : "Retired"}${c.reset} ${edge.sourceId}→${edge.targetId}.`);
+      } else if (outcome.status === "stale") {
+        console.log(`${c.yellow}STALE${c.reset} ${edge.sourceId}→${edge.targetId}: ${outcome.reason} — row untouched; re-run --preflight.`);
+        failures++;
+      } else {
+        console.log(`${c.red}REFUSED${c.reset} ${edge.sourceId}→${edge.targetId}: ${outcome.reason}`);
+        failures++;
+      }
+    }
+  } catch (err) {
+    finalizeCliCausalRun(s.db, runId, "cli_error", startedAtMs);
+    throw err;
+  }
+  finalizeCliCausalRun(s.db, runId, failures > 0 ? "cli_error" : "cli_ok", startedAtMs);
+  if (failures > 0) {
+    process.exitCode = 1;
+  }
+}
+
+/**
+ * `clawmem causal-audit` — the D5 operator inspection surface over
+ * `causal_runs` / `causal_run_events` (shadow-mode calibration and general
+ * writer forensics). Read-only.
+ */
+async function cmdCausalAudit(args: string[]) {
+  const s = getStore();
+  const json = args.includes("--json");
+  const runKeyIdx = args.indexOf("--run");
+  const runKey = runKeyIdx !== -1 ? args[runKeyIdx + 1] : null;
+  const limitIdx = args.indexOf("--limit");
+  const limit = limitIdx !== -1 ? Math.max(1, Math.min(200, Number(args[limitIdx + 1]) || 20)) : 20;
+
+  if (runKey) {
+    const run = s.db.prepare(`SELECT * FROM causal_runs WHERE run_key = ?`).get(runKey) as Record<string, unknown> | null;
+    if (!run) die(`No causal run with run_key ${runKey}.`);
+    const events = s.db.prepare(
+      `SELECT scope, event_type, source_doc_id, target_doc_id, source_fact_ordinal,
+              target_fact_ordinal, confidence, detail, created_at
+       FROM causal_run_events WHERE run_id = ? ORDER BY id`,
+    ).all(run.id as number) as Record<string, unknown>[];
+    if (json) {
+      console.log(JSON.stringify({ run, events }, null, 2));
+      return;
+    }
+    console.log(`${c.bold}Run ${runKey}${c.reset} (${run.source}/${run.mode}) outcome=${c.cyan}${run.outcome}${c.reset}`);
+    console.log(`  started=${run.started_at} finished=${run.finished_at ?? "—"} duration=${run.duration_ms ?? "—"}ms model=${run.model ?? "—"}`);
+    console.log(`  new=${run.new_doc_count} window=${run.window_doc_count} candidates=${run.candidate_count} admitted=${run.admitted_count}`);
+    console.log(`  edges: written=${run.edges_written} refused=${run.edges_refused} errored=${run.edges_errored}`);
+    console.log(`  ${events.length} event(s):`);
+    for (const ev of events) {
+      const pair = ev.source_doc_id != null ? ` ${ev.source_doc_id}→${ev.target_doc_id ?? "?"}` : "";
+      const ords = ev.source_fact_ordinal != null ? ` [${ev.source_fact_ordinal}→${ev.target_fact_ordinal}]` : "";
+      const conf = ev.confidence != null ? ` conf=${ev.confidence}` : "";
+      const detail = ev.detail ? ` — ${String(ev.detail).slice(0, 80)}` : "";
+      console.log(`    ${String(ev.scope).padEnd(8)} ${c.cyan}${ev.event_type}${c.reset}${pair}${ords}${conf}${detail}`);
+    }
+    return;
+  }
+
+  const runs = s.db.prepare(
+    `SELECT run_key, session_id, source, mode, outcome, candidate_count, admitted_count,
+            edges_written, edges_refused, edges_errored, started_at, duration_ms
+     FROM causal_runs ORDER BY started_at DESC, id DESC LIMIT ?`,
+  ).all(limit) as Record<string, unknown>[];
+  if (json) {
+    console.log(JSON.stringify(runs, null, 2));
+    return;
+  }
+  if (runs.length === 0) {
+    console.log("No causal runs recorded. The writer audits runs when CLAWMEM_CAUSAL_WRITER is shadow or on.");
+    return;
+  }
+  console.log(`${c.bold}Recent causal runs${c.reset} (${runs.length}; --run <run_key> for events):`);
+  for (const r of runs) {
+    console.log(
+      `  ${r.started_at}  ${String(r.mode).padEnd(6)} ${c.cyan}${String(r.outcome).padEnd(14)}${c.reset} ` +
+      `cand=${r.candidate_count} adm=${r.admitted_count} w/r/e=${r.edges_written}/${r.edges_refused}/${r.edges_errored} ` +
+      `${r.duration_ms ?? "—"}ms  ${c.dim}${r.run_key}${c.reset}`,
+    );
   }
 }
 
@@ -2928,12 +3963,16 @@ async function cmdLifecycle(args: string[]) {
         return;
       }
 
+      // Archival only. ClawMem no longer physically deletes document rows from any code
+      // path — see the retention note in src/store.ts. `purge_after_days` is inert.
       const archived = store.archiveDocuments(candidates.map(c => c.id));
-      let purged = 0;
+      console.log(`Lifecycle sweep: archived ${archived} document(s). Nothing was deleted.`);
       if (policy.purge_after_days) {
-        purged = store.purgeArchivedDocuments(policy.purge_after_days);
+        console.log(
+          `  Note: purge_after_days=${policy.purge_after_days} is set but INERT — ClawMem no ` +
+          `longer deletes rows. Archived docs stay restorable (clawmem lifecycle restore).`
+        );
       }
-      console.log(`Lifecycle sweep: archived ${archived}, purged ${purged}`);
       break;
     }
 
@@ -3013,8 +4052,9 @@ async function cmdReflect(args: string[]) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - days);
 
-  const recentDocs = store.getDocumentsByType("decision", 50)
-    .filter(d => d.modifiedAt && d.modifiedAt >= cutoff.toISOString());
+  // §51.1 D13: reflection is about when content was authored, not when it was filed
+  const recentDocs = store.getDocumentsByType("decision", 50, { orderBy: "effective" })
+    .filter(d => d.effectiveAt && d.effectiveAt >= cutoff.toISOString());
 
   if (recentDocs.length === 0) {
     console.log(`No decisions found in the last ${days} days.`);
@@ -3068,13 +4108,13 @@ async function cmdReflect(args: string[]) {
   }
 
   // Also report antipatterns
-  const antiDocs = store.getDocumentsByType("antipattern", 10)
-    .filter(d => d.modifiedAt && d.modifiedAt >= cutoff.toISOString());
+  const antiDocs = store.getDocumentsByType("antipattern", 10, { orderBy: "effective" })
+    .filter(d => d.effectiveAt && d.effectiveAt >= cutoff.toISOString());
 
   if (antiDocs.length > 0) {
     console.log(`\n${c.bold}Recent Antipatterns (${antiDocs.length}):${c.reset}`);
     for (const d of antiDocs) {
-      console.log(`  ${c.red}●${c.reset} ${d.title} (${d.modifiedAt?.slice(0, 10)})`);
+      console.log(`  ${c.red}●${c.reset} ${d.title} (${d.effectiveAt?.slice(0, 10)})`);
     }
   }
 
@@ -3454,7 +4494,6 @@ ${c.bold}Setup:${c.reset}
   clawmem collection add <path> --name <name>
   clawmem collection list
   clawmem collection remove <name>     Forget the collection in config.yaml (does NOT delete indexed rows)
-  clawmem collection purge <name> [--yes]  Hard-delete a collection's rows (active+inactive, irreversible)
   clawmem setup hooks [--remove]       Install/remove Claude Code hooks
   clawmem setup mcp [--remove]         Register/remove MCP in ~/.claude.json
   clawmem setup openclaw [--link] [--remove]   Install/remove ClawMem as OpenClaw memory plugin
@@ -3462,7 +4501,8 @@ ${c.bold}Setup:${c.reset}
 
 ${c.bold}Indexing:${c.reset}
   clawmem update [--pull] [--embed]    Re-scan collections (--embed auto-embeds)
-  clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (Claude, ChatGPT, Slack); --synthesize runs post-import LLM fact extraction
+  clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (Claude, ChatGPT, Slack); --synthesize runs post-import LLM fact extraction; preserves per-exchange authored_at
+  clawmem mine <dir> -c name --backfill-dates [--apply]  Derive authored_at for already-mined docs from source transcripts (metadata-only; dry-run without --apply)
   clawmem embed [-f]                   Generate fragment embeddings
   clawmem reindex [--force] [--enrich]  Full re-index (--enrich: run entity extraction + links on all docs)
   clawmem watch                        File watcher daemon
@@ -3475,6 +4515,9 @@ ${c.bold}Search:${c.reset}
     -c/--collection fences retrieval to the named collection(s). Without it,
     a session focus (clawmem focus set <collection>) auto-scopes to that
     collection when the focus topic names one.
+
+${c.bold}Eval:${c.reset}
+  clawmem eval run --gold <file.jsonl> [--limit N] [--audited] [--out DIR] [--db <snapshot>]  Replay gold-labeled queries through the live pipeline (J_doc/recall/MRR); exits 1 when the trust gate fails
 
 ${c.bold}Memory:${c.reset}
   clawmem list [-n/--limit N] [-c col]  Browse recent documents (--json for machine output)
@@ -3512,6 +4555,16 @@ ${c.bold}Integration:${c.reset}
   clawmem update-context               Regenerate all directory CLAUDE.md files
   clawmem doctor                       Full health check
   clawmem backup [--dest <dir>] [--keep <n>]  Snapshot the index (VACUUM INTO), prune to <n> (default 7)
+  clawmem rerank-health [--json]       Probe reranker discrimination (exit 1 if degenerate)
+  clawmem migrate causal-witnesses --preflight [--out <manifest.json>]
+                                       Census unresolved pre-cut causal edges (run before CLAWMEM_CAUSAL_WRITER=on)
+  clawmem migrate causal-witnesses --resolve-unmaterializable keep-weight|retire-edge
+      --manifest <file> --edge <src>:<tgt> [--note <text>] [--apply]
+                                       Resolve an explicitly selected unresolved edge (manifest-bound)
+  clawmem migrate causal-witnesses --restore-edge <src>:<tgt> [--apply]
+                                       Restore a retired causal edge from the archive (fail-closed)
+  clawmem causal-audit [--limit N] [--run <run_key>] [--json]
+                                       Inspect causal writer runs/events (shadow calibration)
 
 ${c.bold}Options:${c.reset}
   -n, --num <N>        Number of results
@@ -3519,6 +4572,8 @@ ${c.bold}Options:${c.reset}
   --json               JSON output
   --min-score <N>      Minimum score threshold
   -f, --force          Force re-embed/reindex all
+  --force-geometry     Override a failing embed geometry-canary preflight
+  --recalibrate-canary Replace the stored canary baseline (first-healthy otherwise)
   --pull               Run update commands before indexing
 `);
 }

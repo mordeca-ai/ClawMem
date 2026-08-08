@@ -7,8 +7,9 @@
  */
 
 import type { Store, SearchResult } from "../store.ts";
-import { DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL, extractSnippet, resolveStore } from "../store.ts";
-import { getVaultPath, getActiveProfile } from "../config.ts";
+import { DEFAULT_EMBED_MODEL, DEFAULT_QUERY_MODEL, DEFAULT_RERANK_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, resolveStore } from "../store.ts";
+import { searchVecBounded } from "../vector-daemon.ts";
+import { getVaultPath, getActiveProfile, surfaceSecondaryVaults } from "../config.ts";
 import type { HookInput, HookOutput } from "../hooks.ts";
 import {
   makeContextOutput,
@@ -28,7 +29,7 @@ import {
 } from "../memory.ts";
 import { enrichResults } from "../search-utils.ts";
 import { sanitizeSnippet } from "../promptguard.ts";
-import { shouldSkipRetrieval, isRetrievedNoise } from "../retrieval-gate.ts";
+import { shouldSkipRetrieval, hasForceRetrieveIntent, isRetrievedNoise } from "../retrieval-gate.ts";
 import { MAX_QUERY_LENGTH } from "../limits.ts";
 import { writeRecallEvents, hashQuery } from "../recall-buffer.ts";
 import { resolveSessionTopic, applyTopicBoost } from "../session-focus.ts";
@@ -117,7 +118,11 @@ export async function contextSurfacing(
     } catch { /* non-fatal */ }
   }
 
-  if (!prompt || prompt.length < MIN_PROMPT_LENGTH) {
+  // §51.5: FORCE_RETRIEVE_PATTERNS carry the contract "(checked before skip)"
+  // — that includes THIS skip. A short explicit memory query ("what did I
+  // say?") must reach retrieval; only short prompts WITHOUT memory intent
+  // take the length early-return. Empty prompts still return unconditionally.
+  if (!prompt || (prompt.length < MIN_PROMPT_LENGTH && !hasForceRetrieveIntent(prompt))) {
     logEmptyTurn(store, input);
     return makeEmptyOutput("context-surfacing");
   }
@@ -148,6 +153,21 @@ export async function contextSurfacing(
   const maxResults = profile.maxResults;
   const tokenBudget = profile.tokenBudget;
   const startTime = Date.now();
+
+  // High-fix (B3): the hook's writes to the MAIN store are bounded by the
+  // busy_timeout cmdHook set for this process (1500ms for context-surfacing).
+  // But skill-vault stores are opened separately via resolveStore(), which
+  // would otherwise use the 5000ms operational default — so a contended
+  // skill-vault write (the recall mirror below) could still stall the hook up
+  // to 5s. Inherit the main store's current cap and pass it to EVERY
+  // skill-vault open so those opens/writes are bounded identically. (Reads are
+  // WAL-safe regardless; this primarily bounds the mirror write.)
+  let hookBusyTimeout = 5000;
+  try {
+    const bt = (store.db.prepare("PRAGMA busy_timeout").get() as { timeout?: number } | undefined)?.timeout;
+    if (typeof bt === "number" && bt > 0) hookBusyTimeout = bt;
+  } catch { /* keep default */ }
+  const skillStoreOpts = { busyTimeout: hookBusyTimeout };
 
   // §11.4: Resolve session-scoped focus topic. Primary signal is the
   // per-session focus file at ~/.cache/clawmem/sessions/<id>.focus
@@ -183,14 +203,31 @@ export async function contextSurfacing(
   // When vector succeeds, also supplement with FTS for keyword-exact recall
   let results: SearchResult[] = [];
   if (profile.useVector) {
+    let vectorTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const vectorPromise = store.searchVec(retrievalQuery, DEFAULT_EMBED_MODEL, maxResults);
-      const timeoutPromise = new Promise<SearchResult[]>((_, reject) =>
-        setTimeout(() => reject(new Error("vector timeout")), profile.vectorTimeout)
-      );
+      // Pass a wall-clock deadline into searchVec: the Promise.race below abandons the vector
+      // promise on timeout but cannot CANCEL it (and cannot interrupt its synchronous scan). The
+      // deadline makes searchVec self-abort before the blocking MATCH, so a slow embed cannot let
+      // an already-timed-out vector leg resume and re-block the hook after it fell back to FTS.
+      const vectorDeadline = Date.now() + profile.vectorTimeout;
+      // searchVecBounded runs Step 1 (the blocking MATCH) in the vector daemon when it is live, so the
+      // Promise.race timer below can ACTUALLY fire (this event loop stays free during the scan). When the
+      // daemon is absent it falls back to the in-process searchVec unchanged; when the daemon is
+      // busy/errors it returns [] and we drop to FTS below.
+      const vectorPromise = searchVecBounded(store, retrievalQuery, DEFAULT_EMBED_MODEL, maxResults, undefined, undefined, undefined, vectorDeadline);
+      const timeoutPromise = new Promise<SearchResult[]>((_, reject) => {
+        vectorTimer = setTimeout(() => reject(new Error("vector timeout")), profile.vectorTimeout);
+      });
       results = await Promise.race([vectorPromise, timeoutPromise]);
-    } catch {
-      // Vector search unavailable, timed out, or errored — fall back to BM25
+    } catch (e) {
+      // Vector search unavailable, timed out, or errored — fall back to BM25. A vault-wide
+      // embedding-model mismatch is a persistent config error, not a transient miss: surface it
+      // loudly once, then degrade (the hook stays fail-open).
+      warnOnceOnVectorModelMismatch(e);
+    } finally {
+      // Clear the timer when the vector promise won the race: a pending (ref'd) setTimeout keeps the
+      // Bun hook process alive for the full vectorTimeout after results are already in hand.
+      if (vectorTimer) clearTimeout(vectorTimer);
     }
   }
 
@@ -208,10 +245,16 @@ export async function contextSurfacing(
     }
   }
 
-  // Dual-query: also search skill vault if configured (secondary source)
-  if (getVaultPath("skill")) {
+  // Dual-query: also search the secondary vault when cross-vault surfacing is
+  // enabled (retrieval.surface_secondary_vaults / CLAWMEM_SURFACE_SECONDARY_VAULTS).
+  // Default OFF since v0.35.0 — automatic surfacing reads only the general vault,
+  // so a configured secondary vault stays isolated unless deliberately opted in.
+  // Every downstream secondary-vault path (snooze routing, enrichment, the recall
+  // mirror) keys off the `_fromVault` tag set here, so this single gate starves
+  // them all when disabled.
+  if (surfaceSecondaryVaults() && getVaultPath("skill")) {
     try {
-      const skillStore = resolveStore("skill");
+      const skillStore = resolveStore("skill", skillStoreOpts);
       const skillResults = skillStore.searchFTS(retrievalQuery, 5);
       // Tag skill vault results for identification in output
       for (const r of skillResults) {
@@ -269,7 +312,21 @@ export async function contextSurfacing(
             if (eq.type === 'lex') {
               hits = store.searchFTS(eq.query, 5);
             } else if (profile.useVector) {
-              try { hits = await store.searchVec(eq.query, DEFAULT_EMBED_MODEL, 5); } catch { /* vector leg non-fatal */ }
+              // Bound BOTH the async embed wait (Promise.race on the remaining 6s budget) AND the
+              // late synchronous MATCH (the deadline arg makes the abandoned promise self-abort
+              // before the scan) — mirroring the balanced leg above. The loop guard only breaks
+              // BETWEEN iterations, so without the race a slow embed here can still blow the budget.
+              const remainingMs = startTime + 6000 - Date.now();
+              if (remainingMs <= 0) break;
+              let deepTimer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                const deepVec = searchVecBounded(store, eq.query, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, startTime + 6000);
+                const deepTimeout = new Promise<SearchResult[]>((_, reject) => {
+                  deepTimer = setTimeout(() => reject(new Error("vector timeout")), remainingMs);
+                });
+                hits = await Promise.race([deepVec, deepTimeout]);
+              } catch (e) { warnOnceOnVectorModelMismatch(e); /* vector leg non-fatal (timed out or errored) */ }
+              finally { if (deepTimer) clearTimeout(deepTimer); }  // don't let a pending timer keep the hook process alive
             }
             for (const r of hits) {
               if (!seen.has(r.filepath)) {
@@ -322,7 +379,7 @@ export async function contextSurfacing(
     // expects the collection-relative path, not the full virtual path
     const parsed = r.filepath.startsWith('clawmem://') ? r.filepath.replace(/^clawmem:\/\/[^/]+\/?/, '') : r.filepath;
     // Use the correct store for skill-vault results
-    const targetStore = (r as any)._fromVault === "skill" ? (() => { try { return resolveStore("skill"); } catch { return store; } })() : store;
+    const targetStore = (r as any)._fromVault === "skill" ? (() => { try { return resolveStore("skill", skillStoreOpts); } catch { return store; } })() : store;
     const doc = targetStore.findActiveDocument(r.collectionName, parsed);
     if (!doc) return true;
     if (doc.snoozed_until && new Date(doc.snoozed_until) > now) return false;
@@ -350,7 +407,7 @@ export async function contextSurfacing(
   let enriched = enrichResults(store, generalResults, prompt);
   if (skillResults.length > 0) {
     try {
-      const skillStore = resolveStore("skill");
+      const skillStore = resolveStore("skill", skillStoreOpts);
       enriched = [...enriched, ...enrichResults(skillStore, skillResults, prompt)];
     } catch {
       // Skill store unavailable — enrich with general store as fallback
@@ -476,7 +533,7 @@ export async function contextSurfacing(
           writeRecallEvents(store, input.sessionId, qHash, mappedDocs, validUsageId, turnIndex);
         } else {
           try {
-            const vaultStore = resolveStore(vault);
+            const vaultStore = resolveStore(vault, skillStoreOpts);
             // Mirror context_usage row into named vault for correct FK + attribution
             const vaultPaths = docs.map(r => r.displayPath);
             const vaultUsageId = vaultStore.insertUsage({

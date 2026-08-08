@@ -22,9 +22,33 @@ import { updateDirectoryContext } from "../directory-context.ts";
 import { loadConfig } from "../collections.ts";
 import { getDefaultLlamaCpp } from "../llm.ts";
 import type { ObservationWithDoc } from "../amem.ts";
-import { extractJsonFromLLM } from "../amem.ts";
-import { DEFAULT_EMBED_MODEL, extractSnippet, type SearchResult } from "../store.ts";
+import {
+  resolveCausalWriterMode,
+  resolveStopBudgetMs,
+  runCausalStep,
+  pruneCausalRuns,
+  PERSIST_RESERVE_MS,
+  CAUSAL_MIN_BUDGET_MS,
+} from "../causal-writer.ts";
+import {
+  resolveJudge,
+  buildContradictionPrompt,
+  extractJudgeJson,
+  JUDGE_VERDICT_SCHEMA,
+  JUDGE_PROMPT_VERSION,
+} from "../judge.ts";
+import {
+  insertJudgeRun,
+  insertJudgeEvent,
+  insertJudgeRunBestEffort,
+  pruneJudgeRuns,
+  type JudgeEventInput,
+  type JudgeLane,
+  type JudgeReasonCode,
+} from "../judge-audit.ts";
+import { DEFAULT_EMBED_MODEL, warnOnceOnVectorModelMismatch, extractSnippet, parseVirtualPath, type SearchResult } from "../store.ts";
 import { ensureEntityCanonical, resolveEntityTypeExact } from "../entity.ts";
+import { isSchemaPlaceholder, CONTRADICTION_RESIDUE } from "../schema-placeholder.ts";
 
 // Observation types that are allowed to contribute SPO triples. Widened from the
 // original {decision, preference, milestone, problem} gate, which rejected 77% of
@@ -72,6 +96,11 @@ export async function checkMergePolicy(
   contentType: string,
   body: string,
   collection: string,
+  /** s342 D2: absolute deadline (already net of the persistence reserve) that
+   *  bounds the dedup embedding. Past it, dedup degrades to a plain insert —
+   *  saveMemory's hash dedup still applies — rather than starting a model call
+   *  outside the Stop budget. */
+  deadlineMs?: number,
 ): Promise<{ action: 'insert' | 'skip' | 'merge'; existingId?: number }> {
   const policy = getMergePolicy(contentType);
 
@@ -82,9 +111,12 @@ export async function checkMergePolicy(
   if (recentDocs.length === 0) return { action: 'insert' };
 
   if (policy === 'dedup_check') {
+    if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+      return { action: 'insert' };
+    }
     // Vector similarity check against recent entries
     try {
-      const results = await store.searchVec(body.slice(0, 500), DEFAULT_EMBED_MODEL, 3);
+      const results = await store.searchVec(body.slice(0, 500), DEFAULT_EMBED_MODEL, 3, undefined, undefined, undefined, deadlineMs);
       const sameType = results.filter(r =>
         r.collectionName === collection &&
         r.score >= DEDUP_SIMILARITY_THRESHOLD
@@ -92,7 +124,8 @@ export async function checkMergePolicy(
       if (sameType.length > 0) {
         return { action: 'skip' };
       }
-    } catch {
+    } catch (e) {
+      warnOnceOnVectorModelMismatch(e);
       // Vector search unavailable — fall through to insert
     }
     return { action: 'insert' };
@@ -190,28 +223,684 @@ export function extractAntipatterns(
 // Contradiction Detection
 // =============================================================================
 
+export type ContradictionEntryVerdict =
+  | "ok"
+  | "invalid-relation"
+  | "invalid-reasoning"
+  | "placeholder-reasoning"
+  | "invalid-confidence"
+  | "index-out-of-range";
+
+/**
+ * Runtime semantic validation for ONE classifier entry, ahead of any mutation.
+ *
+ * Extracted as a pure function so it is testable without an LLM: the hook resolves its own
+ * model internally, so an end-to-end test would assert whatever the deployed model happens
+ * to return that day. It is also why the `reasoning: "..."` bypass stayed invisible — the
+ * only tests exercised `isSchemaPlaceholder` directly, never the real decision boundary.
+ *
+ * The parse gate upstream only proves the ROOT of the response is an array. Entries were
+ * never checked at all, so the deployed model's echoed skeleton reached the mutation path.
+ */
+export function validateContradictionEntry(
+  entry: unknown,
+  candidateCount: number,
+  newFactCount: number,
+): ContradictionEntryVerdict {
+  const rel = (entry ?? {}) as Record<string, unknown>;
+  // Relation must be an exact enum member. The prompt's `"update|contradiction|same"`
+  // skeleton is echoed as this VALUE by the deployed model and is rejected here.
+  if (typeof rel.relation !== "string" || !VALID_RELATIONS.has(rel.relation)) {
+    return "invalid-relation";
+  }
+
+  // Strict typing, NOT coercion. `String(rel.reasoning ?? "")` turned 123, {}, true and
+  // ["real"] into plausible strings that cleared the residue check and proceeded toward
+  // mutation — a fail-open on every JSON-valid non-string value.
+  if (typeof rel.reasoning !== "string") return "invalid-reasoning";
+
+  // Reasoning must not be the prompt's own `"..."` skeleton, nor quote/punctuation residue.
+  if (isSchemaPlaceholder(rel.reasoning, CONTRADICTION_RESIDUE)) {
+    return "placeholder-reasoning";
+  }
+
+  if (
+    typeof rel.confidence !== "number" ||
+    !Number.isFinite(rel.confidence) ||
+    rel.confidence < 0 ||
+    rel.confidence > 1
+  ) {
+    return "invalid-confidence";
+  }
+
+  // Both indices must address real entries. `old_idx` is incidentally bounded by the
+  // candidate lookup, but `new_idx` feeds only a log line today — and once the filepath
+  // contract is repaired an out-of-range `new_idx` would mutate the old document while
+  // reporting `undefined`. Bound both before any mutation can occur.
+  const inRange = (value: unknown, bound: number): boolean =>
+    typeof value === "number" && Number.isInteger(value) && value >= 0 && value < bound;
+
+  if (!inRange(rel.old_idx, candidateCount) || !inRange(rel.new_idx, newFactCount)) {
+    return "index-out-of-range";
+  }
+
+  return "ok";
+}
+
+const VALID_RELATIONS = new Set(["same", "update", "contradiction"]);
+
+export type ContradictionBatch = {
+  /** Entries cleared for mutation, at most one per (old, new) pair, in first-seen order. */
+  accepted: any[];
+  /** Entries that failed per-entry validation. */
+  rejected: number;
+  /** Repeats identical across mutation-relevant fields, collapsed. */
+  duplicates: number;
+  /** Pairs dropped whole because the classifier gave more than one answer for them. */
+  inconsistent: number;
+  /**
+   * v0.29.0: the rejected entries WITH their verdicts, observationally — admission
+   * semantics are unchanged (`rejected === rejectedEntries.length`). Feeds the
+   * durable audit's per-reject events; without it a reject was a bare count.
+   */
+  rejectedEntries: { entry: unknown; reason: Exclude<ContradictionEntryVerdict, "ok"> }[];
+  /** One sample entry per collapsed-duplicate pair, with the repeat count (observational). */
+  duplicateEntries: { entry: unknown; repeats: number }[];
+  /** One sample entry per inconsistently-answered pair, with the distinct-answer count (observational). */
+  inconsistentEntries: { entry: unknown; answers: number }[];
+};
+
+/**
+ * Array-level admission for one classifier response, ahead of ANY mutation.
+ *
+ * `validateContradictionEntry` proves each object is well-formed and says nothing about the
+ * SET. Two entries for the same (old, new) pair each decrement that document's confidence, so
+ * a repeat compounds the penalty and can cross the invalidation floor a single classification
+ * never reaches — and a model that echoes its prompt, which is this model's established
+ * failure mode, emits repeats readily.
+ *
+ * A pair the classifier answered more than one way is dropped ENTIRELY rather than first-wins.
+ * First-wins made the outcome depend on array order: `[0.69, 0.99]` kept the sub-threshold
+ * entry and mutated nothing, while `[0.99, 0.69]` mutated — for the same classification. That
+ * is also why differing confidence or reasoning counts as inconsistent, not as a duplicate:
+ * only a repeat identical across the mutation-relevant fields is safely collapsible. Entries
+ * differing solely in fields that cannot reach the mutation path ARE collapsed — they are the
+ * same classification, so this is deliberately not object identity.
+ *
+ * Exported and pure so the batch contract is testable without an LLM — `detectContradictions`
+ * resolves its own model, so an end-to-end test would assert whatever the deployed model
+ * returned that day.
+ *
+ * NOT decided here: whether several DISTINCT new facts may penalize one old document
+ * repeatedly. That is the unresolved document-identity question.
+ */
+export function admitContradictionEntries(
+  parsed: any[],
+  candidateCount: number,
+  newFactCount: number,
+): ContradictionBatch {
+  // Group EVERY signature per pair before deriving any count. Comparing each later entry
+  // against only the first made the telemetry depend on array order — `[0.9, 0.9, 0.8]`
+  // reported one duplicate while `[0.8, 0.9, 0.9]` reported none, for the same multiset.
+  const groups = new Map<string, { first: any; signatures: string[] }>();
+  let rejected = 0;
+  const rejectedEntries: { entry: unknown; reason: Exclude<ContradictionEntryVerdict, "ok"> }[] = [];
+
+  for (const rel of parsed) {
+    const verdict = validateContradictionEntry(rel, candidateCount, newFactCount);
+    if (verdict !== "ok") {
+      rejected++;
+      rejectedEntries.push({ entry: rel, reason: verdict });
+      continue;
+    }
+
+    const pairKey = `${rel.old_idx}:${rel.new_idx}`;
+    // Every field that drives a mutation participates in identity — relation selects the
+    // branch, confidence gates it, reasoning is the evidence. Fields outside this set cannot
+    // reach the mutation path, so entries differing only in those are genuinely the same
+    // classification.
+    const signature = JSON.stringify([rel.relation, rel.confidence, rel.reasoning]);
+
+    const group = groups.get(pairKey);
+    if (group) group.signatures.push(signature);
+    else groups.set(pairKey, { first: rel, signatures: [signature] });
+  }
+
+  const accepted: any[] = [];
+  let duplicates = 0;
+  let inconsistent = 0;
+  const duplicateEntries: { entry: unknown; repeats: number }[] = [];
+  const inconsistentEntries: { entry: unknown; answers: number }[] = [];
+
+  for (const { first, signatures } of groups.values()) {
+    const distinct = new Set(signatures);
+    if (distinct.size > 1) {
+      inconsistent++;               // the classifier answered this pair more than one way
+      inconsistentEntries.push({ entry: first, answers: distinct.size });
+    } else {
+      accepted.push(first);         // insertion order — deterministic for a given input
+      duplicates += signatures.length - 1;
+      if (signatures.length > 1) duplicateEntries.push({ entry: first, repeats: signatures.length });
+    }
+  }
+
+  return { accepted, rejected, duplicates, inconsistent, rejectedEntries, duplicateEntries, inconsistentEntries };
+}
+
+/**
+ * The deployed model wraps its array in an object (`{"result": [...]}`) rather than returning a
+ * bare array. `parseLinkGenerationFromLLM` in amem.ts has unwrapped that shape since it was
+ * written; this path never did, so the gate rejected structurally-valid responses as unparseable.
+ *
+ * Anything that is neither shape is returned UNCHANGED, so the caller's existing
+ * `!Array.isArray(parsed)` reporting branch still catches genuinely malformed responses.
+ */
+export function unwrapContradictionArray(raw: unknown): unknown {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object") {
+    const inner = (raw as { result?: unknown }).result;
+    if (Array.isArray(inner)) return inner;
+  }
+  return raw;
+}
+
+/**
+ * The only `content_type` the armed invalidation writer can touch.
+ *
+ * Candidate selection matches on PATHNAME (`decisions/`, `observations/`), which is a much wider
+ * population than this — roughly 3x on the vault this was developed against.
+ * Reporting an invalidation intent the armed writer could never honour would point shadow-mode
+ * calibration at the wrong population — roughly two thirds of what it flagged would have been
+ * un-invalidatable — so eligibility is asked ONCE, here, and both the shadow log and the armed
+ * write are gated on the same answer.
+ */
+export const INVALIDATION_ELIGIBLE_CONTENT_TYPE = "observation";
+
+export type ContradictionOutcomes = {
+  contradictions: number;
+  /** Virtual path failed to PARSE — a URI-contract regression. */
+  unparseableTarget: number;
+  /** Parsed fine, but no active row — benign (archived/deleted between search and apply). */
+  missingTarget: number;
+  /** Hit the confidence floor but cannot be invalidated: wrong content_type, or already invalidated. */
+  floorIneligible: number;
+  /** Eligible and at floor, but the writer is unarmed. */
+  shadowInvalidations: number;
+  invalidated: number;
+  /** Armed write matched zero rows — lost a race after the eligibility check. */
+  invalidationNoOp: number;
+  invalidationErrors: number;
+};
+
+/**
+ * v0.29.0: the eligibility answer split into its real causes — the boolean form
+ * conflated wrong-content-type with already-invalidated (`invalidated_at IS NULL`
+ * in the predicate), which made the audit unable to say WHICH kind of ineligible
+ * a floor-reaching document was. `floorIneligible` still counts all of them;
+ * only the audit event distinguishes.
+ */
+type InvalidationEligibility = "eligible" | "ineligible-type" | "already-invalidated" | "row-missing";
+
+function invalidationEligibility(store: Store, docId: number): InvalidationEligibility {
+  const row = store.db
+    .prepare(`SELECT content_type, invalidated_at FROM documents WHERE id = ?`)
+    .get(docId) as { content_type: string | null; invalidated_at: string | null } | undefined;
+  if (!row) return "row-missing";
+  if (row.invalidated_at != null) return "already-invalidated";
+  return row.content_type === INVALIDATION_ELIGIBLE_CONTENT_TYPE ? "eligible" : "ineligible-type";
+}
+
+/**
+ * Applies validated classifier verdicts to the vault. Split out of `detectContradictions` as the
+ * mutation boundary: everything above it is inference and validation, everything here is a write.
+ * Exported so the write path can be driven directly by tests without an LLM — the branches below
+ * had no coverage precisely because they were only reachable through a live model call.
+ */
+export function applyContradictionOutcomes(
+  store: Store,
+  accepted: any[],
+  candidates: SearchResult[],
+  newFacts: string[],
+  /** Source document of each entry in `newFacts`, positionally aligned. Null = unattributable. */
+  newFactDocIds: ReadonlyArray<number | null>,
+  /**
+   * v0.29.0 audit sink. When present (production: inside the run's transaction),
+   * every applied/blocked/errored outcome emits a durable event. Absent in
+   * seam-level tests that assert mutation behavior only.
+   */
+  emit?: (ev: Omit<JudgeEventInput, "runId">) => void,
+): ContradictionOutcomes {
+  const out: ContradictionOutcomes = {
+    contradictions: 0,
+    unparseableTarget: 0,
+    missingTarget: 0,
+    floorIneligible: 0,
+    shadowInvalidations: 0,
+    invalidated: 0,
+    invalidationNoOp: 0,
+    invalidationErrors: 0,
+  };
+
+  for (const rel of accepted) {
+    if (rel.confidence < 0.7) {
+      // Below the mutation threshold: the verdict is recorded (calibration wants to
+      // see near-misses) but nothing is written.
+      emit?.({
+        eventType: "verdict",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasoningHead: rel.reasoning,
+        action: "classified_only",
+      });
+      continue;
+    }
+    const oldDoc = candidates[rel.old_idx];
+    if (!oldDoc) continue;
+
+    // `SearchResult.filepath` is a VIRTUAL path — `clawmem://<collection>/<path>`, built in
+    // store.ts by `'clawmem://' || d.collection || '/' || d.path`. `findActiveDocument` matches
+    // the bare `documents.path` column. Passing the URI straight through could never match any
+    // row, so every contradiction that survived the parse gate and validation died here,
+    // silently. Parse it back to the bare path first — and keep the two failure modes apart:
+    // a parse failure means the URI contract itself broke, a missing row is an ordinary race.
+    const virtual = parseVirtualPath(oldDoc.filepath);
+    if (!virtual) {
+      out.unparseableTarget++;
+      emit?.({
+        eventType: "reject",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasonCode: "target_unparseable",
+        evidenceHead: oldDoc.filepath,
+      });
+      continue;
+    }
+    const existingDoc = store.findActiveDocument(virtual.collectionName, virtual.path);
+    if (!existingDoc) {
+      out.missingTarget++;
+      emit?.({
+        eventType: "reject",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasonCode: "target_missing",
+        evidenceHead: oldDoc.filepath,
+      });
+      continue;
+    }
+
+    if (rel.relation === "contradiction") {
+      // Lower old doc confidence by 0.25 (floor 0.2)
+      const currentConfidence = existingDoc.confidence ?? 0.5;
+      const newConfidence = Math.max(0.2, currentConfidence - 0.25);
+      store.updateDocumentMeta(existingDoc.id, {
+        confidence: newConfidence,
+      });
+      out.contradictions++;
+      emit?.({
+        eventType: "verdict",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        newRef: newFactDocIds[rel.new_idx] != null ? `doc:${newFactDocIds[rel.new_idx]}` : null,
+        oldRef: `doc:${existingDoc.id}`,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasoningHead: rel.reasoning,
+        action: "eroded",
+        scoreBefore: currentConfidence,
+        scoreAfter: newConfidence,
+      });
+      console.error(
+        `[decision-extractor] CONTRADICTION: "${newFacts[rel.new_idx]}" vs "${oldDoc.displayPath}" (conf: ${rel.confidence})`
+      );
+
+      // Soft invalidation: if confidence drops to floor AND the row is invalidation-eligible,
+      // mark as invalidated (Pattern I — prevents stale contradicted knowledge from surfacing)
+      //
+      // SHADOWED BY DEFAULT. Repairing the virtual-path contract above made this reachable for
+      // the first time; no shipped version could apply a classification here. Unlike the
+      // confidence adjustment — bounded, floored, reversible — invalidation hard-gates FTS *and*
+      // vector retrieval, so a false positive makes a real document invisible with no signal.
+      // The classifier feeding it is a model with a demonstrated habit of echoing its prompt,
+      // and hits-to-floor depends entirely on where the document's confidence started.
+      //
+      // Shadow mode logs exactly what the armed writer would remove — no more and no less — so
+      // precision can be adjudicated against real traffic first. Set
+      // CLAWMEM_CONTRADICTION_INVALIDATE=true to arm it.
+      if (newConfidence <= 0.2) {
+        const eligibility = invalidationEligibility(store, existingDoc.id);
+        if (eligibility !== "eligible") {
+          out.floorIneligible++;
+          emit?.({
+            eventType: "verdict",
+            newIdx: rel.new_idx,
+            oldIdx: rel.old_idx,
+            oldRef: `doc:${existingDoc.id}`,
+            relation: rel.relation,
+            confidence: rel.confidence,
+            action: "floor_reached",
+            reasonCode:
+              eligibility === "already-invalidated" ? "already_invalidated"
+              : eligibility === "row-missing" ? "target_missing"
+              : "ineligible_type",
+            scoreBefore: currentConfidence,
+            scoreAfter: newConfidence,
+          });
+          continue;
+        }
+        if (process.env.CLAWMEM_CONTRADICTION_INVALIDATE !== "true") {
+          out.shadowInvalidations++;
+          emit?.({
+            eventType: "verdict",
+            newIdx: rel.new_idx,
+            oldIdx: rel.old_idx,
+            oldRef: `doc:${existingDoc.id}`,
+            relation: rel.relation,
+            confidence: rel.confidence,
+            action: "would_invalidate",
+            scoreBefore: currentConfidence,
+            scoreAfter: newConfidence,
+          });
+          console.warn(
+            `[decision-extractor] contradiction: WOULD invalidate "${oldDoc.displayPath}" ` +
+            `(confidence ${currentConfidence} -> ${newConfidence}) — shadow mode, nothing ` +
+            `written. Set CLAWMEM_CONTRADICTION_INVALIDATE=true to arm.`,
+          );
+          continue;
+        }
+        try {
+          // The content_type predicate is redundant against invalidationEligibility above and
+          // kept deliberately: it makes a lost race a zero-row no-op rather than a wrong write.
+          const res = store.db.prepare(`
+            UPDATE documents
+            SET invalidated_at = datetime('now'),
+                invalidated_by = ?
+            WHERE id = ? AND invalidated_at IS NULL AND content_type = ?
+          `).run(newFactDocIds[rel.new_idx] ?? null, existingDoc.id, INVALIDATION_ELIGIBLE_CONTENT_TYPE);
+
+          // A swallowed result is how the original defect stayed invisible for four months.
+          if (res.changes === 0) out.invalidationNoOp++;
+          else out.invalidated++;
+          emit?.({
+            eventType: "verdict",
+            newIdx: rel.new_idx,
+            oldIdx: rel.old_idx,
+            oldRef: `doc:${existingDoc.id}`,
+            relation: rel.relation,
+            confidence: rel.confidence,
+            action: res.changes === 0 ? "write_noop" : "invalidated",
+            scoreBefore: currentConfidence,
+            scoreAfter: newConfidence,
+          });
+        } catch (e) {
+          out.invalidationErrors++;
+          emit?.({
+            eventType: "error",
+            newIdx: rel.new_idx,
+            oldIdx: rel.old_idx,
+            oldRef: `doc:${existingDoc.id}`,
+            relation: rel.relation,
+            confidence: rel.confidence,
+            reasonCode: "write_error",
+            evidenceHead: e instanceof Error ? e.message : String(e),
+          });
+          console.warn(
+            `[decision-extractor] contradiction: invalidation FAILED for ` +
+            `"${oldDoc.displayPath}": ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+
+    } else if (rel.relation === "update") {
+      // Lower old doc confidence by 0.15 (floor 0.3)
+      const currentConfidence = existingDoc.confidence ?? 0.5;
+      const newConfidence = Math.max(0.3, currentConfidence - 0.15);
+      store.updateDocumentMeta(existingDoc.id, {
+        confidence: newConfidence,
+      });
+      emit?.({
+        eventType: "verdict",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        newRef: newFactDocIds[rel.new_idx] != null ? `doc:${newFactDocIds[rel.new_idx]}` : null,
+        oldRef: `doc:${existingDoc.id}`,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasoningHead: rel.reasoning,
+        action: "eroded",
+        scoreBefore: currentConfidence,
+        scoreAfter: newConfidence,
+      });
+    } else if (rel.relation === "same") {
+      // No mutation for `same` — but the classification is still a calibration fact.
+      emit?.({
+        eventType: "verdict",
+        newIdx: rel.new_idx,
+        oldIdx: rel.old_idx,
+        oldRef: `doc:${existingDoc.id}`,
+        relation: rel.relation,
+        confidence: rel.confidence,
+        reasoningHead: rel.reasoning,
+        action: "classified_only",
+      });
+    }
+  }
+
+  return out;
+}
+
+export type ContradictionResponseResult = {
+  /** Root was neither a bare array nor `{result: [...]}` — nothing was applied. */
+  parseFailed: boolean;
+  /** Shape of the post-unwrap value, for the operator-facing rejection diagnostic. */
+  parsedCategory: string;
+  outcomes: ContradictionOutcomes;
+  rejected: number;
+  duplicates: number;
+  inconsistent: number;
+};
+
+const EMPTY_OUTCOMES = (): ContradictionOutcomes => ({
+  contradictions: 0, unparseableTarget: 0, missingTarget: 0, floorIneligible: 0,
+  shadowInvalidations: 0, invalidated: 0, invalidationNoOp: 0, invalidationErrors: 0,
+});
+
+/**
+ * unwrap -> admit -> apply, as one unit, called by production.
+ *
+ * The three steps were previously wired together only inside `detectContradictions`, which meant
+ * the envelope repair could be unwired at the call site without a single test noticing. This is
+ * the seam a regression test drives; `detectContradictions` adds only the LLM call and the
+ * operator-facing reporting around it.
+ */
+/** Judge identity + response identity for the durable audit (§J7). */
+export type ContradictionAuditContext = {
+  sessionId: string | null;
+  lane: JudgeLane;
+  model: string | null;
+  endpoint: string | null;
+  promptVersion: string;
+  responseSha256: string;
+};
+
+/** Admission verdicts → audit reason codes — mirrors, never invents (§J7). */
+const REJECT_REASON_CODE: Record<Exclude<ContradictionEntryVerdict, "ok">, JudgeReasonCode> = {
+  "invalid-relation": "invalid_relation",
+  "invalid-reasoning": "invalid_reasoning",
+  "placeholder-reasoning": "placeholder_reasoning",
+  "invalid-confidence": "invalid_confidence",
+  "index-out-of-range": "index_oob",
+};
+
+export function applyContradictionResponse(
+  store: Store,
+  rawJson: unknown,
+  candidates: SearchResult[],
+  newFacts: string[],
+  newFactDocIds: ReadonlyArray<number | null>,
+  /**
+   * v0.29.0: when present (production), the run row, per-verdict/per-reject events,
+   * and every mutation commit in ONE transaction — an audit-insert failure rolls the
+   * mutations back (fail-closed: an unauditable erosion is this feature's original
+   * defect). A thrown transaction propagates to the caller, which records the
+   * post-rollback `write_error` run. Seam-level tests may omit it.
+   */
+  audit?: ContradictionAuditContext,
+): ContradictionResponseResult {
+  const parsed = unwrapContradictionArray(rawJson);
+  const parsedCategory = parsed === null ? "unparseable" : Array.isArray(parsed) ? "array" : typeof parsed;
+  if (!Array.isArray(parsed)) {
+    return {
+      parseFailed: true, parsedCategory,
+      outcomes: EMPTY_OUTCOMES(), rejected: 0, duplicates: 0, inconsistent: 0,
+    };
+  }
+  const { accepted, rejected, duplicates, inconsistent, rejectedEntries, duplicateEntries, inconsistentEntries } =
+    admitContradictionEntries(parsed, candidates.length, newFacts.length);
+
+  const applyAll = (): ContradictionOutcomes => {
+    let emit: ((ev: Omit<JudgeEventInput, "runId">) => void) | undefined;
+    if (audit) {
+      const runId = insertJudgeRun(store.db, {
+        sessionId: audit.sessionId,
+        consumer: "decision-extractor",
+        lane: audit.lane,
+        model: audit.model,
+        endpoint: audit.endpoint,
+        promptVersion: audit.promptVersion,
+        responseSha256: audit.responseSha256,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        outcome: "ok",
+        entriesAdmitted: accepted.length,
+        entriesRejected: rejected,
+        entriesDuplicate: duplicates,
+        entriesInconsistent: inconsistent,
+      });
+      emit = ev => { insertJudgeEvent(store.db, { runId, ...ev }); };
+      for (const { entry, reason } of rejectedEntries) {
+        emit({
+          eventType: "reject",
+          reasonCode: REJECT_REASON_CODE[reason],
+          evidenceHead: JSON.stringify(entry),
+        });
+      }
+      // Collapsed duplicates and inconsistently-answered pairs are audit facts too —
+      // counts alone could not say WHICH pair was collapsed or dropped (t1 finding 7).
+      for (const { entry, repeats } of duplicateEntries) {
+        emit({ eventType: "reject", reasonCode: "duplicate", evidenceHead: JSON.stringify({ repeats, entry }) });
+      }
+      for (const { entry, answers } of inconsistentEntries) {
+        emit({ eventType: "reject", reasonCode: "inconsistent", evidenceHead: JSON.stringify({ answers, entry }) });
+      }
+    }
+    return applyContradictionOutcomes(store, accepted, candidates, newFacts, newFactDocIds, emit);
+  };
+
+  const outcomes = audit ? store.db.transaction(applyAll)() : applyAll();
+  return { parseFailed: false, parsedCategory, outcomes, rejected, duplicates, inconsistent };
+}
+
 async function detectContradictions(
   store: Store,
   newObservations: Observation[],
-  sessionId: string
+  sessionId: string,
+  docIdByObservation?: ReadonlyMap<Observation, number>,
+  /** s342 D2: the Stop handler's whole-handler deadline. When present, the
+   *  judge call is skipped below the remaining-budget floor (audited as
+   *  `skipped_budget`) and an in-flight call is bounded by the remainder. */
+  deadlineAt?: number,
 ): Promise<number> {
   const decisions = newObservations.filter(o => o.type === "decision");
   if (decisions.length === 0) return 0;
 
   let contradictionCount = 0;
-  const llm = await getDefaultLlamaCpp();
-  if (!llm) return 0;
 
-  // Batch all new decision facts
-  const newFacts = decisions.flatMap(d => d.facts);
+  // Batch all new decision facts, carrying each fact's source document alongside it so
+  // `invalidated_by` names the document that actually contradicted, not whichever row a
+  // heuristic lookup happened to land on. Null where the observation failed to persist —
+  // an unattributable contradiction is recorded as such rather than mis-attributed.
+  const newFacts: string[] = [];
+  const newFactDocIds: (number | null)[] = [];
+  for (const d of decisions) {
+    const docId = docIdByObservation?.get(d) ?? null;
+    for (const f of d.facts) {
+      newFacts.push(f);
+      newFactDocIds.push(docId);
+    }
+  }
   if (newFacts.length === 0) return 0;
 
-  // Vector search for existing decisions on overlapping topics
+  // §J1 (v0.29.0): contradiction analysis runs ONLY on a configured judge. The stock
+  // expansion model cannot meet the judge contract (probe-verified: non-array output,
+  // placeholder echo, fabricated relations), and dormancy could not be inferred across
+  // the prompt reshape — so unconfigured means DISABLED: an audited no-op with one loud
+  // line, never a silent attempt on the default model.
+  const resolution = resolveJudge();
+  if (resolution.status !== "ready") {
+    insertJudgeRunBestEffort(store.db, {
+      sessionId,
+      consumer: "decision-extractor",
+      lane: "none",
+      promptVersion: JUDGE_PROMPT_VERSION,
+      newFactCount: newFacts.length,
+      outcome: resolution.status === "unconfigured" ? "no_judge_configured" : "config",
+    });
+    if (resolution.status === "invalid") {
+      console.error(
+        `[decision-extractor] contradiction judge misconfigured: ${resolution.error} — ` +
+        `no contradiction was evaluated.`,
+      );
+    } else {
+      console.error(
+        `[decision-extractor] contradiction analysis disabled: no judge configured. ` +
+        `The stock expansion model cannot meet the judge contract; set CLAWMEM_JUDGE_* ` +
+        `(docs/guides/inference-services.md) to enable. No contradiction was evaluated.`,
+      );
+    }
+    return 0;
+  }
+  const judge = resolution.judge;
+
+  // s342 D2: the floor gates the WHOLE contradiction phase — including the
+  // candidate-retrieval embedding below, which is itself a model call — so a
+  // near-exhausted budget never starts ANY of it.
+  if (deadlineAt !== undefined) {
+    const remaining = deadlineAt - Date.now() - PERSIST_RESERVE_MS;
+    if (remaining < CAUSAL_MIN_BUDGET_MS) {
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: judge.descriptor.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: JUDGE_PROMPT_VERSION,
+        newFactCount: newFacts.length,
+        outcome: "skipped_budget",
+      });
+      console.warn(
+        `[decision-extractor] contradiction phase skipped: ${remaining}ms of the ` +
+        `Stop budget remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor — ` +
+        `no contradiction was evaluated.`,
+      );
+      return 0;
+    }
+  }
+
+  // Vector search for existing decisions on overlapping topics — the embedding
+  // is bounded by the whole-handler deadline minus the persistence reserve.
+  const searchDeadline = deadlineAt !== undefined ? deadlineAt - PERSIST_RESERVE_MS : undefined;
   const queryText = newFacts.join(". ");
   let existingDocs: SearchResult[];
   try {
-    existingDocs = await store.searchVec(queryText, DEFAULT_EMBED_MODEL, 5);
-  } catch {
+    existingDocs = await store.searchVec(queryText, DEFAULT_EMBED_MODEL, 5, undefined, undefined, undefined, searchDeadline);
+  } catch (e) {
+    warnOnceOnVectorModelMismatch(e);
     existingDocs = store.searchFTS(queryText, 5);
   }
 
@@ -224,82 +913,227 @@ async function detectContradictions(
 
   if (candidates.length === 0) return 0;
 
-  // Build classification prompt
-  const existingFacts = candidates
-    .map((c, i) => `[OLD-${i}] ${c.displayPath}\n${extractSnippet(c.body || "", queryText, 300).snippet}`)
-    .join("\n\n");
+  // §J5 (v0.29.0): reshaped prompt via the judge module — role-separated instructions,
+  // JSON-encoded data inside CSPRNG nonce fencing, a VALID example row, and the 0.7
+  // erosion threshold stated once. Snippets stay positionally aligned with `candidates`
+  // so old_idx addresses the same document; paths stay OUT of the payload (less egress,
+  // less injection surface).
+  const existingSnippets = candidates.map(c => extractSnippet(c.body || "", queryText, 300).snippet);
+  const prompt = buildContradictionPrompt({ newFacts, existingSnippets, minConfidence: 0.7 });
 
-  const prompt = `You are analyzing decisions for contradictions.
-
-NEW DECISIONS (this session):
-${newFacts.map((f, i) => `[NEW-${i}] ${f}`).join("\n")}
-
-EXISTING DECISIONS (prior sessions):
-${existingFacts}
-
-For each NEW decision, check against EXISTING decisions. Classify each relationship:
-- "same": Identical decision, no action needed
-- "update": New decision supersedes/refines old one
-- "contradiction": New decision directly conflicts with old one
-
-Return JSON array:
-[{"new_idx": 0, "old_idx": 0, "relation": "update|contradiction|same", "confidence": 0.0-1.0, "reasoning": "..."}]
-
-Only include pairs with confidence >= 0.7. Return [] if no relationships found. /no_think`;
+  // s342 D2: the judge shares the whole-handler deadline — never START a call
+  // near budget exhaustion, and bound an in-flight one by the remainder.
+  let judgeSignal: AbortSignal | undefined;
+  if (deadlineAt !== undefined) {
+    const remaining = deadlineAt - Date.now() - PERSIST_RESERVE_MS;
+    if (remaining < CAUSAL_MIN_BUDGET_MS) {
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: judge.descriptor.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: prompt.promptVersion,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        outcome: "skipped_budget",
+      });
+      console.warn(
+        `[decision-extractor] contradiction judge skipped: ${remaining}ms of the ` +
+        `Stop budget remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor — ` +
+        `no contradiction was evaluated.`,
+      );
+      return 0;
+    }
+    judgeSignal = AbortSignal.timeout(remaining);
+  }
 
   try {
-    const result = await llm.generate(prompt, { temperature: 0.3, maxTokens: 400 });
-    if (!result) return 0;
-    const parsed = extractJsonFromLLM(result.text);
-    if (!Array.isArray(parsed)) return 0;
+    const result = await judge.judge(
+      { system: prompt.system, user: prompt.user, schema: JUDGE_VERDICT_SCHEMA },
+      judgeSignal ? { signal: judgeSignal } : {},
+    );
+    if (!result.ok) {
+      // Typed judge failure — audited standalone (nothing mutated), loud, fail-closed.
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: judge.descriptor.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: prompt.promptVersion,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        outcome: result.reason,
+      });
+      console.warn(
+        `[decision-extractor] contradiction judge ${result.reason} ` +
+        `(lane=${judge.descriptor.lane} model=${judge.descriptor.model}): ${result.detail} — ` +
+        `no contradiction was evaluated.`,
+      );
+      return 0;
+    }
+    if (result.truncated) {
+      // §J5b: provider-reported truncation is a typed reject BEFORE extraction — the
+      // repaired-partial-batch class must stay dead.
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: result.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: prompt.promptVersion,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        responseSha256: hashContent(result.text),
+        outcome: "truncated",
+      });
+      console.warn(
+        `[decision-extractor] contradiction judge response TRUNCATED ` +
+        `(len=${result.text.length} model=${JSON.stringify(result.model)}) — rejected before ` +
+        `extraction; no contradiction was evaluated.`,
+      );
+      return 0;
+    }
 
-    for (const rel of parsed) {
-      if (rel.confidence < 0.7) continue;
-      const oldDoc = candidates[rel.old_idx];
-      if (!oldDoc) continue;
+    const audit: ContradictionAuditContext = {
+      sessionId,
+      lane: judge.descriptor.lane,
+      model: result.model,
+      endpoint: judge.descriptor.endpoint,
+      promptVersion: prompt.promptVersion,
+      responseSha256: hashContent(result.text),
+    };
+    let applied: ContradictionResponseResult;
+    try {
+      applied = applyContradictionResponse(
+        store, extractJudgeJson(result.text), candidates, newFacts, newFactDocIds, audit);
+    } catch (e) {
+      // §J7: the run+events+mutations transaction rolled back — nothing mutated. The
+      // in-txn run row died with the transaction; record a standalone write_error run.
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: result.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: prompt.promptVersion,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        responseSha256: audit.responseSha256,
+        outcome: "write_error",
+      });
+      console.error(
+        `[decision-extractor] contradiction apply FAILED — transaction rolled back, ` +
+        `no mutation applied: ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return 0;
+    }
 
-      const existingDoc = store.findActiveDocument(oldDoc.collectionName, oldDoc.filepath);
-      if (!existingDoc) continue;
-
-      if (rel.relation === "contradiction") {
-        // Lower old doc confidence by 0.25 (floor 0.2)
-        const currentConfidence = existingDoc.confidence ?? 0.5;
-        const newConfidence = Math.max(0.2, currentConfidence - 0.25);
-        store.updateDocumentMeta(existingDoc.id, {
-          confidence: newConfidence,
-        });
-        contradictionCount++;
-        console.error(
-          `[decision-extractor] CONTRADICTION: "${newFacts[rel.new_idx]}" vs "${oldDoc.displayPath}" (conf: ${rel.confidence})`
+    if (applied.parseFailed) {
+      // A silent `return 0` here is indistinguishable from "no contradictions found",
+      // which is how a permanently-failing parse gate stayed invisible. Say which it is.
+      //
+      // Deliberately NOT logging raw model output by default: this model echoes prompt
+      // material, and the prompt carries transcript-derived decisions. A raw head would
+      // be a content-exposure path in ordinary operation. Emit shape + identity only;
+      // raw text is opt-in via CLAWMEM_DEBUG_LLM_RAW and still truncated.
+      const category = applied.parsedCategory;
+      insertJudgeRunBestEffort(store.db, {
+        sessionId,
+        consumer: "decision-extractor",
+        lane: judge.descriptor.lane,
+        model: result.model,
+        endpoint: judge.descriptor.endpoint,
+        promptVersion: prompt.promptVersion,
+        newFactCount: newFacts.length,
+        candidateCount: candidates.length,
+        responseSha256: hashContent(result.text),
+        outcome: "parse_reject",
+      });
+      console.warn(
+        `[decision-extractor] contradiction parse gate REJECTED the model response ` +
+        `(expected JSON array, got ${category}; len=${result.text.length} ` +
+        `sha256=${hashContent(result.text).slice(0, 12)} model=${JSON.stringify(result.model)}) — ` +
+        `no contradiction was evaluated.`,
+      );
+      if (process.env.CLAWMEM_DEBUG_LLM_RAW === "true") {
+        console.warn(
+          `[decision-extractor] raw (debug): ${JSON.stringify(result.text.slice(0, 160))}`,
         );
-
-        // Soft invalidation: if confidence drops to floor AND content is observation type,
-        // mark as invalidated (Pattern I — prevents stale contradicted knowledge from surfacing)
-        if (newConfidence <= 0.2) {
-          try {
-            // Find the new contradicting observation's doc ID (if already persisted in this session)
-            const newObsDoc = store.db.prepare(`
-              SELECT id FROM documents
-              WHERE collection = '_clawmem' AND path LIKE ? AND active = 1
-              ORDER BY created_at DESC LIMIT 1
-            `).get(`%${sessionId.slice(0, 8)}%decision%`) as { id: number } | undefined;
-
-            store.db.prepare(`
-              UPDATE documents
-              SET invalidated_at = datetime('now'),
-                  invalidated_by = ?
-              WHERE id = ? AND invalidated_at IS NULL AND content_type = 'observation'
-            `).run(newObsDoc?.id || null, existingDoc.id);
-          } catch { /* non-fatal — invalidation is best-effort */ }
-        }
-
-      } else if (rel.relation === "update") {
-        // Lower old doc confidence by 0.15 (floor 0.3)
-        const currentConfidence = existingDoc.confidence ?? 0.5;
-        store.updateDocumentMeta(existingDoc.id, {
-          confidence: Math.max(0.3, currentConfidence - 0.15),
-        });
       }
+      return 0;
+    }
+
+    // Per-entry validation AND array-level admission happen inside the seam above, both ahead
+    // of any mutation. The parse gate only proves the ROOT is an array; entries were never
+    // checked at all, so the deployed model's echoed skeleton reached the mutation path.
+    const { outcomes, rejected, duplicates, inconsistent } = applied;
+    contradictionCount += outcomes.contradictions;
+
+    if (rejected > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: rejected ${rejected} entr(ies) failing runtime ` +
+        `validation (unknown relation label, placeholder reasoning, non-finite confidence, ` +
+        `or non-integer index) — the classifier is emitting schema residue, not classifications`,
+      );
+    }
+    if (outcomes.unparseableTarget > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.unparseableTarget} classified pair(s) ` +
+        `named an old document whose virtual path could not be PARSED — this is a URI-contract ` +
+        `regression, not a missing row; the classification was discarded without mutating anything`,
+      );
+    }
+    if (outcomes.missingTarget > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.missingTarget} classified pair(s) parsed ` +
+        `to a valid path with no active row (archived or deleted between search and apply) — ` +
+        `the classification was discarded without mutating anything`,
+      );
+    }
+    if (outcomes.floorIneligible > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.floorIneligible} document(s) reached the ` +
+        `confidence floor but are not invalidation-eligible — either their content_type is not ` +
+        `'${INVALIDATION_ELIGIBLE_CONTENT_TYPE}' (candidates are selected by PATH, which is a ` +
+        `wider set) or they were already invalidated. Confidence was lowered; invalidation is ` +
+        `impossible for these whether or not the writer is armed.`,
+      );
+    }
+    if (outcomes.shadowInvalidations > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.shadowInvalidations} invalidation(s) ` +
+        `suppressed by shadow mode. Confidence was still lowered. Adjudicate these before arming ` +
+        `CLAWMEM_CONTRADICTION_INVALIDATE — invalidation removes a document from FTS and ` +
+        `vector retrieval entirely.`,
+      );
+    }
+    if (outcomes.invalidated > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: INVALIDATED ${outcomes.invalidated} document(s) — ` +
+        `they are now absent from FTS and vector retrieval. Restore procedure: ` +
+        `docs/guides/contradiction-invalidation.md`,
+      );
+    }
+    if (outcomes.invalidationNoOp > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.invalidationNoOp} armed invalidation(s) ` +
+        `matched ZERO rows — the row changed between the eligibility check and the write`,
+      );
+    }
+    if (outcomes.invalidationErrors > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: ${outcomes.invalidationErrors} invalidation(s) threw ` +
+        `and were skipped — see the per-document errors above`,
+      );
+    }
+    if (duplicates > 0 || inconsistent > 0) {
+      console.warn(
+        `[decision-extractor] contradiction: collapsed ${duplicates} identical repeat(s) and ` +
+        `dropped ${inconsistent} pair(s) the classifier answered more than one way, before ` +
+        `mutation — repeats would have compounded the confidence penalty on one document`,
+      );
     }
   } catch (err) {
     console.error(`[decision-extractor] Contradiction classification failed:`, err);
@@ -316,38 +1150,102 @@ export async function decisionExtractor(
   store: Store,
   input: HookInput
 ): Promise<HookOutput> {
+  const sessionId = input.sessionId || `session-${Date.now()}`;
+
+  // Judge-audit retention (§J7, code-review t3 finding 1 / t4 finding 1): prune as the
+  // handler's FIRST act — before transcript validation, so literally every invocation,
+  // early returns included, honors the 90-day/10k root cap. Pair-aware, best-effort,
+  // never this session's rows.
+  // s342 D2: the whole-handler deadline starts at handler ENTRY — captured
+  // BEFORE the retention passes below, which take the same database locks as
+  // everything else and must count against the budget, not precede it.
+  // CLAWMEM_STOP_BUDGET_MS bounds EVERY model-bearing phase — observation
+  // extraction, the contradiction judge, and the causal step — with
+  // PERSIST_RESERVE_MS held back for persistence/output so the host never
+  // kills mid-write. Operating requirement (docs/reference/configuration.md):
+  // the installed host hook timeout must exceed this budget plus safety.
+  const stopBudget = resolveStopBudgetMs();
+  const deadlineAt = Date.now() + stopBudget.budgetMs;
+  if (stopBudget.invalid) {
+    console.error(`[decision-extractor] ${stopBudget.invalid}`);
+  }
+
+  // s342 D5: ONE causal invocation record per Stop invocation in shadow/on —
+  // cardinality includes the early returns below, so the step is a named
+  // closure invoked on EVERY handler exit path. Default OFF; `shadow` audits
+  // without writing; `on` writes. Config anomalies audit durably on the run.
+  const phaseSkipNotes: string[] = [];
+  const runCausalInvocation = async (newObs: ObservationWithDoc[]): Promise<void> => {
+    const causalMode = resolveCausalWriterMode();
+    if (causalMode === "off") return;
+    try {
+      const llm = getDefaultLlamaCpp();
+      await runCausalStep(store, llm, {
+        sessionId,
+        mode: causalMode,
+        newObservations: newObs,
+        deadlineAt,
+        invalidConfigNotes: stopBudget.invalid ? [stopBudget.invalid] : [],
+        phaseSkipNotes,
+      });
+    } catch (err) {
+      console.log(`[decision-extractor] Error in causal inference:`, err);
+    }
+  };
+
+  try {
+    pruneJudgeRuns(store.db, { excludeSessionId: sessionId });
+  } catch { /* retention is best-effort */ }
+  try {
+    pruneCausalRuns(store.db, { excludeSessionId: sessionId });
+  } catch { /* retention is best-effort */ }
+
   const transcriptPath = validateTranscriptPath(input.transcriptPath);
-  if (!transcriptPath) return makeEmptyOutput("decision-extractor");
+  if (!transcriptPath) {
+    await runCausalInvocation([]);
+    return makeEmptyOutput("decision-extractor");
+  }
 
   const messages = readTranscript(transcriptPath, 200);
-  if (messages.length === 0) return makeEmptyOutput("decision-extractor");
+  if (messages.length === 0) {
+    await runCausalInvocation([]);
+    return makeEmptyOutput("decision-extractor");
+  }
 
-  const sessionId = input.sessionId || `session-${Date.now()}`;
+
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
   const timestamp = now.toISOString();
 
-  // Try observer first for structured observations
-  const observations = await extractObservations(messages);
+  // Try observer first for structured observations. s342 D2: extraction has
+  // the SAME pre-call floor as the judge and the causal step — near budget
+  // exhaustion it is skipped outright, never started with a degenerate timeout.
+  const extractionRemaining = deadlineAt - Date.now() - PERSIST_RESERVE_MS;
+  let observations: Observation[] = [];
+  if (extractionRemaining < CAUSAL_MIN_BUDGET_MS) {
+    const note =
+      `observation extraction skipped: ${extractionRemaining}ms of the Stop budget ` +
+      `remaining is below the ${CAUSAL_MIN_BUDGET_MS}ms floor`;
+    phaseSkipNotes.push(note);
+    console.warn(`[decision-extractor] ${note}.`);
+  } else {
+    observations = await extractObservations(messages, { timeoutMs: extractionRemaining });
+  }
   const observedDecisions = observations.filter(o => o.type === "decision");
 
   // Persist ALL observations unconditionally (C2 fix: not gated on decisions existing)
   const observationsWithDocs: ObservationWithDoc[] = [];
+  // Exact provenance for contradiction attribution. Reconstructing it later from a session-prefix
+  // LIKE + `ORDER BY created_at DESC LIMIT 1` is position-blind: every observation in one
+  // invocation shares a timestamp, so all of them resolve to the same row regardless of which
+  // fact actually did the contradicting.
+  const docIdByObservation = new Map<Observation, number>();
   if (observations.length > 0) {
     for (const obs of observations) {
       const wit = persistObservationDoc(store, obs, sessionId, dateStr, timestamp);
-      if (wit) observationsWithDocs.push(wit);
-    }
-
-    // Infer causal links from observations with facts
-    if (observationsWithDocs.length > 0) {
-      try {
-        const llm = await getDefaultLlamaCpp();
-        if (llm) {
-          await store.inferCausalLinks(llm, observationsWithDocs);
-        }
-      } catch (err) {
-        console.log(`[decision-extractor] Error in causal inference:`, err);
+      if (wit) {
+        observationsWithDocs.push(wit);
+        docIdByObservation.set(obs, wit.docId);
       }
     }
 
@@ -358,6 +1256,11 @@ export async function decisionExtractor(
     // real source_doc_id provenance from the persisted observation document (Fix F).
     insertObservationTriples(store, observations, observationsWithDocs);
   }
+
+  // s342: the bounded one-hop causal step (C4′) for this invocation —
+  // observation-document nodes, append-only fact-pair witness evidence on the
+  // edge. Replaces the retired first-witness-only writer.
+  await runCausalInvocation(observationsWithDocs);
 
   // Extract decisions (observer-first, regex fallback)
   let decisionBody: string;
@@ -371,7 +1274,7 @@ export async function decisionExtractor(
 
     // Detect contradictions with existing decisions
     try {
-      const contradictions = await detectContradictions(store, observedDecisions, sessionId);
+      const contradictions = await detectContradictions(store, observedDecisions, sessionId, docIdByObservation, deadlineAt);
       if (contradictions > 0) {
         console.error(`[decision-extractor] Found ${contradictions} contradiction(s) with prior decisions`);
       }
@@ -398,8 +1301,9 @@ export async function decisionExtractor(
 
   const decisionPath = `decisions/${dateStr}-${sessionId.slice(0, 8)}.md`;
 
-  // Check existing merge policy first (vector-based dedup for decisions)
-  const mergeResult = await checkMergePolicy(store, "decision", decisionBody, "_clawmem");
+  // Check existing merge policy first (vector-based dedup for decisions),
+  // bounded by the whole-handler deadline minus the persistence reserve.
+  const mergeResult = await checkMergePolicy(store, "decision", decisionBody, "_clawmem", deadlineAt - PERSIST_RESERVE_MS);
 
   if (mergeResult.action === 'skip') {
     process.stderr.write(`[decision-extractor] Skipped near-duplicate decision (vector dedup)\n`);
@@ -446,8 +1350,9 @@ export async function decisionExtractor(
       const antiSemanticPayload = antipatterns.map(a => a.text).join("\n");
       const antiPath = `antipatterns/${dateStr}-${sessionId.slice(0, 8)}.md`;
 
-      // Check existing merge policy first (merge_recent for antipatterns)
-      const antiMerge = await checkMergePolicy(store, "antipattern", antiBody, "_clawmem");
+      // Check existing merge policy first (merge_recent for antipatterns),
+      // under the same whole-handler deadline bound.
+      const antiMerge = await checkMergePolicy(store, "antipattern", antiBody, "_clawmem", deadlineAt - PERSIST_RESERVE_MS);
 
       if (antiMerge.action === 'skip') {
         // Near-duplicate — skip

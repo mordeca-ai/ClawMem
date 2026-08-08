@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.10.4**.
+Guide for upgrading between released versions. Current: **v0.36.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -17,7 +17,7 @@ cd ~/clawmem && git pull
 systemctl --user restart clawmem-watcher.service  # if installed as a user unit
 ```
 
-Hooks (spawned fresh per Claude Code invocation) and the MCP stdio server (respawned per Claude Code session) pick up new code automatically on their next invocation — no restart required for those. Only persistent daemons like `clawmem watch`, `clawmem serve`, and the systemd embed/watcher/curator units need to be restarted.
+Hooks (spawned fresh per Claude Code invocation) pick up new code automatically on their next invocation. The MCP stdio server is respawned per agent session — a **new** session gets the new code, but a session already open when you upgrade keeps its old-code server alive until you reconnect (`/mcp` in Claude Code) or close it. For most releases that stale server is harmless — it just lacks the new features. **For releases that migrate the vault and change write semantics (v0.31.0, v0.32.0), it is not** — see the mixed-version caution in the v0.31.0 section below. The safe order on those upgrades: stop persistent daemons (`clawmem watch`, `clawmem serve`, the systemd embed/watcher/curator units) → upgrade → reconnect or restart every open agent session → start the daemons again.
 
 ### What auto-applies on first open
 
@@ -39,6 +39,357 @@ The first time any v0.7.1+ process opens an existing vault, the migrations run s
 - `clawmem setup hooks` — hook configuration is unchanged (no new hooks, no renamed hooks, no changed budgets)
 - `bun install` / `npm install` — no dependency changes in `package.json` between v0.7.0 and v0.9.0
 - Edit `~/.config/clawmem/config.yaml` — no required fields added
+
+---
+
+## Reranker: zerank-2 GGUF deprecated → seq-cls sidecar
+
+If you followed an earlier "SOTA upgrade" and are running the **`zerank-2-Q4_K_M` GGUF reranker** on `:8090`, **replace it.** That GGUF is broken: llama.cpp's `convert_hf_to_gguf.py` only synthesizes a rerank head when the model card contains the literal `# Qwen3-Reranker`, which zerank-2's card lacks — so the previously-recommended GGUF (and any built by the current/standard llama.cpp converter) is a headless causal LM that produces near-zero, uninformative scores under `--reranking`. Reranking silently degrades to an RRF-dominated passthrough.
+
+**Migration** — serve zerank-2 via the seq-cls sidecar instead (transformers, bf16; ships a reproducible correctness gate):
+
+```bash
+cd extras/rerankers/zerank-2-seq
+docker compose build
+HF_TOKEN=hf_xxx docker compose run --rm convert   # download + convert + verify
+docker compose up -d reranker                      # /v1/rerank on :8090
+```
+
+`CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.36.0: memory_stats + memory_rank diagnostics
+
+**No migration** — no schema change, no reindex, no re-embed, and no behaviour change
+to any existing tool. Two new read-only MCP tools: `memory_stats` (per-collection
+lifecycle + ranking-metadata aggregates) and `memory_rank` (per-result composite
+ranking breakdown with raw-vs-composite rank shifts). See
+[mcp-tools.md](../reference/mcp-tools.md) for parameters.
+
+The MCP stdio server is respawned per agent session, so new sessions see the tools
+immediately; reconnect (`/mcp` in Claude Code) any session that stays open across the
+upgrade. Hooks, the watcher, and all retrieval semantics are untouched.
+
+---
+
+## v0.35.0: secondary-vault surfacing is now opt-in
+
+**No migration** — no schema change, no reindex, no re-embed. One behaviour change to check.
+
+**Behaviour change:** the `context-surfacing` hook no longer merges a configured secondary
+vault's results into the automatically injected context by default. Single-vault
+deployments are unaffected. If you run multi-vault AND relied on automatic cross-vault
+surfacing, re-enable it:
+
+```yaml
+# ~/.config/clawmem/config.yaml
+retrieval:
+  surface_secondary_vaults: true
+```
+
+or `CLAWMEM_SURFACE_SECONDARY_VAULTS=true` (env wins over yaml; only the literal `true`
+enables). Config is process-cached — restart long-lived processes (`clawmem watch`, the
+MCP server) after changing it; hook invocations are per-event processes and pick it up on
+their next run.
+
+Explicit `vault`-parameter MCP calls are not affected by the gate in either state.
+
+## v0.34.0: origin-aware reconciliation
+
+**Migration is automatic** on first open and additive only: one new column
+(`documents.origin`). No data backfill — deliberately: `content_hash` proves nothing about
+ownership (mined imports write it too), so legacy rows stay `NULL` (exempt from absence
+reconciliation) and are adopted by the next writer to touch them. Files present on disk adopt
+`fs` on the next index pass of their collection; hook/`saveMemory` rows adopt `api` on their
+next write.
+
+**Behaviour changes to expect:**
+- A row whose file was already deleted *before* upgrading is no longer auto-deactivated —
+  nothing proves the indexer owned it. Retire it with `memory_forget` or a lifecycle sweep if
+  unwanted.
+- `saveMemory` now rejects a write to a path occupied by a filesystem-owned document or by an
+  inactive document (lifecycle decisions stick), instead of silently overwriting.
+- `clawmem mine` is additive: re-mining into the same collection no longer deactivates
+  earlier batches.
+
+**Verify after upgrading:** `clawmem update` on any collection, then confirm hook-written
+rows survive it — e.g. `sqlite3 <vault> "SELECT COUNT(*) FROM documents WHERE origin='api'
+AND active=0 AND deactivated_reason='absent'"` should stay at its pre-upgrade value (new
+absence deactivations of `api` rows can no longer occur).
+
+---
+
+## v0.33.0: the causal witness writer + Stop-hook deadline + docid validation
+
+**Migration is automatic** on first open and additive only: four new tables (`causal_runs`,
+`causal_run_events`, `causal_witness_sightings`, `retired_causal_edges`) plus indexes. No data
+backfill, no manual step.
+
+**Mixed-version exposure is lower than v0.31/v0.32** — the schema additions are ignored by old
+code and the causal writer defaults to `off`, so a stale process cannot corrupt the new state.
+What a stale process DOES keep until restarted: the unescaped-docid lookup (the `_`/`%` wildcard
+vulnerability, reachable through REST `/documents/{docid}/forget`) and the unbounded Stop-hook
+phases. Restart daemons and reconnect open agent sessions to retire both.
+
+**Before arming the writer** (`CLAWMEM_CAUSAL_WRITER=on`): run
+`clawmem migrate causal-witnesses --preflight`. Edges from the pre-v0.30 writer whose metadata
+cannot yield a valid witness make the new writer fail closed on those candidates; resolve them
+(`--resolve-unmaterializable keep-weight|retire-edge`, manifest-bound, explicitly selected edges
+only — retirement is reversible via `--restore-edge`) or accept the per-candidate refusals.
+Recommended order: `shadow` first, read `clawmem causal-audit` for a few sessions, then `on`.
+
+**Behavior to check after upgrading:**
+
+- Docids are structurally validated everywhere (`^[0-9a-fA-F]{6,64}$` after `#` strip): `_`, `%`,
+  non-hex, and prefixes shorter than 6 now return not-found on every docid surface, MCP and REST.
+  Anything that relied on wildcard matching was relying on the vulnerability.
+- The `decision-extractor` Stop hook now runs to a whole-handler deadline
+  (`CLAWMEM_STOP_BUDGET_MS`, default 25000): under a slow inference server, phases are skipped
+  (audited + logged) instead of overrunning the host hook timeout. Ensure the installed host hook
+  timeout exceeds the budget plus margin (default 25s sits under Claude Code's 30s).
+- `find_causal_links` (MCP + REST) returns the new directed edge-record shape with fact-pair
+  witnesses, capped at a 64 KiB response ceiling that drops whole edges from the tail. Consumers
+  parsing the old shape need updating.
+- With the writer `off` (default), no causal model call and no causal rows — the audit surfaces
+  stay empty until you arm `shadow`/`on`.
+
+---
+
+## v0.32.0: the shared causal pipeline + knowledge-graph evidence
+
+**Migration is automatic** on first open: a new `entity_triple_provenance` table records one row
+per unique evidence source per knowledge-graph fact, backfilled from every existing triple's
+inline evidence (a triple with no inline evidence gets a single `unattributed` row). The backfill
+is idempotent and read-guarded — steady-state opens perform no writes.
+
+**Upgrading with concurrent writers:** the [v0.31.0 mixed-version caution](#v0310-forget-and-archive-survive-re-indexing)
+applies here too. An old-code process still writing after the vault has migrated inserts
+knowledge-graph facts without evidence rows — repaired by a later open's backfill — and keeps
+dropping repeat sightings outright, which is not recoverable: the evidence row is simply never
+written. Restart daemons and reconnect open agent sessions together.
+
+**Behavior to check after upgrading:**
+
+- `memory_retrieve`'s causal mode, `intent_search`, `query_plan`'s graph clauses, and REST
+  `/retrieve`'s causal mode now run ONE shared pipeline. WHY-classified queries on the
+  default-filtered routes reach `_clawmem` **observation documents** (never handoffs/deductions)
+  and follow causal edges one bounded hop in both directions — internal observation paths
+  appearing in causal results is the feature, not a leak. `includeInternal` semantics are
+  unchanged.
+- `intent_search(enable_graph_traversal: false)` now disables the one-hop step too, along with
+  adaptive traversal, MPFP, and entity expansion.
+- REST `/retrieve` causal gains graph traversal (it was anchor-only RRF). The REST classifier now
+  recognizes the same causal phrasings as MCP ("why were", "because we").
+- `kg_query` facts now carry `evidenceCount` + up to 5 `sources`; text output appends
+  `[evidence ×N; sources: …]`.
+- Inactive, invalidated, or out-of-time-window documents no longer consume graph-traversal
+  budget on any causal surface.
+
+---
+
+## v0.31.0: forget and archive survive re-indexing
+
+**Migration is automatic** on first open: a new `documents.deactivated_reason` column records why
+each row was deactivated (`absent` / `forget` / `archive`); existing archived rows are backfilled
+as `'archive'`, and any row a previous version left simultaneously active-and-archived is
+repaired to archived (count reported on stderr — use `lifecycle_restore` to bring any back).
+
+**Mixed-version caution — restart every writer together.** Once any new-code process has opened
+(and therefore migrated) the vault, a still-running old-code process must not keep writing. An
+old-code writer deactivates documents without recording a reason, and the new indexer
+deliberately treats reason-less deactivation as legacy absence — so a `memory_forget` issued
+through a stale session can be reactivated by the next re-index: the exact bug this release
+fixes, reintroduced by the stale process. Exposure requires concurrent long-lived writers — the
+watcher, `clawmem serve`, or an MCP server in an agent session that stays open across the
+upgrade; a single-session setup with no daemons needs nothing beyond the quick path. The
+discipline is one line: restart the daemons and reconnect (`/mcp`) or restart every open agent
+session as part of the upgrade, so no pre-upgrade process keeps writing afterward.
+
+**Behavior to check after upgrading:**
+
+- `memory_forget` on a file-backed document now STICKS across `clawmem update` / the watcher —
+  do not re-run forget after indexing. Only absence-deactivated rows reactivate automatically.
+- `clawmem reindex --force` no longer blanket-deactivates the vault up front; it re-reads and
+  rewrites every file, bypassing the content-hash short-circuit. `_clawmem` is refused by the
+  filesystem indexer outright (database-created memory has no filesystem source).
+- A failed A-MEM enrichment no longer blanks learned keywords/tags/context — an empty note is
+  refused and the prior note preserved.
+
+---
+
+## v0.30.0: ClawMem no longer deletes document rows
+
+No schema change, no re-embed, no reindex. **Check whether you set `purge_after_days`:**
+
+```bash
+grep -A6 '^lifecycle:' ~/.config/clawmem/config.yaml | grep purge_after_days
+```
+
+- **`purge_after_days: null` (the default) — nothing changes.** No deletion was happening.
+- **`purge_after_days: <number>` — deletion stops.** Until now, a non-dry-run
+  `lifecycle_sweep` *and* every SessionStart with the `staleness-check` hook installed
+  permanently deleted every archived row past that window. The MCP preview never listed or
+  counted those rows (it reported only what would be *archived*), and the hook path reported
+  nothing at all. **Anything already deleted is gone**; this release stops the ongoing loss.
+  The value is now inert — archival continues and stays reversible via `lifecycle_restore`.
+
+There is no replacement command. Physical deletion is the one ClawMem mutation with no
+restore path, and no in-process or CLI credential can tell an operator apart from the coding
+agent ClawMem serves — an env var or a confirmation flag is satisfiable by the agent itself.
+So the capability is not offered rather than gated. If you need to reclaim space, operate on
+the SQLite file directly, out-of-band; that is explicitly outside ClawMem's mutation
+contract. A supported retention design (reversible quarantine with a protected window) is
+planned.
+
+**Also fixed:** `archiveDocuments` / `restoreArchivedDocuments` returned SQLite's `changes`
+count, which includes the `documents_fts` trigger writes — archiving 3 documents reported
+16. Every "archived N" / "restored N" figure ClawMem printed was inflated. The mutations
+were always correct; only the counts were wrong. If you parse that output, the numbers will
+now be smaller and accurate.
+
+---
+
+## v0.29.0: contradiction judge — a behavior change to check
+
+Schema changes (`judge_runs`, `judge_events`) auto-apply on first open; no re-embed or
+reindex. **One behavior change needs a decision from you:**
+
+**Contradiction analysis is now judge-gated.** It runs ONLY when `CLAWMEM_JUDGE_*` is
+configured, because the stock expansion model cannot meet the judge contract
+([details](inference-services.md#contradiction-judge)). Check which case you are in:
+
+- **Stock install** (wrapper defaults, or `CLAWMEM_LLM_URL` at the stock 1.7B): nothing to
+  do. No verdict ever applied on the stock model — you lose nothing and gain a skipped LLM
+  call per Stop hook. Configure a judge when you want contradiction analysis.
+- **Custom global LLM** (you pointed `CLAWMEM_LLM_URL`/`CLAWMEM_LLM_MODEL` at a larger or
+  cloud model): contradiction verdicts **may have been genuinely applying** through the
+  global endpoint, and after this upgrade they stop until you opt in. To keep the behavior,
+  configure the judge explicitly — e.g. the same endpoint, task-scoped:
+
+  ```bash
+  export CLAWMEM_JUDGE_URL="$CLAWMEM_LLM_URL"
+  export CLAWMEM_JUDGE_MODEL="your-model-id"        # required — no default on this lane
+  export CLAWMEM_JUDGE_API_KEY="$CLAWMEM_LLM_API_KEY"   # if the endpoint needs one
+  ```
+
+  ClawMem never adopts the global endpoint as a judge automatically — the judge vars are
+  also your data-egress consent (the judge receives new decisions + retrieved snippets).
+  `clawmem doctor` warns when it detects a custom global LLM with no judge configured (it
+  cannot detect a custom model served at the stock localhost endpoint — this notice is the
+  authoritative one).
+
+Also in this release: `CLAWMEM_CONTRADICTION_POLICY=supersede` now **requires a configured
+judge** — without one it is loudly constrained to the non-deactivating `link` policy and
+`clawmem doctor` reports it inactive. Run `clawmem doctor` after upgrading: it smoke-tests
+whatever judge you configure and reports the audit tables.
+
+---
+
+## v0.28.0: hook write-path contracts
+
+No migration, no re-embed, no config change. Drop-in.
+
+**One behavior change to be aware of:** `build_graphs` now reports `N new edge(s), M total`
+instead of `N edges`, and both the MCP tool and the REST endpoint gained `temporalTotal` /
+`semanticTotal` fields. The counts also changed meaning — they report rows actually written
+rather than insert attempts, so an idempotent rebuild now correctly reports 0 new edges (the
+standing total tells you the graph is populated). If you parse that text output, update it.
+
+Totals count only edges whose both endpoints are active, matching what the builders operate on.
+
+**Contradiction detection starts having an effect.** The hook always classified, but two contract
+defects discarded every verdict before it could mutate anything — it will now lower the confidence of documents a
+session's facts contradict (`-0.25`, floored at `0.2`). That is a ranking signal only; nothing
+leaves retrieval. (Superseded in v0.29.0: contradiction analysis now runs only when a judge is
+configured via `CLAWMEM_JUDGE_*` — see the v0.29.0 section above.) The terminal step that *does* remove a document from retrieval — invalidation —
+is **off by default** behind `CLAWMEM_CONTRADICTION_INVALIDATE` and logs `WOULD invalidate`
+instead of writing. Nothing to do on upgrade. Before arming it, calibrate against your own vault:
+[contradiction invalidation](contradiction-invalidation.md).
+
+## v0.27.0: authorship time (`authored_at`) + entity-edge IDF fix
+
+Drop-in; the `authored_at` column and its index auto-migrate on first open. What changes and what to know:
+
+- **Ranking recency now runs on effective time** — `authored_at` (when the content was originally written) when known, `modified_at` otherwise. Documents without `authored_at` behave exactly as before, so an existing vault is unaffected until content carries dates.
+- **New mines are dated automatically.** `clawmem mine` extracts per-message timestamps from Claude Code / codex / Claude.ai / ChatGPT / Slack exports and stamps each exchange chunk; synthesized facts inherit their source's date.
+- **Dating an already-mined vault:** either re-run `clawmem mine` over the same export directory — previously-mined documents take a metadata-only "dated" transition (no `modified_at` bump, no re-enrichment, no re-embed) — or run `clawmem mine <dir> -c <collection> --backfill-dates` (dry-run report), then `--backfill-dates --apply`. Both are safe to repeat; documents whose content no longer matches the source are skipped.
+- **Colliding source filenames are now disambiguated.** Two transcripts that sanitize to the same staging name (e.g. `a/b.jsonl` and `a_b.jsonl`) previously overwrote each other silently; they now mine under distinct hash-suffixed names. Non-colliding sources keep their existing names — no path churn.
+- **Hand-dated notes:** any indexed file may declare `authored_at:` in frontmatter (RFC3339 with timezone, or date-only `YYYY-MM-DD` = UTC midnight; quoted or unquoted). Removing the line clears the stored date on the next content change.
+- Temporal queries ("what did we plan in March"), the recent-decision windows (postcompact, session bootstrap, `clawmem reflect`, profile), and directory context all use effective time; operational clocks (dedup window, lifecycle sweeps, staleness review) intentionally do not.
+- Entity-graph enrichment now computes IDF over active documents only and never creates edges toward archived documents (completes the v0.25.0 hub-bias fix); existing edges are unaffected.
+
+## v0.26.0: offline eval harness + short memory-query fix
+
+No migration steps, no schema change, no re-embed — drop-in. Restart long-lived processes per the quick path. Behavior notes:
+
+- **New offline eval subsystem** (`clawmem eval run --gold <file.jsonl>`): replays gold-labeled queries through the real `query` tool handler and scores them (doc-level Jaccard, precision/recall@k, hit@k, MRR). Purely additive — no runtime surface changes; nothing to run unless you build a gold set. See [docs/guides/eval-harness.md](eval-harness.md).
+- **Short explicit memory queries now reach retrieval.** Prompts under 20 characters that match the memory-intent force patterns ("what did I say?", "recall …", "what's my email?") previously returned an empty `<vault-context>` from the length gate; they now run retrieval. Expect context injection on short memory questions that used to come back empty. Greetings, slash commands, and other short non-memory prompts are unchanged.
+
+## v0.25.0: extraction retries + decision half-life + entity-neighbor ranking
+
+No migration steps, no schema change, no re-embed — drop-in. Restart long-lived processes per the quick path. Behavior notes:
+
+- **LLM extraction paths retry on malformed responses** (observer, conversation-synthesis, A-MEM, entity extraction): up to 3 attempts with error feedback under one hard wall-clock budget. Expect occasional multi-call extraction where a single call previously failed silently; terminal exhaustion logs `[llm-retry] <site>: exhausted…`. `mine --synthesize` failure counts now reflect terminal failures only (transient-recovered calls no longer count).
+- **`decision` recency now decays on a 180-day half-life** (was infinite). Old, unaccessed decisions gradually stop outranking fresh material on composite surfaces; frequently-accessed decisions stretch toward 3× via the existing access extension. No deletion or archival — lifecycle policy is unchanged.
+- **Entity-neighbor ranking (`intent_search` ENTITY channel and the `query` entity walk) reorders**: neighbors now rank by co-occurrence blended with IDF specificity instead of raw count — ubiquitous hub entities drop, specific entities rise; archived documents no longer appear in neighbor results.
+
+## v0.24.0: raw-BM25-primary ranking on `search`
+
+No migration steps — drop-in. Behavior notes:
+
+- **MCP `search` ordering changes for non-recency queries**: results now rank by the raw BM25 transform instead of the composite blend (judged keyword eval: raw MRR 0.848 vs composite 0.415 over 43 targets; the composite lost even the fresh-doc-favorable slice). If you depended on recency/quality multipliers reordering keyword results, phrase the query with recency intent ("recent …", "latest …") — that branch keeps composite — or use `query`.
+- **`minScore` on `search` is now raw-basis with NO default** for non-recency queries: omitted = no filter, explicit `0` honored. Previous composite-scale floors (e.g. `0.3`) do not translate — the raw transform maps `0.70 ⇔ |bm25| ≈ 2.3` and `0.85 ⇔ |bm25| ≈ 5.7`.
+- **`structuredContent.scoreBasis`** on `search` reports `"fts-bm25"` (non-recency) or `"composite"` (recency-intent). Consumers that parsed the compact `score` as a composite value should read the basis field.
+- **CLI `search`, REST, hooks, `query`, and `memory_retrieve` are unchanged** — the ranking-contract change is scoped to the MCP `search` tool, exactly as evaluated.
+- New ops knob: `CLAWMEM_DISABLE_FTS_BYPASS=true` disables the query-pipeline strong-signal bypass at both consumers (MCP + CLI) — harness/incident use.
+
+## v0.23.0: monotonic BM25 exposed score
+
+No migration command, no schema change, no re-embed. Restart long-lived processes per the quick path.
+
+**Behavior change — the exposed FTS score is a real relevance signal.** Through v0.22.0 a clamp bug flattened every FTS result's `score` to the constant 1.0, so ranking on the BM25 surfaces (`search`, REST keyword mode, CLI search, `memory_retrieve` keyword and its semantic-mode FTS fallback, hook FTS lanes) was effectively metadata-only. The score is now `|bm25|/(1+|bm25|)` — bounded [0,1), higher is better. What to expect after upgrading:
+
+- `search` results reorder toward keyword relevance; reported scores drop from the old flat values and vary per hit. If a workflow compared `search` scores against a hardcoded cutoff tuned to the constant-1.0 era, re-tune it (the composite floor semantics of `minScore` are unchanged; the observed values shifted).
+- The `query` pipeline's strong-signal bypass actually fires now on unambiguous keyword queries (skipping LLM expansion, which makes those calls faster) — and no longer fires on a lone weak match.
+- `memory_forget` targeting is stricter: weak keyword matches return a disambiguation list instead of auto-selecting. If a script relied on forget acting on any single match, it must now pass a more specific query or a path.
+- `clawmem doctor`/curator's BM25 probe reports honestly — a near-empty vault may now show a degraded BM25 probe where it previously passed vacuously.
+
+---
+
+## v0.22.0: raw-cosine ranking on the direct vector routes
+
+No migration command, no schema change, no re-embed. Restart long-lived processes per the quick path.
+
+**Behavior change — MCP `vsearch` and `memory_retrieve` semantic/discovery rank non-recency queries by RAW cosine.** Reported scores on those routes are raw cosine (`scoreBasis: "vector-cosine"`), not composite values — expect a different numeric scale (unrelated results sit near ~0.4–0.55 on compressed-band embedding models, not near 0). `vsearch`'s `minScore` filters that raw scale and no longer defaults to 0.3 — omitted means no filter. If a workflow passed `minScore` tuned to composite values, re-tune it to your embedding model's band or omit it. Recency-phrased queries ("latest…", "recently…") behave exactly as before on every route.
+
+**Pinned documents** no longer float above more relevant results on those two routes — pin now means lifecycle retention plus winning exact-score ties. Hooks, `query`, and `search` keep the +0.3 composite pin boost.
+
+**`retrieval.mcp_direct_tuned_weights` / `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` no longer has any effect** (superseded by its own gating eval). Configs that set it keep working; a once-per-process warning is logged — remove the key at your convenience.
+
+---
+
+## v0.21.0: MCP internal-collection exclusion + embedding-geometry canary
+
+No migration command required. Two things to know:
+
+**Behavior change — `_clawmem` excluded from MCP retrieval by default.** `search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` no longer return the system-internal `_clawmem` collection (observations/deductions/handoffs) unless asked. If a workflow depended on those appearing in MCP results, pass `includeInternal: true` or name `_clawmem` in an explicit `collection` filter. `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are unfiltered by design, and hooks already filtered internal docs — `<vault-context>` behavior is unchanged. Details: [docs/reference/mcp-tools.md](../reference/mcp-tools.md).
+
+**What auto-applies on first open** (additive, idempotent — same contract as prior releases): the `embed_canary` and `vault_flags` tables, and an `embed_input_fp` column on `content_vectors`.
+
+**No re-embed required.** Existing vectors stay valid. Pre-0.21.0 rows carry no input fingerprint, so `clawmem doctor`'s new sampled vector validation checks them structurally and flags title provenance as unavailable ("legacy") until each document's next natural re-embed — informational, not an error.
+
+**The canary baseline seeds itself.** The first `clawmem embed` run after upgrade (including a timer-fired one) probes the embedding server with a pair-separation battery and persists a first-healthy baseline; subsequent runs alert relative to it, and a broken-geometry server now aborts `embed --force` BEFORE anything is cleared. `--force-geometry` (proceed despite a failed probe; the vault is flagged tainted until a verified rebuild) and `--force --recalibrate-canary` (replace the baseline after a deliberate model/server change) are operator overrides, not upgrade steps.
+
+**Opt-in knob:** `retrieval.mcp_direct_tuned_weights` (config) / `CLAWMEM_MCP_DIRECT_TUNED_WEIGHTS` (env), default `false` — scored the MCP direct tools' non-recency queries with the retrieval-tuned `query`-tool weights. *(Superseded in v0.22.0 — the knob no longer has any effect; see the v0.22.0 section above.)*
+
+Upgrades from v0.13 → v0.20 shipped no steps beyond the [quick path](#quick-path) — schema changes auto-apply; see [RELEASE_NOTES.md](../../RELEASE_NOTES.md) for what each version changed.
+
+---
+
+## v0.12.0: query reranking blend (no action required)
+
+v0.12.0 changes the `query` tool's rerank/RRF blend so the cross-encoder reranker can promote the best document to the top — the previous blend left RRF #1 mathematically immovable. It is a pure ranking-quality change: **no migration, no schema change, no config change.** It applies automatically on upgrade. Hooks and the per-session MCP stdio server pick it up on their next invocation; restart any long-lived `query` host — `clawmem serve` and persistent MCP/daemon processes — to pick up the improved ordering. The default reranker (`qwen3-reranker-0.6B`) is unchanged, and the blend improvement applies whatever reranker `:8090` serves. (`intent_search` and the context-surfacing hook keep their existing blends.)
 
 ---
 
@@ -122,7 +473,7 @@ Hooks and the stdio MCP server pick up the new binary automatically on their nex
 - **`plugins.slots.memory: "clawmem"` replaces `plugins.slots.contextEngine: "clawmem"`.** On the new pure-memory plugin, the exclusive slot is `memory`. The `setup openclaw` next-steps output tells you to run `openclaw plugins enable clawmem`, which sets the slot and disables competing memory plugins (`memory-core`, `memory-lancedb`) in a single command. You do NOT need to run the older `openclaw config set plugins.slots.contextEngine clawmem` pattern on v0.10.0.
 - **`src/openclaw/package.json` is now the plugin's discovery manifest.** OpenClaw v2026.4.11's `discoverInDirectory` reads `package.json` for the `openclaw.extensions` field and uses that to decide whether a directory under `~/.openclaw/extensions/` is a valid plugin. The older `openclaw.plugin.json` manifest is still shipped and parsed at runtime, but it is not sufficient to pass discovery on v2026.4.11+ without the `package.json` companion file. v0.10.0 adds the `package.json` to the plugin source tree, and `clawmem setup openclaw` verifies it is present before copying.
 - **`clawmem setup openclaw` defaults to recursive copy instead of symlink.** OpenClaw v2026.4.11 walks `~/.openclaw/extensions/` with `readdirSync({ withFileTypes: true })` and uses `dirent.isDirectory()` to descend into candidate plugin directories. Symlinks to directories report `isDirectory() === false` on that API shape, so a symlinked plugin is silently skipped during discovery. v0.10.0's `cmdSetupOpenClaw` therefore copies the plugin source into `~/.openclaw/extensions/clawmem/` with `cpSync(..., { recursive: true, dereference: true })`. A `--link` opt-in flag preserves the old symlink behavior for local development and for older OpenClaw versions, with a warning that v2026.4.11+ discovery will skip the symlink. Setup is idempotent: any existing plugin directory or stale symlink is removed before the new copy is written.
-- **Multi-user ownership check (OpenClaw v2026.4.11+).** If the gateway runs as a dedicated system user (e.g. `openclaw`) and you run `clawmem setup openclaw` as a different user (e.g. `sciros`), the copied plugin directory is owned by the installer user, but OpenClaw's ownership check rejects it with `suspicious ownership (uid=1001, expected uid=997 or root)`. This is a security feature that prevents a privileged gateway process from loading code a less-privileged user dropped into its extensions directory. Fix: `sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem`. Single-user installs where you ARE the gateway user are not affected — your own user owns the copy, and the ownership check passes.
+- **Multi-user ownership check (OpenClaw v2026.4.11+).** If the gateway runs as a dedicated system user (e.g. `openclaw`) and you run `clawmem setup openclaw` as a different user (e.g. `alice`), the copied plugin directory is owned by the installer user, but OpenClaw's ownership check rejects it with `suspicious ownership (uid=1001, expected uid=997 or root)`. This is a security feature that prevents a privileged gateway process from loading code a less-privileged user dropped into its extensions directory. Fix: `sudo chown -R <gateway-user>:<gateway-group> ~/.openclaw/extensions/clawmem`. Single-user installs where you ARE the gateway user are not affected — your own user owns the copy, and the ownership check passes.
 
 ### Rollback
 
@@ -168,7 +519,7 @@ Hooks + MCP stdio pick up new code automatically on next invocation — no resta
 
 When the user's prompt mentions entities already known to the vault (via `entity_nodes`), `context-surfacing` now appends a token-bounded `<vault-facts>` block of raw SPO triple lines to `<vault-context>`, alongside the existing `<facts>` / `<relationships>` blocks. This feeds the model current-state knowledge about entities the user is talking about, without requiring the agent to call `kg_query` explicitly.
 
-- **Three-path entity seeding** — canonical-ID regex (e.g. `default:project:clawmem`) → proper-noun extraction via `resolveEntityTypeExact` → longer-first n-gram scan (3-gram > 2-gram > 1-gram) for lowercase/hyphenated vocabulary like `forge-stack`, `oauth2`, `vm 202`. All three paths run prompt-only — entity seeds NEVER come from surfaced doc bodies, so topic-boosted off-topic docs cannot pollute the facts block.
+- **Three-path entity seeding** — canonical-ID regex (e.g. `default:project:clawmem`) → proper-noun extraction via `resolveEntityTypeExact` → longer-first n-gram scan (3-gram > 2-gram > 1-gram) for lowercase/hyphenated vocabulary like `side-project`, `oauth2`, `vm 12`. All three paths run prompt-only — entity seeds NEVER come from surfaced doc bodies, so topic-boosted off-topic docs cannot pollute the facts block.
 - **Profile-gated token sub-budget** — `factsTokens=0` on `speed` disables the stage entirely. `balanced` uses 200 tokens, `deep` uses 250. The sub-budget is dedicated — `<vault-facts>` cannot steal budget from `<facts>` or `<relationships>`.
 - **Truncation** — at the triple boundary, never mid-triple, never emits an empty block.
 - **Fail-open** — empty entity set → skip. Budget too small → drop block. Per-entity DB error → skip that entity. Any exception in the stage → return baseline `vault-context` unchanged.
@@ -445,7 +796,7 @@ None of these auto-enable. They are new capabilities gated behind environment va
 | Surprisal selector | v0.8.0 | `CLAWMEM_HEAVY_LANE_SURPRISAL=true`. Seeds Phase 2 with k-NN anomaly-ranked doc ids; falls back to stale-first (`surprisal-fallback-stale` metric) on vaults without embeddings. |
 | Post-import conversation synthesis | v0.7.2 | `clawmem mine <dir> --synthesize` flag. One-shot, not persistent. Runs a two-pass LLM pipeline over freshly imported conversation docs to extract structured decision / preference / milestone / problem facts with cross-fact relations. |
 | Consolidation worker | v0.7.1 | `CLAWMEM_ENABLE_CONSOLIDATION=true` (flag exists pre-v0.7.1). v0.7.1 attaches the new safety gates (Ext 1/2/3) to the existing Phase 2/3 path — enabling the flag picks up the gates automatically. |
-| Contradiction policy | v0.7.1 | `CLAWMEM_CONTRADICTION_POLICY=link` (default, keep both rows + insert `contradicts` edge) or `supersede` (mark old row `status='inactive'`). |
+| Contradiction policy | v0.7.1 (judge-gated v0.29.0) | `CLAWMEM_CONTRADICTION_POLICY=link` (default, keep both rows + set the old row's `invalidated_by` backlink) or `supersede` (mark old row `status='inactive'`; requires a configured judge since v0.29.0). |
 | Merge guard dry-run | v0.7.1 | `CLAWMEM_MERGE_GUARD_DRY_RUN=true` logs merge-safety rejections without enforcing — useful for calibration on older vaults before flipping the gate on. Leave `false` (default) to enforce. |
 
 Full environment variable reference: [`docs/reference/cli.md`](../reference/cli.md).

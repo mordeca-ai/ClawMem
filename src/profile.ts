@@ -44,7 +44,8 @@ export function buildStaticProfile(store: Store): string[] {
   const seen = new Set<string>();
 
   // Extract from decisions
-  const decisions = store.getDocumentsByType("decision", 20);
+  // §51.1 D13: static profile reflects currently-true decisions — effective order
+  const decisions = store.getDocumentsByType("decision", 20, { orderBy: "effective" });
   for (const d of decisions) {
     const body = store.getDocumentBody({
       filepath: `${d.collection}/${d.path}`,
@@ -123,11 +124,12 @@ export function buildDynamicProfile(store: Store): string[] {
   // Recent progress documents
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - 7);
-  const progress = store.getDocumentsByType("progress", 5);
-  const recent = progress.filter(p => p.modifiedAt >= cutoff.toISOString());
+  // §51.1 D13: content-currency — cutoff and display on effectiveAt
+  const progress = store.getDocumentsByType("progress", 5, { orderBy: "effective" });
+  const recent = progress.filter(p => p.effectiveAt >= cutoff.toISOString());
 
   for (const p of recent) {
-    items.push(`Progress: ${p.title} (${p.modifiedAt.slice(0, 10)})`);
+    items.push(`Progress: ${p.title} (${p.effectiveAt.slice(0, 10)})`);
   }
 
   // Truncate to budget
@@ -147,7 +149,22 @@ export function buildDynamicProfile(store: Store): string[] {
 // Profile Persistence
 // =============================================================================
 
-export function updateProfile(store: Store): void {
+/**
+ * What a profile rebuild actually did. A boolean cannot carry this: "not rebuilt" has three
+ * distinct causes with three different remedies, and one of them (a FORGOTTEN profile) has no
+ * supported restore at all — `lifecycle_restore` only reverses archival
+ * (`active = 0 AND archived_at IS NOT NULL`). Telling a user to restore a forgotten document
+ * would prescribe a capability that does not exist yet (tracked separately as the
+ * document-lifecycle boundary).
+ */
+export type ProfileUpdateOutcome = "rebuilt" | "held-forget" | "held-archive" | "failed";
+
+/**
+ * Rebuild the generated user profile.
+ *
+ * @returns what happened — callers must not report success for anything but `"rebuilt"` (§55.6 D9).
+ */
+export function updateProfile(store: Store): ProfileUpdateOutcome {
   const staticFacts = buildStaticProfile(store);
   const dynamicItems = buildDynamicProfile(store);
   const now = new Date().toISOString();
@@ -166,8 +183,15 @@ export function updateProfile(store: Store): void {
     // Check for inactive row (UNIQUE(collection, path) prevents re-insert)
     const inactive = store.findAnyDocument(PROFILE_COLLECTION, PROFILE_PATH);
     if (inactive) {
-      // Reactivate and update
-      store.reactivateDocument(inactive.id, "User Profile", hash, now);
+      // §55.6 D9: reactivateDocument refuses a row deactivated by forget or archival, so a
+      // profile the user forgot is NOT resurrected by the next `clawmem update`. Regenerating
+      // the profile is routine housekeeping; overruling a lifecycle decision is not.
+      const revived = store.reactivateDocument(inactive.id, "User Profile", hash, now);
+      if (!revived) {
+        const held = store.db.prepare("SELECT deactivated_reason FROM documents WHERE id = ?")
+          .get(inactive.id) as { deactivated_reason: string | null } | undefined;
+        return held?.deactivated_reason === "archive" ? "held-archive" : "held-forget";
+      }
       store.updateDocumentMeta(inactive.id, {
         content_type: "hub",
         tags: JSON.stringify(["auto-generated", "profile"]),
@@ -183,10 +207,13 @@ export function updateProfile(store: Store): void {
           });
         }
       } catch {
-        // Collection may not exist yet
+        // Collection may not exist yet. Returning "rebuilt" here would make the outcome mean
+        // "I tried", which is exactly the ambiguity this type exists to remove.
+        return "failed";
       }
     }
   }
+  return "rebuilt";
 }
 
 export function getProfile(store: Store): Profile | null {

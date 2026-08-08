@@ -64,6 +64,12 @@ fi
 # Embedding (zembed-1 recommended, --embeddings mode, -ub must match -b)
 export CLAWMEM_EMBED_URL="${CLAWMEM_EMBED_URL:-http://localhost:8088}"
 # LLM text generation (qmd-query-expansion-1.7B or similar, /v1/chat/completions)
+if [[ -z "${CLAWMEM_LLM_URL+x}" ]]; then
+  # Provenance marker (v0.29.0): tells `clawmem doctor` the URL below is the
+  # wrapper's own stock default, so the judge-migration warning never fires on
+  # a stock install. User- or .env-supplied URLs never set this.
+  export CLAWMEM_LLM_URL_SOURCE="default"
+fi
 export CLAWMEM_LLM_URL="${CLAWMEM_LLM_URL:-http://localhost:8089}"
 # Cross-encoder reranker (zerank-2 recommended, -ub must match -b)
 export CLAWMEM_RERANK_URL="${CLAWMEM_RERANK_URL:-http://localhost:8090}"

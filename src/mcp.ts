@@ -20,23 +20,27 @@ import {
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  rethrowIfFatalVectorError,
   type Store,
   type SearchResult,
-  type CausalLink,
+  type CausalEdgeRecord,
   type EvolutionEntry,
 } from "./store.ts";
+import { capCausalWire } from "./causal-reader.ts";
 import {
   applyCompositeScoring,
   hasRecencyIntent,
+  QUERY_WEIGHTS,
   type EnrichedResult,
   type CoActivationFn,
 } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, blendFusionAndRerank, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFtsSignal, ftsBypassEnabled, attachRrfScores, type RankedResult } from "./search-utils.ts";
+import { selectScoringRegime, rankRawPrimary, VECTOR_SCORE_BASIS, FTS_SCORE_BASIS, COMPOSITE_SCORE_BASIS } from "./scoring-regime.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
 import { listCollections } from "./collections.ts";
-import { classifyIntent, decomposeQuery, extractTemporalConstraint, type IntentType } from "./intent.ts";
-import { adaptiveTraversal, mergeTraversalResults, mpfpTraversal } from "./graph-traversal.ts";
+import { decomposeQuery, extractTemporalConstraint, type IntentType } from "./intent.ts";
+import { runCausalRetrieval, hasCausalSignal, hasTimelineSignal, type CausalAssociation } from "./causal-retrieval.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { startConsolidationWorker, stopConsolidationWorker } from "./consolidation.ts";
 import {
@@ -45,6 +49,25 @@ import {
 } from "./maintenance.ts";
 import { listVaults, loadVaultConfig } from "./config.ts";
 import { getEntityGraphNeighbors, searchEntities } from "./entity.ts";
+
+// =============================================================================
+// Reranker fallback telemetry
+// =============================================================================
+
+// blendRerank silently degrades to RRF order when the reranker is degenerate (the deprecated
+// zerank-2 GGUF emitted ~1e-11 scores that contributed nothing at weight 0.9). This surfaces that
+// otherwise-invisible regression. Rate-limited to at most one stderr line per minute; the running
+// count is included so a persistent failure is obvious. Run `clawmem doctor` for the full probe.
+let rerankFallbackCount = 0;
+let lastRerankFallbackWarnAt = 0;
+function onRerankFallback(reason: string): void {
+  rerankFallbackCount++;
+  const now = Date.now();
+  if (now - lastRerankFallbackWarnAt > 60_000) {
+    lastRerankFallbackWarnAt = now;
+    console.error(`[clawmem] reranker degraded → RRF fallback (${reason}); ${rerankFallbackCount} occurrence(s) this process. Run 'clawmem doctor' to check the reranker.`);
+  }
+}
 
 // =============================================================================
 // Types
@@ -93,15 +116,41 @@ function splitIntoWindows(text: string, windowSize: number, overlap = 200): stri
 }
 
 /** Classify query into retrieval mode based on signal patterns */
+// =============================================================================
+// Retrieval visibility policy (VSEARCH-TRUST-HARDENING (b))
+// =============================================================================
+
+// System-internal collections excluded from MCP retrieval by default. Hook precedent:
+// FILTERED_PATHS in context-surfacing. Opt-ins: the includeInternal param, or an explicit
+// collection filter naming an internal collection.
+const INTERNAL_COLLECTIONS = ["_clawmem"];
+
+function resolveExcludedCollections(includeInternal: boolean | undefined, collections?: string[]): string[] | undefined {
+  if (includeInternal) return undefined;
+  if (collections && collections.some(c => INTERNAL_COLLECTIONS.includes(c))) return undefined;
+  return INTERNAL_COLLECTIONS;
+}
+
+type DegradedLeg = { leg: string; reason: "excluded-dominant" | "cap-truncation" };
+
+// Only excluded-dominant carries the includeInternal advice — cap-truncation must stay
+// truthful when the shortfall is dedup-driven (T5-M2).
+function degradedGuidanceText(legs: DegradedLeg[]): string {
+  const anyExcludedDominant = legs.some(l => l.reason === "excluded-dominant");
+  return anyExcludedDominant
+    ? "Note: nearest-neighbor region dominated by excluded internal docs — pass includeInternal:true or refine the query."
+    : "Note: vector results truncated at the scan cap.";
+}
+
 function classifyRetrievalMode(query: string): "keyword" | "semantic" | "causal" | "timeline" | "discovery" | "complex" | "hybrid" {
   const q = query.toLowerCase();
 
-  // Timeline (highest precision signals — check first)
-  if (/\b(last session|yesterday|prior session|previous session|last time we|handoff|what happened last|what did we do|cross.session|earlier today|this morning|what we discussed|when we last)\b/i.test(q)) return "timeline";
+  // Timeline (highest precision signals — check first). Shared signal source with the REST
+  // classifier (causal-retrieval.ts) so the two never drift again.
+  if (hasTimelineSignal(q)) return "timeline";
 
   // Causal
-  if (/\b(why did|why was|why were|what caused|what led to|reason for|decided to|decision about|trade.?off|instead of|chose to|because we)\b/i.test(q)) return "causal";
-  if (/^why\b/i.test(q)) return "causal";
+  if (hasCausalSignal(q)) return "causal";
 
   // Discovery
   if (/\b(similar to|related to|what else|what other|reminds? me of|like this|comparable|neighbors)\b/i.test(q)) return "discovery";
@@ -140,7 +189,13 @@ function addLineNumbers(text: string, startLine: number = 1): string {
 // MCP Server
 // =============================================================================
 
-export async function startMcpServer(): Promise<void> {
+/**
+ * Build the fully-registered MCP server WITHOUT connecting a transport.
+ * Extracted from startMcpServer so tests can drive the real tool handlers over an
+ * in-memory transport (route-level regressions for visibility exclusion + degraded
+ * markers). Returns the server plus a close() that releases every store handle.
+ */
+export function buildMcpServer(): { server: McpServer; store: Store; closeAllStores: () => void } {
   const store = createStore(undefined, { busyTimeout: 5000 });
 
   // Vault store cache: prevents connection churn, closed on shutdown
@@ -230,13 +285,16 @@ This is the recommended entry point for ALL memory queries.`,
         mode: z.enum(["auto", "keyword", "semantic", "causal", "timeline", "discovery", "complex", "hybrid"]).optional().default("auto").describe("Override auto-detection: keyword=BM25, semantic=vector, causal=graph traversal, timeline=session history, discovery=similar docs, complex=multi-topic, hybrid=full pipeline"),
         limit: z.number().optional().default(10),
         compact: z.boolean().optional().default(true),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, mode, limit, compact, vault }) => {
+    async ({ query, mode, limit, compact, includeInternal, vault }) => {
       const store = getStore(vault);
       const effectiveMode = mode === "auto" ? classifyRetrievalMode(query) : mode;
       const lim = limit || 10;
+      const excl = resolveExcludedCollections(includeInternal);
+      const degradedLegs: DegradedLeg[] = [];
 
       // --- Timeline mode → session log ---
       if (effectiveMode === "timeline") {
@@ -257,86 +315,61 @@ This is the recommended entry point for ALL memory queries.`,
         return { content: [{ type: "text", text: lines.join('\n') }], structuredContent: { mode: effectiveMode, sessions } };
       }
 
-      // --- Causal mode → intent classification + graph traversal ---
+      // --- Causal mode → shared intent-aware causal pipeline (v0.32.0) ---
+      // Same pipeline as intent_search, differing only in eligibility (default-filtered) and
+      // the WHY observation lane; entity expansion stays off (legacy stage, intent_search-only).
       if (effectiveMode === "causal") {
         const llm = getDefaultLlamaCpp();
-        const intent = await classifyIntent(query, llm, store.db);
-        const bm25Results = store.searchFTS(query, 30);
-        let vecResults: SearchResult[] = [];
-        try { vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30); } catch { /* no vectors */ }
-        const rrfWeights = intent.intent === 'WHY' ? [1.0, 1.5] : intent.intent === 'WHEN' ? [1.5, 1.0] : [1.0, 1.0];
-        const fusedRanked = reciprocalRankFusion([bm25Results.map(toRanked), vecResults.map(toRanked)], rrfWeights);
-        const allSearch = [...bm25Results, ...vecResults];
-        let fused: SearchResult[] = fusedRanked.map(fr => {
-          const orig = allSearch.find(r => r.filepath === fr.file);
-          return orig ? { ...orig, score: fr.score } : null;
-        }).filter((r): r is SearchResult => r !== null);
+        const { intent, results: causalResults, associations, degraded } = await runCausalRetrieval(store, llm, query, {
+          stages: { traversal: true, mpfp: true, entityExpansion: false, rerank: true, causalOneHop: true },
+          baseEligibility: { excludeCollections: excl },
+          whyObservationLane: true,
+        });
+        // Causal mode reports the flat single-vector degraded shape per the documented
+        // contract (T8-M5), not the multi-leg degradedLegs aggregate.
+        const causalDegraded: DegradedLeg | undefined = degraded.length > 0
+          ? { leg: degraded[0]!.leg, reason: degraded[0]!.reason }
+          : undefined;
 
-        if (intent.intent === 'WHY' || intent.intent === 'ENTITY') {
-          try {
-            const anchorEmb = await llm.embed(query);
-            if (anchorEmb) {
-              const traversed = adaptiveTraversal(store.db, fused.slice(0, 10).map(r => ({ hash: r.hash, score: r.score })), {
-                maxDepth: 2, beamWidth: 5, budget: 30,
-                intent: intent.intent, queryEmbedding: anchorEmb.embedding,
-              });
-              const merged = mergeTraversalResults(store.db, fused.map(r => ({ hash: r.hash, score: r.score })), traversed);
-              // Hydrate merged results back to SearchResult format
-              const fusedMap = new Map(fused.map(r => [r.hash, r]));
-              fused = merged.map(m => {
-                const orig = fusedMap.get(m.hash);
-                if (orig) return { ...orig, score: m.score };
-                // Graph-discovered node — hydrate from DB
-                const doc = store.db.prepare(`
-                  SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
-                  FROM documents d
-                  LEFT JOIN content c ON c.hash = d.hash
-                  WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
-                `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
-                if (!doc) return null;
-                return {
-                  filepath: `clawmem://${doc.collection}/${doc.path}`,
-                  displayPath: `${doc.collection}/${doc.path}`,
-                  title: doc.title || doc.path.split("/").pop() || "",
-                  context: null,
-                  hash: doc.hash,
-                  docid: doc.hash.slice(0, 6),
-                  collectionName: doc.collection,
-                  modifiedAt: doc.modified_at || "",
-                  bodyLength: doc.body?.length || 0,
-                  body: doc.body || "",
-                  score: m.score,
-                  source: "vec" as const,
-                } satisfies SearchResult;
-              }).filter((r): r is SearchResult => r !== null);
-            }
-          } catch { /* graph traversal failed — continue with base results */ }
-        }
-
-        const enriched = enrichResults(store, fused, query);
+        const enriched = enrichResults(store, causalResults, query);
         const scored = applyCompositeScoring(enriched, query).slice(0, lim);
-        const items = scored.map(r => ({
-          docid: `#${r.docid}`, path: r.displayPath, title: r.title,
-          score: Math.round(r.compositeScore * 100) / 100,
-          snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
-        }));
+        const items = scored.map(r => {
+          const causal = associations.get(r.filepath);
+          return {
+            docid: `#${r.docid}`, path: r.displayPath, title: r.title,
+            score: Math.round(r.compositeScore * 100) / 100,
+            snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
+            ...(causal ? { causal } : {}),
+          };
+        });
+        const causalDegradedFields = causalDegraded ? { degraded: true as const, degradedReason: causalDegraded.reason } : {};
+        const degradedNote = causalDegraded ? `\n${degradedGuidanceText([causalDegraded])}` : "";
         return {
-          content: [{ type: "text", text: `[routed: causal, intent: ${intent.intent}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
-          structuredContent: { mode: effectiveMode, intent, results: items },
+          content: [{ type: "text", text: `[routed: causal, intent: ${intent.intent}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${degradedNote}` }],
+          structuredContent: { mode: effectiveMode, intent, results: items, ...causalDegradedFields },
         };
       }
 
-      // --- Complex mode → query decomposition ---
+      // --- Complex mode → query decomposition (multi-leg: per-clause degraded aggregation, T6-M1) ---
       if (effectiveMode === "complex") {
         const llm = getDefaultLlamaCpp();
         const clauses = await decomposeQuery(query, llm, store.db);
         const allResults: SearchResult[] = [];
+        let clauseIdx = 0;
         for (const clause of clauses.sort((a, b) => a.priority - b.priority)) {
+          const clauseExcl = resolveExcludedCollections(includeInternal, clause.collections);
           let results: SearchResult[] = [];
-          if (clause.type === 'bm25') results = store.searchFTS(clause.query, 20, undefined, clause.collections);
-          else if (clause.type === 'vector') { try { results = await store.searchVec(clause.query, DEFAULT_EMBED_MODEL, 20, undefined, clause.collections); } catch { /* */ } }
-          else if (clause.type === 'graph') { results = store.searchFTS(clause.query, 15, undefined, clause.collections); }
+          if (clause.type === 'bm25') results = store.searchFTS(clause.query, 20, undefined, clause.collections, undefined, clauseExcl);
+          else if (clause.type === 'vector') {
+            try {
+              const det = await store.searchVecDetailed(clause.query, DEFAULT_EMBED_MODEL, 20, { collections: clause.collections, excludeCollections: clauseExcl });
+              results = det.results;
+              if (det.degraded && det.degradedReason) degradedLegs.push({ leg: `complex:clause${clauseIdx}:vector`, reason: det.degradedReason });
+            } catch (e) { rethrowIfFatalVectorError(e); /* */ }
+          }
+          else if (clause.type === 'graph') { results = store.searchFTS(clause.query, 15, undefined, clause.collections, undefined, clauseExcl); }
           allResults.push(...results);
+          clauseIdx++;
         }
         const seen = new Set<string>();
         const deduped = allResults.filter(r => { if (seen.has(r.filepath)) return false; seen.add(r.filepath); return true; });
@@ -347,37 +380,59 @@ This is the recommended entry point for ALL memory queries.`,
           score: Math.round(r.compositeScore * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
         }));
+        const degradedNote = degradedLegs.length > 0 ? `\n${degradedGuidanceText(degradedLegs)}` : "";
         return {
-          content: [{ type: "text", text: `[routed: complex, ${clauses.length} clauses] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
-          structuredContent: { mode: effectiveMode, clauses: clauses.length, results: items },
+          content: [{ type: "text", text: `[routed: complex, ${clauses.length} clauses] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${degradedNote}` }],
+          structuredContent: { mode: effectiveMode, clauses: clauses.length, results: items, ...(degradedLegs.length > 0 ? { degraded: true, degradedLegs } : {}) },
         };
       }
 
       // --- Keyword / Semantic / Discovery / Hybrid modes ---
       let results: SearchResult[] = [];
+      let singleLegDegraded: DegradedLeg | undefined;
+      // semantic/discovery: the raw regime applies ONLY to results the vector leg actually
+      // served — the FTS fallback's scores are not cosine, so it keeps composite scoring.
+      let vectorLegServed = false;
       if (effectiveMode === "keyword") {
-        results = store.searchFTS(query, lim);
+        results = store.searchFTS(query, lim, undefined, undefined, undefined, excl);
       } else if (effectiveMode === "semantic" || effectiveMode === "discovery") {
-        try { results = await store.searchVec(query, DEFAULT_EMBED_MODEL, lim); } catch { results = store.searchFTS(query, lim); }
+        try {
+          const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, lim, { excludeCollections: excl });
+          results = det.results;
+          vectorLegServed = true;
+          if (det.degraded && det.degradedReason) singleLegDegraded = { leg: `${effectiveMode}:vector`, reason: det.degradedReason };
+        } catch (e) { rethrowIfFatalVectorError(e); results = store.searchFTS(query, lim, undefined, undefined, undefined, excl); }
       } else {
         // Hybrid: BM25 + vector + RRF
-        const bm25 = store.searchFTS(query, 30);
+        const bm25 = store.searchFTS(query, 30, undefined, undefined, undefined, excl);
         let vec: SearchResult[] = [];
-        try { vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30); } catch { /* */ }
+        try {
+          const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, 30, { excludeCollections: excl });
+          vec = det.results;
+          if (det.degraded && det.degradedReason) singleLegDegraded = { leg: "hybrid:vector", reason: det.degradedReason };
+        } catch (e) { rethrowIfFatalVectorError(e); /* */ }
         if (vec.length > 0) {
           const fusedRanked = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
-          const allSearch = [...bm25, ...vec];
-          results = fusedRanked.map(fr => {
-            const orig = allSearch.find(r => r.filepath === fr.file);
-            return orig ? { ...orig, score: fr.score } : null;
-          }).filter((r): r is SearchResult => r !== null);
+          results = attachRrfScores(fusedRanked, [...bm25, ...vec]);
         } else {
           results = bm25;
         }
       }
 
       const enriched = enrichResults(store, results, query);
-      const scored = applyCompositeScoring(enriched, query).slice(0, lim);
+      // v0.22.0 two-regime scoring (VSEARCH-RAW-PRIMARY-DESIGN.md R1/R4): vector-served
+      // semantic/discovery results on non-recency queries rank by raw cosine (metadata
+      // breaks exact ties only). Keyword/hybrid modes and the FTS fallback keep composite —
+      // their scores are not cosine, so the raw contract cannot hold there.
+      const rawRegime = vectorLegServed
+        && (effectiveMode === "semantic" || effectiveMode === "discovery")
+        && selectScoringRegime(query) === "raw";
+      const retrieveScoreBasis = rawRegime ? VECTOR_SCORE_BASIS : COMPOSITE_SCORE_BASIS;
+      const scored = rawRegime
+        ? rankRawPrimary(enriched, query).slice(0, lim)
+        : applyCompositeScoring(enriched, query).slice(0, lim);
+      const modeDegraded = singleLegDegraded ? { degraded: true as const, degradedReason: singleLegDegraded.reason } : {};
+      const modeDegradedNote = singleLegDegraded ? `\n${degradedGuidanceText([singleLegDegraded])}` : "";
       if (compact) {
         const items = scored.map(r => ({
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
@@ -385,8 +440,8 @@ This is the recommended entry point for ALL memory queries.`,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType,
         }));
         return {
-          content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
-          structuredContent: { mode: effectiveMode, results: items },
+          content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${modeDegradedNote}` }],
+          structuredContent: { mode: effectiveMode, results: items, scoreBasis: retrieveScoreBasis, ...modeDegraded },
         };
       }
       const items: SearchResultItem[] = scored.map(r => {
@@ -399,8 +454,8 @@ This is the recommended entry point for ALL memory queries.`,
         };
       });
       return {
-        content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items, query)}` }],
-        structuredContent: { mode: effectiveMode, results: items },
+        content: [{ type: "text", text: `[routed: ${effectiveMode}] ${formatSearchSummary(items, query)}${modeDegradedNote}` }],
+        structuredContent: { mode: effectiveMode, results: items, scoreBasis: retrieveScoreBasis, ...modeDegraded },
       };
     }
   );
@@ -460,7 +515,7 @@ This is the recommended entry point for ALL memory queries.`,
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: search (BM25 + composite)
+  // Tool: search (BM25 — raw-transform ranking; composite on recency intent)
   // ---------------------------------------------------------------------------
 
   server.registerTool(
@@ -471,32 +526,43 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         query: z.string().describe("Search query"),
         limit: z.number().optional().default(10),
-        minScore: z.number().optional().default(0),
+        minScore: z.number().optional().describe("Score floor. Non-recency queries filter the RAW FTS score, the monotonic |bm25|/(1+|bm25|) transform (default: no filter; explicit 0 honored). Recency-intent queries keep the composite-scale default 0."),
         collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, minScore, collection, compact, vault }) => {
+    async ({ query, limit, minScore, collection, compact, includeInternal, vault }) => {
       const store = getStore(vault);
       const collections = collection
         ? collection.split(",").map(c => c.trim()).filter(Boolean)
         : undefined;
-      const results = store.searchFTS(query, limit || 10, undefined, collections);
+      const excl = resolveExcludedCollections(includeInternal, collections);
+      const results = store.searchFTS(query, limit || 10, undefined, collections, undefined, excl);
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, results, query);
-      const scored = applyCompositeScoring(enriched, query, coFn)
-        .filter(r => r.compositeScore >= (minScore || 0));
+      // v0.24.0 two-regime scoring (S49-JUDGED-EVAL-DESIGN.md, SWITCH verdict): non-recency
+      // queries rank by the raw FTS transform — metadata (incl. pin) breaks exact score
+      // ties only, and minScore (if given) filters the raw score with NO default floor.
+      // Recency-intent queries keep the pre-v0.24.0 composite behavior including its
+      // default-0 floor.
+      const regime = selectScoringRegime(query);
+      const sScoreBasis = regime === "raw" ? FTS_SCORE_BASIS : COMPOSITE_SCORE_BASIS;
+      const scored = regime === "raw"
+        ? rankRawPrimary(enriched, query, coFn).filter(r => minScore === undefined || r.compositeScore >= minScore)
+        : applyCompositeScoring(enriched, query, coFn).filter(r => r.compositeScore >= (minScore || 0));
 
       if (compact) {
         const items = scored.map(r => ({
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+          authored_at: r.authoredAt ?? null,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
-        return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items } };
+        return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items, scoreBasis: sScoreBasis } };
       }
 
       const filtered: SearchResultItem[] = scored.map(r => {
@@ -515,7 +581,7 @@ This is the recommended entry point for ALL memory queries.`,
 
       return {
         content: [{ type: "text", text: formatSearchSummary(filtered, query) }],
-        structuredContent: { results: filtered },
+        structuredContent: { results: filtered, scoreBasis: sScoreBasis },
       };
     }
   );
@@ -532,13 +598,14 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         query: z.string().describe("Natural language query"),
         limit: z.number().optional().default(10),
-        minScore: z.number().optional().default(0.3),
+        minScore: z.number().optional().describe("Score floor. Non-recency queries filter the RAW cosine score (default: no filter; explicit 0 honored; cosine values are embedding-model-specific). Recency-intent queries keep the composite-scale default 0.3."),
         collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
         compact: z.boolean().optional().default(false).describe("Return compact results (id, path, title, score, snippet) instead of full content"),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, minScore, collection, compact, vault }) => {
+    async ({ query, limit, minScore, collection, compact, includeInternal, vault }) => {
       const store = getStore(vault);
       const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
       if (!tableExists) {
@@ -548,21 +615,35 @@ This is the recommended entry point for ALL memory queries.`,
       const collections = collection
         ? collection.split(",").map(c => c.trim()).filter(Boolean)
         : undefined;
-      const results = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit || 10, undefined, collections);
+      const excl = resolveExcludedCollections(includeInternal, collections);
+      const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, limit || 10, { collections, excludeCollections: excl });
+      const results = det.results;
+      const vsDegraded = det.degraded && det.degradedReason ? { degraded: true as const, degradedReason: det.degradedReason } : {};
+      const vsDegradedNote = det.degraded && det.degradedReason ? `\n${degradedGuidanceText([{ leg: "vsearch", reason: det.degradedReason }])}` : "";
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, results, query);
-      const scored = applyCompositeScoring(enriched, query, coFn)
-        .filter(r => r.compositeScore >= (minScore || 0.3));
+      // v0.22.0 two-regime scoring (VSEARCH-RAW-PRIMARY-DESIGN.md R1–R4): non-recency
+      // queries rank by raw cosine — metadata (incl. pin) breaks exact score ties only,
+      // and minScore (if given) filters the raw score with NO default floor. Recency-intent
+      // queries keep the pre-v0.22.0 composite behavior including its 0.3 default.
+      const regime = selectScoringRegime(query);
+      const vsScoreBasis = regime === "raw" ? VECTOR_SCORE_BASIS : COMPOSITE_SCORE_BASIS;
+      const scored = regime === "raw"
+        ? rankRawPrimary(enriched, query, coFn).filter(r => minScore === undefined || r.compositeScore >= minScore)
+        // Recency branch preserves v0.21 semantics EXACTLY, including `||`: an explicit
+        // minScore of 0 still applies the 0.3 composite floor (R4 unchanged-recency contract).
+        : applyCompositeScoring(enriched, query, coFn).filter(r => r.compositeScore >= (minScore || 0.3));
 
       if (compact) {
         const items = scored.map(r => ({
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+          authored_at: r.authoredAt ?? null,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
-        return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items } };
+        return { content: [{ type: "text", text: `${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${vsDegradedNote}` }], structuredContent: { results: items, scoreBasis: vsScoreBasis, ...vsDegraded } };
       }
 
       const items: SearchResultItem[] = scored.map(r => {
@@ -580,8 +661,8 @@ This is the recommended entry point for ALL memory queries.`,
       });
 
       return {
-        content: [{ type: "text", text: formatSearchSummary(items, query) }],
-        structuredContent: { results: items },
+        content: [{ type: "text", text: `${formatSearchSummary(items, query)}${vsDegradedNote}` }],
+        structuredContent: { results: items, scoreBasis: vsScoreBasis, ...vsDegraded },
       };
     }
   );
@@ -604,14 +685,16 @@ This is the recommended entry point for ALL memory queries.`,
         diverse: z.boolean().optional().default(true).describe("Apply MMR diversity filter to reduce near-duplicate results"),
         intent: z.string().optional().describe("Domain intent hint for disambiguation — steers expansion, reranking, chunk selection, and snippet extraction"),
         candidateLimit: z.number().optional().default(30).describe("Max candidates reaching the reranker (default 30)"),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, minScore, collection, compact, diverse, intent, candidateLimit, vault }) => {
+    async ({ query, limit, minScore, collection, compact, diverse, intent, candidateLimit, includeInternal, vault }) => {
       const store = getStore(vault);
       const candLimit = candidateLimit || 30;
       const rankedLists: RankedResult[][] = [];
       const docidMap = new Map<string, string>();
+      const degradedLegs: DegradedLeg[] = [];
       const hasVectors = !!store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
       // Step 0: Temporal constraint extraction (pure regex, ~0ms)
@@ -621,13 +704,11 @@ This is the recommended entry point for ALL memory queries.`,
       const collections = collection
         ? collection.split(",").map(c => c.trim()).filter(Boolean)
         : undefined;
-      const initialFts = store.searchFTS(query, 20, undefined, collections, dateRange);
-      const topScore = initialFts.length > 0 ? Math.abs(initialFts[0]!.score) : 0;
-      const secondScore = initialFts.length > 1 ? Math.abs(initialFts[1]!.score) : 0;
+      const excl = resolveExcludedCollections(includeInternal, collections);
+      const initialFts = store.searchFTS(query, 20, undefined, collections, dateRange, excl);
       // When intent is provided, disable strong-signal bypass — the obvious BM25
       // match may not be what the caller wants (e.g. "performance" with intent "web page load times")
-      const hasStrongSignal = !intent && initialFts.length > 0
-        && topScore >= 0.85 && (topScore - secondScore) >= 0.15;
+      const hasStrongSignal = !intent && ftsBypassEnabled() && hasStrongFtsSignal(initialFts);
 
       // Step 2: Query expansion (skipped if strong signal). Typed routing —
       // original → BOTH FTS + vector (2× RRF anchor), lex → FTS only, vec/hyde → vector only.
@@ -642,30 +723,34 @@ This is the recommended entry point for ALL memory queries.`,
         rankedLists.push(initialFts.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
       }
       if (hasVectors) {
-        const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 20, undefined, collections, dateRange);
-        if (vecResults.length > 0) {
-          for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+        const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, 20, { collections, dateRange, excludeCollections: excl });
+        if (det.degraded && det.degradedReason) degradedLegs.push({ leg: "vector:original", reason: det.degradedReason });
+        if (det.results.length > 0) {
+          for (const r of det.results) docidMap.set(r.filepath, r.docid);
+          rankedLists.push(det.results.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
         }
       }
       // Lists contributed by the original query — these get the 2× RRF weight.
       const numOriginalLists = rankedLists.length;
 
       // Typed expansions — route by type: lex → FTS, vec/hyde → vector.
+      let expansionIdx = 0;
       for (const eq of expanded) {
         if (eq.type === 'lex') {
-          const ftsResults = store.searchFTS(eq.query, 20, undefined, collections, dateRange);
+          const ftsResults = store.searchFTS(eq.query, 20, undefined, collections, dateRange, excl);
           if (ftsResults.length > 0) {
             for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
             rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
           }
         } else if (hasVectors) {
-          const vecResults = await store.searchVec(eq.query, DEFAULT_EMBED_MODEL, 20, undefined, collections, dateRange);
-          if (vecResults.length > 0) {
-            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-            rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+          const det = await store.searchVecDetailed(eq.query, DEFAULT_EMBED_MODEL, 20, { collections, dateRange, excludeCollections: excl });
+          if (det.degraded && det.degradedReason) degradedLegs.push({ leg: `vector:expansion${expansionIdx}`, reason: det.degradedReason });
+          if (det.results.length > 0) {
+            for (const r of det.results) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(det.results.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
           }
         }
+        expansionIdx++;
       }
 
       // Step 2b: Temporal proximity channel (if dateRange detected)
@@ -673,18 +758,24 @@ This is the recommended entry point for ALL memory queries.`,
       if (dateRange) {
         const centerMs = (new Date(dateRange.start).getTime() + new Date(dateRange.end).getTime()) / 2;
         const rangeMs = Math.max(new Date(dateRange.end).getTime() - new Date(dateRange.start).getTime(), 86400000);
+        const temporalExclSql = excl && excl.length > 0
+          ? ` AND d.collection NOT IN (${excl.map(() => '?').join(',')})`
+          : "";
+        // §51.1: the proximity channel measures content time — authorship when
+        // known, filing time otherwise — in the WHERE, the ORDER, and the
+        // proximity math itself.
         const temporalDocs = store.db.prepare(`
           SELECT 'clawmem://' || d.collection || '/' || d.path as filepath,
                  d.collection || '/' || d.path as displayPath,
-                 d.title, d.modified_at
+                 d.title, COALESCE(d.authored_at, d.modified_at) as effective_at
           FROM documents d
-          WHERE d.active = 1 AND d.invalidated_at IS NULL AND d.modified_at >= ? AND d.modified_at <= ?
-          ORDER BY d.modified_at DESC LIMIT 30
-        `).all(dateRange.start, dateRange.end) as { filepath: string; displayPath: string; title: string; modified_at: string }[];
+          WHERE d.active = 1 AND d.invalidated_at IS NULL AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?${temporalExclSql}
+          ORDER BY COALESCE(d.authored_at, d.modified_at) DESC LIMIT 30
+        `).all(dateRange.start, dateRange.end, ...(excl ?? [])) as { filepath: string; displayPath: string; title: string; effective_at: string }[];
 
         if (temporalDocs.length > 0) {
           const temporalRanked: RankedResult[] = temporalDocs.map(d => {
-            const docMs = new Date(d.modified_at).getTime();
+            const docMs = new Date(d.effective_at).getTime();
             const proximity = 1.0 - Math.min(1.0, Math.abs(docMs - centerMs) / rangeMs);
             return { file: d.filepath, displayPath: d.displayPath, title: d.title, body: "", score: proximity };
           });
@@ -711,6 +802,7 @@ This is the recommended entry point for ALL memory queries.`,
                 WHERE d.id = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
               `).get(en.docId) as { collection: string; path: string; title: string; body: string | null } | undefined;
               if (!doc) return null;
+              if (excl && excl.includes(doc.collection)) return null;
               return {
                 file: `clawmem://${doc.collection}/${doc.path}`,
                 displayPath: `${doc.collection}/${doc.path}`,
@@ -753,13 +845,23 @@ This is the recommended entry point for ALL memory queries.`,
         return { file: c.file, text };
       });
 
-      const reranked = await store.rerank(query, chunksToRerank, DEFAULT_RERANK_MODEL, intent);
+      let reranked: { file: string; score: number }[] = [];
+      try {
+        reranked = await store.rerank(query, chunksToRerank, DEFAULT_RERANK_MODEL, intent);
+      } catch {
+        reranked = []; // reranker unavailable → blendRerank falls back to pure RRF order
+      }
 
       const candidateMap = new Map(candidates.map(c => [c.file, c]));
 
-      // Blend RRF + reranker scores using the candidate's actual (normalized)
-      // RRF fusion score, not a rank-index proxy (master-harness-z7o4y fusion fix).
-      const blended = blendFusionAndRerank(candidates, reranked);
+      // Blend the reranker (dominant signal) with a thin normalized-RRF tiebreaker; falls back
+      // to pure RRF order when the reranker is unavailable / all-zero. See blendRerank: the
+      // prior w·(1/rrfRank) blend made RRF rank-1 immovable by the reranker. Harness-validated
+      // 2026-06-25 (NL+KW known-item recall): lifts recall@1-5 + MRR@10 with no material pooled
+      // recall@10 regression. (Supersedes the fork's blendFusionAndRerank here — same normalized
+      // real-RRF signal, plus dominant rerank + degenerate-floor fallback. blendFusionAndRerank
+      // remains on the CLI query path, which upstream never migrated.)
+      const blended = blendRerank(candidates, reranked, { onFallback: onRerankFallback });
 
       // Map to SearchResults for composite scoring — hydrate from DB when needed
       const allSearchResults = [...store.searchFTS(query, 30)];
@@ -799,19 +901,27 @@ This is the recommended entry point for ALL memory queries.`,
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, searchResults, query);
-      let scored = applyCompositeScoring(enriched, query, coFn)
+      // Phase B (§11.12): the `query` tool's hybrid+rerank pipeline uses QUERY_WEIGHTS (search 0.70) —
+      // the eval-validated re-weight. Recency intent still wins RECENCY_WEIGHTS by construction
+      // (applyCompositeScoring ignores options.weights when hasRecencyIntent(query) and !forceWeights).
+      let scored = applyCompositeScoring(enriched, query, coFn, { weights: QUERY_WEIGHTS })
         .filter(r => r.compositeScore >= (minScore || 0));
       if (diverse !== false) scored = applyMMRDiversity(scored);
       scored = scored.slice(0, limit || 10);
+
+      // Multi-leg degraded aggregation (T5-M1): route marker = any(leg), per-leg reasons retained.
+      const queryDegraded = degradedLegs.length > 0 ? { degraded: true as const, degradedLegs } : {};
+      const queryDegradedNote = degradedLegs.length > 0 ? `\n${degradedGuidanceText(degradedLegs)}` : "";
 
       if (compact) {
         const items = scored.map(r => ({
           docid: `#${docidMap.get(r.filepath) || r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+          authored_at: r.authoredAt ?? null,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
-        return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items } };
+        return { content: [{ type: "text", text: `${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${queryDegradedNote}` }], structuredContent: { results: items, ...queryDegraded } };
       }
 
       const items: SearchResultItem[] = scored.map(r => {
@@ -829,8 +939,8 @@ This is the recommended entry point for ALL memory queries.`,
       });
 
       return {
-        content: [{ type: "text", text: formatSearchSummary(items, query) }],
-        structuredContent: { results: items },
+        content: [{ type: "text", text: `${formatSearchSummary(items, query)}${queryDegradedNote}` }],
+        structuredContent: { results: items, ...queryDegraded },
       };
     }
   );
@@ -930,7 +1040,8 @@ This is the recommended entry point for ALL memory queries.`,
           }));
         }
       }
-    } catch {
+    } catch (e) {
+      rethrowIfFatalVectorError(e);
       // Vector search unavailable — degrade gracefully
     }
 
@@ -952,9 +1063,11 @@ This is the recommended entry point for ALL memory queries.`,
 
     const top = candidates[0]!;
 
-    // Clear winner: high score OR significant gap to #2
+    // Clear winner: high score OR significant gap to #2. The gap clause requires an
+    // actual #2 to gap against — a lone weak candidate must not qualify (destructive
+    // ops would otherwise auto-select a garbage single match).
     const gap = candidates.length > 1 ? top.score - candidates[1]!.score : 1.0;
-    const confident = top.score >= 0.7 || gap >= 0.2;
+    const confident = top.score >= 0.7 || (candidates.length > 1 && gap >= 0.2);
 
     // For destructive ops (forget), require higher confidence
     if (destructive && !confident) {
@@ -1012,7 +1125,7 @@ This is the recommended entry point for ALL memory queries.`,
         };
       }
 
-      s.deactivateDocument(collection, path);
+      s.deactivateDocument(collection, path, "forget");
 
       s.insertUsage({
         sessionId: "mcp-forget",
@@ -1239,10 +1352,11 @@ This is the recommended entry point for ALL memory queries.`,
       inputSchema: {
         file: z.string().describe("Path of reference document"),
         limit: z.number().optional().default(5),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs — excluded by default (auto-included when the REFERENCE doc is itself internal)"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ file, limit, vault }) => {
+    async ({ file, limit, includeInternal, vault }) => {
       const store = getStore(vault);
       const tableExists = store.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
       if (!tableExists) {
@@ -1258,14 +1372,21 @@ This is the recommended entry point for ALL memory queries.`,
       const body = store.getDocumentBody(result) ?? "";
       const title = result.title || file;
 
+      // Internal-reference auto-exception (T2-M7): exploring FROM an internal doc is an
+      // explicit ask for the internal space — include internal neighbors.
+      const refIsInternal = INTERNAL_COLLECTIONS.includes(result.collectionName);
+      const excl = resolveExcludedCollections(includeInternal || refIsInternal);
+
       // Use the document's content as the search query
       const queryText = `${title}\n${body.slice(0, 1000)}`;
-      const vecResults = await store.searchVec(queryText, DEFAULT_EMBED_MODEL, (limit || 5) + 1);
+      const det = await store.searchVecDetailed(queryText, DEFAULT_EMBED_MODEL, (limit || 5) + 1, { excludeCollections: excl });
 
       // Filter out the reference document itself
-      const similar = vecResults
+      const similar = det.results
         .filter(r => r.filepath !== result.filepath)
         .slice(0, limit || 5);
+      const fsDegraded = det.degraded && det.degradedReason ? { degraded: true as const, degradedReason: det.degradedReason } : {};
+      const fsDegradedNote = det.degraded && det.degradedReason ? `\n${degradedGuidanceText([{ leg: "find_similar", reason: det.degradedReason }])}` : "";
 
       const items: SearchResultItem[] = similar.map(r => {
         const { line, snippet } = extractSnippet(r.body || "", title, 200);
@@ -1280,8 +1401,8 @@ This is the recommended entry point for ALL memory queries.`,
       });
 
       return {
-        content: [{ type: "text", text: `${items.length} similar to "${title}":\n${items.map(i => `  ${i.file} (${Math.round(i.score * 100)}%)`).join('\n')}` }],
-        structuredContent: { reference: file, results: items },
+        content: [{ type: "text", text: `${items.length} similar to "${title}":\n${items.map(i => `  ${i.file} (${Math.round(i.score * 100)}%)`).join('\n')}${fsDegradedNote}` }],
+        structuredContent: { reference: file, results: items, ...fsDegraded },
       };
     }
   );
@@ -1302,7 +1423,7 @@ This is the recommended entry point for ALL memory queries.`,
     async ({ vault }) => {
       const store = getStore(vault);
       const collections = listCollections();
-      const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0 };
+      const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0 };
 
       for (const col of collections) {
         const stats = await indexCollection(store, col.name, col.path, col.pattern, { defaultContentType: col.content_type });
@@ -1310,6 +1431,7 @@ This is the recommended entry point for ALL memory queries.`,
         totalStats.updated += stats.updated;
         totalStats.unchanged += stats.unchanged;
         totalStats.removed += stats.removed;
+        totalStats.dated += stats.dated;
       }
 
       const summary = `Reindex complete: +${totalStats.added} added, ~${totalStats.updated} updated, =${totalStats.unchanged} unchanged, -${totalStats.removed} removed`;
@@ -1373,6 +1495,310 @@ This is the recommended entry point for ALL memory queries.`,
       return {
         content: [{ type: "text", text: summary.join('\n') }],
         structuredContent: stats,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: memory_stats (v0.36.0 — deterministic lifecycle/ranking-metadata aggregates)
+  // ---------------------------------------------------------------------------
+
+  const round3 = (n: number | null | undefined): number | null =>
+    n === null || n === undefined || !Number.isFinite(n) ? null : Math.round(n * 1000) / 1000;
+  const orNA = (n: number | null | undefined): string =>
+    n === null || n === undefined ? "n/a" : String(n);
+  // Structured unknown-vault error (Source 57 contract: available-name errors for
+  // collection AND vault args). Returns null when the vault resolves.
+  const unknownVaultError = (vault: string | undefined) => {
+    if (vault === undefined) return null;
+    const availableVaults = listVaults();
+    if (availableVaults.includes(vault)) return null;
+    return {
+      content: [{ type: "text" as const, text: `Unknown vault "${vault}". Available: ${availableVaults.join(", ") || "(none)"}` }],
+      structuredContent: { error: "unknown_vault", requested: vault, available: availableVaults } as Record<string, unknown>,
+      isError: true,
+    };
+  };
+
+  server.registerTool(
+    "memory_stats",
+    {
+      title: "Memory Statistics (lifecycle + ranking metadata)",
+      description: "Deterministic SQL aggregates per collection: counts by active state, origin×active lifecycle cross-tabs, deactivation reasons, pinned counts, accrual rates (7d/30d), created-at span, and ranking-metadata distributions (access_count, confidence, quality, effective-time age — mean/median/min/max) over ACTIVE rows. Complements index_stats (embedding coverage / content types). Includes system collections — nothing is filtered. Read-only.",
+      inputSchema: {
+        collection: z.string().optional().describe("Restrict to one collection; an unknown name returns the available list"),
+        vault: z.string().optional().describe("Named vault (omit for default vault); an unknown name returns the available list"),
+      },
+    },
+    async ({ collection, vault }) => {
+      const vaultErr = unknownVaultError(vault);
+      if (vaultErr) return vaultErr;
+      const store = getStore(vault);
+      // Fail-loud contract (no partial stats): any SQL error below propagates to the
+      // MCP error surface — a stats tool that silently drops a section reports a
+      // smaller vault as if it were the whole truth.
+      const available = (store.db.prepare(
+        `SELECT DISTINCT collection FROM documents ORDER BY collection`
+      ).all() as { collection: string }[]).map(r => r.collection);
+
+      if (collection !== undefined && !available.includes(collection)) {
+        return {
+          content: [{ type: "text", text: `Unknown collection "${collection}". Available: ${available.join(", ") || "(none)"}` }],
+          structuredContent: { error: "unknown_collection", requested: collection, available } as Record<string, unknown>,
+          isError: true,
+        };
+      }
+
+      const where = collection !== undefined ? "WHERE collection = ?" : "";
+      const params: string[] = collection !== undefined ? [collection] : [];
+      const nowMs = Date.now();
+      const cut7 = new Date(nowMs - 7 * 86400_000).toISOString();
+      const cut30 = new Date(nowMs - 30 * 86400_000).toISOString();
+      // Effective-time age (days) per §51.1: authored_at ?? modified_at — the same axis
+      // recency ranking decays on. julianday('now') keeps the whole expression in SQL.
+      const EFF_AGE = `julianday('now') - julianday(COALESCE(authored_at, modified_at))`;
+
+      type StatsRow = {
+        collection: string; total: number; active: number; inactive: number;
+        fs_active: number; fs_inactive: number; api_active: number; api_inactive: number;
+        legacy_active: number; legacy_inactive: number; pinned: number;
+        created_7d: number; created_30d: number; first_created: string | null; last_created: string | null;
+        access_max: number | null; access_mean: number | null; access_min: number | null; access_nonzero: number;
+        confidence_mean: number | null; confidence_min: number | null; confidence_max: number | null;
+        quality_mean: number | null; quality_min: number | null; quality_max: number | null;
+        eff_age_mean: number | null; eff_age_min: number | null; eff_age_max: number | null;
+      };
+      // Counts and cross-tabs cover ALL rows; distribution aggregates (access/confidence/
+      // quality/effective age) cover ACTIVE rows only — ranking never sees inactive rows,
+      // so mixing them in would misstate the live corpus the scorer operates on.
+      const rows = store.db.prepare(`
+        SELECT collection,
+               COUNT(*) AS total,
+               SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS active,
+               SUM(CASE WHEN active = 0 THEN 1 ELSE 0 END) AS inactive,
+               SUM(CASE WHEN origin = 'fs' AND active = 1 THEN 1 ELSE 0 END) AS fs_active,
+               SUM(CASE WHEN origin = 'fs' AND active = 0 THEN 1 ELSE 0 END) AS fs_inactive,
+               SUM(CASE WHEN origin = 'api' AND active = 1 THEN 1 ELSE 0 END) AS api_active,
+               SUM(CASE WHEN origin = 'api' AND active = 0 THEN 1 ELSE 0 END) AS api_inactive,
+               SUM(CASE WHEN origin IS NULL AND active = 1 THEN 1 ELSE 0 END) AS legacy_active,
+               SUM(CASE WHEN origin IS NULL AND active = 0 THEN 1 ELSE 0 END) AS legacy_inactive,
+               SUM(CASE WHEN pinned = 1 THEN 1 ELSE 0 END) AS pinned,
+               SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS created_7d,
+               SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS created_30d,
+               MIN(created_at) AS first_created,
+               MAX(created_at) AS last_created,
+               MAX(CASE WHEN active = 1 THEN access_count END) AS access_max,
+               AVG(CASE WHEN active = 1 THEN access_count END) AS access_mean,
+               MIN(CASE WHEN active = 1 THEN access_count END) AS access_min,
+               SUM(CASE WHEN active = 1 AND access_count > 0 THEN 1 ELSE 0 END) AS access_nonzero,
+               AVG(CASE WHEN active = 1 THEN confidence END) AS confidence_mean,
+               MIN(CASE WHEN active = 1 THEN confidence END) AS confidence_min,
+               MAX(CASE WHEN active = 1 THEN confidence END) AS confidence_max,
+               AVG(CASE WHEN active = 1 THEN quality_score END) AS quality_mean,
+               MIN(CASE WHEN active = 1 THEN quality_score END) AS quality_min,
+               MAX(CASE WHEN active = 1 THEN quality_score END) AS quality_max,
+               AVG(CASE WHEN active = 1 THEN ${EFF_AGE} END) AS eff_age_mean,
+               MIN(CASE WHEN active = 1 THEN ${EFF_AGE} END) AS eff_age_min,
+               MAX(CASE WHEN active = 1 THEN ${EFF_AGE} END) AS eff_age_max
+        FROM documents ${where}
+        GROUP BY collection
+        ORDER BY total DESC
+      `).all(cut7, cut30, ...params) as StatsRow[];
+
+      // Medians over ACTIVE rows, per collection and per metric. (cnt+1)/2 and (cnt+2)/2
+      // under integer division select the middle row (odd) or middle pair (even).
+      // `expr` values are the fixed literals below — never caller input.
+      const medianOf = (expr: string): Map<string, number> => new Map(
+        (store.db.prepare(`
+          WITH ranked AS (
+            SELECT collection, ${expr} AS v,
+                   ROW_NUMBER() OVER (PARTITION BY collection ORDER BY ${expr}) AS rn,
+                   COUNT(*) OVER (PARTITION BY collection) AS cnt
+            FROM documents ${where ? where + " AND active = 1" : "WHERE active = 1"}
+          )
+          SELECT collection, AVG(v) AS median
+          FROM ranked
+          WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2)
+          GROUP BY collection
+        `).all(...params) as { collection: string; median: number }[]).map(m => [m.collection, m.median])
+      );
+      const medAccess = medianOf("access_count");
+      const medConfidence = medianOf("confidence");
+      const medQuality = medianOf("quality_score");
+      const medEffAge = medianOf(EFF_AGE);
+
+      const reasons = store.db.prepare(`
+        SELECT deactivated_reason AS reason, COUNT(*) AS count
+        FROM documents ${where ? where + " AND active = 0" : "WHERE active = 0"}
+        GROUP BY deactivated_reason
+        ORDER BY count DESC
+      `).all(...params) as { reason: string | null; count: number }[];
+
+      const collectionsOut = rows.map(r => ({
+        collection: r.collection,
+        total: r.total,
+        active: r.active,
+        inactive: r.inactive,
+        origins: {
+          fs: { total: r.fs_active + r.fs_inactive, active: r.fs_active, inactive: r.fs_inactive },
+          api: { total: r.api_active + r.api_inactive, active: r.api_active, inactive: r.api_inactive },
+          legacy: { total: r.legacy_active + r.legacy_inactive, active: r.legacy_active, inactive: r.legacy_inactive },
+        },
+        pinned: r.pinned,
+        accrual: { created7d: r.created_7d, created30d: r.created_30d },
+        span: { firstCreated: r.first_created, lastCreated: r.last_created },
+        accessCount: {
+          max: r.access_max, mean: round3(r.access_mean), min: r.access_min,
+          median: round3(medAccess.get(r.collection) ?? null), nonzero: r.access_nonzero,
+        },
+        confidence: {
+          mean: round3(r.confidence_mean), median: round3(medConfidence.get(r.collection) ?? null),
+          min: round3(r.confidence_min), max: round3(r.confidence_max),
+        },
+        quality: {
+          mean: round3(r.quality_mean), median: round3(medQuality.get(r.collection) ?? null),
+          min: round3(r.quality_min), max: round3(r.quality_max),
+        },
+        effectiveAgeDays: {
+          mean: round3(r.eff_age_mean), median: round3(medEffAge.get(r.collection) ?? null),
+          min: round3(r.eff_age_min), max: round3(r.eff_age_max),
+        },
+      }));
+
+      const lines = [
+        `Memory statistics${vault ? ` (vault: ${vault})` : ""}${collection ? ` — collection ${collection}` : ` — ${collectionsOut.length} collection(s)`}:`,
+        ...collectionsOut.map(c =>
+          `  ${c.collection}: ${c.active}/${c.total} active (fs ${c.origins.fs.active}+${c.origins.fs.inactive}, api ${c.origins.api.active}+${c.origins.api.inactive}, legacy ${c.origins.legacy.active}+${c.origins.legacy.inactive}; active+inactive)` +
+          `${c.pinned ? `, pinned ${c.pinned}` : ""}, +${c.accrual.created7d}/7d +${c.accrual.created30d}/30d` +
+          `, access max ${orNA(c.accessCount.max)} med ${orNA(c.accessCount.median)} mean ${orNA(c.accessCount.mean)} (nonzero ${c.accessCount.nonzero})` +
+          `, eff-age med ${orNA(c.effectiveAgeDays.median)}d`
+        ),
+        ...(reasons.length ? [
+          `  Deactivation reasons:`,
+          ...reasons.map(x => `    ${x.reason ?? "(null — pre-v0.31.0)"}: ${x.count}`),
+        ] : []),
+      ];
+
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        structuredContent: {
+          vault: vault ?? "default",
+          generatedAt: new Date(nowMs).toISOString(),
+          collections: collectionsOut,
+          deactivationReasons: reasons,
+        } as Record<string, unknown>,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: memory_rank (v0.36.0 — composite ranking explanation)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "memory_rank",
+    {
+      title: "Ranking Explanation (composite breakdown)",
+      description: "Deterministic ranking diagnostic: runs the real FTS + composite scoring pipeline for a query and returns each result's per-factor breakdown (weights, recency, confidence blend, quality/length/frequency multipliers, pin and co-activation deltas) plus raw-vs-composite rank shifts (positive shift = composite promoted the doc). Output is the UNION of the composite top-limit and the raw top-limit, so raw winners demoted out of the composite view stay visible. FTS-only candidates — no vector or LLM stage. Read-only.",
+      inputSchema: {
+        query: z.string().describe("Query to explain ranking for"),
+        limit: z.number().int().min(1).max(50).optional().default(10).describe("Results to explain per view (1-50)"),
+        collection: z.string().optional().describe("Filter to collection (single name or comma-separated)"),
+        weightProfile: z.enum(["default", "query"]).optional().default("default").describe("Composite weights to explain: 'default' = hook/memory_retrieve (0.50/0.25/0.25), 'query' = the query tool's (0.70/0.15/0.15). Recency-intent queries use the recency weights regardless, as in production."),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
+        vault: z.string().optional().describe("Named vault (omit for default vault); an unknown name returns the available list"),
+      },
+    },
+    async ({ query, limit, collection, weightProfile, includeInternal, vault }) => {
+      const vaultErr = unknownVaultError(vault);
+      if (vaultErr) return vaultErr;
+      const store = getStore(vault);
+      const lim = limit ?? 10;
+      const collections = collection
+        ? collection.split(",").map(c => c.trim()).filter(Boolean)
+        : undefined;
+      const excl = resolveExcludedCollections(includeInternal, collections);
+      // Wider candidate pool than `limit` so raw-vs-composite rank shifts stay visible
+      // when the two orderings diverge deep into the pool.
+      const candidateN = Math.min(Math.max(lim * 3, 30), 100);
+      const results = store.searchFTS(query, candidateN, undefined, collections, undefined, excl);
+      const enriched = enrichResults(store, results, query);
+      const coFn = (path: string) => store.getCoActivated(path);
+      const scored = applyCompositeScoring(enriched, query, coFn, {
+        explain: true,
+        weights: weightProfile === "query" ? QUERY_WEIGHTS : undefined,
+      });
+
+      // Raw ordering = production `search`'s non-recency ordering (rankRawPrimary),
+      // including its tie contract (pin → legacy composite → path) — NOT a re-sort of
+      // the composite-ordered array, which would let exact raw ties inherit composite
+      // order. Ranks are keyed by filepath: docids are content-hash prefixes, so
+      // identical-content documents at different paths share a docid and would
+      // overwrite each other's rank.
+      const rawRanked = rankRawPrimary(enriched, query, coFn);
+      const rawRankByPath = new Map<string, number>();
+      rawRanked.forEach((r, i) => rawRankByPath.set(r.filepath, i + 1));
+
+      const recencyIntent = hasRecencyIntent(query);
+      // Union view (relevance-inversion visibility): the composite top-limit PLUS any
+      // raw-top-limit doc the composite ordering pushed below the cutoff — the demoted
+      // raw winner is the central defect signature and must not vanish from the report.
+      const inRawTop = new Set(rawRanked.slice(0, lim).map(r => r.filepath));
+      const selected: { r: (typeof scored)[number]; compositeRank: number; demotedRawWinner: boolean }[] = [];
+      scored.forEach((r, i) => {
+        if (i < lim) selected.push({ r, compositeRank: i + 1, demotedRawWinner: false });
+        else if (inRawTop.has(r.filepath)) selected.push({ r, compositeRank: i + 1, demotedRawWinner: true });
+      });
+
+      const items = selected.map(({ r, compositeRank, demotedRawWinner }) => ({
+        docid: `#${r.docid}`,
+        path: r.displayPath,
+        title: r.title,
+        contentType: r.contentType,
+        pinned: r.pinned,
+        searchScore: round3(r.score),
+        compositeScore: round3(r.compositeScore),
+        compositeRank,
+        rawRank: rawRankByPath.get(r.filepath)!,
+        rankShift: rawRankByPath.get(r.filepath)! - compositeRank,
+        demotedRawWinner,
+        breakdown: r.rankBreakdown,
+      }));
+
+      const lines = [
+        `Ranking explanation for "${query}" (${scored.length} candidate(s), showing ${items.length} = composite top ${Math.min(lim, scored.length)} ∪ demoted raw winners; weights: ${recencyIntent ? "recency-intent" : weightProfile}):`,
+        ...items.map(it => {
+          const b = it.breakdown!;
+          const parts = [
+            `search ${it.searchScore}`,
+            `recency ${round3(b.recencyScore)}`,
+            `conf ${round3(b.blendedConfidence)}`,
+            `×q ${round3(b.qualityMultiplier)}`,
+            `×len ${round3(b.lengthFactor)}${b.lengthFloorApplied ? "(floor)" : ""}`,
+          ];
+          if (b.frequencyBoostMultiplier !== 1) parts.push(`×freq ${round3(b.frequencyBoostMultiplier)}`);
+          if (b.canonicalMultiplier !== 1) parts.push(`×canon ${round3(b.canonicalMultiplier)}`);
+          // Any nonzero pin delta renders — a NEGATIVE delta is the pin-cap clamp
+          // (RANKING-DEFECT-HANDOFF §Addendum) and hiding it would bury the inversion.
+          if (b.pinBoost !== 0) parts.push(`pinΔ ${round3(b.pinBoost)}`);
+          if (b.coActivationMultiplier !== 1) parts.push(`×co ${round3(b.coActivationMultiplier)}`);
+          const shift = it.rankShift === 0 ? "" : ` (raw #${it.rawRank}, shift ${it.rankShift > 0 ? "+" : ""}${it.rankShift})`;
+          const demoted = it.demotedRawWinner ? " ⚠ demoted raw winner" : "";
+          return `  #${it.compositeRank} ${it.path} — composite ${it.compositeScore}${shift}${demoted} [${parts.join(", ")}]`;
+        }),
+      ];
+
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        structuredContent: {
+          query,
+          recencyIntent,
+          weightProfile: recencyIntent ? "recency" : weightProfile,
+          scoreBasis: "composite-explain",
+          view: "composite-top ∪ raw-top",
+          candidateCount: scored.length,
+          results: items,
+        } as Record<string, unknown>,
       };
     }
   );
@@ -1494,7 +1920,7 @@ This is the recommended entry point for ALL memory queries.`,
       const shouldBuildTemporal = types.includes('temporal') || types.includes('all');
       const shouldBuildSemantic = types.includes('semantic') || types.includes('all');
 
-      const results: { temporal?: number; semantic?: number } = {};
+      const results: { temporal?: number; semantic?: number; temporalTotal?: number; semanticTotal?: number } = {};
 
       if (shouldBuildTemporal) {
         results.temporal = store.buildTemporalBackbone();
@@ -1504,9 +1930,23 @@ This is the recommended entry point for ALL memory queries.`,
         results.semantic = await store.buildSemanticGraph(semantic_threshold);
       }
 
+      // The builders count rows SQLite actually inserted, so a second idempotent build
+      // legitimately reports 0 new edges while the graph is fully populated. Report the
+      // standing total alongside, or "0 edges" reads as "the graph is empty".
+      //
+      // Counts only edges whose BOTH endpoints are active — the same population the builders
+      // operate on. Shared with the REST endpoint via the store so the two cannot drift.
+      const totalFor = (t: string) => store.countActiveRelations(t);
+
       const lines = [];
-      if (results.temporal !== undefined) lines.push(`Temporal graph: ${results.temporal} edges`);
-      if (results.semantic !== undefined) lines.push(`Semantic graph: ${results.semantic} edges`);
+      if (results.temporal !== undefined) {
+        results.temporalTotal = totalFor("temporal");
+        lines.push(`Temporal graph: ${results.temporal} new edge(s), ${results.temporalTotal} total`);
+      }
+      if (results.semantic !== undefined) {
+        results.semanticTotal = totalFor("semantic");
+        lines.push(`Semantic graph: ${results.semantic} new edge(s), ${results.semanticTotal} total`);
+      }
 
       return {
         content: [{
@@ -1539,169 +1979,41 @@ This is the recommended entry point for ALL memory queries.`,
       const store = getStore(vault);
       const llm = getDefaultLlamaCpp();
 
-      // Step 1: Intent classification
-      const intent = force_intent
-        ? { intent: force_intent as IntentType, confidence: 1.0 }
-        : await classifyIntent(query, llm, store.db);
-
-      // Step 1b: Temporal constraint — convert intent's local dates to UTC for search
-      // extractTemporalConstraint() already returns UTC; intent classification stores local dates
-      const dateRange = (intent.temporal_start && intent.temporal_end)
-        ? {
-            start: intent.temporal_start.includes('T') ? intent.temporal_start : new Date(intent.temporal_start + 'T00:00:00').toISOString(),
-            end: intent.temporal_end.includes('T') ? intent.temporal_end : new Date(intent.temporal_end + 'T23:59:59.999').toISOString(),
-          }
-        : extractTemporalConstraint(query) || undefined;
-
-      // Step 2: Baseline search (BM25 + Vector) — with temporal filter if detected
-      const bm25Results = store.searchFTS(query, 30, undefined, undefined, dateRange);
-      const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 30, undefined, undefined, dateRange);
-
-      // Step 3: Intent-weighted RRF
-      const rrfWeights = intent.intent === 'WHEN'
-        ? [1.5, 1.0]  // Boost BM25 for temporal (dates in text)
-        : intent.intent === 'WHY'
-        ? [1.0, 1.5]  // Boost vector for causal (semantic)
-        : [1.0, 1.0]; // Balanced
-
-      const fusedRanked = reciprocalRankFusion([bm25Results.map(toRanked), vecResults.map(toRanked)], rrfWeights);
-
-      // Map RRF results back to SearchResult with updated scores
-      const allSearchResults = [...bm25Results, ...vecResults];
-      const fused: SearchResult[] = fusedRanked.map(fr => {
-        const original = allSearchResults.find(r => r.filepath === fr.file);
-        return original ? { ...original, score: fr.score } : null;
-      }).filter((r): r is SearchResult => r !== null);
-
-      // Step 4: Graph expansion (if enabled and intent allows)
-      let expanded = fused;
-      if (enable_graph_traversal && (intent.intent === 'WHY' || intent.intent === 'ENTITY')) {
-        const anchorEmbeddingResult = await llm.embed(query);
-        if (anchorEmbeddingResult) {
-          const traversed = adaptiveTraversal(store.db, fused.slice(0, 10).map(r => ({ hash: r.hash, score: r.score })), {
-            maxDepth: 2,
-            beamWidth: 5,
-            budget: 30,
-            intent: intent.intent,
-            queryEmbedding: anchorEmbeddingResult.embedding,
-          });
-
-          // Merge traversed nodes with original results
-          const merged = mergeTraversalResults(
-            store.db,
-            fused.map(r => ({ hash: r.hash, score: r.score })),
-            traversed
-          );
-
-          // Step 4b: MPFP multi-path traversal (runs intent-specific meta-path patterns)
-          const mpfpNodes = mpfpTraversal(
-            store.db,
-            fused.slice(0, 10).map(r => ({ hash: r.hash, score: r.score })),
-            intent.intent,
-            20
-          );
-          // Normalize MPFP scores to [0,1] before merging (raw Forward Push mass is unbounded)
-          const maxMpfpScore = mpfpNodes.length > 0 ? Math.max(...mpfpNodes.map(n => n.score)) : 1;
-          const mpfpNormalizer = maxMpfpScore > 0 ? 1 / maxMpfpScore : 1;
-
-          // Merge normalized MPFP results into merged array
-          for (const node of mpfpNodes) {
-            const normalizedScore = node.score * mpfpNormalizer;
-            const doc = store.db.prepare(`SELECT hash FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL LIMIT 1`).get(node.docId) as { hash: string } | undefined;
-            if (doc) {
-              const existing = merged.find(m => m.hash === doc.hash);
-              if (existing) {
-                existing.score = Math.max(existing.score, normalizedScore * 0.9);
-              } else {
-                merged.push({ hash: doc.hash, score: normalizedScore * 0.75 });
-              }
-            }
-          }
-
-          // Step 4c: Entity co-occurrence graph expansion (ENTITY intent only)
-          if (intent.intent === 'ENTITY') {
-            // Get doc IDs from top fused results for entity seed lookup
-            const seedDocIds = fused.slice(0, 10).map(r => {
-              const row = store.db.prepare(`SELECT id FROM documents WHERE hash = ? AND active = 1 LIMIT 1`).get(r.hash) as { id: number } | undefined;
-              return row?.id;
-            }).filter((id): id is number => id !== undefined);
-
-            const entityNeighbors = getEntityGraphNeighbors(store.db, seedDocIds, 15);
-            for (const en of entityNeighbors) {
-              const doc = store.db.prepare(`SELECT hash FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL LIMIT 1`).get(en.docId) as { hash: string } | undefined;
-              if (doc && !merged.some(m => m.hash === doc.hash)) {
-                merged.push({ hash: doc.hash, score: en.score * 0.7 }); // Slight discount for entity-graph-only hits
-              }
-            }
-          }
-
-          // Convert back to SearchResult format — hydrate graph-discovered nodes from DB
-          expanded = merged.map(m => {
-            const original = fused.find(f => f.hash === m.hash);
-            if (original) return { ...original, score: m.score };
-            // Graph-discovered node not in original fused results — hydrate from DB
-            const doc = store.db.prepare(`
-              SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
-              FROM documents d
-              LEFT JOIN content c ON c.hash = d.hash
-              WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
-            `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
-            if (!doc) return null;
-            return {
-              filepath: `clawmem://${doc.collection}/${doc.path}`,
-              displayPath: `${doc.collection}/${doc.path}`,
-              title: doc.title || doc.path.split("/").pop() || "",
-              context: null,
-              hash: doc.hash,
-              docid: doc.hash.slice(0, 6),
-              collectionName: doc.collection,
-              modifiedAt: doc.modified_at || "",
-              bodyLength: doc.body?.length || 0,
-              body: doc.body || "",
-              score: m.score,
-              source: "vec" as const,
-            } satisfies SearchResult;
-          }).filter((r): r is SearchResult => r !== null);
-        }
-      }
-
-      // Step 5: Rerank top 30 and blend scores (same pattern as query tool)
-      const toRerank = expanded.slice(0, 30);
-      const rerankDocs = toRerank.map(r => ({
-        file: r.filepath,
-        text: r.body?.slice(0, 200) || r.title,
-      }));
-
-      const reranked = await store.rerank(query, rerankDocs);
-
-      // Blend original + rerank scores using file-keyed join (matching query tool pattern)
-      const rerankMap = new Map(reranked.map(r => [r.file, r.score]));
-      const rankMap = new Map(toRerank.map((r, i) => [r.filepath, i + 1]));
-      const blendedResults = toRerank.map(r => {
-        const rerankScore = rerankMap.get(r.filepath) || 0;
-        const rank = rankMap.get(r.filepath) || toRerank.length;
-        const origWeight = rank <= 3 ? 0.75 : rank <= 10 ? 0.60 : 0.40;
-        const blended = origWeight * r.score + (1 - origWeight) * rerankScore;
-        return { ...r, score: blended };
+      // Shared intent-aware causal pipeline (v0.32.0) — unfiltered by design (system memory is
+      // this tool's substrate; docs/reference/mcp-tools.md), so no observation lane: its anchors
+      // already reach _clawmem. enable_graph_traversal=false disables EVERY graph stage
+      // (adaptive, MPFP, entity expansion, causal one-hop); anchor search + rerank remain.
+      const graphOn = enable_graph_traversal !== false;
+      const { intent, results: pipelineResults, associations } = await runCausalRetrieval(store, llm, query, {
+        forceIntent: force_intent as IntentType | undefined,
+        stages: { traversal: graphOn, mpfp: graphOn, entityExpansion: graphOn, rerank: true, causalOneHop: graphOn },
+        baseEligibility: {},
+        whyObservationLane: false,
       });
-      blendedResults.sort((a, b) => b.score - a.score);
+      const expanded = pipelineResults;
 
-      // Step 6: Composite scoring
-      const enriched = enrichResults(store, blendedResults, query);
+      // Composite scoring. suppressUnpromotedObservationPenalty: intent_search is
+      // unfiltered by design — _clawmem observations are its substrate, and the fork's
+      // ADR-0112 down-weight would bury the causal one-hop docs this tool exists to reach.
+      const enriched = enrichResults(store, expanded, query);
 
-      const scored = applyCompositeScoring(enriched, query);
+      const scored = applyCompositeScoring(enriched, query, undefined, { suppressUnpromotedObservationPenalty: true });
 
-      // Format results
-      const results = scored.slice(0, limit || 10).map(r => ({
-        docid: r.docid,
-        file: r.filepath,
-        title: r.title,
-        score: r.score,
-        compositeScore: r.compositeScore,
-        context: r.context,
-        snippet: r.body?.slice(0, 300) || '',
-        contentType: r.contentType,
-      }));
+      // Format results — one-hop causal hits carry their associations (anchor + direction)
+      const results = scored.slice(0, limit || 10).map(r => {
+        const causal = associations.get(r.filepath);
+        return {
+          docid: r.docid,
+          file: r.filepath,
+          title: r.title,
+          score: r.score,
+          compositeScore: r.compositeScore,
+          context: r.context,
+          snippet: r.body?.slice(0, 300) || '',
+          contentType: r.contentType,
+          ...(causal ? { causal } : {}),
+        };
+      });
 
       return {
         content: [{
@@ -1730,10 +2042,11 @@ This is the recommended entry point for ALL memory queries.`,
         query: z.string().describe("Complex or multi-topic query"),
         limit: z.number().optional().default(10),
         compact: z.boolean().optional().default(true).describe("Return compact results"),
+        includeInternal: z.boolean().optional().default(false).describe("Include system-internal _clawmem docs (observations/deductions) — excluded by default"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
-    async ({ query, limit, compact, vault }) => {
+    async ({ query, limit, compact, includeInternal, vault }) => {
       const store = getStore(vault);
       const llm = getDefaultLlamaCpp();
 
@@ -1744,64 +2057,44 @@ This is the recommended entry point for ALL memory queries.`,
       const sortedClauses = [...clauses].sort((a, b) => a.priority - b.priority);
       const allResults: SearchResult[] = [];
       const clauseDetails: { type: string; query: string; priority: number; resultCount: number }[] = [];
+      const degradedLegs: DegradedLeg[] = [];
 
+      let clauseIdx = 0;
+      const planAssociations = new Map<string, CausalAssociation[]>();
       for (const clause of sortedClauses) {
+        const clauseExcl = resolveExcludedCollections(includeInternal, clause.collections);
         let results: SearchResult[] = [];
         if (clause.type === 'bm25') {
-          results = store.searchFTS(clause.query, 20, undefined, clause.collections);
+          results = store.searchFTS(clause.query, 20, undefined, clause.collections, undefined, clauseExcl);
         } else if (clause.type === 'vector') {
-          results = await store.searchVec(clause.query, DEFAULT_EMBED_MODEL, 20, undefined, clause.collections);
+          const det = await store.searchVecDetailed(clause.query, DEFAULT_EMBED_MODEL, 20, { collections: clause.collections, excludeCollections: clauseExcl });
+          results = det.results;
+          if (det.degraded && det.degradedReason) degradedLegs.push({ leg: `clause${clauseIdx}:vector`, reason: det.degradedReason });
         } else if (clause.type === 'graph') {
-          // Graph clause: run intent_search-style retrieval
-          const intent = await classifyIntent(clause.query, llm, store.db);
-          const bm25 = store.searchFTS(clause.query, 15, undefined, clause.collections);
-          const vec = await store.searchVec(clause.query, DEFAULT_EMBED_MODEL, 15, undefined, clause.collections);
-          const fused = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], [1.0, 1.0]);
-          const searchMap = new Map([...bm25, ...vec].map(r => [r.filepath, r]));
-          results = fused
-            .map(fr => searchMap.get(fr.file))
-            .filter((r): r is SearchResult => r !== null);
-
-          // Graph expansion for WHY/ENTITY
-          if (intent.intent === 'WHY' || intent.intent === 'ENTITY') {
-            const anchorEmb = await llm.embed(clause.query);
-            if (anchorEmb) {
-              const traversed = adaptiveTraversal(store.db, results.slice(0, 5).map(r => ({ hash: r.hash, score: r.score })), {
-                maxDepth: 2, beamWidth: 3, budget: 15, intent: intent.intent, queryEmbedding: anchorEmb.embedding,
-              });
-              const merged = mergeTraversalResults(store.db, results.map(r => ({ hash: r.hash, score: r.score })), traversed);
-              const expandedMap = new Map(results.map(r => [r.hash, r]));
-              results = merged.map(m => {
-                const existing = expandedMap.get(m.hash);
-                if (existing) return { ...existing, score: m.score };
-                // Graph-discovered node — hydrate from DB
-                const doc = store.db.prepare(`
-                  SELECT d.collection, d.path, d.title, d.hash, c.doc as body, d.modified_at
-                  FROM documents d
-                  LEFT JOIN content c ON c.hash = d.hash
-                  WHERE d.hash = ? AND d.active = 1 AND d.invalidated_at IS NULL LIMIT 1
-                `).get(m.hash) as { collection: string; path: string; title: string; hash: string; body: string | null; modified_at: string } | undefined;
-                if (!doc) return null;
-                return {
-                  filepath: `clawmem://${doc.collection}/${doc.path}`,
-                  displayPath: `${doc.collection}/${doc.path}`,
-                  title: doc.title || doc.path.split("/").pop() || "",
-                  context: null,
-                  hash: doc.hash,
-                  docid: doc.hash.slice(0, 6),
-                  collectionName: doc.collection,
-                  modifiedAt: doc.modified_at || "",
-                  bodyLength: doc.body?.length || 0,
-                  body: doc.body || "",
-                  score: m.score,
-                  source: "vec" as const,
-                } satisfies SearchResult;
-              }).filter((r): r is SearchResult => r !== null);
+          // Graph clause → shared causal pipeline (v0.32.0), keeping this site's bounded
+          // variant: traversal + one-hop only, smaller budgets, no MPFP/entity/rerank
+          // (the plan-level RRF below does the final ranking). clause.collections now
+          // constrain traversal too, not just anchors.
+          const { results: graphResults, degraded: graphDegraded, associations: graphAssociations } = await runCausalRetrieval(store, llm, clause.query, {
+            stages: { traversal: true, mpfp: false, entityExpansion: false, rerank: false, causalOneHop: true },
+            budgets: { anchorLimit: 15, seedCount: 5, traversalBeam: 3, traversalBudget: 15 },
+            baseEligibility: { allowCollections: clause.collections, excludeCollections: clauseExcl },
+            whyObservationLane: true,
+          });
+          for (const d of graphDegraded) degradedLegs.push({ leg: `clause${clauseIdx}:graph:${d.leg.replace(/^causal:/, "")}`, reason: d.reason });
+          // One-hop associations survive clause merging and reach the final items (T6-F10).
+          for (const [fp, assoc] of graphAssociations) {
+            const existing = planAssociations.get(fp) ?? [];
+            for (const a of assoc) {
+              if (!existing.some(e => e.anchorDocid === a.anchorDocid && e.direction === a.direction)) existing.push(a);
             }
+            planAssociations.set(fp, existing);
           }
+          results = graphResults;
         }
         clauseDetails.push({ type: clause.type, query: clause.query, priority: clause.priority, resultCount: results.length });
         allResults.push(...results);
+        clauseIdx++;
       }
 
       // Deduplicate by filepath, keeping highest score
@@ -1830,26 +2123,37 @@ This is the recommended entry point for ALL memory queries.`,
       const scored = applyCompositeScoring(enriched, query, coFn).slice(0, limit || 10);
 
       const planSummary = clauseDetails.map(c => `  ${c.type}(p${c.priority}): "${c.query}" → ${c.resultCount} results`).join("\n");
+      const planDegraded = degradedLegs.length > 0 ? { degraded: true as const, degradedLegs } : {};
+      const planDegradedNote = degradedLegs.length > 0 ? `\n${degradedGuidanceText(degradedLegs)}` : "";
 
       if (compact) {
-        const items = scored.map(r => ({
-          docid: `#${r.docid}`, path: r.displayPath, title: r.title,
-          score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
-          snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
-        }));
+        const items = scored.map(r => {
+          const causal = planAssociations.get(r.filepath);
+          return {
+            docid: `#${r.docid}`, path: r.displayPath, title: r.title,
+            score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
+            snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+            authored_at: r.authoredAt ?? null,
+            ...(causal ? { causal } : {}),
+          };
+        });
         return {
-          content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}` }],
-          structuredContent: { plan: clauseDetails, results: items },
+          content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${planDegradedNote}` }],
+          structuredContent: { plan: clauseDetails, results: items, ...planDegraded },
         };
       }
 
-      const items = scored.map(r => ({
-        docid: r.docid, file: r.filepath, title: r.title, score: r.score,
-        compositeScore: r.compositeScore, context: r.context, snippet: r.body?.slice(0, 300) || '', contentType: r.contentType,
-      }));
+      const items = scored.map(r => {
+        const causal = planAssociations.get(r.filepath);
+        return {
+          docid: r.docid, file: r.filepath, title: r.title, score: r.score,
+          compositeScore: r.compositeScore, context: r.context, snippet: r.body?.slice(0, 300) || '', contentType: r.contentType,
+          ...(causal ? { causal } : {}),
+        };
+      });
       return {
-        content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items, query)}` }],
-        structuredContent: { plan: clauseDetails, results: items },
+        content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items, query)}${planDegradedNote}` }],
+        structuredContent: { plan: clauseDetails, results: items, ...planDegraded },
       };
     }
   );
@@ -1862,9 +2166,9 @@ This is the recommended entry point for ALL memory queries.`,
     "find_causal_links",
     {
       title: "Find Causal Links",
-      description: "USE THIS to trace decision chains: 'what led to X', 'trace how we got from A to B'. Follow up intent_search with this tool on a top result to walk the full causal chain. Returns depth-annotated links with reasoning.",
+      description: "USE THIS to trace causal evidence: 'what led to X', 'what did X cause'. Returns directed causal edge records — invariant sourceDocId/targetDocId plus separate traversal depth/direction — each carrying up to 3 fact-pair witnesses with reasoning. Evidence-preserving edge traversal; multi-hop CHAIN quality is experimental (depth > 1 records are per-edge evidence, not a verified chain).",
       inputSchema: {
-        docid: z.string().describe("Document ID (e.g., '#123' or path)"),
+        docid: z.string().describe("Document ID (e.g., '#a1b2c3' — a 6-64 char hex hash prefix)"),
         direction: z.enum(['causes', 'caused_by', 'both']).optional().default('both').describe("Direction: 'causes' (outbound), 'caused_by' (inbound), or 'both'"),
         depth: z.number().optional().default(5).describe("Maximum traversal depth (1-10)"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
@@ -1872,67 +2176,93 @@ This is the recommended entry point for ALL memory queries.`,
     },
     async ({ docid, direction, depth, vault }) => {
       const store = getStore(vault);
+      // s342 D4: EVERY exit of this tool — errors included — is byte-bounded.
+      // The caller-controlled docid is display-bounded before it is echoed.
+      const docidEcho = docid.slice(0, 256);
       // Resolve docid to document
       const resolved = store.findDocumentByDocid(docid);
       if (!resolved) {
         return {
-          content: [{ type: "text", text: `Document not found: ${docid}` }],
+          content: [{ type: "text", text: `Document not found: ${docidEcho}` }],
         };
       }
 
-      // Get the numeric docId
+      // Get the numeric docId. s342: anchor eligibility — the reader enforces
+      // `active = 1 AND invalidated_at IS NULL` on the anchor and on every
+      // recursive expansion, so an invalidated anchor resolves to nothing here.
       const doc = store.db.prepare(`
         SELECT id, title, collection, path
         FROM documents
-        WHERE hash = ? AND active = 1
+        WHERE hash = ? AND active = 1 AND invalidated_at IS NULL
         LIMIT 1
       `).get(resolved.hash) as { id: number; title: string; collection: string; path: string } | undefined;
 
       if (!doc) {
         return {
-          content: [{ type: "text", text: `Document not found: ${docid}` }],
+          content: [{ type: "text", text: `Document not found: ${docidEcho}` }],
         };
       }
 
-      // Find causal links
-      const links = store.findCausalLinks(doc.id, direction, depth);
+      // Evidence-preserving directed edge traversal (s342 reader)
+      const { edges, truncated } = store.findCausalLinks(doc.id, direction, depth);
 
-      if (links.length === 0) {
-        return {
-          content: [{ type: "text", text: `No causal links found for "${doc.title}" (${direction})` }],
-          structuredContent: { source: doc, links: [] },
-        };
-      }
-
-      // Format summary
-      const directionLabel = direction === 'causes' ? 'causes' : direction === 'caused_by' ? 'is caused by' : 'is causally related to';
-      const lines = [`"${doc.title}" ${directionLabel} ${links.length} document(s):\n`];
-
-      for (const link of links) {
-        const confidence = Math.round(link.weight * 100);
-        const reasoning = link.reasoning ? ` - ${link.reasoning}` : '';
-        lines.push(`[Depth ${link.depth}] ${confidence}% ${link.title} (${link.filepath})${reasoning}`);
-      }
-
-      return {
-        content: [{ type: "text", text: lines.join('\n') }],
+      // EVERY result shape — including zero edges — goes through the wire cap:
+      // both representations are built from ONE retained edge set and capped
+      // together as the complete serialized result (CAUSAL_READER_MAX_BYTES).
+      // Base fields are display-bounded so the empty response always fits, and
+      // the overflow envelope backstops the ceiling unconditionally.
+      const anchorTitle = doc.title.slice(0, 300);
+      const anchorPath = `${doc.collection}/${doc.path}`.slice(0, 600);
+      type CausalToolResult = {
+        content: Array<{ type: "text"; text: string }>;
         structuredContent: {
-          source: {
-            id: doc.id,
-            title: doc.title,
-            filepath: `${doc.collection}/${doc.path}`,
-          },
-          direction,
-          links: links.map(l => ({
-            id: l.docId,
-            title: l.title,
-            filepath: l.filepath,
-            depth: l.depth,
-            confidence: Math.round(l.weight * 100),
-            reasoning: l.reasoning,
-          })),
-        },
+          source?: { id: number; title: string; filepath: string };
+          direction: typeof direction;
+          links: CausalEdgeRecord[];
+          truncated: boolean;
+          overflow?: boolean;
+        };
       };
+      return capCausalWire<CausalToolResult>(edges, truncated, (kept: CausalEdgeRecord[], isTruncated: boolean) => {
+        const lines = kept.length === 0
+          ? [
+              isTruncated
+                ? `Causal edges exist for "${anchorTitle}" (${direction}) but none fit the response ceiling.`
+                : `No causal links found for "${anchorTitle}" (${direction})`,
+            ]
+          : [
+              `"${anchorTitle}" has ${kept.length} causal edge(s) (${direction})` +
+              `${isTruncated ? ' [truncated]' : ''}:\n`,
+            ];
+        for (const edge of kept) {
+          const pct = Math.round(edge.weight * 100);
+          const arrow = edge.direction === 'causes' ? '→' : '←';
+          lines.push(
+            `[depth ${edge.depth}] ${arrow} ${pct}% ${edge.title} (${edge.filepath}) ` +
+            `— edge ${edge.sourceDocId}→${edge.targetDocId}, ${edge.evidenceCount} witness(es)` +
+            `${edge.legacy ? ' [legacy]' : ''}`,
+          );
+          for (const w of edge.witnesses) {
+            lines.push(`    · [${w.sourceFactOrdinal}→${w.targetFactOrdinal}] ${Math.round(w.confidence * 100)}% ${w.reasoning}`);
+          }
+        }
+        return {
+          content: [{ type: "text", text: lines.join('\n') }],
+          structuredContent: {
+            source: {
+              id: doc.id,
+              title: anchorTitle,
+              filepath: anchorPath,
+            },
+            direction,
+            links: kept,
+            truncated: isTruncated,
+          },
+        };
+      }, () => ({
+        content: [{ type: "text", text: "Causal response exceeds the reader byte ceiling even with zero edges — refine the request." }],
+        structuredContent: { direction, links: [], truncated: true, overflow: true },
+      }));
     }
   );
 
@@ -1973,7 +2303,7 @@ This is the recommended entry point for ALL memory queries.`,
         };
       }
 
-      const triples = store.queryEntityTriples(entityId, { asOf: as_of, direction });
+      const triples = store.queryEntityTriples(entityId, { asOf: as_of, direction, includeProvenance: true, provenanceLimit: 5 });
       const stats = store.getTripleStats();
 
       if (triples.length === 0) {
@@ -1988,7 +2318,18 @@ This is the recommended entry point for ALL memory queries.`,
         const validity = t.current ? "current" : `ended ${t.validTo}`;
         const from = t.validFrom ? ` (since ${t.validFrom})` : "";
         const conf = Math.round(t.confidence * 100);
-        lines.push(`[${t.direction}] ${t.subject} → ${t.predicate} → ${t.object}${from} [${validity}, ${conf}%]`);
+        // Evidence summary (v0.32.0): count of UNIQUE evidence sources plus a bounded source
+        // list. Evidence with no source document renders as `unattributed`, never null/null.
+        let evidence = "";
+        const count = t.evidenceCount ?? 0;
+        if (count > 0 && t.sources && t.sources.length > 0) {
+          // Repeated paths stay repeated (same doc, different facts): the `+M more` remainder is
+          // computed from the rows actually shown, so deduping the display would misreport it.
+          const shown = t.sources.map(s => (s.docId != null && s.collection && s.path) ? `${s.collection}/${s.path}` : "unattributed");
+          const more = count - t.sources.length;
+          evidence = ` [evidence ×${count}; sources: ${shown.join(", ")}${more > 0 ? ` +${more} more` : ""}]`;
+        }
+        lines.push(`[${t.direction}] ${t.subject} → ${t.predicate} → ${t.object}${from} [${validity}, ${conf}%]${evidence}`);
       }
 
       return {
@@ -2014,7 +2355,7 @@ This is the recommended entry point for ALL memory queries.`,
       title: "Memory Evolution Status",
       description: "Get the evolution timeline for a memory document, showing how its keywords and context have changed over time based on new evidence.",
       inputSchema: {
-        docid: z.string().describe("Document ID (e.g., '#123' or path)"),
+        docid: z.string().describe("Document ID (e.g., '#a1b2c3' — a 6-64 char hex hash prefix)"),
         limit: z.number().optional().default(10).describe("Maximum number of evolution entries to return (1-100)"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
@@ -2119,7 +2460,7 @@ This is the recommended entry point for ALL memory queries.`,
       title: "Document Timeline",
       description: "Show the temporal neighborhood around a document — what was created/modified before and after it. Token-efficient progressive disclosure: search → timeline (context) → get (full content). Use after finding a document via search to understand what happened around it.",
       inputSchema: {
-        docid: z.string().describe("Document ID (e.g., '#123' or short hash)"),
+        docid: z.string().describe("Document ID (e.g., '#a1b2c3' — a 6-64 char hex hash prefix)"),
         before: z.number().optional().default(5).describe("Number of documents to show before the focus (1-20)"),
         after: z.number().optional().default(5).describe("Number of documents to show after the focus (1-20)"),
         same_collection: z.boolean().optional().default(false).describe("Constrain to same collection (like session scoping)"),
@@ -2341,9 +2682,9 @@ This is the recommended entry point for ALL memory queries.`,
     "lifecycle_sweep",
     {
       title: "Lifecycle Sweep",
-      description: "Run lifecycle policies: archive stale docs, optionally purge old archives. Defaults to dry_run (preview only).",
+      description: "Run lifecycle policies: archive stale documents. Archives only — never deletes; archival is reversible via lifecycle_restore. Defaults to dry_run (preview only).",
       inputSchema: {
-        dry_run: z.boolean().optional().default(true).describe("Preview what would be archived/purged without acting"),
+        dry_run: z.boolean().optional().default(true).describe("Preview what would be archived without acting"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
@@ -2384,16 +2725,20 @@ This is the recommended entry point for ALL memory queries.`,
           }
         }
 
-        return { content: [{ type: "text", text: `Would archive ${candidates.length} document(s):\n${lines.join("\n") || "(none)"}${recallLines.join("\n")}` }] };
+        return { content: [{ type: "text", text: `Would archive ${candidates.length} document(s) (reversible via lifecycle_restore; nothing is deleted):\n${lines.join("\n") || "(none)"}${recallLines.join("\n")}` }] };
       }
 
+      // Archival only. ClawMem no longer physically deletes document rows from any code
+      // path — see the retention note in src/store.ts. Archival is reversible via
+      // lifecycle_restore, so this tool has no unrecoverable effect.
       const archived = store.archiveDocuments(candidates.map(c => c.id));
-      let purged = 0;
-      if (policy.purge_after_days) {
-        purged = store.purgeArchivedDocuments(policy.purge_after_days);
-      }
 
-      return { content: [{ type: "text", text: `Lifecycle sweep: archived ${archived}, purged ${purged}` }] };
+      const purgeNote = policy.purge_after_days
+        ? `\n\nNote: purge_after_days=${policy.purge_after_days} is set but INERT — ClawMem no ` +
+          `longer deletes rows. Archived documents remain restorable via lifecycle_restore.`
+        : "";
+
+      return { content: [{ type: "text", text: `Lifecycle sweep: archived ${archived} document(s). Nothing was deleted.${purgeNote}` }] };
     }
   );
 
@@ -2616,6 +2961,12 @@ This is the recommended entry point for ALL memory queries.`,
       };
     }
   );
+
+  return { server, store, closeAllStores };
+}
+
+export async function startMcpServer(): Promise<void> {
+  const { server, store, closeAllStores } = buildMcpServer();
 
   // ---------------------------------------------------------------------------
   // Connect
