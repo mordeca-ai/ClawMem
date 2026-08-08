@@ -4,6 +4,37 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.1 — CLI exit-code contract: aborts, partial embeds, doctor, and --fail-on-empty
+
+CLI exit-code contract: no command may decline the work it was asked to do and still exit 0.
+
+- `embed`: the four quiet abort branches at the embed-model-identity guard (endpoint
+  unreachable on the force path, embedding dimension changed, vault contains mixed
+  embedding models, embedding model changed at the same dimension) now set a non-zero
+  exit code instead of a bare `return`. These returned ~190 lines before the
+  "Embedded N documents (M fragments, K failed)" summary line, so a caller parsing that
+  summary saw no line at all and sailed on.
+- `embed`: a run that completes with a non-zero failed-fragment count now exits non-zero
+  by default.
+- `doctor`: the issue classes that incremented the issue counter without setting an exit
+  code now fail closed, so `embed && doctor && echo OK` can no longer print OK over a
+  vault that embedded nothing.
+- `vsearch`/`query`: `--fail-on-empty` gives callers a distinct exit for zero results,
+  so "no match" is distinguishable from "ran fine".
+
+Verified by a table-driven exit-code contract suite (tests/unit/exit-code-contract.test.ts)
+driven against a fake embed server (tests/helpers/fake-embed-server.ts) that can report a
+chosen model/dimension and reject selected inputs on demand — every case was watched go RED
+against the pre-fix code before the fix landed.
+
+Scope note: an earlier scope extension on this bug claimed `doctor` always exits 0 and that
+there is no read-path model guard. Both were audited and REFUTED before any code was
+written — `doctor` already failed closed for 7 of 18 issue classes, and
+`assertQueryEmbedModelConsistent` (src/store.ts) is a thorough read-path guard that rejects
+heterogeneous vaults. No fix was built for either.
+
+---
+
 ## v0.36.0 — the ranking pipeline and vault lifecycle become inspectable
 
 Two read-only diagnostic MCP tools. Composite ranking and lifecycle state were

@@ -854,6 +854,10 @@ export async function cmdEmbed(args: string[]) {
       // Explicit baseline replacement (T8-M3): baselines are first-healthy calibrations
       // and never roll on their own — this is the intentional recalibration operation.
       "recalibrate-canary": { type: "boolean", default: false },
+      // Back-compat escape hatch (master-harness-zkjyh): a run that leaves fragments
+      // unembedded is now a FAILURE by default, because a caller cannot otherwise tell
+      // a partial embed from a complete one. --lenient restores the historic exit-0.
+      lenient: { type: "boolean", default: false },
     },
     allowPositionals: false,
   });
@@ -1012,6 +1016,11 @@ export async function cmdEmbed(args: string[]) {
       const probe = await probeEmbed();
       if (!probe) {
         console.error(`${c.red}Force re-embed aborted: could not reach the embedding endpoint. Nothing was cleared.${c.reset}`);
+        // A refused run is NOT success (master-harness-zkjyh): these four guards printed
+        // red and returned bare, so `update --embed` / the embed timer / any `set -e`
+        // caller saw exit 0 and treated a refusal as a completed embed. Matches the
+        // canary/finalize paths above, which have always set a nonzero code.
+        process.exitCode = 1;
         return;
       }
       console.log(`${c.yellow}Force mode: clearing all embeddings (rebuilding at dim ${probe.dim})${c.reset}`);
@@ -1027,6 +1036,7 @@ export async function cmdEmbed(args: string[]) {
         const probe = await probeEmbed();
         if (probe && probe.dim !== existingDim) {
           console.error(`${c.red}Embedding dimension changed (${existingDim} → ${probe.dim}). Run 'clawmem embed --force' to clear and rebuild the full vault.${c.reset}`);
+          process.exitCode = 1;
           return;
         }
         // Same dimension but a DIFFERENT model still mixes the vector space (cosine
@@ -1035,10 +1045,12 @@ export async function cmdEmbed(args: string[]) {
         const existingModels = s.getVecModels();
         if (existingModels.length > 1) {
           console.error(`${c.red}Vault already contains mixed embedding models: ${existingModels.join(", ")}. Run 'clawmem embed --force' to rebuild with a single model.${c.reset}`);
+          process.exitCode = 1;
           return;
         }
         if (probe && probe.model && existingModels.length === 1 && existingModels[0] !== probe.model) {
           console.error(`${c.red}Embedding model changed (${existingModels[0]} → ${probe.model}) at the same dimension. Mixing models in one vector space breaks similarity. Run 'clawmem embed --force' to rebuild with the current model.${c.reset}`);
+          process.exitCode = 1;
           return;
         }
         expectedDim = existingDim;
@@ -1238,6 +1250,16 @@ export async function cmdEmbed(args: string[]) {
 
     // End-of-run verification — shared finalization (T9-H1 + T10-M1); see finalizeCanary.
     await finalizeCanary(failedFragments);
+
+    // Partial-embed contract (master-harness-zkjyh): fragments that never embedded leave
+    // the vault incomplete (their documents are marked 'failed' for retry above), so the
+    // run must not report success. The count stays in the summary line printed above;
+    // this only sets the exit code. --lenient does NOT clear a code set by finalizeCanary
+    // — a tainted/unverified geometry is a different, non-negotiable failure.
+    if (failedFragments > 0 && !values.lenient) {
+      console.error(`${c.red}Embed incomplete: ${failedFragments} failed fragment(s) — the vault is missing vectors for them. Re-run 'clawmem embed' (pass --lenient to exit 0 on partial failure).${c.reset}`);
+      process.exitCode = 1;
+    }
   } catch (err) {
     // Fatal aborts must NOT exit 0 — otherwise the embed timer / `update --embed`
     // cannot tell the run was incomplete. Set a nonzero exit code (cleanup still
@@ -1449,12 +1471,17 @@ async function cmdVsearch(args: string[]) {
       collection: { type: "string", short: "c" },
       json: { type: "boolean", default: false },
       "min-score": { type: "string", default: "0.3" },
+      // OPT-IN only (master-harness-zkjyh). ~20 live consumers shell out to
+      // vsearch/query under `set -e`; flipping the default to nonzero on an empty
+      // result set would break every one of them. The flag is enough to satisfy
+      // "a caller can distinguish 'no match' from 'ran fine'".
+      "fail-on-empty": { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
 
   const query = positionals.join(" ");
-  if (!query) die("Usage: clawmem vsearch <query>");
+  if (!query) die("Usage: clawmem vsearch <query> [--fail-on-empty]");
 
   const s = getStore();
   const limit = parseInt(values.num!, 10);
@@ -1484,6 +1511,7 @@ async function cmdVsearch(args: string[]) {
     printResults(scored, query);
   }
 
+  signalEmptyResults(scored.length, !!values["fail-on-empty"]);
   await disposeDefaultLlamaCpp();
 }
 
@@ -1495,12 +1523,14 @@ async function cmdQuery(args: string[]) {
       collection: { type: "string", short: "c" },
       json: { type: "boolean", default: false },
       "min-score": { type: "string", default: "0" },
+      // See cmdVsearch: opt-in only, default exit code unchanged.
+      "fail-on-empty": { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
 
   const query = positionals.join(" ");
-  if (!query) die("Usage: clawmem query <query>");
+  if (!query) die("Usage: clawmem query <query> [--fail-on-empty]");
 
   const s = getStore();
   const limit = parseInt(values.num!, 10);
@@ -1612,7 +1642,27 @@ async function cmdQuery(args: string[]) {
     printResults(scored, query);
   }
 
+  signalEmptyResults(scored.length, !!values["fail-on-empty"]);
   await disposeDefaultLlamaCpp();
+}
+
+/**
+ * Zero-result signalling for vsearch/query (master-harness-zkjyh).
+ *
+ * EXIT 2, not 1: a search that ran correctly and matched nothing is a distinct outcome
+ * from a search that failed (bad flag, unreachable embedder, corrupt vault → 1). Callers
+ * that care need to tell them apart; conflating them into 1 would just move the problem.
+ *
+ * OPT-IN: without --fail-on-empty this is a no-op, because the existing consumers
+ * (tools/recall, tools/route-query, tools/l2-ingest-gate, tools/eval-retrieval, …) run
+ * these commands under `set -e` and treat "no hits" as a normal, successful outcome.
+ */
+export const EXIT_NO_RESULTS = 2;
+
+function signalEmptyResults(resultCount: number, failOnEmpty: boolean): void {
+  if (!failOnEmpty || resultCount > 0) return;
+  console.error(`No results (exit ${EXIT_NO_RESULTS}: --fail-on-empty)`);
+  process.exitCode = EXIT_NO_RESULTS;
 }
 
 function printResults(results: Array<{ displayPath: string; title: string; compositeScore: number; score: number; contentType: string; body?: string }>, query: string) {
@@ -3184,6 +3234,15 @@ async function cmdDoctor() {
   console.log();
   if (issues > 0) {
     console.log(`${c.yellow}${issues} issue(s) found.${c.reset}`);
+    // Hoisted exit-code assignment (master-harness-zkjyh). Eleven of the eighteen
+    // `issues++` sites above had no paired `process.exitCode = 1`, so doctor could
+    // print red ✗ diagnostics and still exit 0 — a health check that cannot fail.
+    // One assignment here is deliberate over pairing eleven sites: it also covers
+    // every FUTURE issue class by construction, and the defect class being fixed is
+    // exactly "somebody added an issue and forgot the line". The already-paired
+    // sites are unchanged (they still set 1); the printed diagnostics above name
+    // the specific reason, so nothing is lost by keying the code off the count.
+    process.exitCode = 1;
   } else {
     console.log(`${c.green}All checks passed.${c.reset}`);
   }
@@ -4503,15 +4562,15 @@ ${c.bold}Indexing:${c.reset}
   clawmem update [--pull] [--embed]    Re-scan collections (--embed auto-embeds)
   clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (Claude, ChatGPT, Slack); --synthesize runs post-import LLM fact extraction; preserves per-exchange authored_at
   clawmem mine <dir> -c name --backfill-dates [--apply]  Derive authored_at for already-mined docs from source transcripts (metadata-only; dry-run without --apply)
-  clawmem embed [-f]                   Generate fragment embeddings
+  clawmem embed [-f] [--lenient]       Generate fragment embeddings (exits 1 on failed fragments; --lenient exits 0)
   clawmem reindex [--force] [--enrich]  Full re-index (--enrich: run entity extraction + links on all docs)
   clawmem watch                        File watcher daemon
   clawmem status                       Show index status
 
 ${c.bold}Search:${c.reset}
   clawmem search <query> [-n N] [-c col[,col]]   BM25 keyword search
-  clawmem vsearch <query> [-n N] [-c col[,col]]  Vector similarity
-  clawmem query <query> [-n N] [-c col[,col]]    Hybrid + rerank (best)
+  clawmem vsearch <query> [-n N] [-c col[,col]] [--fail-on-empty]  Vector similarity
+  clawmem query <query> [-n N] [-c col[,col]] [--fail-on-empty]    Hybrid + rerank (best)
     -c/--collection fences retrieval to the named collection(s). Without it,
     a session focus (clawmem focus set <collection>) auto-scopes to that
     collection when the focus topic names one.
@@ -4574,6 +4633,10 @@ ${c.bold}Options:${c.reset}
   -f, --force          Force re-embed/reindex all
   --force-geometry     Override a failing embed geometry-canary preflight
   --recalibrate-canary Replace the stored canary baseline (first-healthy otherwise)
+  --lenient            embed: exit 0 even when some fragments failed (back-compat)
+  --fail-on-empty      vsearch/query: exit 2 when the search returns zero results
+                       (opt-in; the default stays exit 0 so existing callers under
+                       'set -e' are unaffected)
   --pull               Run update commands before indexing
 `);
 }
