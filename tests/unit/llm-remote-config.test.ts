@@ -78,6 +78,48 @@ describe("remote LLM model selection", () => {
     expect(seenUrl).toBe("https://api.example.com/v1/chat/completions");
   });
 
+  it("passes a full /chat/completions URL through without appending /v1", async () => {
+    let seenUrl: string | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      seenUrl = String(url);
+      const seenBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        model: seenBody.model,
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    const llm = new LlamaCpp({
+      remoteLlmUrl: "https://api.z.ai/api/paas/v4/chat/completions",
+      remoteLlmModel: "glm-4.5-flash",
+    });
+
+    await llm.generate("test prompt");
+
+    expect(seenUrl).toBe("https://api.z.ai/api/paas/v4/chat/completions");
+  });
+
+  it("strips a trailing slash before the /chat/completions passthrough", async () => {
+    let seenUrl: string | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      seenUrl = String(url);
+      const seenBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        model: seenBody.model,
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    const llm = new LlamaCpp({
+      remoteLlmUrl: "https://api.z.ai/api/paas/v4/chat/completions/",
+      remoteLlmModel: "glm-4.5-flash",
+    });
+
+    await llm.generate("test prompt");
+
+    expect(seenUrl).toBe("https://api.z.ai/api/paas/v4/chat/completions");
+  });
+
   it("uses CLAWMEM_LLM_MODEL when bootstrapping the default LLM instance from env", async () => {
     let seenBody: Record<string, unknown> | undefined;
     process.env.CLAWMEM_LLM_URL = "http://localhost:8089";

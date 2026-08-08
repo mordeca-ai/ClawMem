@@ -3,7 +3,7 @@
  *
  *  1. Collection-scoped purge API (store.purgeCollection)
  *  2. Mandatory explicit scope on deleteInactiveDocuments / cleanupOrphanedContent /
- *     cleanupOrphanedVectors, plus the archived-row carve-out (default: spared;
+ *     plus the archived-row carve-out (default: spared;
  *     opts.includeArchived: true removes them too).
  *
  * The incident: a bare, unscoped call to deleteInactiveDocuments() +
@@ -17,7 +17,6 @@ import { describe, it, expect, beforeEach } from "bun:test";
 import {
   deleteInactiveDocuments,
   cleanupOrphanedContent,
-  cleanupOrphanedVectors,
   purgeCollection,
   type Store,
 } from "../../src/store.ts";
@@ -262,61 +261,6 @@ describe("cleanupOrphanedContent scope guard", () => {
   });
 });
 
-// =============================================================================
-// cleanupOrphanedVectors — mandatory scope + archived carve-out
-// =============================================================================
-
-describe("cleanupOrphanedVectors scope guard", () => {
-  let store: Store;
-  beforeEach(() => {
-    store = createTestStore();
-    store.ensureVecTable(2);
-  });
-
-  it("throws on invalid/missing scope", () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect(() => (cleanupOrphanedVectors as any)(store.db)).toThrow();
-  });
-
-  function seedVectorDoc(row: SeedRow) {
-    const { hash } = seedRow(store, row);
-    store.insertEmbedding(hash, 0, 0, new Float32Array([1, 0]), "test", new Date().toISOString());
-    return hash;
-  }
-
-  it("all-scope, default options: vectors for archived docs are spared", () => {
-    seedVectorDoc({ collection: "a", path: "archived.md", active: 0, archivedAt: new Date().toISOString(), hash: "hash-archived-v" });
-    seedVectorDoc({ collection: "a", path: "forgotten.md", active: 0, archivedAt: null, hash: "hash-forgotten-v" });
-
-    const deleted = cleanupOrphanedVectors(store.db, { all: true });
-
-    expect(deleted).toBe(1);
-    const remaining = store.db.prepare(`SELECT hash FROM content_vectors`).all() as { hash: string }[];
-    expect(remaining.map(r => r.hash)).toEqual(["hash-archived-v"]);
-  });
-
-  it("all-scope with includeArchived=true removes archived-doc vectors too", () => {
-    seedVectorDoc({ collection: "a", path: "archived.md", active: 0, archivedAt: new Date().toISOString(), hash: "hash-archived-v2" });
-
-    const deleted = cleanupOrphanedVectors(store.db, { all: true }, { includeArchived: true });
-    expect(deleted).toBe(1);
-    expect(store.db.prepare(`SELECT 1 FROM content_vectors WHERE hash = 'hash-archived-v2'`).get()).toBeFalsy();
-  });
-
-  it("collection-scope restricts the sweep", () => {
-    seedVectorDoc({ collection: "smoke", path: "forgotten.md", active: 0, archivedAt: null, hash: "hash-smoke-v" });
-    seedVectorDoc({ collection: "other", path: "forgotten.md", active: 0, archivedAt: null, hash: "hash-other-v" });
-
-    const deleted = cleanupOrphanedVectors(store.db, { collection: "smoke" });
-
-    expect(deleted).toBe(1);
-    expect(store.db.prepare(`SELECT 1 FROM content_vectors WHERE hash = 'hash-smoke-v'`).get()).toBeFalsy();
-    expect(store.db.prepare(`SELECT 1 FROM content_vectors WHERE hash = 'hash-other-v'`).get()).toBeTruthy();
-  });
-
-  it("returns 0 when vectors_vec table does not exist", () => {
-    const bareStore = createTestStore(); // ensureVecTable never called
-    seedRow(bareStore, { collection: "a", path: "x.md", active: 0, archivedAt: null });
-    expect(cleanupOrphanedVectors(bareStore.db, { all: true })).toBe(0);
-  });
-});
+// (cleanupOrphanedVectors was removed with the upstream v0.11.0 sync — unfenced
+// vector mutation, no production caller; cleanStaleEmbeddings is the lease-fenced
+// replacement. Its scope-guard tests were removed with it.)
