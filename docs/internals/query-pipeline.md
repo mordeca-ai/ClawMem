@@ -43,13 +43,17 @@ Cross-Encoder Reranking
   │ Batch cap = 4
   │
   ▼
-Position-Aware Blending
-  │ α = 0.75 (top 3), 0.60 (mid), 0.40 (tail)
-  │ Blends original + reranked scores
+Rerank / RRF Blend (blendRerank)
+  │ 0.9 · reranker + 0.1 · normalized-RRF tiebreaker
+  │ Reranker is the dominant signal; can promote a doc over RRF #1
+  │ Falls back to pure RRF order if the reranker is unavailable / degenerate
+  │ (no score above RERANK_DEGENERATE_FLOOR ≈ 1e-4); emits a rate-limited warning on fallback
+  │ (the reranker-health guard surfaces this — see `clawmem doctor` / `clawmem rerank-health`)
   │
   ▼
 Composite Scoring
-  │ (relevance * 0.50 + recency * 0.25 + confidence * 0.25)
+  │ (relevance * 0.70 + recency * 0.15 + confidence * 0.15)   ← query-tuned weights (v0.13.0)
+  │ recency-intent queries instead use 0.10 / 0.70 / 0.20
   │ × quality multiplier × co-activation boost
   │
   ▼

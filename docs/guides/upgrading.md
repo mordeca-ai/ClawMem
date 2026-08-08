@@ -42,6 +42,29 @@ The first time any v0.7.1+ process opens an existing vault, the migrations run s
 
 ---
 
+## Reranker: zerank-2 GGUF deprecated → seq-cls sidecar
+
+If you followed an earlier "SOTA upgrade" and are running the **`zerank-2-Q4_K_M` GGUF reranker** on `:8090`, **replace it.** That GGUF is broken: llama.cpp's `convert_hf_to_gguf.py` only synthesizes a rerank head when the model card contains the literal `# Qwen3-Reranker`, which zerank-2's card lacks — so the previously-recommended GGUF (and any built by the current/standard llama.cpp converter) is a headless causal LM that produces near-zero, uninformative scores under `--reranking`. Reranking silently degrades to an RRF-dominated passthrough.
+
+**Migration** — serve zerank-2 via the seq-cls sidecar instead (transformers, bf16; ships a reproducible correctness gate):
+
+```bash
+cd extras/rerankers/zerank-2-seq
+docker compose build
+HF_TOKEN=hf_xxx docker compose run --rm convert   # download + convert + verify
+docker compose up -d reranker                      # /v1/rerank on :8090
+```
+
+`CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
+
+---
+
+## v0.12.0: query reranking blend (no action required)
+
+v0.12.0 changes the `query` tool's rerank/RRF blend so the cross-encoder reranker can promote the best document to the top — the previous blend left RRF #1 mathematically immovable. It is a pure ranking-quality change: **no migration, no schema change, no config change.** It applies automatically on upgrade. Hooks and the per-session MCP stdio server pick it up on their next invocation; restart any long-lived `query` host — `clawmem serve` and persistent MCP/daemon processes — to pick up the improved ordering. The default reranker (`qwen3-reranker-0.6B`) is unchanged, and the blend improvement applies whatever reranker `:8090` serves. (`intent_search` and the context-surfacing hook keep their existing blends.)
+
+---
+
 ## v0.10.3 → v0.10.4
 
 v0.10.4 fixes [issue #11](https://github.com/yoloshii/ClawMem/issues/11) — `clawmem setup openclaw` previously hardcoded `~/.openclaw/extensions/clawmem` and ignored `OPENCLAW_STATE_DIR`, breaking installs into custom OpenClaw profiles. The fix is non-breaking: vault on disk is byte-identical, no schema changes, no env-var changes for users on the default profile, no retrieval-pipeline or hook changes. Pure `bun update -g clawmem`.

@@ -28,10 +28,11 @@ import {
 import {
   applyCompositeScoring,
   hasRecencyIntent,
+  QUERY_WEIGHTS,
   type EnrichedResult,
   type CoActivationFn,
 } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, blendFusionAndRerank, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, type RankedResult } from "./search-utils.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
 import { listCollections } from "./collections.ts";
@@ -45,6 +46,25 @@ import {
 } from "./maintenance.ts";
 import { listVaults, loadVaultConfig } from "./config.ts";
 import { getEntityGraphNeighbors, searchEntities } from "./entity.ts";
+
+// =============================================================================
+// Reranker fallback telemetry
+// =============================================================================
+
+// blendRerank silently degrades to RRF order when the reranker is degenerate (the deprecated
+// zerank-2 GGUF emitted ~1e-11 scores that contributed nothing at weight 0.9). This surfaces that
+// otherwise-invisible regression. Rate-limited to at most one stderr line per minute; the running
+// count is included so a persistent failure is obvious. Run `clawmem doctor` for the full probe.
+let rerankFallbackCount = 0;
+let lastRerankFallbackWarnAt = 0;
+function onRerankFallback(reason: string): void {
+  rerankFallbackCount++;
+  const now = Date.now();
+  if (now - lastRerankFallbackWarnAt > 60_000) {
+    lastRerankFallbackWarnAt = now;
+    console.error(`[clawmem] reranker degraded → RRF fallback (${reason}); ${rerankFallbackCount} occurrence(s) this process. Run 'clawmem doctor' to check the reranker.`);
+  }
+}
 
 // =============================================================================
 // Types
@@ -753,13 +773,23 @@ This is the recommended entry point for ALL memory queries.`,
         return { file: c.file, text };
       });
 
-      const reranked = await store.rerank(query, chunksToRerank, DEFAULT_RERANK_MODEL, intent);
+      let reranked: { file: string; score: number }[] = [];
+      try {
+        reranked = await store.rerank(query, chunksToRerank, DEFAULT_RERANK_MODEL, intent);
+      } catch {
+        reranked = []; // reranker unavailable → blendRerank falls back to pure RRF order
+      }
 
       const candidateMap = new Map(candidates.map(c => [c.file, c]));
 
-      // Blend RRF + reranker scores using the candidate's actual (normalized)
-      // RRF fusion score, not a rank-index proxy (master-harness-z7o4y fusion fix).
-      const blended = blendFusionAndRerank(candidates, reranked);
+      // Blend the reranker (dominant signal) with a thin normalized-RRF tiebreaker; falls back
+      // to pure RRF order when the reranker is unavailable / all-zero. See blendRerank: the
+      // prior w·(1/rrfRank) blend made RRF rank-1 immovable by the reranker. Harness-validated
+      // 2026-06-25 (NL+KW known-item recall): lifts recall@1-5 + MRR@10 with no material pooled
+      // recall@10 regression. (Supersedes the fork's blendFusionAndRerank here — same normalized
+      // real-RRF signal, plus dominant rerank + degenerate-floor fallback. blendFusionAndRerank
+      // remains on the CLI query path, which upstream never migrated.)
+      const blended = blendRerank(candidates, reranked, { onFallback: onRerankFallback });
 
       // Map to SearchResults for composite scoring — hydrate from DB when needed
       const allSearchResults = [...store.searchFTS(query, 30)];
@@ -799,7 +829,10 @@ This is the recommended entry point for ALL memory queries.`,
 
       const coFn = (path: string) => store.getCoActivated(path);
       const enriched = enrichResults(store, searchResults, query);
-      let scored = applyCompositeScoring(enriched, query, coFn)
+      // Phase B (§11.12): the `query` tool's hybrid+rerank pipeline uses QUERY_WEIGHTS (search 0.70) —
+      // the eval-validated re-weight. Recency intent still wins RECENCY_WEIGHTS by construction
+      // (applyCompositeScoring ignores options.weights when hasRecencyIntent(query) and !forceWeights).
+      let scored = applyCompositeScoring(enriched, query, coFn, { weights: QUERY_WEIGHTS })
         .filter(r => r.compositeScore >= (minScore || 0));
       if (diverse !== false) scored = applyMMRDiversity(scored);
       scored = scored.slice(0, limit || 10);
