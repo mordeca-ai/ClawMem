@@ -4,6 +4,72 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.11.2 — Packaging: `bin` path so `npm install -g` registers the `clawmem` command on npm 11
+
+v0.11.2 is a packaging-only fix. The `bin` map declared `"clawmem": "./bin/clawmem"`; npm 11's publish path rejects the `./`-prefixed form and **drops the bin entry from the tarball** (older npm silently rewrote it — the live v0.11.0 ships `bin/clawmem`), so a global install would land the files but expose no `clawmem` command. Changed to `"clawmem": "bin/clawmem"`, verified with `npm publish --dry-run` (no warning; the bin survives in the packed `package.json`).
+
+No source change from v0.11.1. **v0.11.1 was git-tagged but never reached npm** (the publish that surfaced this packaging issue also failed on an expired npm token), so on npm v0.11.2 supersedes v0.11.0 directly and carries the full v0.11.1 query-expansion fix documented below.
+
+## v0.11.1 — Query expansion: typed lex/vec/hyde routing + terse qmd prompt (fixes garbage / mis-routed expansions)
+
+v0.11.1 fixes the LLM query-expansion stage, which had two compounding bugs that quietly degraded `query` / `intent_search` recall: the expansion model produced **garbage variants**, and the variants that were usable got **routed to the wrong search backend**.
+
+Root cause — two layers:
+
+- **Prompt was out-of-distribution for the finetune.** `expandQueryRemote` (`src/llm.ts`) sent a verbose prose instruction with no format constraint. The shipped expansion model (`qmd-query-expansion-1.7B`, a Qwen3-1.7B finetune) was trained on QMD's terse `/no_think Expand this search query: <q>` form. The mismatch produced bare question-stem "lex" terms ("What are the", "How do the"), literal template echoes, and `</think>` leakage — roughly a third of queries returned pure template noise.
+- **Variant type was erased at the routing layer.** The expander emits typed `lex` (keyword), `vec` (semantic), and `hyde` (hypothetical-answer) variants, but every consumer dropped the type and searched **each variant on both backends** — so keyword expansions were vector-searched and hypothetical-answer passages were BM25-searched, each leg fed the input it handles worst. The CLI (`clawmem query`) was worse: it re-parsed already-stripped `lex:` / `vec:` prefixes, collapsing every variant into a single mis-typed list.
+
+What changed:
+
+- **Terse, in-distribution prompt.** `expandQueryRemote` now sends `/no_think Expand this search query: <q>` (plus the intent line when provided), matching the finetune's training form. Clean lex/vec/hyde verified end-to-end against the live server.
+- **Typed `ExpandedQuery` contract end-to-end.** `store.expandQuery` returns `{ type, query }[]` instead of erasing the type, and every consumer routes by it: `lex → BM25`, `vec` / `hyde → vector`, original query → both backends (the only leg that fans out to both, keeping its 2× RRF anchor). Fixes the MCP `query` tool (`src/mcp.ts`), the CLI (`src/clawmem.ts`), and the deep-escalation path in `context-surfacing` (`src/hooks/context-surfacing.ts`). The MCP tool now also counts the original query's actual contributed list count for the 2× positional weight, fixing a latent mis-weight when the original's BM25 or vector leg came back empty.
+- **Shared sanitize guards.** A single `sanitizeExpandedQueries` (`src/llm.ts`) runs in both the remote parser and the store wrapper: strips stray control tokens (`/no_think`, `/think`, word-boundary-safe), rejects template-residue / `<think>` / empty lines, dedups, and echo-filters variants equal to the original. A typed `expansionFallback` covers expansion failure or all-junk output, and `isFallbackExpansion` detects a leaked llm-level fallback so the store returns expansions-only and does not cache it.
+- **Versioned expansion cache.** Cache key bumped to `expandQuery:v3-qmd-terse-typed` with a provider fingerprint and typed-JSON value; the old newline-delimited cache ages out via LRU (no manual purge). A malformed v3 entry is rejected and re-expanded instead of partially accepted.
+
+### Verification
+
+`tsc` clean on the touched files; full unit suite green (187 pass). Live end-to-end against the running expansion server: typed shape, zero echo, zero template-junk, correct per-type routing, cache round-trip. Validated under a fresh GPT-5.5 high-reasoning adversarial review via `codex exec` (impl-review session `019ef534`, separate from the design session `019eefbe`): Turn 1 surfaced three real findings — a leaked llm-level fallback being cached, partial acceptance of a malformed typed-cache entry, and CLI expansion-only candidates dropped after RRF — each fixed and re-verified to verbatim "zero remaining findings."
+
+### What didn't change
+
+- Composite scoring, MMR diversity, cross-encoder reranking, RRF fusion weights, vault format, hook set, and the agent tool surface are unchanged.
+- No schema migration, no config or env-var change, no public API change; the expansion model and the three inference services are the same. **One behavior change:** query expansion now routes each variant to a single backend by type instead of searching every variant on both — recall improves on the same vault the moment you upgrade. Pure `bun add -g clawmem` upgrade.
+
+Docs `docs/internals/query-pipeline.md`, `AGENTS.md`, and `CLAUDE.md` updated to describe typed routing (`AGENTS.md` / `CLAUDE.md` also carry a pending correction: MPFP meta-path fusion is max-score, not RRF).
+
+## v0.11.0 — Embedding dimension-migration safety + lease-fenced, atomic vector writes
+
+v0.11.0 hardens the embedding write path against a class of **silent vector loss** surfaced by a real incident: a re-embed reported success, but pure-vector retrieval (`vsearch` / `find_similar`) returned nothing for the affected docs. Root-cause analysis found two layers — a model-serving quality issue (operator-side; see Troubleshooting → "weak or irrelevant results") and, in ClawMem itself, an **unsafe dimension migration**: when the embedding model's output dimension changed, `ensureVecTable` dropped the `vectors_vec` table while the metadata-based worklist (`getHashesNeedingFragments`) skipped the now-vectorless documents (their `content_vectors` rows still existed). The result was a vault whose vectors were silently wiped while `embed` reported "all done."
+
+What changed in the embedding write path:
+
+- **`ensureVecTable` never drops an existing table.** A dimension/schema mismatch now throws a fatal `VecDimensionMismatchError` and aborts the run instead of dropping. The only path that clears vectors is the explicit `clearAllEmbeddings`, reached only via `embed --force`.
+- **`embed` detects dimension AND model drift non-destructively.** An implicit (non-`--force`) run that sees a changed dimension — or a *different model at the same dimension*, which mixes a heterogeneous, similarity-meaningless vector space — aborts with instructions to run `--force`, never mutating. `embed --force` probes the endpoint **first** and aborts without clearing if it's unreachable, so a force rebuild against a dead server cannot wipe the vault. The whole run is bound to one `(dimension, model)`; every embedding is validated before it is stored.
+- **All vector mutations are atomic and lease-fenced.** `insertEmbedding`, `clearAllEmbeddings`, `cleanStaleEmbeddings`, and table creation each run in a single immediate-write-lock transaction that verifies a renewable, token-fenced **embedding lease** (`worker_leases`, name `embedding`, heartbeat-renewed) before mutating — so two concurrent embeds, or a process that lost its lease mid-run, cannot interleave a clear with an insert or mix two models into one index. A second concurrent `embed` skips cleanly.
+- **Crash-safe retry budget.** `embed_attempts` increments exactly once per attempt (at start), resets on a successful embed, and resets whenever a document's content changes (new hash) via a new `reset_embed_on_hash_change` trigger that covers *every* hash-changing path. A document can no longer be permanently excluded by stale failures from old content. Partial embeds are retried in full.
+- **`doctor` now reports content_vectors ↔ vectors_vec consistency** (a set-difference check, including the worst case where `vectors_vec` is absent but metadata rows remain), and flags a vault that contains mixed embedding models.
+- **`embed` exits non-zero** when a run aborts (dimension/model mismatch or lost lease), so the embed timer / `update --embed` can detect an incomplete run.
+
+### Verification
+
+Validated across a 9-turn GPT-5.5 high-reasoning adversarial review under `codex exec` (session `019eefbe`): a diagnosis pass, four design passes (which overturned an initial "defer the concurrency lease" decision by demonstrating that two same-dimension models can silently build a heterogeneous index), and four code-review passes that drove findings 6 → 4 → 3 → 2 → **0** ("vector-table mutations are now atomic, lease-fenced, and dimension/model consistent"). Ships with new unit tests covering throw-on-mismatch, `getVecTableDim` states, the lease fence on insert/clear, the hash-change trigger, attempt-budget resets, and `getVecModels` heterogeneity detection; full suite green except one pre-existing unrelated integration test.
+
+### What didn't change
+
+- Retrieval pipeline, composite scoring, vault format, hook set, agent tool surface, and OpenClaw/Hermes plugin registration are unchanged.
+- No public API change. **One behavior change:** `embed` now **aborts** on a dimension/model change instead of silently re-embedding into a dropped table — run `clawmem embed --force` to migrate. The only schema addition is the `reset_embed_on_hash_change` trigger, created automatically on store open (no manual migration).
+---
+
+## Fork delta (mordeca-ai/ClawMem) — v0.10.8..v0.10.15
+
+The sections below this banner (v0.10.15 down to v0.10.8) are fork-side releases
+made on the mordeca-ai fork while upstream advanced from v0.10.7 to v0.11.x; they
+merged cleanly under the v0.11.2 sync (fork version numbering yields to upstream's
+lineage from here on). One fork change was superseded by upstream: the 73tb.24
+terse expansion prompt is now upstream's v0.11.1 typed-expansion implementation.
+
+---
+
 ## v0.10.15 — token-aware per-model embed cap for `truncateForEmbed` (fixes the high-entropy under-char-cap failure mode)
 
 `truncateForEmbed()` was the embed path's only size defense and it was
