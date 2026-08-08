@@ -111,6 +111,22 @@ export function loadConfig(): CollectionConfig {
       config.collections = {};
     }
 
+    // `clawmem collection add` enforces isValidCollectionName, but a hand-edited config.yaml
+    // bypasses it entirely. A name containing '/' makes every virtual path for that collection
+    // ambiguous — `clawmem://a/b/doc.md` parses as collection 'a', path 'b/doc.md' — so lookups
+    // that round-trip through parseVirtualPath silently resolve to the wrong pair or to nothing.
+    // Warn rather than throw: rejecting outright would lock an existing vault out of its own
+    // config, and the damage is confined to virtual-path round-trips.
+    for (const name of Object.keys(config.collections)) {
+      if (!isValidCollectionName(name)) {
+        console.warn(
+          `[clawmem] collection name ${JSON.stringify(name)} in ${configPath} is not valid ` +
+          `(expected only letters, digits, '_' and '-'). Virtual-path lookups for this ` +
+          `collection may resolve incorrectly — rename it with 'clawmem collection add'.`,
+        );
+      }
+    }
+
     // Parse lifecycle policy if present
     const raw = YAML.parse(content);
     if (raw?.lifecycle && typeof raw.lifecycle === "object") {
@@ -118,7 +134,15 @@ export function loadConfig(): CollectionConfig {
       config.lifecycle = {
         archive_after_days: typeof lc.archive_after_days === "number" ? lc.archive_after_days : 90,
         type_overrides: typeof lc.type_overrides === "object" && lc.type_overrides !== null ? lc.type_overrides : {},
-        purge_after_days: typeof lc.purge_after_days === "number" ? lc.purge_after_days : null,
+        // INERT since v0.30.0 (see src/config.ts for the same guard) — only a positive
+        // finite value is accepted; a negative or infinite one previously yielded a future
+        // cutoff that deleted every archived row.
+        purge_after_days:
+          typeof lc.purge_after_days === "number" &&
+          Number.isFinite(lc.purge_after_days) &&
+          lc.purge_after_days > 0
+            ? lc.purge_after_days
+            : null,
         exempt_collections: Array.isArray(lc.exempt_collections) ? lc.exempt_collections : [],
         dry_run: lc.dry_run !== false,
       };

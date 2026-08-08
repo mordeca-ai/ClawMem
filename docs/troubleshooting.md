@@ -75,13 +75,31 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 ## Search & retrieval
 
+**Historical/mined conversations rank as if they were written today**
+- Fixed in v0.27.0: ranking recency, temporal filters, and the recent-decision windows run on **effective time** (`authored_at` when known, `modified_at` otherwise). New mines capture authorship automatically.
+- For vaults mined before v0.27.0: re-run `clawmem mine` over the same export directory (metadata-only "dated" transition — no re-enrichment/re-embed), or `clawmem mine <dir> -c <collection> --backfill-dates` (dry-run) then `--apply`.
+- Documents that still lack `authored_at` (source transcripts without timestamps, plain-text imports) keep filing-time behavior by design.
+
 **context-surfacing hook returns empty**
-- Prompt too short (< 20 chars), starts with `/`, or no docs score above threshold.
+- Prompt too short (< 20 chars — short memory-intent queries like "what did I say?" are exempt and force retrieval), starts with `/`, or no docs score above threshold.
 - Fix: Check `clawmem status` for doc counts. Check `clawmem embed` for embedding coverage.
 
 **intent_search returns weak results for WHY/ENTITY**
 - Graph may be sparse (few A-MEM edges).
 - Fix: Run `build_graphs` to add temporal backbone + semantic edges.
+
+### `build_graphs` reports 0 new edges
+
+Expected on a rebuild. Inserts are idempotent, so a second call over an unchanged corpus writes
+nothing and correctly reports `0 new`. Read the accompanying total (`N new edge(s), M total`) —
+if the total is non-zero the graph is populated and there is nothing to fix.
+
+Before v0.28.0 these counters reported insert *attempts* rather than rows written, so a call
+that persisted nothing could still report a healthy-looking count. If you are on an older
+version, a non-zero count is not evidence that edges landed.
+
+Totals count only edges whose **both endpoints are active**, matching the population the
+builders operate on — so archiving documents legitimately lowers the total.
 
 **search returns results but query returns nothing**
 - `query` applies stricter scoring (composite + MMR + expansion). If expansion LLM is down, the pipeline may return empty.
@@ -250,7 +268,7 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 
 **Hook fires but returns empty context**
 - The context-surfacing hook filters aggressively. Common causes:
-  - Prompt too short (< 20 chars), starts with `/`, or matches the heartbeat/greeting filter
+  - Prompt too short (< 20 chars; short memory-intent queries are exempt and force retrieval), starts with `/`, or matches the heartbeat/greeting filter
   - Duplicate prompt within the 600-second dedup window (SHA-256 hash match)
   - Vector search silently failed (dimension mismatch, server down) and BM25-only results scored too low after composite scoring
   - All results fell below the profile's minimum composite score threshold after recency decay, confidence weighting, and quality multiplier were applied
@@ -263,6 +281,29 @@ Common issues when running ClawMem with hooks, MCP server, or OpenClaw plugin. O
 **Duplicate observations after every session**
 - The `saveMemory()` API enforces a 30-minute normalized content hash dedup window.
 - If duplicates still appear: check that the dedup window hasn't been bypassed by large time gaps or content variations.
+
+**`[decision-extractor] contradiction: N invalidation(s) suppressed by shadow mode`**
+- Not an error. Contradiction invalidation ships unarmed (v0.28.0+): the hook eroded a document's confidence to the `0.2` floor, which is the point at which it *would* set `invalidated_at` and drop the document out of FTS and vector retrieval. It logged the intent and wrote nothing.
+- The preceding `WOULD invalidate "<collection>/<path>"` lines name each affected document, and name **only documents the armed writer could actually remove** — candidates are selected by pathname but only `content_type='observation'` is invalidation-eligible, so the two populations differ substantially — on a reference vault, roughly 3x more candidates than eligible rows. Confidence erosion still applied — that half is live, bounded, and reversible.
+- A companion line reports documents that **reached the floor but are not eligible**. Those are informational: erosion has bottomed out there and arming the flag would not touch them.
+- To act on it: read the named documents and decide whether removing them from retrieval would have been correct, then arm with `CLAWMEM_CONTRADICTION_INVALIDATE=true`. Exposure depends on your vault — see [contradiction invalidation](guides/contradiction-invalidation.md) for the measurement queries and the full procedure.
+- **Stderr visibility no longer gates calibration (v0.29.0)**: every judge evaluation writes durable `judge_runs`/`judge_events` rows in the vault database, so hosts that discard hook stderr (OpenClaw surfaces it only on non-zero exits) calibrate from the audit rows instead — see the queries in [contradiction invalidation](guides/contradiction-invalidation.md).
+- If the proposals are frequent and look wrong, that is a judge-precision signal (check `CLAWMEM_JUDGE_MODEL` and the `judge_runs` rows for that model), not a logging problem. The docs' recommended default is `claude-haiku-4-5`; upgrading the judge is a one-variable change.
+
+**A memory stopped appearing in search but is still in the vault**
+- `invalidated_at IS NULL` is a hard predicate on the FTS join and both vector joins, so an invalidated document is absent from `search`, `vsearch`, `query`, and context-surfacing with no query-time signal. `get`/`multi_get` by path still return it, which is the usual way this gets noticed.
+- Diagnose: `sqlite3 ~/.cache/clawmem/index.sqlite "SELECT id, path, content_type, invalidated_at, invalidated_by FROM documents WHERE invalidated_at IS NOT NULL ORDER BY invalidated_at DESC;"`
+- On the `documents` table, **contradiction invalidation is the only writer of this column**, and only when armed via `CLAWMEM_CONTRADICTION_INVALIDATE=true` (and only on `content_type='observation'`). Grepping the source turns up a second `invalidated_at` writer in `consolidation.ts` — that one targets a *different table*, `consolidated_observations`, whose superseded rows are filtered by `status='inactive'` rather than by the joins above. The two are unrelated; do not diagnose one from the other.
+- Restore one document **by numeric `id`**, which the audit query above returns: `sqlite3 ~/.cache/clawmem/index.sqlite "UPDATE documents SET invalidated_at=NULL, invalidated_by=NULL WHERE id=<id>;"`. Do not match on the logged path — the hook logs `collection/path` while the table stores the bare `path`, so a `WHERE path=` clause usually matches nothing, and a bare path can collide across collections. Retrieval resumes immediately; the body and its vectors were never touched, so no re-index or re-embed is needed.
+- The restore deliberately leaves `confidence` alone — the document returns at whatever erosion left it (usually `0.2`), retrievable but ranking low. Raise it separately if you judge the erosion itself was wrong: `UPDATE documents SET confidence=0.8 WHERE id=<id>;`.
+- If contradiction invalidation is the cause and you want it off, remove `CLAWMEM_CONTRADICTION_INVALIDATE` from wherever the hook's environment is configured (a shell `unset` will not affect a value set in your hook config or plugin host); a bulk restore scoped `WHERE invalidated_at IS NOT NULL AND content_type='observation'` covers exactly what that path can have written. Full procedure: [contradiction invalidation](guides/contradiction-invalidation.md).
+
+**A memory is gone from the vault entirely — not merely absent from search (pre-v0.30.0 only)**
+- Check this first, because the entry above will mislead you: if the row was *deleted* rather than invalidated, the `invalidated_at` query returns nothing and there is no document to restore. Confirm which case you are in: `sqlite3 ~/.cache/clawmem/index.sqlite "SELECT id, active, archived_at FROM documents WHERE path LIKE '%<filename>%';"` — no row at all means deletion, not invalidation.
+- **Cause, on v0.29.0 and earlier:** a configured `lifecycle.purge_after_days` permanently deleted every archived document past that window. It fired from a non-dry-run `lifecycle_sweep` (MCP) and from the `staleness-check` SessionStart hook, and neither reported it — the MCP dry-run preview listed only what would be *archived*, and the hook discarded the count inside a catch. If `purge_after_days` was null (the default), this never happened to you.
+- **Fixed in v0.30.0: ClawMem physically deletes no document row on any code path**, and `purge_after_days` is inert. Retention is archival, reversed by `lifecycle_restore`. Upgrading stops any ongoing loss.
+- **Already-deleted rows are unrecoverable from the vault** — the row, not just its retrieval flag, is gone. Recover from a backup of `index.sqlite` if you keep one, or re-index the source files: for file-backed collections the markdown on disk was never touched, so `clawmem update --embed` re-indexes it. Only vault-native content with no file behind it (mined conversations, synthesized facts, `_clawmem` observations) is genuinely lost.
+- Verify your current exposure: `grep -A6 '^lifecycle:' ~/.config/clawmem/config.yaml`. On v0.30.0+ a sweep that sees `purge_after_days` set says so explicitly and deletes nothing.
 
 ## OpenClaw
 

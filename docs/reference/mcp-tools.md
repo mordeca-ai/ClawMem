@@ -230,12 +230,17 @@ Document lifecycle statistics: active, archived, forgotten, pinned, snoozed coun
 
 ### lifecycle_sweep
 
-Archive stale documents based on lifecycle policy.
+Archive stale documents based on lifecycle policy. **Archives only — never deletes.**
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `dry_run` | boolean | true | Preview only (no action) |
 | `vault` | string | — | Named vault |
+
+Archival is reversible via `lifecycle_restore`. Through v0.29.0 a non-dry-run sweep also
+permanently deleted every archived row past `purge_after_days` — a set the preview never
+listed or counted. As of v0.30.0 ClawMem does not physically delete document rows on any
+path, and `purge_after_days` is inert.
 
 ### lifecycle_restore
 
@@ -283,6 +288,20 @@ Build temporal backbone and semantic graph.
 | `graph_types` | array | `["all"]` | `temporal`, `semantic`, or `all` |
 | `semantic_threshold` | number | 0.7 | Similarity threshold for semantic edges |
 | `vault` | string | — | Named vault |
+
+**Response** (v0.28.0+):
+
+| Field | Meaning |
+|---|---|
+| `temporal` / `semantic` | Edges **newly written by this call**. Inserts are idempotent, so a rebuild over an unchanged corpus correctly returns `0`. |
+| `temporalTotal` / `semanticTotal` | Edges of that type **currently in the active graph** — both endpoints active. |
+
+Text output reads `Temporal graph: N new edge(s), M total`.
+
+`0 new` does **not** mean the graph is empty — check the total. Before v0.28.0 these counters
+reported insert *attempts* rather than rows written, so a call that persisted nothing could
+still report a non-zero count. Only the graph types you request appear in the response; the
+REST endpoint differs (see [rest-api.md](rest-api.md)).
 
 ### profile
 

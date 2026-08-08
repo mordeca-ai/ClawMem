@@ -210,7 +210,16 @@ export function loadVaultConfig(): ClawMemConfig {
     lifecycle = {
       archive_after_days: typeof lc.archive_after_days === "number" ? lc.archive_after_days : 90,
       type_overrides: typeof lc.type_overrides === "object" && lc.type_overrides !== null ? lc.type_overrides : {},
-      purge_after_days: typeof lc.purge_after_days === "number" ? lc.purge_after_days : null,
+      // INERT since v0.30.0 — ClawMem no longer physically deletes rows on any path.
+      // Still parsed so existing configs load, but only a positive finite value is
+      // accepted: `-1` or `Infinity` would previously have produced a future cutoff that
+      // deleted every archived row, including ones archived moments earlier.
+      purge_after_days:
+        typeof lc.purge_after_days === "number" &&
+        Number.isFinite(lc.purge_after_days) &&
+        lc.purge_after_days > 0
+          ? lc.purge_after_days
+          : null,
       exempt_collections: Array.isArray(lc.exempt_collections) ? lc.exempt_collections : [],
       dry_run: lc.dry_run !== false,
     };

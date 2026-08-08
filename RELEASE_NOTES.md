@@ -4,6 +4,193 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.30.0 — ClawMem stops deleting rows
+
+ClawMem's governing rule for agent-mediated memory mutation is that nothing an agent does should be unrecoverable. Every mutation surface honored that except one: `purgeArchivedDocuments` physically `DELETE`d rows. This release removes physical deletion from the package entirely rather than gating it, because a gate cannot work here — see below.
+
+### Why removal rather than an administrator gate
+
+The obvious fix is to keep purge and require administrator authority for it. That fix does not hold, and the reasoning is worth stating because it generalizes: **ClawMem's primary consumer is a coding agent with shell access.** Any credential expressible in-process or on the command line — an env var, a confirmation flag, an interactive prompt — is equally available to that agent, which can type an opt-in env var and a `--purge` flag as readily as a human can. A gate like that only relabels the operation; it does not remove it from agent authority. (No such flag or variable exists in this release — that design was built, reviewed, and rejected for this reason.) A longer confirmation boundary also satisfies neither "immutable prior revision" nor "supported restore": once the row is gone there is nothing left to restore.
+
+So the capability is not offered. Reclaiming disk space is an out-of-band operator action on the SQLite file, explicitly outside ClawMem's mutation contract. A supported retention design — reversible quarantine with a protected window — is planned separately.
+
+### What was removed (`src/store.ts`)
+
+- **`purgeArchivedDocuments`** — ran `DELETE FROM documents WHERE active = 0 AND archived_at <= ?`. Reachable from three call sites, below.
+- **`deleteInactiveDocuments`** — ran `DELETE FROM documents WHERE active = 0`: strictly broader, destroying every inactive row (archived *and* forgotten) with no age bound and no authorization. It had no callers but sat on the public `Store` interface.
+- **the store-level `removeCollection`** — ran `DELETE FROM documents WHERE collection = ?`, an unauthorized hard delete of an entire collection. Also callerless; `clawmem collection remove` goes through `collections.ts` (YAML config only), which remains the reversible path.
+
+No code path now issues a `DELETE` against `documents`.
+
+### The three purge call sites, and the one that mattered most
+
+- **`lifecycle_sweep` (MCP)** — a non-dry-run sweep archived, then deleted every archived row past `purge_after_days`. That set was **never previewed**: the dry-run branch reported `Would archive N document(s)` and said nothing about deletion, and the deleted population was different from the previewed candidates entirely. The preview was not weakly binding — it was silent.
+- **`staleness-check` (SessionStart hook)** — the worst host of the three: unattended, no model and no operator in the loop, the purge count discarded, all of it inside a `catch {}` documented as "lifecycle errors never block the hook", so a failed delete was silent too. Auto-**archival** here is unchanged and remains reversible.
+- **`clawmem lifecycle sweep` (CLI)** — archives only, and says so when it sees `purge_after_days` set.
+
+### Count reporting was wrong (`src/store.ts`)
+
+`archiveDocuments` and `restoreArchivedDocuments` returned SQLite's `changes`, which counts the `documents_fts` trigger writes as well — archiving 3 documents reported **16**. Every "archived N" / "restored N" ClawMem has printed was inflated. Both now count the affected documents explicitly inside the same transaction. The mutations were always correct; only the reported numbers were wrong. Found by writing the first behavioral test of this path.
+
+### Behavior changes to expect
+
+- `purge_after_days` is **inert**. It is still parsed so existing configs load, but only a positive finite value is accepted — a negative value previously produced a *future* cutoff that deleted every archived row, including ones archived moments earlier.
+- `lifecycle_sweep` reports `archived N document(s). Nothing was deleted.` The tool description no longer advertises purge.
+- Archive/restore counts are now accurate, and smaller than before.
+
+Test coverage: `tests/unit/no-hard-delete.test.ts` — the invariant that no path destroys a row, the real SessionStart hook exercised end to end, and the count regression. There was previously **no test of the purge path at all**, which is part of why this survived.
+
+---
+
+## v0.29.0 — the contradiction judge: opt-in model override, judge-gated analysis, durable audit
+
+v0.28.0 repaired the contradiction write path; this release faces the model behind it. A live contract probe at the production seam showed the prescribed stock expansion model cannot meet the judge contract at all — it returns an object where the contract requires an array, echoes the schema's enum text back as a value, and fabricates confident relations between unrelated facts, deterministically. The same weak model sat in a *fail-open* position at the merge-time gate, where a parseable answer bypassed the deterministic heuristic and a missing confidence defaulted to exactly the actionable threshold. This release routes every contradiction decision through an explicitly configured **judge**, disables the analysis when none is configured, fixes the fail-open surfaces, and makes every evaluation durably auditable.
+
+### Judge-gated analysis — a behavior change (`src/judge.ts`, `src/hooks/decision-extractor.ts`)
+
+- **No judge configured ⇒ contradiction analysis is DISABLED**, as an audited no-op with one loud line per run — never a silent attempt on the stock model. This honors opt-in strictly: the reshaped prompt (below) could have made the stock model start clearing admission, activating erosion for users who never chose it.
+- **Migration note:** the evidence that "no verdict ever applied" holds for stock deployments. If you had pointed the *global* `CLAWMEM_LLM_URL`/`CLAWMEM_LLM_MODEL` at a larger or cloud model, real verdicts may have been applying — the judge no longer rides the global vars, so set `CLAWMEM_JUDGE_*` to keep that behavior. ClawMem deliberately never auto-adopts the global endpoint as a judge: the judge vars are also the data-egress consent (new decisions + retrieved snippets go to the judge you configure). `clawmem doctor` warns when it can detect this situation; [docs/guides/upgrading.md](docs/guides/upgrading.md) is the authoritative notice.
+- **Three lanes**, one strict contract: any OpenAI-compatible endpoint (`CLAWMEM_JUDGE_URL` + `_MODEL` + `_API_KEY`), the Anthropic Messages API (`CLAWMEM_JUDGE_PROVIDER=anthropic`, default model `claude-haiku-4-5` — the recommended default), or a sandboxed headless `claude -p` on a Claude Code subscription (`claude-cli`: `--safe-mode`, no tools, no MCP, no session persistence, untrusted payload over stdin only, recursion-guarded). The judge never runs local inference and never auto-downloads a model. The Haiku recommendation is backed by a shipped, passing capability-evaluation artifact; `claude-sonnet-5` is an **unverified** upgrade candidate — its preserved CLI-lane artifact shows zero fabrication with contradiction recall 3/4 and long-input 0/2 (borderline label + spawn-budget timeouts), and no API-lane artifact exists yet.
+
+### The merge-time gate had two fail-opens (`src/merge-guards.ts`, `src/consolidation.ts`)
+
+- **The LLM layer bypassed the heuristic whenever its answer parsed**, and a missing `confidence` defaulted to `0.5` — the exact actionable threshold. With a fabricating model that could block valid merges or, under `supersede`, deactivate rows. The legacy object contract, permissive extraction, and confidence-defaulting are all removed: the gate now speaks the same strict relation-array contract as the hook judge, and a missing confidence is an invalid entry, never a default.
+- **The deterministic heuristic scores a disjoint-number pair at exactly the default threshold** ("supports protocol version 1" vs "version 2" is actionable). Heuristic-only operation is therefore constrained to the non-deactivating `link` policy: **`supersede` requires a configured judge.** A configured-but-blocked `supersede` is loud — a runtime warning, a `merge_supersede_blocked` audit event per occurrence, and a `clawmem doctor` report that the policy is presently inactive. The effective policy is resolved once upstream and passed into the mutation helper as a parameter; mutation code no longer reads the policy env at all.
+- Phase-2 `link` sets the old consolidated row's `invalidated_by` **backlink** — it never inserted a `contradicts` edge; three docs that claimed otherwise are corrected (Phase 3 deductive synthesis is the edge writer).
+
+### Strict judge extraction (`src/judge.ts`)
+
+- The shared LLM-JSON extractor repairs a truncated array by keeping the complete elements — fine for enrichment, **fail-open for a mutation consumer**: token truncation silently applied a partial verdict batch. The judge path uses its own extractor: fence- and prose-tolerant, but a truncated JSON value is a typed reject, never a repair. Provider-reported truncation (`stop_reason`/`finish_reason`) is rejected before extraction even runs.
+
+### Prompt reshape + injection fencing (`src/judge.ts`)
+
+- The old prompt's example row was **invalid JSON** (`"confidence": 0.0-1.0`, `"relation": "update|contradiction|same"`) — placeholder-echo bait for weak models, noise for strong ones. The reshaped prompt states the schema in prose, shows a *valid* example, and instructs that unrelated pairs — the common case — return exactly `[]`.
+- Instructions and data are role-separated. Vault-derived content travels JSON-encoded inside per-request CSPRNG-nonce markers and is declared data-under-analysis, never instructions. Fencing is a mitigation with tests (collision, marker imitation, nested instructions), not a proof — the strict admission pipeline, thresholds, bounded erosion, and the audit below remain the backstops.
+- Consumer-specific thresholds: the decision-erosion prompt states `0.7` (its mutation threshold); merge prompts state your resolved `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` — the prompt never overrides an operator setting.
+
+### Durable audit: `judge_runs` / `judge_events` (`src/judge-audit.ts`, `src/store.ts`)
+
+- Interactive hosts do not persist successful hook stderr, which made the previous release's shadow output unreachable exactly where calibration needed it. Every judge evaluation now writes durable rows: a run (consumer, lane, model, endpoint, prompt version, response hash, outcome, admission counts) plus per-verdict / per-reject / per-error events with scores, namespaced targets, and reason codes mirroring the real validator verdicts.
+- **Mutation-authorizing evaluations commit audit and mutation in one transaction** — an audit failure rolls the mutation back (Phase-3 deductive checks commit a precondition audit first; non-mutating outcomes write standalone best-effort rows). That is a deliberate fail-closed trade: an unauditable erosion is this feature's original defect, and audit coupling intentionally expands the set of errors that fail the feature closed — same-store transactions keep that trade cheap, not free. A judge failure that falls back to the deterministic heuristic records BOTH runs, linked, so neither the failed lane's identity nor the actually-deciding classifier is ever lost. Caller cancellation (`aborted`) is terminal: audited, no heuristic, no mutation.
+- **Calibration is now audit-based on every host** — including hosts that discard hook stderr. The previous guidance that shadow calibration was impossible under OpenClaw is reversed; query the audit rows instead.
+
+### `clawmem doctor` (`src/clawmem.ts`, `bin/clawmem`)
+
+- New judge check: a three-scenario **smoke test** against the configured judge — a designed contradiction must yield exactly one `(0,0,"contradiction")` verdict at ≥ 0.7, an unrelated control must come back exactly empty (any verdict there is fabrication), and the merge single-pair contract must be actionable. An installation check, never capability certification. Unconfigured ⇒ the capability-floor note, the migration warning (provenance-aware — the wrapper marks its own stock default URL so stock installs never false-positive), and the inactive-`supersede` report. Plus audit row counts.
+
+Full suite 1,821/0 (92 new tests, including the truncation-repair regression, the audit-rollback fail-closed pin, the argv-content invariant for the subscription lane, pair-linkage retention, and a production-boundary integration suite driving the real Phase-2 gate with live judge lanes). The design went through a nine-turn cross-model adversarial DESIGN review (codex / GPT-5.x) to verbatim "Zero remaining findings." before implementation — thirty-three findings absorbed across the turns, including the merge-gate fail-open, the truncation-repair fail-open, and the accidental-activation hazard that forced the symmetric disable — and the implementation went through further adversarial CODE review rounds whose findings (among them: a failed-over heuristic could authorize `supersede`; a dirty response wrapping one valid verdict could decide) are all folded and regression-pinned.
+
+---
+
+## v0.28.0 — hook write-path contracts: extraction guards, honest counters
+
+Two Stop-hook write paths — A-MEM causal inference and contradiction detection — reported success while persisting nothing. Instrumentation counted *attempts* against `INSERT OR IGNORE`, so a total write failure was indistinguishable from a healthy run. This release makes the reporting truthful, hardens the validation ahead of every mutation, and repairs the two contract defects that left contradiction detection unable to apply a classification at all. The terminal mutation that repair unblocks — invalidation — ships **shadowed behind an opt-in flag**, not armed.
+
+### Counters report outcomes, not attempts (`src/amem.ts`, `src/store.ts`, `src/mcp.ts`, `src/server.ts`)
+
+- **`inferCausalLinks` sums `.changes`** from each insert instead of incrementing per candidate, and warns when candidates clear every filter but no row lands (the signature of silent `INSERT OR IGNORE` suppression). The summary line now reports proposed / passed-filters / placeholder-rejected / range-rejected rather than a single fabricated success count.
+- **Both graph builders** (`buildTemporalBackbone`, `buildSemanticGraph`) count inserted rows the same way — the two feed one response and previously reported in different units.
+- **`build_graphs` reports standing totals** alongside the delta, on the MCP tool *and* the REST endpoint: `N new edge(s), M total`. An idempotent rebuild legitimately writes 0 new edges, which read as "the graph is empty" without the total. **Response-shape change** — see below.
+- **Totals count the ACTIVE graph.** Only edges whose *both* endpoints are active are counted, matching the population the builders operate on; a raw count reported edges the live graph no longer contained. Shared via `store.countActiveRelations()` so the two surfaces cannot drift.
+
+### Validation ahead of every mutation (`src/hooks/decision-extractor.ts`, `src/schema-placeholder.ts`)
+
+- **`validateContradictionEntry`** is a pure, exported, typed-verdict validator applied to every classifier entry before any document is mutated: exact relation-enum membership, strict `typeof reasoning === "string"` (coercion was a fail-open on every JSON-valid non-string), finite `[0,1]` confidence, and *both* index bounds.
+- **Array-level admission** (`admitContradictionEntries`, exported and pure). Only repeats identical across the fields that can drive a mutation (relation, confidence, reasoning) are collapsed; a pair the classifier answered more than one way — differing label, confidence, or reasoning — is dropped whole. Repeats compounded the confidence penalty on a single document and could cross the invalidation floor a single classification never reaches, and a first-wins collapse would have made the outcome depend on array order. Whether several *distinct* new facts may penalize one old document repeatedly is a separate open question, unchanged here.
+- **The shared anti-parrot guard normalizes before matching.** Residue comparison folds NFKC, drops `Default_Ignorable_Code_Point` characters, lowercases, collapses whitespace runs, and strips outer punctuation — so a doubled space, a newline, fullwidth text, a trailing period, or an invisible zero-width character inside a word no longer walks past the guard. Internal punctuation is deliberately *not* normalized: doing so mapped plausible identifiers like `canonical_entity_name` onto blocklist entries. Marker detection folds NFKC, drops invisibles, removes every template marker, and asks whether any letter or digit remains — so arbitrary punctuation envelopes (`**{{x}}**`, `- {{x}}`, `|{{x}}|`, `【{{x}}】`, fullwidth `｛｛x｝｝`) and multi-line markers are all caught without enumerating wrapper characters. A value whose every letter and digit sits inside a marker is filtered as carrying no assertable content, whether it is echoed residue or a bare code fragment; content that merely *contains* a marker, like `"${HOME} is the user home directory"`, is untouched. **That applies to claim fields only.** Identifier fields — conversation-synthesis aliases and link targets, SPO subjects and objects — are names, not assertions, so no marker shape is rejected there on shape alone (`${HOME}` is a legitimate object of `uses`; `{{user.name}}` is a Handlebars path). Their residue is caught by consumer-scoped sets naming the exact skeleton that field's own prompt emits. Link targets were previously unguarded entirely despite their prompt carrying a copyable skeleton. Residue sets stay consumer-scoped — a memory *about* this defect is legitimate content, not residue.
+- **The contradiction parse gate reports instead of returning silently**, emitting response shape, length, content hash and served model identity. Raw model text stays opt-in behind `CLAWMEM_DEBUG_LLM_RAW` — the prompt carries transcript-derived material, so logging it by default would be a content-exposure path.
+- **`/no_think` is applied idempotently** — six prompts already carry the token inline for the local fallback and were being sent a doubled control token.
+
+### Contradiction detection could never apply a classification (`src/hooks/decision-extractor.ts`)
+
+Two independent defects sat between a valid classification and any effect on the vault. Both are model-independent, and both failed silently.
+
+- **The document lookup was handed a URI where it expected a path.** `SearchResult.filepath` is a *virtual* path — `clawmem://<collection>/<path>`, assembled in the store's projection — while `findActiveDocument` matches the bare `documents.path` column. The hook passed the URI straight through, so no candidate could ever resolve to a row, and the miss exited through a bare `continue`. Every classification that survived the parse gate and every validation above it died there without mutating anything. The path is now resolved with `parseVirtualPath` before lookup, and a target that still fails to resolve increments a counter and warns rather than disappearing.
+- **The parse gate rejected the deployed model's response shape.** The model wraps its array in an object (`{"result": [...]}`). `parseLinkGenerationFromLLM` in `amem.ts` has unwrapped that form since it was written; this path never did, so structurally valid responses were counted as malformed. Both forms are accepted now.
+
+Taken together these are why contradiction detection had no observable effect on any vault regardless of what its logs reported. Precisely: the hook ran, called the model, and parsed a verdict — but no verdict could ever be *applied*, and no document was mutated, in any version shipping this implementation. Read it as newly-effective, not as newly-fixed.
+
+### Invalidation ships shadowed — `CLAWMEM_CONTRADICTION_INVALIDATE`
+
+Repairing the lookup made the soft-invalidation branch reachable for the first time, so it is gated rather than simply switched on. The two mutations behind a contradiction are not symmetrical:
+
+- **Confidence erosion** (`-0.25`, floored at `0.2`) is a ranking signal — 25% of the default composite. A degraded document ranks lower and stays fully retrievable. **Live.**
+- **Invalidation** sets `invalidated_at`, which is a hard predicate on the FTS join and both vector joins. An invalidated document leaves retrieval entirely, with no query-time signal that anything was suppressed. **Off unless `CLAWMEM_CONTRADICTION_INVALIDATE=true`.**
+
+Unarmed, the hook logs `WOULD invalidate "<collection>/<path>"` per suppressed write plus per-session summaries, so precision can be adjudicated against real traffic before anything is removed.
+
+**Shadow mode reports exactly what arming would remove — no more.** Candidates are selected by *pathname* (`decisions/`, `observations/`), but the armed writer only touches `content_type='observation'`: on the reference vault, roughly three times as many candidates as eligible rows. Eligibility is now asked once and gates the shadow log and the armed write identically, so calibration cannot be aimed at a population two thirds of which could never have been invalidated. Documents that reach the floor while ineligible are reported separately, and the armed write checks `.changes` rather than discarding its result — a swallowed outcome is how the original defect stayed invisible.
+
+Exposure is vault-specific along five axes: the eligible population's confidence distribution (`(0.95, 1.0]` needs four classifications to reach the floor, `(0.70, 0.95]` three, `(0.45, 0.70]` two, `<= 0.45` one), content-type mix, the classifier model, corpus semantics, and classification opportunity (only the top 5 search results per session are ever classified, from a pool that changes when the vector leg falls back to FTS). The [contradiction invalidation guide](docs/guides/contradiction-invalidation.md) has the measurement queries, the adjudication procedure, and the restore statements.
+
+**Eligibility is `content_type='observation'` only.** A superseded *decision* is eroded but never retired — decision records are outside the writer's reach by design. **Shadow output is not reachable under OpenClaw**, where the plugin surfaces hook stderr only on a non-zero exit and a successful shadow run exits zero; this flag should not be armed on that host, and calibrating under Claude Code is not an equivalent substitute because exposure is host-dependent. No shipped systemd unit runs this hook — `clawmem-watcher.service` is the indexer.
+
+### Upgrade note — `build_graphs` response shape
+
+Additive, but a contract change. Both surfaces gain `temporalTotal` / `semanticTotal`, and the MCP text line changes from `Temporal graph: N edges` to `Temporal graph: N new edge(s), M total`. Anything parsing that text should be updated. The REST endpoint continues to emit all four keys unconditionally (its pre-existing shape); the MCP tool continues to include only the graph types requested.
+
+### Quality gates
+
+Full suite 1,775/0. Cross-model adversarial passes (codex / GPT-5.6) throughout — seventeen turns, including successive fail-opens in the same validator, a duplicate-entry defect that compounded mutations on one document, and a round in which the newly-added regression tests were shown not to exercise the guard they were written for.
+
+## v0.27.0 — authorship time: memories rank by when they were written
+
+Fixes a confirmed recency-contamination defect: ClawMem had exactly one time axis per document (filing/update time), so a 2025 conversation mined today ranked — and filtered, and injected — as if written today. Worst under recency intent, where recency carries 70% of the composite weight. Documents now carry a second, nullable axis: `authored_at`, when the content was originally written.
+
+### Authorship capture end-to-end (`src/normalize.ts`, `src/clawmem.ts`, `src/indexer.ts`, `src/store.ts`)
+
+- **Mining extracts message timestamps** from all supported formats through strict per-format adapters — RFC3339-with-explicit-offset for Claude Code / codex / Claude.ai (timezone-less values are rejected, never host-interpreted; impossible dates are rejected, not normalized), epoch-seconds for ChatGPT / Slack with range guards. Each exchange chunk is stamped with the max timestamp *within that exchange only* — never a transcript-level fallback (privacy exports flatten multiple conversations into one stream, so a transcript max would cross conversation boundaries).
+- **Synthesized facts inherit** their source conversation's authorship; the shared `saveMemory` API advances `authored_at` monotonically (a newer repeated assertion moves it forward; reprocessing older evidence never regresses it; NULL-safe).
+- **Any vault file can declare `authored_at:` in frontmatter** — full timestamp or date-only `YYYY-MM-DD` (UTC midnight), quoted or unquoted. Frontmatter is authoritative: removing the line clears the stored date on the next content change.
+- **Re-mining an existing vault dates documents without churn**: a body-identical re-index whose only change is `authored_at` takes a metadata-only "dated" transition — `modified_at` preserved, stored confidence untouched, no re-enrichment queued.
+- **`clawmem mine <dir> -c <collection> --backfill-dates [--apply]`**: recoverable-only backfill for already-mined vaults. Dry-run report by default; the apply phase is transactional and re-asserts the validated content hash on every row, so a concurrent change can never receive a mismatched date; documents whose content no longer matches the source are skipped, never guessed.
+- **Colliding transcript names no longer overwrite each other**: sources that sanitize to the same staging name (`a/b.jsonl` vs `a_b.jsonl`) previously clobbered each other silently; they now mine under distinct hash-suffixed identities, decided once per source and stable across re-runs (non-colliding sources keep their existing names — zero path churn).
+
+### Effective time in ranking and retrieval (`src/memory.ts`, `src/mcp.ts`, callers)
+
+- **Composite recency ages documents by `authored_at ?? modified_at`**, and the confidence signal's internal recency uses the same effective date (the access-pattern sentinel stays on filing time). Documents without authorship behave exactly as before.
+- **Temporal filters and the temporal-proximity channel** ("what did we plan in March") select, order, and score by effective time on both the FTS and vector legs.
+- **Recent-content windows** — postcompact recent decisions/antipatterns, session-bootstrap current focus, `clawmem reflect`, directory context, profile — apply their cutoffs and display their dates on effective time, so a freshly-mined historical decision no longer masquerades as this week's work. Operational clocks (the dedup window, lifecycle sweeps, staleness review, session log) intentionally keep filing/update time.
+- **Result metadata**: compact search results now carry `authored_at` (null = unknown).
+
+### Entity-edge IDF population fix (`src/entity.ts`)
+
+Completes the v0.25.0 hub-bias fix: the enrichment/edge-creation path computed IDF with an active-only numerator over an all-documents denominator, letting archived history deflate specificity (below zero in the extreme) and suppress edges for entities that are specific among the live corpus — and could create edges toward archived documents. Both populations are now active-only and archived candidates are excluded, matching the neighbor path. Bug-first tests demonstrate the pre-fix failure.
+
+### Quality gates
+
+Full suite 1,681/0 (62 new tests, including direct caller-level pins for every recency window and a live CLI backfill lane). The authorship design was adversarially design-reviewed before any code (6 turns, 29 findings absorbed — including the two-axes consumer classification, the confidence-lane uniformity rule, and set-independent mine identity), then the implementation was reviewed to verbatim "Zero remaining findings — ship as is." in 3 turns (7 findings, among them a year-0000–0099 date-construction bug and a backfill validation race); the entity fix cleared in 1 turn. Cross-model adversarial passes (codex / GPT-5.6) throughout.
+
+## v0.26.0 — offline eval harness (evidence-overlap replay) + short memory-query gate fix
+
+Retrieval quality becomes measurable: a gold-labeled replay harness scores the real `query` pipeline against hand-labeled evidence, ending the era of ranking/extraction changes shipping un-measured. Plus a gate-ordering bug fix that was dropping short explicit memory questions.
+
+### Offline eval harness (`src/eval/`, `clawmem eval run`)
+
+An offline, CLI-only evaluation subsystem (pattern extracted from the HORMA paper's evidence-grounded reward, re-authored for ClawMem's deterministic on-device substrate):
+
+- **Replays the real pipeline, never a mirror.** `clawmem eval run --gold <file.jsonl>` drives the actual registered `query` MCP tool handler over an in-memory transport — expansion, RRF fusion, rerank blending, composite scoring, and MMR diversity at their tool defaults — so the number measures the product, not a copy that drifts.
+- **Doc-level evidence-overlap metrics**: Jaccard `|C∩E|/|C∪E|` between retrieved and gold document sets, plus precision@k, recall@k, hit@k, and MRR; per-tag slices; p95 latency. Artifacts: `run.json` (machine) + `report.md` (hand-audit companion).
+- **Gold sets are strict, hand-labeled JSONL** (any path via `--gold`, so private labels can live outside the repo): unknown fields, malformed lines, and duplicate ids are hard errors; an example with any evidence ref that doesn't resolve to an active document is excluded from scoring — regardless of its replay mode — and fails the run's trust gate, so partial or stale gold can never inflate recall.
+- **Trust gate, machine-visible**: enough scored examples (`--min-examples`, default 30), zero unresolved refs, and an explicit `--audited` attestation that a 10–20% hand-audit of the labels passed. A completed run with a failing gate exits `1` (artifacts still written) so automation can't mistake an untrusted number for a trusted one.
+- **Identity integrity**: retrieved results map back to document ids by inverting the `collection/path` display path; zero or multiple matches (a collection name containing `/` colliding with a sibling) hard-fail the run instead of guessing or silently dropping — either would corrupt the metric.
+- **State-safe**: the replay writes no retrieval, lifecycle, or telemetry state (`context_usage` / `recall_events` / `memory_relations` untouched, regression-pinned); normal inference caches may populate as in any live query. `--db <snapshot>` points the whole run at a `VACUUM INTO` copy for corpus-frozen A/B comparisons between checkouts.
+- First build ships the `query` replay profile; `intent`/`context` replay, benchmark adapters, and provenance are follow-on phases. Guide: [docs/guides/eval-harness.md](docs/guides/eval-harness.md).
+
+### Short memory-intent queries now reach retrieval (`src/hooks/context-surfacing.ts`, `src/retrieval-gate.ts`)
+
+The retrieval gate's `FORCE_RETRIEVE_PATTERNS` (memory verbs, temporal refs, personal-data queries) carry the explicit contract "(checked before skip)" — but the context-surfacing hook returned on `prompt.length < 20` before the gate ever ran, so short explicit memory questions ("what did I say?", 15 chars) got an empty `<vault-context>` in violation of the gate's own contract. The force check is now consulted before the length early-return (new `hasForceRetrieveIntent` export, shared with `shouldSkipRetrieval` so there is one source of truth). Empty prompts, short non-memory prompts, slash commands, heartbeat suppression, duplicate dedupe, and the query-text privacy split (pre-retrieval skips never persist prompt text) are all unchanged.
+
+### Quality gates
+
+Full suite 1,619/0 (42 new tests). Each item independently reviewed by a cross-model adversarial pass (codex / GPT-5.6) to verbatim "Zero remaining findings — ship as is.": the eval harness in 3 turns, the gate-ordering fix in 1.
+
+### What didn't change
+
+No schema changes, no migrations, no re-embed. All runtime retrieval surfaces (hooks beyond the gate ordering, `query`, `intent_search`, `search`, `vsearch`, `memory_retrieve`, REST) score and rank exactly as in v0.25.0. No MCP tool was added — the eval harness is CLI-only.
+
+---
+
 ## v0.25.0 — extraction retry-with-error-feedback + decision half-life + entity-neighbor hub-bias fix
 
 Three independently reviewed items from the strategic queue (§13.1, §36.11, BL-001) — the first queue burndown since the ranking was locked. Three files, three pipelines, no shared invariants.

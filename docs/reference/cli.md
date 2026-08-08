@@ -7,7 +7,7 @@ Complete command reference for the ClawMem memory engine. Always use the `bin/cl
 ```bash
 clawmem init                    # Initialize vault (creates SQLite DB)
 clawmem status                  # Quick index status
-clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation)
+clawmem doctor                  # Full health check (GPU connectivity, index integrity, embedding-geometry canary, sampled vector validation, contradiction-judge config + live smoke test when CLAWMEM_JUDGE_* is set)
 ```
 
 ## Collection management
@@ -17,21 +17,14 @@ clawmem collection add <path> --name <name>   # Add a collection
 clawmem collection list                        # List all collections
 clawmem collection remove <name>               # Forget the collection in config.yaml
                                                 # (does NOT delete indexed rows)
-clawmem collection purge <name>                # Preview a hard-delete of this collection's rows
-clawmem collection purge <name> --yes          # Hard-delete: documents (active+inactive) + orphaned content/vectors
 ```
 
-`collection remove` and `collection purge` are different operations. `remove` only
-edits `config.yaml` so the collection stops being re-scanned — existing rows in the
-SQLite index are untouched. `purge` (v0.10.8+, master-harness-t5i0) hard-deletes that
-collection's rows from the index — active and inactive alike — plus any content/vector
-rows that become orphaned as a result, without touching any other collection. It
-refuses an empty or wildcard-bearing name, and without `--yes` only prints a preview
-(active/inactive counts) — nothing is deleted. This is the operation to use for tearing
-down a disposable/scratch/smoke-test collection; **do not** reach for the DB-wide
-maintenance functions (`deleteInactiveDocuments`/`cleanupOrphaned*` in `src/store.ts`)
-for a single-collection teardown — see [Backup](#backup) below for why that's
-dangerous.
+`collection remove` only edits `config.yaml` so the collection stops being re-scanned —
+existing rows in the SQLite index are untouched. There is deliberately no
+collection-level hard delete: as of v0.30.0 **ClawMem physically deletes no document row
+on any path** (the fork's former `collection purge` verb, master-harness-t5i0, was
+retired at the v0.36 sync for the same reason). Retire unwanted rows with
+`memory_forget` or a lifecycle sweep; reclaim disk space out-of-band on the SQLite file.
 
 ## Indexing
 
@@ -44,6 +37,10 @@ clawmem mine <dir> --embed                     # Import + embed in one pass
 clawmem mine <dir> --dry-run                   # Preview without importing
 clawmem mine <dir> --synthesize                # v0.7.2: import + post-import LLM fact extraction
 clawmem mine <dir> --synthesize --synthesis-max-docs 50   # Cap synthesis to first 50 conversations (default 20)
+clawmem mine <dir> -c convos --backfill-dates  # v0.27.0: derive authored_at for ALREADY-mined docs from
+                                               # source transcripts — dry-run report by default
+clawmem mine <dir> -c convos --backfill-dates --apply     # Execute the backfill (metadata-only: modified_at,
+                                               # stored confidence, and embeddings are never touched)
 clawmem reindex                                # Force re-scan all collections
 clawmem embed                   # Embed all un-embedded fragments (geometry-canary preflight runs first)
 clawmem embed --force           # Re-embed everything (clears existing vectors; aborts BEFORE clearing if the canary preflight fails)
@@ -62,6 +59,12 @@ clawmem embed --force --recalibrate-canary    # v0.21.0: replace the stored cana
 - **Plain text** — files with `User:`/`Assistant:` markers
 
 Each user+assistant exchange pair becomes one indexed document with `content_type: conversation`. Files are chunked, written to a temporary staging directory, indexed through the standard pipeline (including A-MEM enrichment), then staging is cleaned up.
+
+#### Authorship time (v0.27.0)
+
+Mining preserves **when the content was originally written**: message timestamps are extracted per format (strict RFC3339 for Claude Code / codex / Claude.ai; epoch seconds for ChatGPT / Slack; plain text has none), each exchange chunk is stamped `authored_at` = the max timestamp within that exchange, and synthesized facts inherit their source doc's date. `created_at`/`modified_at` remain filing/update time. Ranking recency, temporal filters ("from March"), and recency windows (postcompact, session bootstrap, `reflect`, profile) all run on **effective time** — `authored_at` when known, `modified_at` otherwise — so a 2025 conversation mined today no longer ranks as if written today. Any vault file may also declare `authored_at:` in frontmatter (full timestamp or date-only `YYYY-MM-DD`, quoted or not).
+
+For vaults mined before v0.27.0, `--backfill-dates` re-derives dates from the source transcripts and applies a **metadata-only** update (dry-run report by default; `--apply` executes; documents whose content no longer matches the source are skipped, never guessed).
 
 #### `--synthesize` (v0.7.2)
 
@@ -220,6 +223,27 @@ Or via cron:
 ```cron
 15 3 * * * /path/to/clawmem/bin/clawmem backup >> ~/.cache/clawmem/backup.log 2>&1
 ```
+## Lifecycle & retention
+
+```bash
+clawmem lifecycle status                    # Lifecycle stats + active policy
+clawmem lifecycle sweep [--dry-run]         # Archive stale docs per policy (reversible)
+clawmem lifecycle search <query>            # Search archived docs (FTS, no restore)
+clawmem lifecycle restore --query <term> | --collection <name> | --all
+```
+
+`sweep` archives only; `restore` reverses it. **ClawMem physically deletes no document row
+on any path** (v0.30.0) — `purge_after_days` is inert, and a sweep that sees it configured
+says so. To reclaim disk space, act on the SQLite file out-of-band; that is deliberately
+outside ClawMem's mutation contract.
+
+## Offline eval harness
+
+```bash
+clawmem eval run --gold <file.jsonl> [--profile query] [--limit N] [--min-examples N] [--audited] [--out <dir>] [--db <snapshot>] [--json]
+```
+
+Replays gold-labeled queries through the real `query` tool handler and scores retrieved documents against hand-labeled evidence (doc-level Jaccard, precision/recall@k, hit@k, MRR). Writes `run.json` + `report.md`; touches no retrieval, lifecycle, or telemetry state (normal inference caches may populate, as in any live query). Exits `1` when the trust gate fails (too few scored examples, unresolved gold refs, or no `--audited` label-audit attestation). Gold schema, trust gates, and A/B workflow: [docs/guides/eval-harness.md](../guides/eval-harness.md).
 
 ## Session focus topic (v0.9.0)
 
@@ -251,6 +275,7 @@ The session ID is resolved from `--session-id <id>`, then `CLAUDE_SESSION_ID`, t
 | `CLAWMEM_LLM_MODEL` | `qwen3` | Model name sent to the configured LLM endpoint |
 | `CLAWMEM_LLM_REASONING_EFFORT` | — | Optional top-level `reasoning_effort` field for Chat Completions endpoints that support it (for example OpenAI reasoning models). Leave unset for llama-server/vLLM unless explicitly supported. |
 | `CLAWMEM_LLM_NO_THINK` | `true` | Append `/no_think` to remote prompts; set `false` for standard OpenAI models and other endpoints that reject or treat it as literal prompt text |
+| `CLAWMEM_JUDGE_URL` / `_PROVIDER` / `_MODEL` / `_API_KEY` / `_NO_THINK` / `_STRUCTURED` | (none) | **v0.29.0.** The contradiction **judge** — task-scoped endpoint for contradiction classification (decision-extractor hook + merge-time gate), independent of the global `CLAWMEM_LLM_*` vars. Unset ⇒ contradiction analysis is disabled (audited no-op). Full table + lane semantics: [inference services](../guides/inference-services.md#contradiction-judge). |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server |
 | `CLAWMEM_RERANK_API_KEY` | — | Bearer token for an authenticated remote reranker endpoint |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block node-llama-cpp auto-downloads |

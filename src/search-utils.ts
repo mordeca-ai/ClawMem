@@ -45,7 +45,7 @@ export function enrichResults(
 ): EnrichedResult[] {
   return results.map(r => {
     const row = store.db.prepare(`
-      SELECT content_type, observation_type, modified_at, access_count, confidence, domain, workstream, tags,
+      SELECT content_type, observation_type, modified_at, authored_at, access_count, confidence, domain, workstream, tags,
              quality_score, pinned, last_accessed_at, duplicate_count, revision_count, invalidated_at
       FROM documents
       WHERE active = 1 AND (collection || '/' || path) = ?
@@ -58,6 +58,7 @@ export function enrichResults(
       observationType: row?.observation_type ?? null,
       invalidatedAt: row?.invalidated_at ?? null,
       modifiedAt: row?.modified_at ?? r.modifiedAt,
+      authoredAt: row?.authored_at ?? null,
       accessCount: row?.access_count ?? 0,
       confidence: row?.confidence ?? 0.5,
       qualityScore: row?.quality_score ?? 0.5,

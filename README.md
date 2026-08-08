@@ -19,7 +19,7 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 - **Surfaces relevant context** on every prompt (context-surfacing hook)
 - **Bootstraps sessions** with your profile, latest handoff, recent decisions, and stale notes
 - **Captures decisions, preferences, milestones, and problems** from session transcripts using a local GGUF observer model
-- **Imports conversation exports** from Claude Code, ChatGPT, Claude.ai, Slack, and plain text via `clawmem mine`, with optional post-import LLM fact extraction (`--synthesize`) that pulls structured decisions / preferences / milestones / problems and cross-fact links out of otherwise full-text conversation dumps (v0.7.2)
+- **Imports conversation exports** from Claude Code, ChatGPT, Claude.ai, Slack, and plain text via `clawmem mine`, with optional post-import LLM fact extraction (`--synthesize`) that pulls structured decisions / preferences / milestones / problems and cross-fact links out of otherwise full-text conversation dumps (v0.7.2). Imports preserve **authorship time** (v0.27.0): ranking recency and temporal queries run on when content was actually written, so historical conversations mined today don't rank as fresh — with a metadata-only `--backfill-dates` lane for vaults mined earlier
 - **Generates handoffs** at session end so the next session can pick up where you left off
 - **Learns what matters** via a feedback loop that boosts referenced notes and decays unused ones
 - **Guards against prompt injection** in surfaced content
@@ -27,7 +27,7 @@ ClawMem turns your markdown notes, project docs, and research dumps into persist
 - **Traverses multi-graphs** (semantic, temporal, causal) via adaptive beam search
 - **Evolves memory metadata** as new documents create or refine connections
 - **Infers causal relationships** between facts extracted from session observations
-- **Detects contradictions** between new and prior decisions, auto-decaying superseded ones (with an additional merge-time contradiction gate in the consolidation worker that blocks cross-observation contradictions before they land, v0.7.1)
+- **Detects contradictions** between new and prior decisions, auto-decaying superseded ones — when a contradiction **judge** is configured (`CLAWMEM_JUDGE_*`, v0.29.0; disabled otherwise) (with an additional merge-time contradiction gate in the consolidation worker that blocks cross-observation contradictions before they land, v0.7.1)
 - **Guards against cross-entity merges** during consolidation — name-aware dual-threshold merge safety compares entity anchors before merging similar observations, preventing "Alice decided X" from merging into "Bob decided X" (v0.7.1)
 - **Prevents context bleed in derived insights** — the Phase 3 deductive synthesis pipeline validates every draft against an anti-contamination wrapper (deterministic entity contamination check + LLM validator + dedupe) before writing cross-session deductive observations (v0.7.1)
 - **Frames surfaced facts as background knowledge** — `context-surfacing` wraps injected content in `<instruction>` + `<facts>` + `<relationships>` blocks, telling the model to treat facts as already-known and exposing memory-graph edges between surfaced docs directly in-prompt (v0.7.1)
@@ -493,7 +493,8 @@ clawmem collection list                         List collections
 clawmem collection remove <name>                Remove a collection
 
 clawmem update [--pull] [--embed]               Incremental re-scan
-clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (--synthesize runs post-import LLM fact extraction, v0.7.2)
+clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (--synthesize runs post-import LLM fact extraction, v0.7.2; preserves per-exchange authored_at, v0.27.0)
+clawmem mine <dir> -c name --backfill-dates [--apply]  Derive authored_at for already-mined docs (metadata-only; dry-run without --apply)
 clawmem embed [-f]                              Generate fragment embeddings
 clawmem reindex [--force]                       Full re-index
 clawmem watch                                   File watcher daemon
@@ -515,6 +516,7 @@ clawmem surface --bootstrap --stdin             IO6: per-session bootstrap injec
 
 clawmem reflect [N]                             Cross-session reflection (last N days, default 14)
 clawmem consolidate [--dry-run] [N]             Find and archive duplicate low-confidence docs
+clawmem eval run --gold <file.jsonl>            Offline eval: replay gold-labeled queries, score J_doc/recall/MRR
 
 clawmem install-service [--enable] [--remove]   Systemd watcher service
 clawmem setup hooks [--remove]                  Install/remove Claude Code hooks
@@ -603,8 +605,10 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | `session_log` | USE THIS for "last time", "yesterday", "what happened", "what did we do". Returns session history with handoffs and file changes. DO NOT use `query()` for cross-session questions — this tool has session-specific data that search cannot find. |
 | `profile` | Current static + dynamic user profile |
 | `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary |
-| `lifecycle_sweep` | Run lifecycle policies: archive stale docs past retention threshold, optionally purge old archives. Defaults to dry_run (preview only) |
+| `lifecycle_sweep` | Run lifecycle policies: archive stale docs past retention threshold. Archives only — never deletes. Defaults to dry_run (preview only) |
 | `lifecycle_restore` | Restore documents that were auto-archived by lifecycle policies. Filter by query, collection, or restore all |
+
+**ClawMem never physically deletes a document row (v0.30.0).** Forget and archive deactivate; `lifecycle_restore` reverses archival; `purge_after_days` is inert. Through v0.29.0 a configured retention window permanently deleted archived rows from a non-dry-run sweep and from the SessionStart hook, without reporting it — see [upgrading](docs/guides/upgrading.md#v0300-clawmem-no-longer-deletes-document-rows).
 
 ### Compact Mode
 
@@ -620,7 +624,7 @@ Hooks installed by `clawmem setup hooks`:
 | `postcompact-inject` | SessionStart | Re-injects authoritative context after compaction: precompact state + recent decisions + antipatterns + vault context (1200 token budget) |
 | `curator-nudge` | SessionStart | Surfaces curator report actions, nudges when report is stale (>7 days) |
 | `precompact-extract` | PreCompact | Extracts decisions, file paths, open questions before auto-compaction → writes `precompact-state.md` to auto-memory |
-| `decision-extractor` | Stop | GGUF observer extracts structured observations (decisions, preferences, milestones, problems, bugfixes, features, refactors, discoveries), infers causal links, detects contradictions with prior decisions |
+| `decision-extractor` | Stop | GGUF observer extracts structured observations (decisions, preferences, milestones, problems, bugfixes, features, refactors, discoveries), infers causal links, detects contradictions with prior decisions (judge-gated — requires `CLAWMEM_JUDGE_*`, v0.29.0) |
 | `handoff-generator` | Stop | GGUF observer generates rich handoff, regex fallback |
 | `feedback-loop` | Stop | Silently boosts referenced notes, decays unused ones, records co-activation + usage relations between co-referenced docs, tracks utility signals (surfaced vs referenced ratio for lifecycle automation) |
 
@@ -667,7 +671,7 @@ For WHY and ENTITY queries, the search pipeline expands results through the memo
 - **Temporal** — chronological document ordering
 - **Causal** — LLM-inferred cause→effect from Observer facts + Beads `blocks`/`waits-for` deps
 - **Supporting** — LLM-analyzed document relationships + Beads `discovered-from` deps
-- **Contradicts** — LLM-analyzed document relationships. Additional `contradicts` edges are inserted by the consolidation worker's merge-time contradiction gate (v0.7.1) when it blocks a Phase 2 merge under the `link` policy, and by Phase 3 deductive synthesis when a new draft contradicts a prior deductive observation.
+- **Contradicts** — LLM-analyzed document relationships. Additional `contradicts` edges are inserted by Phase 3 deductive synthesis when a new draft contradicts a prior deductive observation. *(Phase 2's merge-time gate does not insert edges — a blocked merge under `link` sets the old consolidated row's `invalidated_by` backlink instead.)*
 
 ### Content Type Scoring
 
@@ -699,7 +703,7 @@ Content types are inferred from frontmatter or file path patterns. Half-lives ex
 
 **Snooze:** Snoozed documents are filtered out of context surfacing until their snooze date. Use `memory_snooze` for temporary suppression.
 
-**Contradiction detection:** When `decision-extractor` identifies a new decision that contradicts a prior one, the old decision's confidence is automatically lowered (−0.25 for contradictions, −0.15 for updates). Superseded decisions naturally fade from context surfacing without manual intervention. **v0.7.1 adds a second layer at the consolidation boundary:** before the background worker merges a new pattern into an existing consolidated observation, a deterministic heuristic (negation asymmetry, number/date mismatch) plus an LLM check detect contradictions. Blocked merges route to either `link` policy (both rows remain active + a `contradicts` edge is inserted, default) or `supersede` policy (old row marked `status='inactive'`). Configurable via `CLAWMEM_CONTRADICTION_POLICY` and `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE`.
+**Contradiction detection (judge-gated, v0.29.0):** Contradiction analysis runs only when a **judge** is configured via `CLAWMEM_JUDGE_*` — without one it is disabled as an audited no-op, because the stock expansion model cannot meet the judge contract ([details](docs/guides/inference-services.md#contradiction-judge)). With a judge: when `decision-extractor` identifies a new decision that contradicts a prior one, the old decision's confidence is automatically lowered (−0.25 for contradictions, −0.15 for updates). Superseded decisions naturally fade from context surfacing without manual intervention. When erosion reaches the `0.2` floor the hook can additionally set `invalidated_at`, which removes the document from FTS and vector retrieval entirely. That step applies **only to `content_type='observation'` rows** — a superseded *decision* is eroded but never retired — and is **off by default** behind `CLAWMEM_CONTRADICTION_INVALIDATE` and logs `WOULD invalidate` instead of writing, because its exposure depends on the vault's confidence distribution and content-type mix ([calibration guide](docs/guides/contradiction-invalidation.md)). *Two contract defects fixed in v0.28.0 had previously prevented this path from applying any classification at all — earlier versions classified but never mutated a document.* **v0.7.1 adds a second layer at the consolidation boundary:** before the background worker merges a new pattern into an existing consolidated observation, a deterministic heuristic (negation asymmetry, number/date mismatch) plus the configured judge detect contradictions (heuristic-only, and constrained to `link`, when no judge is configured). Blocked merges route to either `link` policy (both rows remain active; the old row gains an `invalidated_by` backlink, default) or `supersede` policy (old row marked `status='inactive'` — requires a configured judge, otherwise loudly constrained to `link`). Configurable via `CLAWMEM_CONTRADICTION_POLICY` and `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE`. Mutation-authorizing evaluations commit their durable `judge_runs`/`judge_events` audit rows in the same transaction as the mutation (Phase-3 deductive checks commit a precondition audit first; non-mutating outcomes write standalone rows) — that audit is what calibration reads. Data-egress note: a cloud or subscription judge receives the new decisions and the retrieved candidate snippets.
 
 ## Features
 
@@ -771,6 +775,10 @@ Automatically generates context sections in per-folder CLAUDE.md files from rece
 
 Notes referenced by the agent during a session get boosted (`access_count++`). Unreferenced notes decay via recency. Over time, useful notes rise and noise fades.
 
+### Offline Eval Harness
+
+`clawmem eval run --gold <file.jsonl>` replays hand-labeled queries through the real `query` tool handler and scores the retrieved documents against gold evidence: doc-level Jaccard (`|C∩E|/|C∪E|`), precision/recall@k, hit@k, MRR. Touches no retrieval, lifecycle, or telemetry state (normal inference caches may populate, as in any live query); writes `run.json` + `report.md` for A/B comparison between checkouts or DB snapshots. Gold schema, trust gates, and labeling discipline: [docs/guides/eval-harness.md](docs/guides/eval-harness.md).
+
 ## Feature Flags
 
 | Variable | Default | Effect |
@@ -788,6 +796,12 @@ Notes referenced by the agent during a session get boosted (`access_count++`). U
 | `CLAWMEM_LLM_MODEL` | `qwen3` | Model name sent to the configured LLM endpoint. Override this for OpenAI-compatible proxies such as `gpt-5.4-mini`. |
 | `CLAWMEM_LLM_REASONING_EFFORT` | (none) | Optional top-level `reasoning_effort` field for Chat Completions endpoints that support it (for example OpenAI reasoning models). Leave unset for llama-server/vLLM unless your serving stack explicitly accepts that field. |
 | `CLAWMEM_LLM_NO_THINK` | `true` | Append `/no_think` to remote LLM prompts. Set to `false` for standard OpenAI models and other endpoints that reject or treat the Qwen-style suffix as literal prompt text. |
+| `CLAWMEM_JUDGE_URL` | (none) | **v0.29.0.** OpenAI-compatible endpoint for the **contradiction judge** — a task-scoped override, independent of `CLAWMEM_LLM_*` (query expansion stays on the stock model). Setting it activates contradiction analysis. Data-egress note: the judge receives new decisions + retrieved candidate snippets. [Guide](docs/guides/inference-services.md#contradiction-judge). |
+| `CLAWMEM_JUDGE_PROVIDER` | `openai` when `_URL` set | **v0.29.0.** `openai` \| `anthropic` \| `claude-cli`. `anthropic` calls the Messages API directly (default model `claude-haiku-4-5`); `claude-cli` runs a sandboxed headless `claude -p` on your Claude Code subscription — no API key. |
+| `CLAWMEM_JUDGE_MODEL` | provider-specific | **v0.29.0.** Wire model id. **Required** on `openai` (no universal default); defaults to `claude-haiku-4-5` on `anthropic`/`claude-cli` (the suite-verified recommended default; `claude-sonnet-5` is an unverified upgrade candidate — see the [judge guide](docs/guides/inference-services.md#contradiction-judge) for its honest evaluation status). |
+| `CLAWMEM_JUDGE_API_KEY` | (none) | **v0.29.0.** Bearer / `x-api-key` for the judge endpoint. On `anthropic`, falls back to `ANTHROPIC_API_KEY`. |
+| `CLAWMEM_JUDGE_NO_THINK` | `false` | **v0.29.0.** Append `/no_think` on the judge lane (only useful for a local Qwen-family judge on the `openai` lane). |
+| `CLAWMEM_JUDGE_STRUCTURED` | lane-specific | **v0.29.0.** Schema-constrained judge output. Default `false` on `openai` (endpoint support varies), `true` on `anthropic`/`claude-cli`. Set explicitly to override. |
 | `CLAWMEM_RERANK_URL` | `http://localhost:8090` | Reranker server URL. Without it, falls to `node-llama-cpp` (if allowed). |
 | `CLAWMEM_RERANK_API_KEY` | (none) | Bearer token for an authenticated remote reranker endpoint. Independent of the embed and LLM keys. |
 | `CLAWMEM_NO_LOCAL_MODELS` | `false` | Block `node-llama-cpp` from auto-downloading GGUF models. Set `true` for remote-only setups where you want fail-fast on unreachable endpoints. |
@@ -795,8 +809,9 @@ Notes referenced by the agent during a session get boosted (`access_count++`). U
 | `CLAWMEM_MERGE_SCORE_NORMAL` | `0.93` | **v0.7.1.** Phase 2 consolidation merge-safety threshold when candidate and existing anchors align. Merges above this normalized 3-gram cosine score are allowed. |
 | `CLAWMEM_MERGE_SCORE_STRICT` | `0.98` | **v0.7.1.** Strictest merge-safety threshold — fallback when anchor sets are ambiguous. |
 | `CLAWMEM_MERGE_GUARD_DRY_RUN` | `false` | **v0.7.1.** When `true`, Phase 2 merge-safety rejections are logged but not enforced — use for calibration before enabling the gate. |
-| `CLAWMEM_CONTRADICTION_POLICY` | `link` | **v0.7.1.** Merge-time contradiction gate policy. `link` inserts a new row + `contradicts` edge (default). `supersede` marks the old row `status='inactive'`. |
-| `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` | `0.5` | **v0.7.1.** Minimum combined heuristic + LLM confidence required before the contradiction gate blocks a merge. |
+| `CLAWMEM_CONTRADICTION_POLICY` | `link` | **v0.7.1, judge-gated v0.29.0.** Merge-time contradiction gate policy. `link` inserts a new row and sets the old row's `invalidated_by` backlink (default). `supersede` marks the old row `status='inactive'` — **requires a configured judge**; without one it is loudly constrained to `link` and `clawmem doctor` reports the policy as inactive. |
+| `CLAWMEM_CONTRADICTION_MIN_CONFIDENCE` | `0.5` | **v0.7.1.** Minimum confidence required before the contradiction gate blocks a merge. The judge prompt states this same threshold — the prompt never overrides your configured value. |
+| `CLAWMEM_CONTRADICTION_INVALIDATE` | `false` | **v0.28.0, judge-gated v0.29.0.** A different subsystem from the two rows above — this one governs the **`decision-extractor` hook**, not the merge-time gate. Set to exactly `true` to let a contradiction that erodes a document to the `0.2` confidence floor also set `invalidated_at`, removing it from FTS *and* vector retrieval. Off by default: the hook logs `WOULD invalidate`, writes a durable audit row, and mutates nothing further. Confidence erosion runs whenever a judge is configured (without a judge, nothing runs at all). Eligible rows are `content_type='observation'` only. [Calibration guide](docs/guides/contradiction-invalidation.md). |
 
 ## Configuration
 

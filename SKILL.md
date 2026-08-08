@@ -95,10 +95,10 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `memory_pin` | Lifecycle retention + priority among relevance-equivalent results (+0.3 composite boost on composite surfaces; exact-tie precedence on raw routes — vector + `search` non-recency). Use PROACTIVELY for constraints, architecture decisions, corrections. |
 | `memory_snooze` | Use PROACTIVELY when `<vault-context>` surfaces noise — snooze 30 days. |
 | `memory_forget` | Deactivate a memory by closest match. Sparingly — prefer snooze. Weak matches return a disambiguation list instead of acting (v0.23.0). |
-| `build_graphs` | Temporal backbone + semantic graph after bulk ingestion. NOT after every reindex. |
+| `build_graphs` | Temporal backbone + semantic graph after bulk ingestion. NOT after every reindex. Reports `N new edge(s), M total` — `0 new` on a rebuild is correct, not an empty graph. |
 | `timeline` | Temporal neighborhood around a doc. Progressive disclosure: search → timeline → get. |
 | `memory_evolution_status` | How a doc's A-MEM metadata evolved over time. |
-| `lifecycle_status` / `lifecycle_sweep` / `lifecycle_restore` | Lifecycle stats / archive stale (dry-run default) / restore auto-archived. |
+| `lifecycle_status` / `lifecycle_sweep` / `lifecycle_restore` | Lifecycle stats / archive stale (dry-run default, archives only — ClawMem never deletes rows) / restore auto-archived. |
 | `index_stats` / `status` / `reindex` | Doc counts + embedding coverage / quick health / force re-index (does NOT embed). |
 | `beads_sync` / `vault_sync` / `list_vaults` | Beads issues from Dolt / index a dir into a named vault / list vaults. |
 
@@ -195,6 +195,8 @@ Applied on the composite surfaces: hooks, `query`, and `memory_retrieve`'s keywo
 compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore) × qualityMultiplier × coActivationBoost
 ```
 
+**Effective time (v0.27.0):** `recencyScore` ages documents by `authored_at ?? modified_at` — mined/synthesized historical content ranks by when it was written, not when it was filed. Result metadata carries `authored_at` (null = unknown); temporal filters and recency-intent queries use the same axis.
+
 - `qualityMultiplier = 0.7 + 0.6·qualityScore` (0.7× penalty … 1.3× boost).
 - `coActivationBoost = 1 + min(coCount/10, 0.15)` (docs surfaced together get up to +15%).
 - Length normalization penalizes verbose entries (floor 30%); frequency boost capped at +10%.
@@ -213,17 +215,19 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 - **`memory_pin`** (lifecycle retention + priority among relevance-equivalent results; +0.3 boost on composite surfaces, exact-tie precedence on raw routes) — PROACTIVELY when: user says "remember this"/"important"; an architecture/critical decision was just made; a user preference/constraint should persist across sessions. Do NOT pin routine/session-specific items.
 - **`memory_snooze`** — PROACTIVELY when a memory keeps surfacing but isn't relevant now, user says "not now"/"later", or content is time-boxed.
 - **`memory_forget`** — only when genuinely wrong or permanently obsolete. Prefer snooze for temporary suppression.
-- **Contradiction auto-resolution:** when `decision-extractor` detects a new decision contradicting an old one, the old one's confidence is lowered automatically — no manual action needed.
+- **ClawMem never physically deletes a document row (v0.30.0).** Every lifecycle operation above is reversible: pin/snooze are metadata, forget and archive deactivate, contradiction handling only erodes confidence. Retention archives — `lifecycle_restore` brings it back — and `purge_after_days` is inert. Through v0.29.0 it permanently deleted archived rows from a non-dry-run sweep and from the SessionStart hook, unreported.
+- **Contradiction auto-resolution (judge-gated, v0.29.0):** runs ONLY when a judge is configured via `CLAWMEM_JUDGE_*` — disabled (audited no-op) otherwise. With a judge: when `decision-extractor` detects a new decision contradicting an old one, the old one's confidence is lowered automatically (−0.25, floor 0.2). It stays retrievable; only its ranking drops. Removing it from retrieval outright (`invalidated_at`) is a separate, **opt-in** step behind `CLAWMEM_CONTRADICTION_INVALIDATE`, and applies **only to `content_type='observation'`** — a superseded decision is eroded, never retired, so do NOT tell a user that contradiction handling will retire a prior decision. Unarmed it logs `WOULD invalidate` and writes nothing. Do NOT suggest arming it without the vault-specific calibration in [`docs/guides/contradiction-invalidation.md`](docs/guides/contradiction-invalidation.md).
 
 ---
 
 ## Operational gotchas (agent-facing)
 
-- **Empty `context-surfacing`** → prompt < 20 chars, starts with `/`, or nothing scored above threshold. Check `clawmem status` (doc counts) + embedding coverage.
+- **Empty `context-surfacing`** → prompt < 20 chars (short memory-intent queries like "what did I say?" are exempt — they force retrieval), starts with `/`, or nothing scored above threshold. Check `clawmem status` (doc counts) + embedding coverage.
 - **Vector search empty but BM25 works** → missing embeddings (the watcher indexes but does NOT embed). Run `clawmem embed` or wait for the embed timer.
 - **`intent_search` weak for WHY/ENTITY** → sparse graph. Run `build_graphs` (temporal backbone + semantic edges). Otherwise don't run it after every reindex — A-MEM links per-doc automatically.
 - **Rankings look RRF-flat / reranker suspect** → `clawmem rerank-health`. A mis-served reranker (e.g. a GGUF that drops the score head) returns HTTP 200 but inert, non-discriminating scores, silently collapsing ranking to RRF. The reranker is a served sidecar, not a bundled model — verify it discriminates, don't assume liveness = correctness.
 - **Intermittent `UserPromptSubmit hook timed out after 8s — output discarded`** → almost always the context-surfacing hook's **cold-start**, NOT inference: a fresh Bun process + opening a large `index.sqlite` + a cold OS page cache. Warm calls are sub-second. On a memory-constrained host (e.g. WSL with a low memory cap) or a large vault, the cache is evicted between turns so it **recurs on certain turns**. A timed-out hook silently drops that turn's `<vault-context>` (degraded recall, no error). **Durable fix: give the host enough RAM to keep the index + Bun modules cached**; raising the hook `timeout` in `~/.claude/settings.json` (8s default; no CLI knob) is only a secondary margin — avoid 15s+ as a standing default since the hook blocks prompt submission. Full detail: [`docs/troubleshooting.md`](docs/troubleshooting.md) → *Hooks slow or near timeout* / *Tuning the context-surfacing hook timeout*.
+- **A known document is absent from `search`/`vsearch`/`query` but `get` by path returns it** → it is invalidated (`documents.invalidated_at IS NULL` is a hard predicate on the FTS and both vector joins, with no query-time signal). On `documents` the only writer is contradiction invalidation, and only when armed — the `invalidated_at` in `consolidation.ts` is a different table. Diagnose + restore: [`docs/troubleshooting.md`](docs/troubleshooting.md#hooks).
 - **Anything setup-shaped** (download blocked, server unreachable, watcher memory bloat, indexer bugs) → [`docs/troubleshooting.md`](docs/troubleshooting.md). This skill does not duplicate it.
 
 ---

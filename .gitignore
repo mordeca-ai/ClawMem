@@ -23,13 +23,21 @@ node_modules/
 # Internal dev artifacts
 eval-queries*.json
 eval-bypass-cases*.json
-eval-bundles/
+eval-bundles/*
+# v0.29.0: the judge-recommendation evidence SHIPS (J8 reproducibility) — the
+# harness + raw model artifacts only; review transcripts stay local.
+!eval-bundles/judge-override-2026-08-01/
+eval-bundles/judge-override-2026-08-01/*
+!eval-bundles/judge-override-2026-08-01/tooling/
+!eval-bundles/judge-override-2026-08-01/artifacts/
+eval-runs/
 .ralph/
 ralph.yml
 Brain.
 test-beads/
 config.yaml
 dist/
-.codex-review-session.txt
+.codex-review-session.txt*
+.codex-review/
 .codex-review-jobs/
 .no-test-on-stop

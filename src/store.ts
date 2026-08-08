@@ -26,6 +26,7 @@ import {
   isFallbackExpansion,
   type RerankDocument,
 } from "./llm.ts";
+import { normalizeIsoTimestamp } from "./normalize.ts";
 import {
   findContextForPath as collectionsFindContextForPath,
   addContext as collectionsAddContext,
@@ -34,7 +35,6 @@ import {
   getCollection,
   listCollections as collectionsListCollections,
   addCollection as collectionsAddCollection,
-  removeCollection as collectionsRemoveCollection,
   renameCollection as collectionsRenameCollection,
   setGlobalContext,
   loadConfig as collectionsLoadConfig,
@@ -458,6 +458,7 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
     // master-harness-s1lli: persist description frontmatter so it can be
     // recovered + embedded at embed time (mirrors the z7o4y title fix).
     ["description", "ALTER TABLE documents ADD COLUMN description TEXT"],
+    ["authored_at", "ALTER TABLE documents ADD COLUMN authored_at TEXT"],
   ];
   for (const [col, sql] of migrations) {
     if (!colNames.has(col)) {
@@ -496,6 +497,8 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   // Timeline indexes use existing columns (modified_at, id) — always safe
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_timeline ON documents(modified_at, id) WHERE active = 1`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_timeline_coll ON documents(collection, modified_at, id) WHERE active = 1`);
+  // §51.1: temporal predicates filter on effective time (authorship when known, filing time otherwise)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_effective_time ON documents(COALESCE(authored_at, modified_at)) WHERE active = 1`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
 
   // Cache table for LLM API calls
@@ -1059,6 +1062,57 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
       expires_at TEXT NOT NULL
     )
   `);
+
+  // v0.29.0: durable contradiction-judge audit. One judge_runs row per evaluation
+  // (a provider-failure→heuristic fallback is TWO rows linked by fallback_from_run_id,
+  // pruned as a unit via the self-FK cascade); judge_events carries per-verdict /
+  // per-reject / per-error facts. Interactive hosts do not persist hook stderr, so
+  // these rows are the only durable evidence erosion calibration can read.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS judge_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL DEFAULT (datetime('now')),
+      session_id TEXT,
+      consumer TEXT NOT NULL,
+      lane TEXT NOT NULL,
+      model TEXT,
+      endpoint TEXT,
+      prompt_version TEXT,
+      new_fact_count INTEGER NOT NULL DEFAULT 0,
+      candidate_count INTEGER NOT NULL DEFAULT 0,
+      response_sha256 TEXT,
+      outcome TEXT NOT NULL,
+      fallback_from_run_id INTEGER REFERENCES judge_runs(id) ON DELETE CASCADE,
+      entries_admitted INTEGER NOT NULL DEFAULT 0,
+      entries_rejected INTEGER NOT NULL DEFAULT 0,
+      entries_duplicate INTEGER NOT NULL DEFAULT 0,
+      entries_inconsistent INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_runs_consumer_ts ON judge_runs(consumer, ts DESC)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_runs_fallback ON judge_runs(fallback_from_run_id)`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS judge_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL REFERENCES judge_runs(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL,
+      new_idx INTEGER,
+      old_idx INTEGER,
+      new_ref TEXT,
+      old_ref TEXT,
+      relation TEXT,
+      confidence REAL,
+      reasoning_head TEXT,
+      reason_code TEXT,
+      action TEXT,
+      evidence_head TEXT,
+      score_before REAL,
+      score_after REAL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_events_run ON judge_events(run_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_judge_events_action ON judge_events(action)`);
 }
 
 
@@ -1350,14 +1404,10 @@ export type Store = {
 
   // Cleanup and maintenance
   deleteLLMCache: () => number;
-  // deleteInactiveDocuments/cleanupOrphanedContent require an explicit scope
-  // ({ collection: string } | { all: true }) — see master-harness-t5i0.
-  // A bare call with no scope argument is a TypeScript compile error.
-  // (cleanupOrphanedVectors was removed with upstream v0.11.0 — unfenced vector
-  // mutation, no production caller; cleanStaleEmbeddings is the fenced replacement.)
-  deleteInactiveDocuments: (scope: CleanupScope, opts?: CleanupOptions) => number;
-  cleanupOrphanedContent: (scope: CleanupScope, opts?: CleanupOptions) => number;
-  purgeCollection: (collectionName: string) => { documents: number; content: number; vectors: number };
+  // v0.30.0 doctrine supersedes the t5i0 scoped-delete surface: no code path may
+  // hard-delete documents rows (deleteInactiveDocuments and purgeCollection removed;
+  // cleanupOrphanedContent's predicate is cascade-proof by construction).
+  cleanupOrphanedContent: () => number;
   vacuumDatabase: () => void;
 
   // Context
@@ -1433,9 +1483,9 @@ export type Store = {
   markUsageReferenced: (id: number) => void;
 
   // SAME: Document metadata operations
-  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }) => void;
+  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number; authored_at?: string | null }) => void;
   incrementAccessCount: (paths: string[]) => void;
-  getDocumentsByType: (contentType: string, limit?: number) => DocumentRow[];
+  getDocumentsByType: (contentType: string, limit?: number, opts?: { orderBy?: "operational" | "effective" }) => DocumentRow[];
   getStaleDocuments: (beforeDate: string) => DocumentRow[];
   pinDocument: (collection: string, path: string, pinned: boolean) => void;
   snoozeDocument: (collection: string, path: string, until: string | null) => void;
@@ -1452,6 +1502,7 @@ export type Store = {
 
   // MAGMA graph building
   buildTemporalBackbone: () => number;
+  countActiveRelations: (relationType: string) => number;
   buildSemanticGraph: (threshold?: number) => Promise<number>;
 
   // A-MEM: Self-Evolving Memory
@@ -1500,7 +1551,6 @@ export type Store = {
   archiveDocuments: (ids: number[]) => number;
   getArchiveCandidates: (policy: import("./collections.ts").LifecyclePolicy) => { id: number; collection: string; path: string; title: string; modified_at: string; last_accessed_at: string | null; content_type: string }[];
   restoreArchivedDocuments: (filter: { ids?: number[]; collection?: string; sinceDate?: string }) => number;
-  purgeArchivedDocuments: (olderThanDays: number) => number;
   getLifecycleStats: () => { active: number; archived: number; forgotten: number; pinned: number; snoozed: number; neverAccessed: number; oldestAccess: string | null };
   searchArchived: (query: string, limit?: number) => { id: number; collection: string; path: string; title: string; archived_at: string; score: number }[];
 };
@@ -1557,9 +1607,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Cleanup and maintenance
     deleteLLMCache: () => deleteLLMCache(db),
-    deleteInactiveDocuments: (scope: CleanupScope, opts?: CleanupOptions) => deleteInactiveDocuments(db, scope, opts),
-    cleanupOrphanedContent: (scope: CleanupScope, opts?: CleanupOptions) => cleanupOrphanedContent(db, scope, opts),
-    purgeCollection: (collectionName: string) => purgeCollection(db, collectionName),
+    cleanupOrphanedContent: () => cleanupOrphanedContent(db),
     vacuumDatabase: () => vacuumDatabase(db),
 
     // Context
@@ -1674,7 +1722,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     // SAME: Document metadata operations
     updateDocumentMeta: (docId: number, meta) => updateDocumentMetaFn(db, docId, meta),
     incrementAccessCount: (paths: string[]) => incrementAccessCountFn(db, paths),
-    getDocumentsByType: (contentType: string, limit?: number) => getDocumentsByTypeFn(db, contentType, limit),
+    getDocumentsByType: (contentType: string, limit?: number, opts?: { orderBy?: "operational" | "effective" }) => getDocumentsByTypeFn(db, contentType, limit, opts),
     getStaleDocuments: (beforeDate: string) => getStaleDocumentsFn(db, beforeDate),
     pinDocument: (collection: string, path: string, pinned: boolean) => pinDocumentFn(db, collection, path, pinned),
     snoozeDocument: (collection: string, path: string, until: string | null) => snoozeDocumentFn(db, collection, path, until),
@@ -1726,6 +1774,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // MAGMA graph building
     buildTemporalBackbone: () => buildTemporalBackbone(db),
+    countActiveRelations: (relationType: string) => countActiveRelations(db, relationType),
     buildSemanticGraph: (threshold?: number) => buildSemanticGraph(db, threshold),
 
     // A-MEM: Self-Evolving Memory
@@ -2047,17 +2096,25 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       if (ids.length === 0) return 0;
       const now = new Date().toISOString();
       const placeholders = ids.map(() => "?").join(",");
-      const result = db.prepare(`
-        UPDATE documents SET active = 0, archived_at = ?
-        WHERE id IN (${placeholders}) AND active = 1
-      `).run(now, ...ids);
-      return result.changes;
+      // `result.changes` is NOT the number of documents archived: the `documents_fts`
+      // triggers fire on this UPDATE and their shadow-table writes inflate the count
+      // (3 documents reported as 16). Count the matching rows explicitly, in the same
+      // transaction, so the number returned is the outcome rather than a side-effect total.
+      return db.transaction(() => {
+        const row = db.prepare(`
+          SELECT COUNT(*) AS n FROM documents WHERE id IN (${placeholders}) AND active = 1
+        `).get(...ids) as { n: number } | undefined;
+        db.prepare(`
+          UPDATE documents SET active = 0, archived_at = ?
+          WHERE id IN (${placeholders}) AND active = 1
+        `).run(now, ...ids);
+        return row?.n ?? 0;
+      })();
     },
 
     // Lifecycle management
     getArchiveCandidates: (policy) => getArchiveCandidatesFn(db, policy),
     restoreArchivedDocuments: (filter) => restoreArchivedDocumentsFn(db, filter),
-    purgeArchivedDocuments: (olderThanDays) => purgeArchivedDocumentsFn(db, olderThanDays),
     getLifecycleStats: () => getLifecycleStatsFn(db),
     searchArchived: (query, limit?) => searchArchivedFn(db, query, limit),
   };
@@ -2276,6 +2333,8 @@ export type DocumentRow = {
   title: string;
   hash: string;
   modifiedAt: string;
+  authoredAt: string | null;  // §51.1: authorship time; null = unknown
+  effectiveAt: string;        // §51.1: COALESCE(authored_at, modified_at) — content time
   domain: string | null;
   workstream: string | null;
   tags: string | null;
@@ -2362,215 +2421,44 @@ export function deleteLLMCache(db: Database): number {
   return result.changes;
 }
 
-/**
- * Mandatory scope for the DB-wide cleanup operations below (deleteInactiveDocuments,
- * cleanupOrphanedContent, cleanupOrphanedVectors). There is deliberately no default —
- * every call site must say explicitly whether it means one collection or the whole
- * database. This is the hardening for master-harness-t5i0: a bare, unscoped call to
- * deleteInactiveDocuments() previously hard-deleted 3566 pre-existing inactive
- * document rows (and their orphaned content/vectors) when only 50 disposable
- * smoke-test docs were meant to be purged.
- */
-export type CleanupScope = { collection: string } | { all: true };
+// NOTE: `deleteInactiveDocuments` was removed in v0.30.0. It ran
+// `DELETE FROM documents WHERE active = 0` — strictly broader than the retention purge,
+// since it destroyed every inactive row (archived AND forgotten) with no age restriction
+// and no authorization. It had no callers, but sat on the public `Store` interface, so any
+// holder of a store could invoke it. Deactivation must stay reversible; see the retention
+// note on the removed purge helper below.
 
 /**
- * Options shared by the scoped cleanup operations. `includeArchived` defaults to
- * false: lifecycle-archived rows (active = 0, archived_at IS NOT NULL, set by
- * `clawmem lifecycle sweep`) are restorable state, not garbage, and are spared by
- * default even under an `{all: true}` scope. Pass `includeArchived: true` to
- * deliberately also sweep archived rows (that is `clawmem lifecycle sweep`'s own
- * purge-after-days path, via purgeArchivedDocuments — NOT these functions).
+ * Remove content rows that no document references at all.
+ *
+ * The predicate must consider EVERY document, not just active ones. `documents.hash` is
+ * `ON DELETE CASCADE` on `content(hash)`, so deleting content still referenced by an
+ * archived or forgotten document destroys that document row too — a hard delete reached
+ * indirectly, which is exactly what the retention rule forbids. Scoping to `active = 1`
+ * did that: one archived document plus a cleanup call left zero documents.
+ *
+ * With the predicate below no cascade is possible, because nothing references the rows it
+ * removes. Returns the number of orphaned content rows deleted.
  */
-export interface CleanupOptions {
-  includeArchived?: boolean;
-}
-
-function assertCleanupScope(scope: CleanupScope): void {
-  if (!scope || typeof scope !== "object") {
-    throw new Error("cleanup scope is required: { collection: string } | { all: true }");
-  }
-  if ("collection" in scope) {
-    if (typeof scope.collection !== "string" || scope.collection.trim().length === 0) {
-      throw new Error("cleanup scope collection name must be a non-empty string");
-    }
-    if (/[*?[\]]/.test(scope.collection)) {
-      throw new Error(
-        `cleanup scope collection name is ambiguous (wildcard characters not supported): "${scope.collection}"`
-      );
-    }
-  } else if (!("all" in scope) || scope.all !== true) {
-    throw new Error("cleanup scope is required: { collection: string } | { all: true }");
-  }
-}
-
-/**
- * Remove inactive document records (active = 0), scoped to one named collection or
- * explicitly the whole database. By default, rows with archived_at IS NOT NULL
- * (lifecycle-archived, restorable) are spared regardless of scope; pass
- * opts.includeArchived = true to also delete them.
- * Returns the number of inactive documents deleted.
- */
-export function deleteInactiveDocuments(db: Database, scope: CleanupScope, opts: CleanupOptions = {}): number {
-  assertCleanupScope(scope);
-  const archivedGuard = opts.includeArchived ? "" : " AND archived_at IS NULL";
-  // Count via SELECT before DELETE rather than trusting run().changes: SQLite's
-  // changes() counter is cumulative across trigger side effects for the *same*
-  // top-level statement, which would over-report here if a row happened to still
-  // be FTS-indexed. Counting first keeps the return value an honest row count
-  // regardless of trigger/FK internals.
-  if ("collection" in scope) {
-    const before = db.prepare(
-      `SELECT COUNT(*) as c FROM documents WHERE active = 0 AND collection = ?${archivedGuard}`
-    ).get(scope.collection) as { c: number };
-    db.prepare(`DELETE FROM documents WHERE active = 0 AND collection = ?${archivedGuard}`).run(scope.collection);
-    return before.c;
-  }
-
-  const before = db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 0${archivedGuard}`).get() as { c: number };
-  db.prepare(`DELETE FROM documents WHERE active = 0${archivedGuard}`).run();
-  return before.c;
-}
-
-/**
- * Remove orphaned content hashes that are not referenced by any document still
- * considered "live" — active, or (by default) lifecycle-archived. Scoped to one
- * named collection or explicitly the whole database. Pass opts.includeArchived =
- * true to also drop content only referenced by archived rows (matching the
- * legacy active-only-liveness definition).
- * Returns the number of orphaned content hashes deleted.
- */
-export function cleanupOrphanedContent(db: Database, scope: CleanupScope, opts: CleanupOptions = {}): number {
-  assertCleanupScope(scope);
-  const liveClause = opts.includeArchived ? "active = 1" : "(active = 1 OR archived_at IS NOT NULL)";
-
-  // NOTE: content.hash is the parent side of `documents.hash REFERENCES
-  // content(hash) ON DELETE CASCADE` — deleting an orphaned content row will
-  // also cascade-delete any (already-inactive, non-live) document row still
-  // pointing at it. That is intentional here (it finishes GC'ing a forgotten
-  // document whose content just got swept) but it means run().changes is not
-  // a trustworthy content-row count — it includes the cascaded document
-  // deletes too. Count via SELECT before DELETE instead.
-  if ("collection" in scope) {
-    const before = db.prepare(`
-      SELECT COUNT(*) as c FROM content
-      WHERE hash IN (SELECT DISTINCT hash FROM documents WHERE collection = ?)
-        AND hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
-    `).get(scope.collection) as { c: number };
-    db.prepare(`
-      DELETE FROM content
-      WHERE hash IN (SELECT DISTINCT hash FROM documents WHERE collection = ?)
-        AND hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
-    `).run(scope.collection);
-    return before.c;
-  }
-
-  const before = db.prepare(`
-    SELECT COUNT(*) as c FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
-  `).get() as { c: number };
-  db.prepare(`
+export function cleanupOrphanedContent(db: Database): number {
+  const result = db.prepare(`
     DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE ${liveClause})
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents)
   `).run();
-  return before.c;
+  return result.changes;
 }
 
 // (Removed cleanupOrphanedVectors — an exposed, unfenced, non-transactional vector
 // mutation with no production caller. Use cleanStaleEmbeddings, which is lease-fenced
 // and atomic. See INCIDENT-2026-06-22 / codex review.)
 
-/**
- * Hard-delete a single named collection's documents — both active and inactive
- * (archived or forgotten) — plus their now-orphaned content and vector rows. This
- * is the collection-scoped purge API from master-harness-t5i0: the operation a
- * disposable smoke-test collection teardown actually needs, without reaching for
- * the DB-wide cleanup functions above and risking every other collection's
- * inactive/archived rows in the same pass.
- *
- * Unlike deleteInactiveDocuments/cleanupOrphaned*, this is a deliberate full
- * removal of one named collection (active rows included) — there is no
- * archived-row carve-out, because the caller is explicitly nuking that collection
- * in its entirety, not doing routine maintenance. Refuses an empty/missing or
- * wildcard-bearing collection name.
- *
- * Returns counts of rows deleted from each table.
- */
-export function purgeCollection(
-  db: Database,
-  collectionName: string
-): { documents: number; content: number; vectors: number } {
-  if (typeof collectionName !== "string" || collectionName.trim().length === 0) {
-    throw new Error("purgeCollection requires a non-empty collection name");
-  }
-  if (/[*?[\]]/.test(collectionName)) {
-    throw new Error(
-      `purgeCollection refuses an ambiguous collection name (wildcard characters not supported): "${collectionName}"`
-    );
-  }
-
-  const hashRows = db.prepare(
-    `SELECT DISTINCT hash FROM documents WHERE collection = ?`
-  ).all(collectionName) as { hash: string }[];
-
-  if (hashRows.length === 0) {
-    const exists = db.prepare(`SELECT 1 FROM documents WHERE collection = ? LIMIT 1`).get(collectionName);
-    if (!exists) {
-      throw new Error(`purgeCollection: no documents found for collection "${collectionName}" — nothing to purge`);
-    }
-  }
-
-  const hashes = hashRows.map(r => r.hash);
-  // Count via SELECT before DELETE: run().changes on a DELETE that touches an
-  // active (FTS-indexed) row is cumulative across the documents_fts sync
-  // trigger's internal shadow-table writes and over-reports the document
-  // count. Counting first keeps the return value an honest row count.
-  const docsBefore = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE collection = ?`).get(collectionName) as { c: number }).c;
-  db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
-
-  let contentDeleted = 0;
-  let vectorsDeleted = 0;
-
-  if (hashes.length > 0) {
-    const placeholders = hashes.map(() => "?").join(",");
-
-    const contentResult = db.prepare(`
-      DELETE FROM content
-      WHERE hash IN (${placeholders})
-        AND hash NOT IN (SELECT DISTINCT hash FROM documents)
-    `).run(...hashes);
-    contentDeleted = contentResult.changes;
-
-    const tableExists = db.prepare(`
-      SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'
-    `).get();
-    if (tableExists) {
-      const orphanHashRows = db.prepare(`
-        SELECT DISTINCT cv.hash FROM content_vectors cv
-        WHERE cv.hash IN (${placeholders})
-          AND cv.hash NOT IN (SELECT DISTINCT hash FROM documents)
-      `).all(...hashes) as { hash: string }[];
-
-      if (orphanHashRows.length > 0) {
-        const orphanHashes = orphanHashRows.map(r => r.hash);
-        const orphanPlaceholders = orphanHashes.map(() => "?").join(",");
-
-        db.prepare(`
-          DELETE FROM vectors_vec WHERE hash_seq IN (
-            SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
-            WHERE cv.hash IN (${orphanPlaceholders})
-          )
-        `).run(...orphanHashes);
-
-        const vecResult = db.prepare(`
-          DELETE FROM content_vectors WHERE hash IN (${orphanPlaceholders})
-        `).run(...orphanHashes);
-        vectorsDeleted = vecResult.changes;
-      }
-    }
-  }
-
-  return { documents: docsBefore, content: contentDeleted, vectors: vectorsDeleted };
-}
+// (Removed the t5i0 scoped cleanup surface — CleanupScope/CleanupOptions,
+// deleteInactiveDocuments, and purgeCollection — at the v0.36 sync (9jyc0):
+// upstream v0.30.0 removed physical document-row deletion from the package
+// entirely ("ClawMem stops deleting rows"), and the fork's collection purge is
+// exactly that capability. Disk reclamation is an out-of-band operator action
+// on the SQLite file. The t5i0 scope-guard's goal — bounding destructive
+// radius — is achieved more strongly by not offering destruction at all.)
 
 /**
  * Run VACUUM to reclaim unused space in the database.
@@ -2727,6 +2615,14 @@ export type SaveMemoryParams = {
   semanticPayload?: string;
   /** Topic key for future upsert support (Phase 2). */
   topicKey?: string;
+  /**
+   * §51.1: when the content was originally written (UTC ISO), as opposed to
+   * created_at/modified_at which stay filing/update time. Validated strictly;
+   * invalid values are treated as absent. Advances monotonically on dedup and
+   * path-conflict updates (a newer repeated assertion moves it forward;
+   * reprocessing older evidence never regresses it).
+   */
+  authoredAt?: string;
 };
 
 export type SaveMemoryResult = {
@@ -2753,6 +2649,7 @@ const DEDUP_WINDOW_MINUTES = 30;
 
 export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryResult {
   const now = new Date().toISOString();
+  const authoredAt = normalizeIsoTimestamp(params.authoredAt);
   const payload = params.semanticPayload || params.body;
   const normHash = hashNormalized(payload);
   const bodyHasher = new Bun.CryptoHasher("sha256");
@@ -2778,13 +2675,26 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
   ) as { id: number; duplicate_count: number } | null;
 
   if (dedupRow) {
-    // Increment duplicate_count and update last_seen_at
-    db.prepare(`
-      UPDATE documents
-      SET duplicate_count = duplicate_count + 1,
-          last_seen_at = ?
-      WHERE id = ?
-    `).run(now, dedupRow.id);
+    // Increment duplicate_count and update last_seen_at. §51.1: a validated
+    // incoming authorship advances authored_at monotonically (CASE, not scalar
+    // MAX — MAX(NULL, x) is NULL in SQLite and could never populate an
+    // initially unknown row); absent incoming leaves the column untouched.
+    if (authoredAt) {
+      db.prepare(`
+        UPDATE documents
+        SET duplicate_count = duplicate_count + 1,
+            last_seen_at = ?,
+            authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END
+        WHERE id = ?
+      `).run(now, authoredAt, authoredAt, dedupRow.id);
+    } else {
+      db.prepare(`
+        UPDATE documents
+        SET duplicate_count = duplicate_count + 1,
+            last_seen_at = ?
+        WHERE id = ?
+      `).run(now, dedupRow.id);
+    }
 
     return {
       action: 'deduplicated',
@@ -2803,8 +2713,8 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
     db.prepare(`
       INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
                              content_type, confidence, quality_score, normalized_hash,
-                             duplicate_count, revision_count, last_seen_at, topic_key, description)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?)
+                             duplicate_count, revision_count, last_seen_at, topic_key, description, authored_at)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)
     `).run(
       params.collection,
       params.path,
@@ -2819,6 +2729,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
       now,
       params.topicKey ?? null,
       params.description ?? null,
+      authoredAt,
     );
   } catch (err: any) {
     // UNIQUE(collection, path) conflict — update existing row
@@ -2828,17 +2739,24 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
       ).get(params.collection, params.path) as { id: number } | null;
 
       if (existing) {
+        // §51.1: same monotonic authored_at advancement as the dedup branch.
+        const authoredSet = authoredAt
+          ? ", authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END"
+          : "";
+        const updateVals: (string | number | null)[] = [
+          bodyHash, params.title, now, params.contentType,
+          params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
+          now,
+        ];
+        if (authoredAt) updateVals.push(authoredAt, authoredAt);
+        updateVals.push(existing.id);
         db.prepare(`
           UPDATE documents
           SET hash = ?, title = ?, modified_at = ?, content_type = ?,
               confidence = ?, quality_score = ?, normalized_hash = ?,
-              revision_count = revision_count + 1, last_seen_at = ?
+              revision_count = revision_count + 1, last_seen_at = ?${authoredSet}
           WHERE id = ?
-        `).run(
-          bodyHash, params.title, now, params.contentType,
-          params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
-          now, existing.id
-        );
+        `).run(...updateVals);
 
         const updated = db.prepare("SELECT revision_count FROM documents WHERE id = ?")
           .get(existing.id) as { revision_count: number } | null;
@@ -3503,27 +3421,13 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
 }
 
 /**
- * Remove a collection and clean up its documents.
- * Uses collections.ts to remove from YAML config and cleans up database.
+ * NOTE: the store-level `removeCollection` was removed in v0.30.0. It ran
+ * `DELETE FROM documents WHERE collection = ?` — an unauthorized hard delete of an entire
+ * collection's documents. It had no callers: `clawmem collection remove` goes through
+ * `collections.ts`'s `removeCollection`, which edits the YAML config only and leaves the
+ * indexed rows to deactivate on the next update. That is the reversible path and remains
+ * the only one. Do not reintroduce a row-destroying variant here.
  */
-export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
-  // Delete documents from database
-  const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
-
-  // Clean up orphaned content hashes
-  const cleanupResult = db.prepare(`
-    DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
-  `).run();
-
-  // Remove from YAML config (returns true if found and removed)
-  collectionsRemoveCollection(collectionName);
-
-  return {
-    deletedDocs: docResult.changes,
-    cleanedHashes: cleanupResult.changes
-  };
-}
 
 /**
  * Rename a collection.
@@ -3826,9 +3730,10 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     params.push(String(collectionId));
   }
 
-  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint)
+  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint).
+  // §51.1: content-time predicate — authorship when known, filing time otherwise.
   if (dateRange) {
-    sql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
+    sql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
     params.push(dateRange.start, dateRange.end);
   }
 
@@ -3984,9 +3889,10 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
     params.push(String(collectionId));
   }
 
-  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint)
+  // Temporal filter: restrict to date range (UTC ISO timestamps from extractTemporalConstraint).
+  // §51.1: content-time predicate — authorship when known, filing time otherwise.
   if (dateRange) {
-    docSql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
+    docSql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
     params.push(dateRange.start, dateRange.end);
   }
 
@@ -4120,7 +4026,8 @@ function hydrateVecResultsClassified(
     params.push(String(opts.collectionId));
   }
   if (opts.dateRange) {
-    docSql += ` AND d.modified_at >= ? AND d.modified_at <= ?`;
+    // §51.1: content-time predicate — authorship when known, filing time otherwise.
+    docSql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
     params.push(opts.dateRange.start, opts.dateRange.end);
   }
 
@@ -5349,7 +5256,7 @@ function markUsageReferencedFn(db: Database, id: number): void {
 // SAME: Document Metadata Operations
 // =============================================================================
 
-function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number }): void {
+function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number; authored_at?: string | null }): void {
   const sets: string[] = [];
   const vals: (string | number | null)[] = [];
   if (meta.domain !== undefined) { sets.push("domain = ?"); vals.push(meta.domain); }
@@ -5360,6 +5267,9 @@ function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: stri
   if (meta.review_by !== undefined) { sets.push("review_by = ?"); vals.push(meta.review_by); }
   if (meta.confidence !== undefined) { sets.push("confidence = ?"); vals.push(meta.confidence); }
   if (meta.quality_score !== undefined) { sets.push("quality_score = ?"); vals.push(meta.quality_score); }
+  // §51.1: undefined = leave untouched; explicit null = CLEAR (file-backed
+  // frontmatter is authoritative — a removed/invalid authored_at clears the row).
+  if (meta.authored_at !== undefined) { sets.push("authored_at = ?"); vals.push(meta.authored_at); }
   if (sets.length === 0) return;
   vals.push(docId);
   db.prepare(`UPDATE documents SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
@@ -5387,16 +5297,24 @@ function incrementAccessCountFn(db: Database, paths: string[]): void {
   `).run(now, ...paths);
 }
 
-function getDocumentsByTypeFn(db: Database, contentType: string, limit: number = 10): DocumentRow[] {
+function getDocumentsByTypeFn(db: Database, contentType: string, limit: number = 10, opts?: { orderBy?: "operational" | "effective" }): DocumentRow[] {
+  // §51.1 D13: "effective" orders/limits by content time (authorship when known).
+  // Content-currency callers must use the returned effectiveAt — not modifiedAt —
+  // for ordering, cutoff filtering, and displayed dates. Default stays operational.
+  const orderExpr = opts?.orderBy === "effective"
+    ? "COALESCE(d.authored_at, d.modified_at)"
+    : "d.modified_at";
   return db.prepare(`
     SELECT d.id, d.collection, d.path, d.title, d.hash, d.modified_at as modifiedAt,
+           d.authored_at as authoredAt,
+           COALESCE(d.authored_at, d.modified_at) as effectiveAt,
            d.domain, d.workstream, d.tags, d.content_type as contentType,
            d.review_by as reviewBy, d.confidence, d.access_count as accessCount,
            LENGTH(c.doc) as bodyLength, d.pinned
     FROM documents d
     JOIN content c ON c.hash = d.hash
     WHERE d.active = 1 AND d.content_type = ?
-    ORDER BY d.modified_at DESC
+    ORDER BY ${orderExpr} DESC
     LIMIT ?
   `).all(contentType, limit) as DocumentRow[];
 }
@@ -5424,8 +5342,12 @@ function updateObservationFieldsFn(
 }
 
 function getStaleDocumentsFn(db: Database, beforeDate: string): DocumentRow[] {
+  // Staleness review stays on operational time (§51.1) — authoredAt/effectiveAt
+  // are hydrated only so the returned rows satisfy the DocumentRow contract.
   return db.prepare(`
     SELECT d.id, d.collection, d.path, d.title, d.hash, d.modified_at as modifiedAt,
+           d.authored_at as authoredAt,
+           COALESCE(d.authored_at, d.modified_at) as effectiveAt,
            d.domain, d.workstream, d.tags, d.content_type as contentType,
            d.review_by as reviewBy, d.confidence, d.access_count as accessCount,
            LENGTH(c.doc) as bodyLength
@@ -5587,6 +5509,26 @@ export { detectBeadsProject };
  * Build temporal backbone - connect documents in chronological order.
  * Returns number of edges created.
  */
+/**
+ * Count edges of one relation type whose BOTH endpoints are still active.
+ *
+ * The graph builders only ever operate on active documents, so a raw `COUNT(*)` over
+ * `memory_relations` reports edges the live graph no longer contains — deactivating one
+ * endpoint left the reported total unchanged while the active graph had shrunk. Counting the
+ * same population the builders work on is what makes "N new, M total" internally consistent.
+ *
+ * Lives here rather than inline at each caller so the MCP tool and the REST endpoint cannot
+ * drift apart: they previously carried separate copies of this query.
+ */
+export function countActiveRelations(db: Database, relationType: string): number {
+  return (db.prepare(
+    `SELECT COUNT(*) c FROM memory_relations r
+       JOIN documents src ON src.id = r.source_id AND src.active = 1
+       JOIN documents tgt ON tgt.id = r.target_id AND tgt.active = 1
+     WHERE r.relation_type = ?`,
+  ).get(relationType) as { c: number }).c;
+}
+
 export function buildTemporalBackbone(db: Database): number {
   // Get all documents ordered by creation time
   const docs = db.prepare(`
@@ -5603,12 +5545,12 @@ export function buildTemporalBackbone(db: Database): number {
     const prev = docs[i - 1]!;
     const curr = docs[i]!;
 
-    db.prepare(`
+    // Count rows SQLite actually wrote — `INSERT OR IGNORE` suppresses conflicts,
+    // so an attempt counter reports edges that were never persisted.
+    edges += db.prepare(`
       INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
       VALUES (?, ?, 'temporal', 1.0, ?)
-    `).run(prev.id, curr.id, new Date().toISOString());
-
-    edges++;
+    `).run(prev.id, curr.id, new Date().toISOString()).changes;
   }
 
   return edges;
@@ -5654,11 +5596,12 @@ export async function buildSemanticGraph(
 
     for (const sim of similar) {
       const similarity = 1 - sim.distance;
-      db.prepare(`
+      // Count rows SQLite actually wrote, matching buildTemporalBackbone — the two
+      // counters feed one `build_graphs` response and must report the same unit.
+      edges += db.prepare(`
         INSERT OR IGNORE INTO memory_relations (source_id, target_id, relation_type, weight, created_at)
         VALUES (?, ?, 'semantic', ?, ?)
-      `).run(doc1.id, sim.target_id, similarity, new Date().toISOString());
-      edges++;
+      `).run(doc1.id, sim.target_id, similarity, new Date().toISOString()).changes;
     }
   }
 
@@ -5914,34 +5857,47 @@ function restoreArchivedDocumentsFn(
   db: Database,
   filter: { ids?: number[]; collection?: string; sinceDate?: string }
 ): number {
-  let sql = "UPDATE documents SET active = 1, archived_at = NULL WHERE active = 0 AND archived_at IS NOT NULL";
+  let where = "WHERE active = 0 AND archived_at IS NOT NULL";
   const params: any[] = [];
 
   if (filter.ids?.length) {
     const placeholders = filter.ids.map(() => "?").join(",");
-    sql += ` AND id IN (${placeholders})`;
+    where += ` AND id IN (${placeholders})`;
     params.push(...filter.ids);
   }
   if (filter.collection) {
-    sql += " AND collection = ?";
+    where += " AND collection = ?";
     params.push(filter.collection);
   }
   if (filter.sinceDate) {
-    sql += " AND archived_at >= ?";
+    where += " AND archived_at >= ?";
     params.push(filter.sinceDate);
   }
 
-  return db.prepare(sql).run(...params).changes;
+  // Same trigger-inflation problem as archiveDocuments: `.changes` counts the
+  // `documents_fts` shadow writes too. Count the matching rows explicitly instead.
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT COUNT(*) AS n FROM documents ${where}`)
+      .get(...params) as { n: number } | undefined;
+    db.prepare(`UPDATE documents SET active = 1, archived_at = NULL ${where}`).run(...params);
+    return row?.n ?? 0;
+  })();
 }
 
-function purgeArchivedDocumentsFn(db: Database, olderThanDays: number): number {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - olderThanDays);
-  const result = db.prepare(`
-    DELETE FROM documents WHERE active = 0 AND archived_at IS NOT NULL AND archived_at <= ?
-  `).run(cutoff.toISOString());
-  return result.changes;
-}
+// NOTE: `purgeArchivedDocumentsFn` was removed in v0.30.0. It ran
+// `DELETE FROM documents WHERE active = 0 AND archived_at <= ?` — the only operation in
+// ClawMem that destroyed a row rather than deactivating it, and therefore the only one
+// with no restore path. It was reachable from an agent-invoked MCP tool, from an
+// unattended SessionStart hook, and from the CLI.
+//
+// ClawMem no longer physically deletes document rows from ANY code path. Retention is
+// archival, which `restoreArchivedDocuments` reverses. Reclaiming disk space is an
+// out-of-band operator action on the SQLite file, explicitly outside ClawMem's mutation
+// contract — deliberately NOT an affordance this package offers, because any in-process
+// or CLI credential is equally available to the coding agent the package serves.
+//
+// A supported retention design (reversible quarantine with a protected window) is tracked
+// separately. Do not reintroduce a hard delete here without it.
 
 function getLifecycleStatsFn(db: Database): {
   active: number; archived: number; forgotten: number;

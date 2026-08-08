@@ -111,6 +111,82 @@ llama-server -m qmd-query-expansion-1.7B-q4_k_m.gguf \
 
 For better entity-extraction quality during `reindex --enrich`, point `CLAWMEM_LLM_URL` at a 7B+ model or cloud API (see [../internals/entity-resolution.md](../internals/entity-resolution.md)).
 
+## Contradiction judge
+
+**Capability floor, stated plainly:** the stock query-expansion model above cannot do
+contradiction classification. Verified with a live contract probe at the production seam,
+it returns an object where the contract requires an array, echoes the schema's enum text
+back as a value, and fabricates confident relations between unrelated facts. That failure is
+deterministic, not a tuning issue — the model is a search-expansion finetune, and judging is
+a different task.
+
+ClawMem therefore ships contradiction analysis **disabled until you configure a judge**
+(v0.29.0). Without one, the `decision-extractor` hook writes an audited `no_judge_configured` run and
+mutates nothing, and the merge-time gate's LLM layer is off — its deterministic heuristic
+still runs (audited as `lane='heuristic'` runs), constrained to the non-deactivating `link`
+policy. Nothing ever falls
+back to the stock model for judging.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CLAWMEM_JUDGE_URL` | (none) | Endpoint base URL. Setting it activates the judge (`openai` lane unless `_PROVIDER` says otherwise). |
+| `CLAWMEM_JUDGE_PROVIDER` | `openai` when `_URL` set | `openai` \| `anthropic` \| `claude-cli`. |
+| `CLAWMEM_JUDGE_MODEL` | provider-specific | **Required** on `openai`; defaults to `claude-haiku-4-5` on `anthropic`/`claude-cli`. |
+| `CLAWMEM_JUDGE_API_KEY` | (none) | Bearer / `x-api-key`. On `anthropic`, falls back to `ANTHROPIC_API_KEY`. |
+| `CLAWMEM_JUDGE_NO_THINK` | `false` | Judge-lane `/no_think` — only useful for a local Qwen-family judge. |
+| `CLAWMEM_JUDGE_STRUCTURED` | `false` on `openai`, `true` otherwise | Schema-constrained output where the lane supports it. |
+
+Three lanes:
+
+```bash
+# 1. Any OpenAI-compatible endpoint — cloud (OpenRouter, OpenAI, Groq, …) or
+#    self-hosted (vLLM, ollama, llama-server serving a capable instruct model):
+export CLAWMEM_JUDGE_URL=https://openrouter.ai/api
+export CLAWMEM_JUDGE_MODEL=your-chosen-model
+export CLAWMEM_JUDGE_API_KEY=YOUR_KEY_PLACEHOLDER
+
+# 2. Anthropic Messages API directly:
+export CLAWMEM_JUDGE_PROVIDER=anthropic
+export CLAWMEM_JUDGE_API_KEY=YOUR_KEY_PLACEHOLDER   # or rely on ANTHROPIC_API_KEY
+
+# 3. Your Claude Code subscription — no API key. Runs a sandboxed headless
+#    `claude -p` (--safe-mode, no tools, no MCP, no session persistence):
+export CLAWMEM_JUDGE_PROVIDER=claude-cli
+```
+
+**Recommended judge: `claude-haiku-4-5`** (the `anthropic`/`claude-cli` default) — the task
+is a short pairwise classification (~1.5K tokens in, a few hundred out; roughly $0.003 per
+evaluation at API list pricing), and the recommendation is backed by the judge evaluation
+suite, not parameter count. If your `judge_runs`/`judge_events` audit rows show borderline
+verdicts, `claude-sonnet-5` is the natural one-variable upgrade candidate — **use the
+`anthropic` API lane for it**: the `claude-cli` lane's 20-second spawn budget (sized to fit
+the Stop-hook window) suits Haiku, while Sonnet-class models with adaptive thinking can
+exceed it on long candidate texts. Honest status: the preserved Sonnet artifact (CLI lane)
+shows zero fabricated verdicts; contradiction recall 3/4 (one 20-second spawn timeout on
+the numeric case); long-input 0/2 (one borderline `update` label, one timeout) — **no
+passing API-lane artifact exists yet**, so treat Sonnet as an unverified upgrade and validate it on your own key with
+the shipped harness (`eval-bundles/judge-override-2026-08-01/tooling/capability-eval.ts`).
+Any sufficiently capable instruct model works through the `openai` lane — run
+`clawmem doctor` to smoke-test whatever you configure.
+
+**What configuring a judge activates:** confidence erosion on contradicted/superseded
+decisions (−0.25 / −0.15, floored, reversible) goes live. Removing documents from retrieval
+(`invalidated_at`) stays separately opt-in behind `CLAWMEM_CONTRADICTION_INVALIDATE`, and
+`supersede` merge policy becomes available. Every mutation-authorizing evaluation commits its
+audit rows in the same transaction as the mutation; Phase-3 deductive checks commit a
+precondition audit first, and non-mutating outcomes write standalone rows —
+[calibration guide](contradiction-invalidation.md).
+
+**Data egress:** a cloud or subscription judge receives the new decisions and the retrieved
+candidate snippets for each evaluation. Untrusted vault content travels JSON-encoded inside
+per-request nonce fencing and is never passed as instructions, but it does leave the machine
+— use a self-hosted `openai`-lane judge if that is unacceptable.
+
+`clawmem doctor` runs a three-scenario **smoke test** against the configured judge (a
+designed contradiction must be detected, an unrelated control must come back empty, the
+merge single-pair contract must be actionable). It is an installation check, not capability
+certification — precision is measured from your vault's audit rows.
+
 ## Reranker server
 
 Cross-encoder reranking for the `query` (4000-char context, deep) and `intent_search` (200-char context, fast) pipelines on port 8090, via the `/v1/rerank` endpoint.

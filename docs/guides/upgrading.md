@@ -1,6 +1,6 @@
 # Upgrading ClawMem
 
-Guide for upgrading between released versions. Current: **v0.25.0**.
+Guide for upgrading between released versions. Current: **v0.30.0**.
 
 ClawMem upgrades are designed to be drop-in: pull the new version, restart any long-lived processes, and the SQLite schema auto-migrates on first open. This guide documents per-version specifics for upgrades that have additional considerations beyond the quick path below.
 
@@ -58,6 +58,114 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 `CLAWMEM_RERANK_URL` already points at `:8090`, so nothing else changes. **zembed-1** (embedding) and **qwen3-reranker-0.6B** (default reranker) are unaffected. See [`extras/rerankers/zerank-2-seq/`](../../extras/rerankers/zerank-2-seq/) for details and the non-commercial (CC-BY-NC-4.0) license note.
 
 ---
+
+## v0.30.0: ClawMem no longer deletes document rows
+
+No schema change, no re-embed, no reindex. **Check whether you set `purge_after_days`:**
+
+```bash
+grep -A6 '^lifecycle:' ~/.config/clawmem/config.yaml | grep purge_after_days
+```
+
+- **`purge_after_days: null` (the default) — nothing changes.** No deletion was happening.
+- **`purge_after_days: <number>` — deletion stops.** Until now, a non-dry-run
+  `lifecycle_sweep` *and* every SessionStart with the `staleness-check` hook installed
+  permanently deleted every archived row past that window. The MCP preview never listed or
+  counted those rows (it reported only what would be *archived*), and the hook path reported
+  nothing at all. **Anything already deleted is gone**; this release stops the ongoing loss.
+  The value is now inert — archival continues and stays reversible via `lifecycle_restore`.
+
+There is no replacement command. Physical deletion is the one ClawMem mutation with no
+restore path, and no in-process or CLI credential can tell an operator apart from the coding
+agent ClawMem serves — an env var or a confirmation flag is satisfiable by the agent itself.
+So the capability is not offered rather than gated. If you need to reclaim space, operate on
+the SQLite file directly, out-of-band; that is explicitly outside ClawMem's mutation
+contract. A supported retention design (reversible quarantine with a protected window) is
+planned.
+
+**Also fixed:** `archiveDocuments` / `restoreArchivedDocuments` returned SQLite's `changes`
+count, which includes the `documents_fts` trigger writes — archiving 3 documents reported
+16. Every "archived N" / "restored N" figure ClawMem printed was inflated. The mutations
+were always correct; only the counts were wrong. If you parse that output, the numbers will
+now be smaller and accurate.
+
+---
+
+## v0.29.0: contradiction judge — a behavior change to check
+
+Schema changes (`judge_runs`, `judge_events`) auto-apply on first open; no re-embed or
+reindex. **One behavior change needs a decision from you:**
+
+**Contradiction analysis is now judge-gated.** It runs ONLY when `CLAWMEM_JUDGE_*` is
+configured, because the stock expansion model cannot meet the judge contract
+([details](inference-services.md#contradiction-judge)). Check which case you are in:
+
+- **Stock install** (wrapper defaults, or `CLAWMEM_LLM_URL` at the stock 1.7B): nothing to
+  do. No verdict ever applied on the stock model — you lose nothing and gain a skipped LLM
+  call per Stop hook. Configure a judge when you want contradiction analysis.
+- **Custom global LLM** (you pointed `CLAWMEM_LLM_URL`/`CLAWMEM_LLM_MODEL` at a larger or
+  cloud model): contradiction verdicts **may have been genuinely applying** through the
+  global endpoint, and after this upgrade they stop until you opt in. To keep the behavior,
+  configure the judge explicitly — e.g. the same endpoint, task-scoped:
+
+  ```bash
+  export CLAWMEM_JUDGE_URL="$CLAWMEM_LLM_URL"
+  export CLAWMEM_JUDGE_MODEL="your-model-id"        # required — no default on this lane
+  export CLAWMEM_JUDGE_API_KEY="$CLAWMEM_LLM_API_KEY"   # if the endpoint needs one
+  ```
+
+  ClawMem never adopts the global endpoint as a judge automatically — the judge vars are
+  also your data-egress consent (the judge receives new decisions + retrieved snippets).
+  `clawmem doctor` warns when it detects a custom global LLM with no judge configured (it
+  cannot detect a custom model served at the stock localhost endpoint — this notice is the
+  authoritative one).
+
+Also in this release: `CLAWMEM_CONTRADICTION_POLICY=supersede` now **requires a configured
+judge** — without one it is loudly constrained to the non-deactivating `link` policy and
+`clawmem doctor` reports it inactive. Run `clawmem doctor` after upgrading: it smoke-tests
+whatever judge you configure and reports the audit tables.
+
+---
+
+## v0.28.0: hook write-path contracts
+
+No migration, no re-embed, no config change. Drop-in.
+
+**One behavior change to be aware of:** `build_graphs` now reports `N new edge(s), M total`
+instead of `N edges`, and both the MCP tool and the REST endpoint gained `temporalTotal` /
+`semanticTotal` fields. The counts also changed meaning — they report rows actually written
+rather than insert attempts, so an idempotent rebuild now correctly reports 0 new edges (the
+standing total tells you the graph is populated). If you parse that text output, update it.
+
+Totals count only edges whose both endpoints are active, matching what the builders operate on.
+
+**Contradiction detection starts having an effect.** The hook always classified, but two contract
+defects discarded every verdict before it could mutate anything — it will now lower the confidence of documents a
+session's facts contradict (`-0.25`, floored at `0.2`). That is a ranking signal only; nothing
+leaves retrieval. (Superseded in v0.29.0: contradiction analysis now runs only when a judge is
+configured via `CLAWMEM_JUDGE_*` — see the v0.29.0 section above.) The terminal step that *does* remove a document from retrieval — invalidation —
+is **off by default** behind `CLAWMEM_CONTRADICTION_INVALIDATE` and logs `WOULD invalidate`
+instead of writing. Nothing to do on upgrade. Before arming it, calibrate against your own vault:
+[contradiction invalidation](contradiction-invalidation.md).
+
+## v0.27.0: authorship time (`authored_at`) + entity-edge IDF fix
+
+Drop-in; the `authored_at` column and its index auto-migrate on first open. What changes and what to know:
+
+- **Ranking recency now runs on effective time** — `authored_at` (when the content was originally written) when known, `modified_at` otherwise. Documents without `authored_at` behave exactly as before, so an existing vault is unaffected until content carries dates.
+- **New mines are dated automatically.** `clawmem mine` extracts per-message timestamps from Claude Code / codex / Claude.ai / ChatGPT / Slack exports and stamps each exchange chunk; synthesized facts inherit their source's date.
+- **Dating an already-mined vault:** either re-run `clawmem mine` over the same export directory — previously-mined documents take a metadata-only "dated" transition (no `modified_at` bump, no re-enrichment, no re-embed) — or run `clawmem mine <dir> -c <collection> --backfill-dates` (dry-run report), then `--backfill-dates --apply`. Both are safe to repeat; documents whose content no longer matches the source are skipped.
+- **Colliding source filenames are now disambiguated.** Two transcripts that sanitize to the same staging name (e.g. `a/b.jsonl` and `a_b.jsonl`) previously overwrote each other silently; they now mine under distinct hash-suffixed names. Non-colliding sources keep their existing names — no path churn.
+- **Hand-dated notes:** any indexed file may declare `authored_at:` in frontmatter (RFC3339 with timezone, or date-only `YYYY-MM-DD` = UTC midnight; quoted or unquoted). Removing the line clears the stored date on the next content change.
+- Temporal queries ("what did we plan in March"), the recent-decision windows (postcompact, session bootstrap, `clawmem reflect`, profile), and directory context all use effective time; operational clocks (dedup window, lifecycle sweeps, staleness review) intentionally do not.
+- Entity-graph enrichment now computes IDF over active documents only and never creates edges toward archived documents (completes the v0.25.0 hub-bias fix); existing edges are unaffected.
+
+## v0.26.0: offline eval harness + short memory-query fix
+
+No migration steps, no schema change, no re-embed — drop-in. Restart long-lived processes per the quick path. Behavior notes:
+
+- **New offline eval subsystem** (`clawmem eval run --gold <file.jsonl>`): replays gold-labeled queries through the real `query` tool handler and scores them (doc-level Jaccard, precision/recall@k, hit@k, MRR). Purely additive — no runtime surface changes; nothing to run unless you build a gold set. See [docs/guides/eval-harness.md](eval-harness.md).
+- **Short explicit memory queries now reach retrieval.** Prompts under 20 characters that match the memory-intent force patterns ("what did I say?", "recall …", "what's my email?") previously returned an empty `<vault-context>` from the length gate; they now run retrieval. Expect context injection on short memory questions that used to come back empty. Greetings, slash commands, and other short non-memory prompts are unchanged.
 
 ## v0.25.0: extraction retries + decision half-life + entity-neighbor ranking
 
@@ -529,7 +637,7 @@ None of these auto-enable. They are new capabilities gated behind environment va
 | Surprisal selector | v0.8.0 | `CLAWMEM_HEAVY_LANE_SURPRISAL=true`. Seeds Phase 2 with k-NN anomaly-ranked doc ids; falls back to stale-first (`surprisal-fallback-stale` metric) on vaults without embeddings. |
 | Post-import conversation synthesis | v0.7.2 | `clawmem mine <dir> --synthesize` flag. One-shot, not persistent. Runs a two-pass LLM pipeline over freshly imported conversation docs to extract structured decision / preference / milestone / problem facts with cross-fact relations. |
 | Consolidation worker | v0.7.1 | `CLAWMEM_ENABLE_CONSOLIDATION=true` (flag exists pre-v0.7.1). v0.7.1 attaches the new safety gates (Ext 1/2/3) to the existing Phase 2/3 path — enabling the flag picks up the gates automatically. |
-| Contradiction policy | v0.7.1 | `CLAWMEM_CONTRADICTION_POLICY=link` (default, keep both rows + insert `contradicts` edge) or `supersede` (mark old row `status='inactive'`). |
+| Contradiction policy | v0.7.1 (judge-gated v0.29.0) | `CLAWMEM_CONTRADICTION_POLICY=link` (default, keep both rows + set the old row's `invalidated_by` backlink) or `supersede` (mark old row `status='inactive'`; requires a configured judge since v0.29.0). |
 | Merge guard dry-run | v0.7.1 | `CLAWMEM_MERGE_GUARD_DRY_RUN=true` logs merge-safety rejections without enforcing — useful for calibration on older vaults before flipping the gate on. Leave `false` (default) to enforce. |
 
 Full environment variable reference: [`docs/reference/cli.md`](../reference/cli.md).

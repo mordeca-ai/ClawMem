@@ -4,8 +4,8 @@
  */
 
 import { parseArgs } from "util";
-import { existsSync, mkdirSync, readFileSync } from "fs";
-import { resolve as pathResolve, basename } from "path";
+import { existsSync, mkdirSync, readFileSync, statSync } from "fs";
+import { resolve as pathResolve, basename, relative as pathRelative } from "path";
 import { createHash } from "crypto";
 import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
 import { retryOnBusyAsync, isSqliteBusyError } from "./busy-retry.ts";
@@ -55,7 +55,11 @@ import {
   getConfigPath,
 } from "./collections.ts";
 import { formatSearchResults, type OutputFormat } from "./formatter.ts";
-import { indexCollection } from "./indexer.ts";
+import { runEval, IMPLEMENTED_PROFILES, EvalIntegrityError, type EvalProfile, type RunEvalResult } from "./eval/run.ts";
+import { GoldFileError } from "./eval/gold.ts";
+import { indexCollection, parseDocument, hashContent } from "./indexer.ts";
+import type { Store as StoreType } from "./store.ts";
+import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, HALF_LIVES, type EnrichedResult } from "./memory.ts";
 import { enrichResults, reciprocalRankFusion, toRanked, blendFusionAndRerank, hasStrongFtsSignal, ftsBypassEnabled, type RankedResult } from "./search-utils.ts";
@@ -73,7 +77,10 @@ import {
 import { readHookInput, writeHookOutput, makeEmptyOutput, type HookOutput } from "./hooks.ts";
 import { contextSurfacing } from "./hooks/context-surfacing.ts";
 import { sessionBootstrap } from "./hooks/session-bootstrap.ts";
-import { decisionExtractor } from "./hooks/decision-extractor.ts";
+import { decisionExtractor, unwrapContradictionArray, admitContradictionEntries } from "./hooks/decision-extractor.ts";
+import { resolveJudge, buildContradictionPrompt, extractJudgeJson, JUDGE_VERDICT_SCHEMA } from "./judge.ts";
+import { evaluateMergeContradiction, isActionableContradiction, resolveContradictionPolicy } from "./merge-guards.ts";
+import { judgeAuditCounts } from "./judge-audit.ts";
 import { handoffGenerator } from "./hooks/handoff-generator.ts";
 import { feedbackLoop } from "./hooks/feedback-loop.ts";
 import { stalenessCheck } from "./hooks/staleness-check.ts";
@@ -237,61 +244,6 @@ async function cmdCollectionRemove(args: string[]) {
   }
 }
 
-/**
- * Hard-delete a named collection's document/content/vector rows from the
- * index (master-harness-t5i0). This is the scoped-purge counterpart to
- * `collection remove` — `remove` only forgets the collection from
- * config.yaml (stops future indexing), it does NOT touch existing rows.
- * `purge` deletes the DB rows for exactly one named collection, active and
- * inactive, without risking any other collection's data — the operation a
- * disposable smoke-test / scratch collection teardown actually needs,
- * instead of reaching for the DB-wide cleanup commands.
- *
- * Destructive and irreversible (no lifecycle-restore path once purged), so
- * it requires --yes to actually execute; without it, prints a preview of
- * what would be deleted.
- */
-async function cmdCollectionPurge(args: string[]) {
-  const { values, positionals } = parseArgs({
-    args,
-    options: {
-      yes: { type: "boolean", default: false },
-    },
-    allowPositionals: true,
-  });
-
-  const name = positionals[0];
-  if (!name) die("Usage: clawmem collection purge <name> --yes");
-
-  const store = getStore();
-
-  const preview = store.db.prepare(`
-    SELECT
-      SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) as active,
-      SUM(CASE WHEN active = 0 THEN 1 ELSE 0 END) as inactive,
-      COUNT(*) as total
-    FROM documents WHERE collection = ?
-  `).get(name) as { active: number | null; inactive: number | null; total: number };
-
-  if (!preview.total) {
-    die(`No documents found for collection "${name}" — nothing to purge`);
-  }
-
-  if (!values.yes) {
-    console.log(`Would purge collection ${c.bold}${name}${c.reset}:`);
-    console.log(`  ${preview.active ?? 0} active, ${preview.inactive ?? 0} inactive document(s) (${preview.total} total)`);
-    console.log();
-    console.log(`${c.yellow}This is irreversible.${c.reset} Re-run with --yes to actually delete.`);
-    return;
-  }
-
-  const result = store.purgeCollection(name);
-  console.log(`${c.green}Purged collection '${name}'${c.reset}: ${result.documents} document(s), ${result.content} content row(s), ${result.vectors} vector row(s)`);
-  if (getCollection(name)) {
-    console.log(`${c.dim}Note: '${name}' is still configured in config.yaml — run 'clawmem collection remove ${name}' too if you don't want it re-indexed.${c.reset}`);
-  }
-}
-
 async function cmdUpdate(args: string[]) {
   const { values } = parseArgs({
     args,
@@ -338,6 +290,97 @@ async function cmdUpdate(args: string[]) {
   }
 }
 
+// =============================================================================
+// §51.1 D10 — mine/backfill shared identity derivation
+// =============================================================================
+
+/**
+ * One staging-content formatter for mine writes AND the backfill body-hash
+ * guard — a second formatter would drift and break the guard.
+ */
+function buildMineStagingContent(chunk: ConversationChunk): string {
+  const esc = (s: string) => s.replace(/"/g, '\\"');
+  return [
+    "---",
+    `title: "${esc(chunk.title)}"`,
+    `content_type: conversation`,
+    `source: "${esc(chunk.sourcePath)}"`,
+    ...(chunk.authoredAt ? [`authored_at: "${chunk.authoredAt}"`] : []),
+    "---",
+    "",
+    chunk.body,
+  ].join("\n");
+}
+
+/**
+ * Has this source ever produced suffixed chunks in the collection?
+ * Prepared prefix-range existence query over UNIQUE(collection, path) — NOT a
+ * raw LIKE (its % and _ wildcards would misread path characters). The probe
+ * prefix ends in "_" (0x5F); replacing that final character with backtick
+ * (0x60, its successor code point) gives exact bounds under SQLite binary text
+ * ordering. Active AND inactive rows both count: once suffixed, always suffixed.
+ */
+function suffixedPathExists(store: StoreType, collectionName: string, suffixedBase: string): boolean {
+  const lower = `${suffixedBase}_`;
+  const upper = `${suffixedBase}\``;
+  const row = store.db.prepare(
+    `SELECT 1 FROM documents WHERE collection = ? AND path >= ? AND path < ? LIMIT 1`
+  ).get(collectionName, lower, upper);
+  return row !== null && row !== undefined;
+}
+
+/**
+ * Decide each source's staging-name base ONCE per source, before any chunk name
+ * is derived. A source uses the suffixed scheme `<base>-h<8-hex sha256(relPosixPath)>`
+ * when (a) it collides with another source in the current batch after
+ * sanitization, or (b) any of its suffixed chunk paths already exist in the
+ * target collection — so group-membership changes (a collision partner removed,
+ * a transcript growing new chunks) can never flip an already-suffixed source
+ * back to the legacy namespace. Also fixes the pre-existing silent overwrite:
+ * two sources sanitizing to one staging name used to clobber each other's
+ * chunks via concurrent Bun.write.
+ */
+function deriveMineIdentity(
+  sourceRelPaths: string[],
+  store: StoreType,
+  collectionName: string
+): Map<string, { base: string; suffixed: boolean }> {
+  const norm = (p: string) => p.replace(/\\/g, "/");
+  const sanitize = (p: string) => p.replace(/[\/\\]/g, "_").replace(/\.[^.]+$/, "");
+
+  const bySafe = new Map<string, string[]>();
+  for (const rel of [...new Set(sourceRelPaths)]) {
+    const safe = sanitize(norm(rel));
+    const list = bySafe.get(safe) ?? [];
+    list.push(rel);
+    bySafe.set(safe, list);
+  }
+
+  const out = new Map<string, { base: string; suffixed: boolean }>();
+  for (const [safe, rels] of bySafe) {
+    for (const rel of rels) {
+      const relPosix = norm(rel);
+      const hash8 = new Bun.CryptoHasher("sha256").update(relPosix).digest("hex").slice(0, 8);
+      const suffixedBase = `${safe}-h${hash8}`;
+      const suffixed = rels.length > 1 || suffixedPathExists(store, collectionName, suffixedBase);
+      out.set(rel, { base: suffixed ? suffixedBase : safe, suffixed });
+    }
+  }
+
+  // Final output-name uniqueness assertion: an 8-hex hash collision (or a file
+  // literally named like another source's suffixed base) is a hard error —
+  // never a silent overwrite.
+  const seen = new Map<string, string>();
+  for (const [rel, id] of out) {
+    const prior = seen.get(id.base);
+    if (prior !== undefined) {
+      die(`mine: staging name collision between "${prior}" and "${rel}" (base "${id.base}") — cannot derive unique identities`);
+    }
+    seen.set(id.base, rel);
+  }
+  return out;
+}
+
 async function cmdMine(args: string[]) {
   const { values, positionals } = parseArgs({
     args,
@@ -347,12 +390,14 @@ async function cmdMine(args: string[]) {
       "dry-run": { type: "boolean", default: false },
       synthesize: { type: "boolean", default: false },
       "synthesis-max-docs": { type: "string" },
+      "backfill-dates": { type: "boolean", default: false },
+      apply: { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
 
   const dir = positionals[0];
-  if (!dir) die("Usage: clawmem mine <directory> [-c collection-name] [--embed] [--dry-run] [--synthesize] [--synthesis-max-docs N]");
+  if (!dir) die("Usage: clawmem mine <directory> [-c collection-name] [--embed] [--dry-run] [--synthesize] [--synthesis-max-docs N] | --backfill-dates [--apply]");
   const absDir = pathResolve(dir);
   if (!existsSync(absDir)) die(`Directory not found: ${absDir}`);
 
@@ -366,7 +411,7 @@ async function cmdMine(args: string[]) {
   // Normalize and chunk
   let totalChunks = 0;
   let totalConversations = 0;
-  const allChunks: { title: string; body: string; sourcePath: string; chunkIndex: number }[] = [];
+  const allChunks: ConversationChunk[] = [];
 
   for (const file of files) {
     const conv = normalizeFile(file);
@@ -378,7 +423,9 @@ async function cmdMine(args: string[]) {
 
     console.log(`  ${c.green}✓${c.reset} ${conv.source} (${conv.format}, ${conv.messages.length} messages → ${chunks.length} chunks)`);
     for (const chunk of chunks) {
-      chunk.sourcePath = file.replace(absDir + "/", "");
+      // §51.1 D10: relative POSIX form — identity hashes must not depend on
+      // the machine's absolute path or separator style.
+      chunk.sourcePath = pathRelative(absDir, file).replace(/\\/g, "/");
     }
     allChunks.push(...chunks);
     totalChunks += chunks.length;
@@ -387,42 +434,47 @@ async function cmdMine(args: string[]) {
   if (totalConversations === 0) die("No conversation files could be parsed");
   console.log(`\n${c.bold}Parsed:${c.reset} ${totalConversations} conversations → ${totalChunks} exchange chunks`);
 
+  const collectionName = values.collection || "conversations";
+
+  // §51.1 D10 — exclusive backfill mode: derive authored_at for already-mined
+  // docs from their source transcripts. Metadata-only; dry-run by default.
+  if (values["backfill-dates"]) {
+    if (values.embed || values.synthesize || values["dry-run"] || values["synthesis-max-docs"]) {
+      die("--backfill-dates is an exclusive mode (dry-run by default; --apply executes) — it cannot combine with --embed, --synthesize, --dry-run, or --synthesis-max-docs");
+    }
+    runBackfillDates(allChunks, collectionName, values.apply as boolean);
+    return;
+  }
+  if (values.apply) die("--apply only applies to --backfill-dates");
+
   if (values["dry-run"]) {
     console.log(`${c.yellow}Dry run — no changes made${c.reset}`);
     return;
   }
 
   // Write chunks as markdown to a staging directory (outside source tree), then index
-  const collectionName = values.collection || "conversations";
   const { tmpdir } = await import("os");
   const stagingDir = pathResolve(tmpdir(), `clawmem-mine-${Date.now()}`);
   mkdirSync(stagingDir, { recursive: true });
 
   const { rmSync } = await import("fs");
+  const s = getStore();
+  // §51.1 D10: per-source identity decided before any chunk name is derived
+  const identity = deriveMineIdentity(allChunks.map(ch => ch.sourcePath), s, collectionName);
   try {
     const writePromises: Promise<number>[] = [];
     for (const chunk of allChunks) {
-      const safeSource = chunk.sourcePath.replace(/[\/\\]/g, "_").replace(/\.[^.]+$/, "");
-      const filename = `${safeSource}_${String(chunk.chunkIndex).padStart(4, "0")}.md`;
-      const esc = (s: string) => s.replace(/"/g, '\\"');
-      const frontmatter = [
-        "---",
-        `title: "${esc(chunk.title)}"`,
-        `content_type: conversation`,
-        `source: "${esc(chunk.sourcePath)}"`,
-        "---",
-        "",
-        chunk.body,
-      ].join("\n");
-      writePromises.push(Bun.write(pathResolve(stagingDir, filename), frontmatter));
+      const id = identity.get(chunk.sourcePath)!;
+      const filename = `${id.base}_${String(chunk.chunkIndex).padStart(4, "0")}.md`;
+      writePromises.push(Bun.write(pathResolve(stagingDir, filename), buildMineStagingContent(chunk)));
     }
     await Promise.all(writePromises);
 
     // Index through existing pipeline
-    const s = getStore();
     console.log(`\n${c.cyan}Indexing ${totalChunks} conversation chunks${c.reset} as collection '${collectionName}'`);
     const stats = await indexCollection(s, collectionName, stagingDir, "**/*.md");
-    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged`);
+    const datedNote = stats.dated > 0 ? `, ${c.cyan}◷${stats.dated}${c.reset} dated` : "";
+    console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged${datedNote}`);
 
     // Ext 4 — post-import conversation synthesis (opt-in via --synthesize)
     // Runs AFTER indexCollection has committed. Failure is non-fatal and never
@@ -707,6 +759,77 @@ export async function runBatchedEmbed(
   }
 
   return { embedded, totalFragments, failedFragments, requestCount };
+}
+
+/**
+ * §51.1 D10 — recoverable-only authored_at backfill.
+ *
+ * Matches already-mined documents to their re-derived chunks via the shared
+ * identity derivation, then applies a metadata-only UPDATE of authored_at.
+ * Guards (all mandatory): the naming rule's collision handling; body-hash
+ * equality (parser/chunker evolution can shift chunk indices while preserving
+ * filenames — a mismatched chunk is skipped, never guessed); exact
+ * collection+path match; idempotence. Never touches hash/content/modified_at/
+ * stored confidence/embeddings. Dry-run by default; one transaction on --apply.
+ */
+function runBackfillDates(allChunks: ConversationChunk[], collectionName: string, apply: boolean): void {
+  const s = getStore();
+  const identity = deriveMineIdentity(allChunks.map(ch => ch.sourcePath), s, collectionName);
+
+  const counts = { chunks: 0, noDate: 0, unmatched: 0, bodyMismatch: 0, unchanged: 0 };
+  const updates: { id: number; authoredAt: string; expectedHash: string; path: string }[] = [];
+
+  for (const chunk of allChunks) {
+    counts.chunks++;
+    if (!chunk.authoredAt) { counts.noDate++; continue; }
+    const id = identity.get(chunk.sourcePath)!;
+    const path = `${id.base}_${String(chunk.chunkIndex).padStart(4, "0")}.md`;
+    const row = s.db.prepare(
+      `SELECT id, hash, authored_at FROM documents WHERE collection = ? AND path = ? AND active = 1`
+    ).get(collectionName, path) as { id: number; hash: string; authored_at: string | null } | null;
+    if (!row) { counts.unmatched++; continue; }
+
+    // Body-hash equality guard — rebuild the staging content and parse it
+    // through the SAME pipeline the indexer used, so the comparison cannot
+    // drift from what was actually hashed at mine time.
+    const { body } = parseDocument(buildMineStagingContent(chunk), path);
+    const expectedHash = hashContent(body);
+    if (expectedHash !== row.hash) { counts.bodyMismatch++; continue; }
+
+    if (row.authored_at === chunk.authoredAt) { counts.unchanged++; continue; }
+    updates.push({ id: row.id, authoredAt: chunk.authoredAt, expectedHash, path });
+  }
+
+  console.log(`\n${c.bold}Backfill dates${c.reset} (collection '${collectionName}'${apply ? "" : ", DRY RUN"}):`);
+  console.log(`  ${counts.chunks} chunks scanned — ${c.green}${updates.length}${c.reset} to update, ${c.dim}${counts.unchanged} already set, ${counts.noDate} without source timestamps${c.reset}, ${c.yellow}${counts.unmatched} unmatched${c.reset}, ${c.red}${counts.bodyMismatch} body-mismatch skipped${c.reset}`);
+
+  if (!apply) {
+    if (updates.length > 0) console.log(`  Run again with ${c.cyan}--apply${c.reset} to write.`);
+    return;
+  }
+  if (updates.length === 0) { console.log("  Nothing to write."); return; }
+
+  // Guarded, transactional apply: the UPDATE re-asserts the validated hash and
+  // active state so a concurrent mine/index between validation and write can
+  // never attach a source timestamp to content that did not pass the guard.
+  // BEGIN IMMEDIATE takes the write lock up front.
+  let applied = 0;
+  s.db.exec("BEGIN IMMEDIATE");
+  try {
+    const stmt = s.db.prepare(
+      `UPDATE documents SET authored_at = ? WHERE id = ? AND hash = ? AND active = 1`
+    );
+    for (const u of updates) {
+      applied += stmt.run(u.authoredAt, u.id, u.expectedHash).changes;
+    }
+    s.db.exec("COMMIT");
+  } catch (err) {
+    s.db.exec("ROLLBACK");
+    throw err;
+  }
+  const raced = updates.length - applied;
+  console.log(`  ${c.green}✓${c.reset} ${applied} document(s) dated (metadata-only — modified_at/embeddings untouched)`);
+  if (raced > 0) console.log(`  ${c.yellow}⚠${c.reset} ${raced} document(s) changed concurrently and were skipped — re-run to reconcile`);
 }
 
 // SQLITE_BUSY retry helper lives in busy-retry.ts (testable — importing THIS module runs
@@ -1514,6 +1637,97 @@ function printResults(results: Array<{ displayPath: string; title: string; compo
 }
 
 // =============================================================================
+// Offline eval harness (HORMA-1)
+// =============================================================================
+
+async function cmdEval(args: string[]) {
+  const usage = "Usage: clawmem eval run --gold <file.jsonl> [--profile query] [--limit N] [--min-examples N] [--audited] [--out <dir>] [--db <path>] [--json]";
+  const sub = args[0];
+  if (sub !== "run") die(usage);
+
+  const { values } = parseArgs({
+    args: args.slice(1),
+    options: {
+      gold: { type: "string" },
+      profile: { type: "string", default: "query" },
+      limit: { type: "string", default: "10" },
+      "min-examples": { type: "string", default: "30" },
+      audited: { type: "boolean", default: false },
+      out: { type: "string" },
+      db: { type: "string" },
+      json: { type: "boolean", default: false },
+    },
+  });
+
+  if (!values.gold) die(usage);
+  const profile = values.profile!;
+  if (!(IMPLEMENTED_PROFILES as readonly string[]).includes(profile)) {
+    die(`Profile "${profile}" is not implemented yet — the first build replays "query" only (intent/context/raw/structured are follow-on phases).`);
+  }
+  // Number() rejects trailing garbage ("10x" → NaN) and Number.isInteger
+  // rejects fractions ("1.5") — parseInt would silently accept both.
+  const limit = Number(values.limit);
+  const minExamples = Number(values["min-examples"]);
+  if (!Number.isInteger(limit) || limit < 1) die("--limit must be a positive integer");
+  if (!Number.isInteger(minExamples) || minExamples < 1) die("--min-examples must be a positive integer");
+
+  // Point BOTH the resolution store and the replay server at a snapshot DB
+  // (e.g. a VACUUM INTO copy) for frozen runs. Must land before any store
+  // opens — and must already exist as a file, or createStore would silently
+  // create an EMPTY vault at the typo'd path and score everything 0.
+  if (values.db) {
+    const dbPath = pathResolve(values.db);
+    if (!existsSync(dbPath) || !statSync(dbPath).isFile()) die(`--db snapshot not found (or not a file): ${dbPath}`);
+    process.env.INDEX_PATH = dbPath;
+  }
+
+  const goldPath = pathResolve(values.gold);
+  if (!existsSync(goldPath)) die(`Gold file not found: ${goldPath}`);
+
+  const s = getStore();
+  let result: RunEvalResult;
+  try {
+    result = await runEval({
+      goldPath,
+      profile: profile as EvalProfile,
+      limit,
+      minExamples,
+      audited: values.audited,
+      outDir: values.out ? pathResolve(values.out) : pathResolve(`eval-runs/${new Date().toISOString().replace(/[:.]/g, "-")}-${profile}`),
+      store: s,
+    });
+  } catch (e) {
+    if (e instanceof GoldFileError || e instanceof EvalIntegrityError) die(e.message);
+    throw e;
+  } finally {
+    await disposeDefaultLlamaCpp();
+  }
+
+  const { report, artifacts } = result;
+  if (values.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    const a = report.aggregate;
+    const n = (v: number | null, d = 3) => (v === null ? "—" : v.toFixed(d));
+    console.log(`${c.bold}eval run ${report.run_id}${c.reset} (profile ${report.profile}, k=${report.limit})`);
+    console.log(`  examples: ${report.examples_scored} scored / ${report.examples_total} total` +
+      (report.skipped.length ? ` · ${report.skipped.length} skipped` : "") +
+      (report.unresolved_gold.length ? ` · ${c.red}${report.unresolved_gold.length} unresolved${c.reset}` : ""));
+    console.log(`  J_doc ${c.cyan}${n(a.jaccard_mean)}${c.reset} · recall@k ${c.cyan}${n(a.recall_mean)}${c.reset} · precision@k ${n(a.precision_mean)} · hit@k ${n(a.hit_at_k)} · MRR ${c.cyan}${n(a.mrr)}${c.reset} · p95 ${n(a.elapsed_ms_p95, 0)}ms`);
+    console.log(`  gates: ${report.gates.pass ? `${c.green}PASS${c.reset}` : `${c.red}FAIL${c.reset} — ${report.gates.reasons.join("; ")}`}`);
+    if (artifacts) {
+      console.log(`  ${c.dim}wrote ${artifacts.runJsonPath}${c.reset}`);
+      console.log(`  ${c.dim}wrote ${artifacts.reportMdPath}${c.reset}`);
+    }
+  }
+
+  // A failed trust gate must be machine-visible, not just printed — automation
+  // treating exit 0 as "trustworthy number" is exactly what the gate prevents.
+  // exitCode (not exit()) so the dispatcher's finally/cleanup still runs.
+  if (!report.gates.pass) process.exitCode = 1;
+}
+
+// =============================================================================
 // Hook dispatch
 // =============================================================================
 
@@ -1529,6 +1743,16 @@ const CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS = 1500;
 async function cmdHook(args: string[]) {
   const hookName = args[0];
   if (!hookName) die("Usage: clawmem hook <name>");
+
+  // v0.29.0 judge recursion guard: a claude-cli judge spawn sets this marker in the
+  // child env. A nested session's ClawMem hooks must no-op BEFORE stdin is read or
+  // the store is opened — otherwise a judge call inside a Stop hook could recurse
+  // into another judge spawn. Central here so EVERY hook is covered.
+  if (process.env.CLAWMEM_JUDGE_SPAWN === "1") {
+    console.error(`[clawmem] hook ${hookName} skipped: running inside a judge spawn (CLAWMEM_JUDGE_SPAWN=1)`);
+    writeHookOutput(makeEmptyOutput(hookName));
+    return;
+  }
 
   const input = await readHookInput();
   // Open the store capped from the START for the context-surfacing hook (not just after open via the
@@ -2817,6 +3041,121 @@ async function cmdDoctor() {
     }
   }
 
+  // 10. Contradiction judge (v0.29.0). A SMOKE TEST, never capability
+  // certification: three fixture scenarios through the configured judge, zero
+  // store involvement. Runs ONLY when a judge is configured — the default lane
+  // is never probed (no reliable non-downloading cache detector exists, and the
+  // stock model's verdict is established and documented).
+  try {
+    const resolution = resolveJudge();
+    const configuredPolicy = resolveContradictionPolicy();
+    if (resolution.status === "unconfigured") {
+      console.log(
+        `${c.yellow}!${c.reset} Contradiction judge: not configured — contradiction analysis is ` +
+        `DISABLED (the stock expansion model cannot meet the judge contract). ` +
+        `Set CLAWMEM_JUDGE_* to enable: docs/guides/inference-services.md`,
+      );
+      // Migration warning (§J1): a capable GLOBAL LLM may have produced real verdicts
+      // before v0.29.0 decoupled the judge from CLAWMEM_LLM_*. Provenance-aware — the
+      // wrapper marks its own stock default; a custom model served AT the stock
+      // endpoint is undetectable, so upgrading.md remains the authoritative notice.
+      const urlSource = process.env.CLAWMEM_LLM_URL_SOURCE;
+      const llmUrl = process.env.CLAWMEM_LLM_URL;
+      const llmModel = process.env.CLAWMEM_LLM_MODEL?.trim();
+      const userSuppliedUrl = !!llmUrl && urlSource !== "default" && llmUrl !== "http://localhost:8089";
+      const nonStockModel = !!llmModel && llmModel !== "qwen3";
+      if (userSuppliedUrl || nonStockModel) {
+        console.log(
+          `${c.yellow}!${c.reset} Migration: a custom global LLM is configured ` +
+          `(${userSuppliedUrl ? llmUrl : `model=${llmModel}`}) but no judge is. If it was doing ` +
+          `real contradiction analysis before v0.29.0, set CLAWMEM_JUDGE_* to keep it — the ` +
+          `judge no longer rides the global vars (docs/guides/upgrading.md).`,
+        );
+      }
+      if (configuredPolicy === "supersede") {
+        console.log(
+          `${c.yellow}!${c.reset} CLAWMEM_CONTRADICTION_POLICY=supersede is configured but ` +
+          `presently INACTIVE (no judge) — merge contradictions are constrained to ` +
+          `non-deactivating 'link'.`,
+        );
+      }
+    } else if (resolution.status === "invalid") {
+      console.log(`${c.red}✗${c.reset} Contradiction judge: misconfigured — ${resolution.error}`);
+      issues++;
+    } else {
+      const judge = resolution.judge;
+      const d = judge.descriptor;
+      const scenarioA = {
+        newFacts: ["Decided: the ingestion worker now writes directly to Postgres; the Redis queue layer is removed entirely."],
+        existing: ["Decided: all ingestion must go through the Redis queue; workers never write directly to Postgres."],
+      };
+      const scenarioB = {
+        newFacts: ["Decided: bump the frontend to Tailwind v4 in the next sprint."],
+        existing: ["Observation: the nightly backup cron runs at 03:00 and rotates 7 snapshots."],
+      };
+      const runPair = async (sc: { newFacts: string[]; existing: string[] }) => {
+        const prompt = buildContradictionPrompt({ newFacts: sc.newFacts, existingSnippets: sc.existing, minConfidence: 0.7 });
+        const res = await judge.judge({ system: prompt.system, user: prompt.user, schema: JUDGE_VERDICT_SCHEMA });
+        if (!res.ok) return { ok: false as const, detail: `${res.reason}: ${res.detail}` };
+        if (res.truncated) return { ok: false as const, detail: "response truncated" };
+        const parsed = unwrapContradictionArray(extractJudgeJson(res.text));
+        if (!Array.isArray(parsed)) return { ok: false as const, detail: "response is not a JSON array" };
+        const batch = admitContradictionEntries(parsed, sc.existing.length, sc.newFacts.length);
+        return { ok: true as const, parsed, batch };
+      };
+
+      const a = await runPair(scenarioA);
+      // A CLEAN response is required — one raw entry, one admitted, zero
+      // rejected/duplicate/inconsistent. A right answer wrapped in schema junk
+      // or repeats is not a passing judge (code-review t1 finding 5).
+      const aPass = a.ok && a.parsed.length === 1 && a.batch.accepted.length === 1 &&
+        a.batch.rejected === 0 && a.batch.duplicates === 0 && a.batch.inconsistent === 0 &&
+        a.batch.accepted[0].relation === "contradiction" &&
+        a.batch.accepted[0].new_idx === 0 && a.batch.accepted[0].old_idx === 0 &&
+        a.batch.accepted[0].confidence >= 0.7;
+      const b = await runPair(scenarioB);
+      // ANY verdict on unrelated facts — even a low-confidence `same` — is fabrication.
+      const bPass = b.ok && b.parsed.length === 0;
+      const cEval = await evaluateMergeContradiction(resolution, scenarioA.existing[0]!, scenarioA.newFacts[0]!);
+      const cRun = cEval.kind === "decided" ? cEval.runs[cEval.runs.length - 1] : undefined;
+      const cPass = cEval.kind === "decided" && cEval.result.source === "llm" &&
+        isActionableContradiction(cEval.result) &&
+        (cRun?.entriesAdmitted ?? 0) === 1 && (cRun?.entriesRejected ?? 1) === 0 &&
+        (cRun?.entriesDuplicate ?? 1) === 0 && (cRun?.entriesInconsistent ?? 1) === 0;
+
+      if (aPass && bPass && cPass) {
+        console.log(
+          `${c.green}✓${c.reset} Contradiction judge: ${d.lane}/${d.model} passed the smoke test ` +
+          `(designed contradiction detected, unrelated control clean, merge contract actionable). ` +
+          `${c.dim}Smoke test only — not capability certification.${c.reset}`,
+        );
+      } else {
+        const parts = [
+          aPass ? null : `scenario A (designed contradiction): ${a.ok ? 'no valid (0,0,"contradiction") verdict at ≥ 0.7' : a.detail}`,
+          bPass ? null : `scenario B (unrelated control): ${b.ok ? "fabricated a verdict on unrelated facts" : b.detail}`,
+          cPass ? null : `scenario C (merge single-pair): not actionable via the judge`,
+        ].filter(Boolean);
+        console.log(
+          `${c.red}✗${c.reset} Contradiction judge: ${d.lane}/${d.model} FAILED the smoke test — ` +
+          `${parts.join("; ")}. Rejects stay fail-closed, but this judge is not fit to rely on. ` +
+          `See docs/guides/inference-services.md.`,
+        );
+        issues++;
+      }
+      if (configuredPolicy === "supersede") {
+        console.log(`${c.dim}   supersede policy: ACTIVE (judge configured)${c.reset}`);
+      }
+    }
+    // Durable audit rows — the evidence calibration reads.
+    try {
+      const s = getStore();
+      const counts = judgeAuditCounts(s.db);
+      console.log(`${c.dim}   judge audit: ${counts.runs} run(s), ${counts.events} event(s)${counts.oldestTs ? `, oldest ${counts.oldestTs}` : ""}${c.reset}`);
+    } catch { /* audit tables absent on pre-0.29.0 vaults — non-fatal */ }
+  } catch (err) {
+    console.log(`${c.yellow}!${c.reset} Contradiction judge: could not probe (${(err as Error).message})`);
+  }
+
   console.log();
   if (issues > 0) {
     console.log(`${c.yellow}${issues} issue(s) found.${c.reset}`);
@@ -3137,7 +3476,6 @@ async function main() {
           case "add": await cmdCollectionAdd(subSubArgs); break;
           case "list": await cmdCollectionList(); break;
           case "remove": await cmdCollectionRemove(subSubArgs); break;
-          case "purge": await cmdCollectionPurge(subSubArgs); break;
           default: die("Usage: clawmem collection <add|list|remove|purge>");
         }
         break;
@@ -3165,6 +3503,9 @@ async function main() {
         break;
       case "query":
         await cmdQuery(subArgs);
+        break;
+      case "eval":
+        await cmdEval(subArgs);
         break;
       case "hook":
         await cmdHook(subArgs);
@@ -3314,12 +3655,16 @@ async function cmdLifecycle(args: string[]) {
         return;
       }
 
+      // Archival only. ClawMem no longer physically deletes document rows from any code
+      // path — see the retention note in src/store.ts. `purge_after_days` is inert.
       const archived = store.archiveDocuments(candidates.map(c => c.id));
-      let purged = 0;
+      console.log(`Lifecycle sweep: archived ${archived} document(s). Nothing was deleted.`);
       if (policy.purge_after_days) {
-        purged = store.purgeArchivedDocuments(policy.purge_after_days);
+        console.log(
+          `  Note: purge_after_days=${policy.purge_after_days} is set but INERT — ClawMem no ` +
+          `longer deletes rows. Archived docs stay restorable (clawmem lifecycle restore).`
+        );
       }
-      console.log(`Lifecycle sweep: archived ${archived}, purged ${purged}`);
       break;
     }
 
@@ -3399,8 +3744,9 @@ async function cmdReflect(args: string[]) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - days);
 
-  const recentDocs = store.getDocumentsByType("decision", 50)
-    .filter(d => d.modifiedAt && d.modifiedAt >= cutoff.toISOString());
+  // §51.1 D13: reflection is about when content was authored, not when it was filed
+  const recentDocs = store.getDocumentsByType("decision", 50, { orderBy: "effective" })
+    .filter(d => d.effectiveAt && d.effectiveAt >= cutoff.toISOString());
 
   if (recentDocs.length === 0) {
     console.log(`No decisions found in the last ${days} days.`);
@@ -3454,13 +3800,13 @@ async function cmdReflect(args: string[]) {
   }
 
   // Also report antipatterns
-  const antiDocs = store.getDocumentsByType("antipattern", 10)
-    .filter(d => d.modifiedAt && d.modifiedAt >= cutoff.toISOString());
+  const antiDocs = store.getDocumentsByType("antipattern", 10, { orderBy: "effective" })
+    .filter(d => d.effectiveAt && d.effectiveAt >= cutoff.toISOString());
 
   if (antiDocs.length > 0) {
     console.log(`\n${c.bold}Recent Antipatterns (${antiDocs.length}):${c.reset}`);
     for (const d of antiDocs) {
-      console.log(`  ${c.red}●${c.reset} ${d.title} (${d.modifiedAt?.slice(0, 10)})`);
+      console.log(`  ${c.red}●${c.reset} ${d.title} (${d.effectiveAt?.slice(0, 10)})`);
     }
   }
 
@@ -3840,7 +4186,6 @@ ${c.bold}Setup:${c.reset}
   clawmem collection add <path> --name <name>
   clawmem collection list
   clawmem collection remove <name>     Forget the collection in config.yaml (does NOT delete indexed rows)
-  clawmem collection purge <name> [--yes]  Hard-delete a collection's rows (active+inactive, irreversible)
   clawmem setup hooks [--remove]       Install/remove Claude Code hooks
   clawmem setup mcp [--remove]         Register/remove MCP in ~/.claude.json
   clawmem setup openclaw [--link] [--remove]   Install/remove ClawMem as OpenClaw memory plugin
@@ -3848,7 +4193,8 @@ ${c.bold}Setup:${c.reset}
 
 ${c.bold}Indexing:${c.reset}
   clawmem update [--pull] [--embed]    Re-scan collections (--embed auto-embeds)
-  clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (Claude, ChatGPT, Slack); --synthesize runs post-import LLM fact extraction
+  clawmem mine <dir> [-c name] [--embed] [--synthesize]  Import conversation exports (Claude, ChatGPT, Slack); --synthesize runs post-import LLM fact extraction; preserves per-exchange authored_at
+  clawmem mine <dir> -c name --backfill-dates [--apply]  Derive authored_at for already-mined docs from source transcripts (metadata-only; dry-run without --apply)
   clawmem embed [-f]                   Generate fragment embeddings
   clawmem reindex [--force] [--enrich]  Full re-index (--enrich: run entity extraction + links on all docs)
   clawmem watch                        File watcher daemon
@@ -3861,6 +4207,9 @@ ${c.bold}Search:${c.reset}
     -c/--collection fences retrieval to the named collection(s). Without it,
     a session focus (clawmem focus set <collection>) auto-scopes to that
     collection when the focus topic names one.
+
+${c.bold}Eval:${c.reset}
+  clawmem eval run --gold <file.jsonl> [--limit N] [--audited] [--out DIR] [--db <snapshot>]  Replay gold-labeled queries through the live pipeline (J_doc/recall/MRR); exits 1 when the trust gate fails
 
 ${c.bold}Memory:${c.reset}
   clawmem list [-n/--limit N] [-c col]  Browse recent documents (--json for machine output)

@@ -70,9 +70,13 @@ export async function stalenessCheck(
           });
         }
       }
-      if (config.lifecycle.purge_after_days && !config.lifecycle.dry_run) {
-        store.purgeArchivedDocuments(config.lifecycle.purge_after_days);
-      }
+      // No physical deletion here, regardless of `purge_after_days` — which is inert as of
+      // v0.30.0, because ClawMem deletes no document row on any path.
+      //
+      // This hook ran the delete until v0.30.0, and was the worst possible host for it:
+      // unattended on SessionStart, no model and no operator in the loop, the count
+      // discarded, all inside the silent catch below. Archival above is reversible via
+      // `lifecycle_restore`; a delete is not. See the retention note in src/store.ts.
     }
   } catch {
     // Fail-open: lifecycle errors never block the hook

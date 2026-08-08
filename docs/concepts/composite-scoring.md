@@ -33,7 +33,7 @@ Raw relevance from the search backend — BM25, vector cosine similarity, or RRF
 
 ### Recency score (0.0 - 1.0)
 
-Exponential decay based on document age and content type half-life:
+Exponential decay based on document age and content type half-life. **Age is measured on effective time (v0.27.0): `authored_at` — when the content was originally written — when known, `modified_at` otherwise.** Mined conversations and synthesized facts carry `authored_at` from their source transcripts, and any vault file can declare it in frontmatter, so historical content ranks by its true age instead of its filing date. The confidence signal's internal recency uses the same effective date; all operational clocks (the dedup window, lifecycle sweeps, the attention-decay access sentinel) stay on filing/update time.
 
 | Content type | Half-life | Behavior |
 |-------------|-----------|----------|
@@ -52,7 +52,7 @@ Half-lives extend up to 3x for frequently-accessed memories (access reinforcemen
 
 Starts at 0.5 for new documents. Adjusted by:
 
-- **Contradiction detection** — when `decision-extractor` finds a new decision contradicting an old one, the old decision's confidence is lowered. The consolidation worker applies an additional merge-time contradiction gate (v0.7.1): before merging a new pattern into an existing consolidated observation, it checks for contradictions via a deterministic heuristic plus an LLM confirmation. Contradictory merges are blocked and either linked via a `contradicts` edge (default) or supersede the old row with `status='inactive'` (see [consolidation safety](architecture.md#consolidation-safety-v071)).
+- **Contradiction detection** (judge-gated since v0.29.0 — requires `CLAWMEM_JUDGE_*`) — when `decision-extractor` finds a new decision contradicting an old one, the old decision's confidence is lowered. The consolidation worker applies an additional merge-time contradiction gate (v0.7.1): before merging a new pattern into an existing consolidated observation, it checks for contradictions via the configured judge (deterministic heuristic only, `link`-constrained, without one). Contradictory merges are blocked and either linked via the old row's `invalidated_by` backlink (default) or supersede the old row with `status='inactive'` (judge required; see [consolidation safety](architecture.md#consolidation-safety-v071)).
 - **Feedback loop** — referenced notes get confidence boosts
 - **Attention decay** — non-durable types (handoff, progress, conversation, note, project) lose 5% confidence per week without access. Decision, deductive, preference, hub, research, and antipattern types are exempt.
 

@@ -602,6 +602,7 @@ This is the recommended entry point for ALL memory queries.`,
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+          authored_at: r.authoredAt ?? null,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
         return { content: [{ type: "text", text: formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query) }], structuredContent: { results: items, scoreBasis: sScoreBasis } };
@@ -682,6 +683,7 @@ This is the recommended entry point for ALL memory queries.`,
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+          authored_at: r.authoredAt ?? null,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
         return { content: [{ type: "text", text: `${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${vsDegradedNote}` }], structuredContent: { results: items, scoreBasis: vsScoreBasis, ...vsDegraded } };
@@ -802,18 +804,21 @@ This is the recommended entry point for ALL memory queries.`,
         const temporalExclSql = excl && excl.length > 0
           ? ` AND d.collection NOT IN (${excl.map(() => '?').join(',')})`
           : "";
+        // §51.1: the proximity channel measures content time — authorship when
+        // known, filing time otherwise — in the WHERE, the ORDER, and the
+        // proximity math itself.
         const temporalDocs = store.db.prepare(`
           SELECT 'clawmem://' || d.collection || '/' || d.path as filepath,
                  d.collection || '/' || d.path as displayPath,
-                 d.title, d.modified_at
+                 d.title, COALESCE(d.authored_at, d.modified_at) as effective_at
           FROM documents d
-          WHERE d.active = 1 AND d.invalidated_at IS NULL AND d.modified_at >= ? AND d.modified_at <= ?${temporalExclSql}
-          ORDER BY d.modified_at DESC LIMIT 30
-        `).all(dateRange.start, dateRange.end, ...(excl ?? [])) as { filepath: string; displayPath: string; title: string; modified_at: string }[];
+          WHERE d.active = 1 AND d.invalidated_at IS NULL AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?${temporalExclSql}
+          ORDER BY COALESCE(d.authored_at, d.modified_at) DESC LIMIT 30
+        `).all(dateRange.start, dateRange.end, ...(excl ?? [])) as { filepath: string; displayPath: string; title: string; effective_at: string }[];
 
         if (temporalDocs.length > 0) {
           const temporalRanked: RankedResult[] = temporalDocs.map(d => {
-            const docMs = new Date(d.modified_at).getTime();
+            const docMs = new Date(d.effective_at).getTime();
             const proximity = 1.0 - Math.min(1.0, Math.abs(docMs - centerMs) / rangeMs);
             return { file: d.filepath, displayPath: d.displayPath, title: d.title, body: "", score: proximity };
           });
@@ -956,6 +961,7 @@ This is the recommended entry point for ALL memory queries.`,
           docid: `#${docidMap.get(r.filepath) || r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+          authored_at: r.authoredAt ?? null,
           fragment: r.fragmentType ? { type: r.fragmentType, label: r.fragmentLabel } : undefined,
         }));
         return { content: [{ type: "text", text: `${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${queryDegradedNote}` }], structuredContent: { results: items, ...queryDegraded } };
@@ -1460,7 +1466,7 @@ This is the recommended entry point for ALL memory queries.`,
     async ({ vault }) => {
       const store = getStore(vault);
       const collections = listCollections();
-      const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0 };
+      const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0 };
 
       for (const col of collections) {
         const stats = await indexCollection(store, col.name, col.path, col.pattern, { defaultContentType: col.content_type });
@@ -1468,6 +1474,7 @@ This is the recommended entry point for ALL memory queries.`,
         totalStats.updated += stats.updated;
         totalStats.unchanged += stats.unchanged;
         totalStats.removed += stats.removed;
+        totalStats.dated += stats.dated;
       }
 
       const summary = `Reindex complete: +${totalStats.added} added, ~${totalStats.updated} updated, =${totalStats.unchanged} unchanged, -${totalStats.removed} removed`;
@@ -1652,7 +1659,7 @@ This is the recommended entry point for ALL memory queries.`,
       const shouldBuildTemporal = types.includes('temporal') || types.includes('all');
       const shouldBuildSemantic = types.includes('semantic') || types.includes('all');
 
-      const results: { temporal?: number; semantic?: number } = {};
+      const results: { temporal?: number; semantic?: number; temporalTotal?: number; semanticTotal?: number } = {};
 
       if (shouldBuildTemporal) {
         results.temporal = store.buildTemporalBackbone();
@@ -1662,9 +1669,23 @@ This is the recommended entry point for ALL memory queries.`,
         results.semantic = await store.buildSemanticGraph(semantic_threshold);
       }
 
+      // The builders count rows SQLite actually inserted, so a second idempotent build
+      // legitimately reports 0 new edges while the graph is fully populated. Report the
+      // standing total alongside, or "0 edges" reads as "the graph is empty".
+      //
+      // Counts only edges whose BOTH endpoints are active — the same population the builders
+      // operate on. Shared with the REST endpoint via the store so the two cannot drift.
+      const totalFor = (t: string) => store.countActiveRelations(t);
+
       const lines = [];
-      if (results.temporal !== undefined) lines.push(`Temporal graph: ${results.temporal} edges`);
-      if (results.semantic !== undefined) lines.push(`Semantic graph: ${results.semantic} edges`);
+      if (results.temporal !== undefined) {
+        results.temporalTotal = totalFor("temporal");
+        lines.push(`Temporal graph: ${results.temporal} new edge(s), ${results.temporalTotal} total`);
+      }
+      if (results.semantic !== undefined) {
+        results.semanticTotal = totalFor("semantic");
+        lines.push(`Semantic graph: ${results.semantic} new edge(s), ${results.semanticTotal} total`);
+      }
 
       return {
         content: [{
@@ -2005,6 +2026,7 @@ This is the recommended entry point for ALL memory queries.`,
           docid: `#${r.docid}`, path: r.displayPath, title: r.title,
           score: Math.round((r.compositeScore ?? r.score) * 100) / 100,
           snippet: (r.body || "").substring(0, 150), content_type: r.contentType, modified_at: r.modifiedAt,
+          authored_at: r.authoredAt ?? null,
         }));
         return {
           content: [{ type: "text", text: `Query Plan (${sortedClauses.length} clauses):\n${planSummary}\n\n${formatSearchSummary(items.map(i => ({ ...i, file: i.path, compositeScore: i.score, context: null })), query)}${planDegradedNote}` }],
@@ -2510,9 +2532,9 @@ This is the recommended entry point for ALL memory queries.`,
     "lifecycle_sweep",
     {
       title: "Lifecycle Sweep",
-      description: "Run lifecycle policies: archive stale docs, optionally purge old archives. Defaults to dry_run (preview only).",
+      description: "Run lifecycle policies: archive stale documents. Archives only — never deletes; archival is reversible via lifecycle_restore. Defaults to dry_run (preview only).",
       inputSchema: {
-        dry_run: z.boolean().optional().default(true).describe("Preview what would be archived/purged without acting"),
+        dry_run: z.boolean().optional().default(true).describe("Preview what would be archived without acting"),
         vault: z.string().optional().describe("Named vault (omit for default vault)"),
       },
     },
@@ -2553,16 +2575,20 @@ This is the recommended entry point for ALL memory queries.`,
           }
         }
 
-        return { content: [{ type: "text", text: `Would archive ${candidates.length} document(s):\n${lines.join("\n") || "(none)"}${recallLines.join("\n")}` }] };
+        return { content: [{ type: "text", text: `Would archive ${candidates.length} document(s) (reversible via lifecycle_restore; nothing is deleted):\n${lines.join("\n") || "(none)"}${recallLines.join("\n")}` }] };
       }
 
+      // Archival only. ClawMem no longer physically deletes document rows from any code
+      // path — see the retention note in src/store.ts. Archival is reversible via
+      // lifecycle_restore, so this tool has no unrecoverable effect.
       const archived = store.archiveDocuments(candidates.map(c => c.id));
-      let purged = 0;
-      if (policy.purge_after_days) {
-        purged = store.purgeArchivedDocuments(policy.purge_after_days);
-      }
 
-      return { content: [{ type: "text", text: `Lifecycle sweep: archived ${archived}, purged ${purged}` }] };
+      const purgeNote = policy.purge_after_days
+        ? `\n\nNote: purge_after_days=${policy.purge_after_days} is set but INERT — ClawMem no ` +
+          `longer deletes rows. Archived documents remain restorable via lifecycle_restore.`
+        : "";
+
+      return { content: [{ type: "text", text: `Lifecycle sweep: archived ${archived} document(s). Nothing was deleted.${purgeNote}` }] };
     }
   );
 
