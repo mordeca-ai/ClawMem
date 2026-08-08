@@ -5,7 +5,6 @@
  * All operations are non-fatal and log errors with [amem] prefix.
  */
 
-import { isSchemaPlaceholder, CAUSAL_RESIDUE } from "./schema-placeholder.ts";
 import type { Database } from "bun:sqlite";
 import type { LlamaCpp } from "./llm.ts";
 import { withRetryAndFeedback } from "./llm-retry.ts";
@@ -558,20 +557,40 @@ Return ONLY valid JSON in this exact format:
 }
 
 /**
+ * A note carrying no information. Blank entries do not count: the parser preserves
+ * whitespace-only strings inside the arrays, so `{keywords: [" "], tags: [], context: " "}`
+ * would otherwise be written over NULL and permanently mask the row from backfill.
+ * A note with ONE real keyword, tag, or context is information and is kept.
+ */
+function isEmptyNote(note: MemoryNote): boolean {
+  const hasText = (xs: string[]) => xs.some(x => typeof x === "string" && x.trim().length > 0);
+  return !hasText(note.keywords) && !hasText(note.tags) && !note.context.trim();
+}
+
+/**
  * Store memory note in the documents table.
  * Updates amem_keywords, amem_tags, and amem_context columns.
  *
- * @param store - Store instance
- * @param docId - Document numeric ID
- * @param note - Memory note to store
+ * §55.6 D8.2 — FAIL-CLOSED. An empty note is never written, whatever the row currently holds:
+ *
+ *  - Over a learned note, the empty write destroyed it. `constructMemoryNote` fails OPEN to an
+ *    empty note when inference is unavailable, and this write used to be unconditional, so a
+ *    transient outage during a routine reindex blanked A-MEM on every document it touched
+ *    (measured: `["LEARNED"]` -> `[]` on a reactivation with an identical body).
+ *  - Over a NULL row it was worse in a quieter way: it makes a FAILURE indistinguishable from
+ *    completed enrichment, and `backfillAmem`'s `amem_keywords IS NULL` predicate then never
+ *    retries it. NULL is the retryable state and must survive a failed attempt.
+ *
+ * @returns whether the note was actually written — so callers cannot report success after a no-op.
  */
 export function storeMemoryNote(
   store: Store,
   docId: number,
   note: MemoryNote
-): void {
+): boolean {
+  if (isEmptyNote(note)) return false;
   try {
-    store.db.prepare(`
+    const result = store.db.prepare(`
       UPDATE documents
       SET amem_keywords = ?,
           amem_tags = ?,
@@ -583,8 +602,12 @@ export function storeMemoryNote(
       note.context,
       docId
     );
+    // `.changes` is inflated by the documents_fts triggers and is NOT a row count — but zero
+    // is still unambiguous: no row matched, so nothing landed.
+    return result.changes > 0;
   } catch (err) {
     console.log(`[amem] Error storing memory note for docId ${docId}:`, err);
+    return false;
   }
 }
 
@@ -1062,13 +1085,23 @@ export async function postIndexEnrich(
 
     console.log(`[amem] Starting enrichment for docId ${docId} (isNew=${isNew})`);
 
-    // Step 1: Construct and store memory note (always)
+    // Step 1: Construct and store memory note (always attempted)
     const note = await constructMemoryNote(store, llm, docId);
-    storeMemoryNote(store, docId, note);
+    // §55.6 D8.2: report what actually happened. An empty note is refused, and saying
+    // "Completed note refresh" after a refused write is how a silent inference outage used to
+    // read as success in the logs.
+    const noteStored = storeMemoryNote(store, docId, note);
+    if (!noteStored) {
+      console.log(`[amem] No note stored for docId ${docId} (enrichment produced nothing — existing note, if any, left intact)`);
+    }
 
     // For updated documents, stop here to avoid churn
     if (!isNew) {
-      console.log(`[amem] Completed note refresh for docId ${docId}`);
+      console.log(
+        noteStored
+          ? `[amem] Completed note refresh for docId ${docId}`
+          : `[amem] Note refresh for docId ${docId} made no change`,
+      );
       return;
     }
 
@@ -1112,7 +1145,7 @@ export async function postIndexEnrich(
  *
  * Populated by the decision-extractor hook after an observation is successfully
  * persisted. Consumed by:
- *   - `inferCausalLinks` (A-MEM) — uses docId + facts
+ *   - `runCausalStep` (causal-writer) — uses docId + facts
  *   - `insertObservationTriples` (decision-extractor) — uses docId + obsType + triples
  */
 export interface ObservationWithDoc {
@@ -1120,217 +1153,4 @@ export interface ObservationWithDoc {
   facts: string[];
   obsType?: string;
   triples?: Array<{ subject: string; predicate: string; object: string }>;
-}
-
-/**
- * Causal link identified by LLM
- */
-interface CausalLink {
-  source_fact_idx: number;
-  target_fact_idx: number;
-  confidence: number;
-  reasoning: string;
-}
-
-/**
- * Infer causal relationships between facts from observations.
- * Analyzes facts using LLM and creates causal edges in memory_relations.
- *
- * @param store - Store instance
- * @param llm - LLM instance
- * @param observations - Array of observations with docId and facts
- * @returns Number of causal links created
- */
-export async function inferCausalLinks(
-  store: Store,
-  llm: LlamaCpp,
-  observations: ObservationWithDoc[]
-): Promise<number> {
-  try {
-    // Build flat list of facts with source document mapping
-    const factMap: Array<{ fact: string; docId: number }> = [];
-    for (const obs of observations) {
-      for (const fact of obs.facts) {
-        factMap.push({ fact, docId: obs.docId });
-      }
-    }
-
-    // Need at least 2 facts to infer causality
-    if (factMap.length < 2) {
-      console.log(`[amem] Insufficient facts (${factMap.length}) for causal inference`);
-      return 0;
-    }
-
-    console.log(`[amem] Inferring causal links from ${factMap.length} facts across ${observations.length} observations`);
-
-    // Build LLM prompt
-    const factsText = factMap.map((f, idx) =>
-      `${idx}. ${f.fact}`
-    ).join('\n');
-
-    const prompt = `Analyze the following facts from a session and identify causal relationships.
-
-Facts:
-${factsText}
-
-Identify cause-effect relationships where one fact directly or indirectly caused another.
-Consider:
-- Temporal ordering (causes precede effects)
-- Logical dependencies (one fact enables or triggers another)
-- Problem-solution patterns (a discovery leads to an action)
-
-Return ONLY valid JSON array in this exact format:
-[
-  {
-    "source_fact_idx": 0,
-    "target_fact_idx": 2,
-    "confidence": 0.85,
-    "reasoning": "Brief explanation of causal relationship"
-  },
-  {
-    "source_fact_idx": 1,
-    "target_fact_idx": 3,
-    "confidence": 0.72,
-    "reasoning": "Brief explanation of causal relationship"
-  }
-]
-
-Only include relationships with confidence >= 0.6. Return empty array [] if no causal relationships found.`;
-
-    const links = await withRetryAndFeedback<CausalLink[]>({
-      initialPrompt: prompt,
-      llm,
-      maxTokens: 600,
-      temperature: 0.3,
-      label: "amem.inferCausalLinks",
-      parse: (text) => {
-        const value = extractJsonFromLLM(text) as CausalLink[] | null;
-        if (!Array.isArray(value)) {
-          return {
-            ok: false,
-            error:
-              "Response was not the expected JSON array of causal-link objects. Return ONLY that JSON array (or [] if none).",
-          };
-        }
-        // Structural validation of every entry lives INSIDE the parse closure
-        // so a malformed entry triggers a corrective retry instead of being
-        // silently dropped. Semantic filtering (confidence threshold, index
-        // ranges, self-links) stays outside — retrying would not fix those.
-        for (const link of value) {
-          if (!link || typeof link !== "object" ||
-              !Number.isInteger(link.source_fact_idx) ||
-              !Number.isInteger(link.target_fact_idx) ||
-              typeof link.confidence !== "number" ||
-              typeof link.reasoning !== "string") {
-            return {
-              ok: false,
-              error:
-                'Every array entry must be an object with integer "source_fact_idx" and "target_fact_idx", numeric "confidence", and string "reasoning" fields. Return ONLY the corrected JSON array.',
-            };
-          }
-        }
-        return { ok: true, value };
-      },
-    });
-
-    if (links === null) {
-      console.log(`[amem] Invalid JSON for causal inference after retries`);
-      return 0;
-    }
-
-    // Filter by confidence threshold and insert causal links
-    let linksCreated = 0;      // rows SQLite actually wrote
-    let candidatesAccepted = 0; // links that cleared every filter and were attempted
-    let placeholderRejects = 0; // links rejected as echoed prompt-skeleton residue
-    let invalidRejects = 0;     // links rejected for non-finite / out-of-range confidence
-    const timestamp = new Date().toISOString();
-    const insertStmt = store.db.prepare(`
-      INSERT OR IGNORE INTO memory_relations (
-        source_id, target_id, relation_type, weight, metadata, created_at
-      ) VALUES (?, ?, 'causal', ?, ?, ?)
-    `);
-
-    for (const link of links) {
-      // Structure already validated inside the parse closure (§13.1);
-      // semantic filters below are not retry-worthy.
-
-      // Anti-parrot: a weak extraction model run out-of-distribution echoes the prompt's
-      // skeleton instead of extracting. Structurally valid residue passes the parse gate,
-      // the structural validator AND the confidence threshold, so without this check it
-      // reaches the INSERT. The observer, consolidation and conversation-synthesis paths
-      // have shared this guard since the 1.7B mining failure; causal never adopted it.
-      if (isSchemaPlaceholder(link.reasoning, CAUSAL_RESIDUE)) {
-        placeholderRejects++;
-        continue;
-      }
-
-      // Range validation. The parse closure only asserts `typeof confidence === "number"`,
-      // and Infinity is a number: `1e309` cleared the >= 0.6 threshold and wrote a row whose
-      // `weight` column landed as NULL. Reject non-finite and out-of-unit-interval values
-      // before they can reach the INSERT.
-      if (!Number.isFinite(link.confidence) || link.confidence < 0 || link.confidence > 1) {
-        invalidRejects++;
-        continue;
-      }
-
-      // Filter by confidence threshold
-      if (link.confidence < 0.6) {
-        continue;
-      }
-
-      // Validate indices
-      if (link.source_fact_idx < 0 || link.source_fact_idx >= factMap.length ||
-          link.target_fact_idx < 0 || link.target_fact_idx >= factMap.length) {
-        console.log(`[amem] Invalid fact indices: ${link.source_fact_idx} -> ${link.target_fact_idx}`);
-        continue;
-      }
-
-      // Get document IDs (bounds already validated above)
-      const sourceEntry = factMap[link.source_fact_idx]!;
-      const targetEntry = factMap[link.target_fact_idx]!;
-
-      // Skip self-links (same document)
-      if (sourceEntry.docId === targetEntry.docId) {
-        continue;
-      }
-
-      // Insert causal relation
-      const metadata = JSON.stringify({
-        reasoning: link.reasoning,
-        source_fact: sourceEntry.fact,
-        target_fact: targetEntry.fact,
-      });
-
-      // Count what SQLite actually wrote, not what we attempted. `INSERT OR IGNORE`
-      // silently suppresses PK/FK conflicts, so an attempt counter reports success
-      // for a run that persisted nothing — which is exactly how a total failure of
-      // this path stayed invisible for months.
-      linksCreated += insertStmt.run(
-        sourceEntry.docId, targetEntry.docId, link.confidence, metadata, timestamp,
-      ).changes;
-      candidatesAccepted++;
-    }
-
-    if (linksCreated !== candidatesAccepted) {
-      console.warn(
-        `[amem] causal: ${candidatesAccepted} candidate(s) passed filters but only ` +
-        `${linksCreated} row(s) were written — suppressed by INSERT OR IGNORE`,
-      );
-    }
-    if (placeholderRejects > 0) {
-      console.warn(
-        `[amem] causal: rejected ${placeholderRejects} link(s) whose reasoning was echoed ` +
-        `prompt-skeleton residue — the extraction model is parroting, not extracting`,
-      );
-    }
-    console.log(
-      `[amem] Wrote ${linksCreated} causal link(s) ` +
-      `(${links.length} proposed, ${candidatesAccepted} passed filters, ` +
-      `${placeholderRejects} placeholder-rejected, ${invalidRejects} range-rejected)`,
-    );
-    return linksCreated;
-  } catch (err) {
-    console.log(`[amem] Error in inferCausalLinks:`, err);
-    return 0;
-  }
 }

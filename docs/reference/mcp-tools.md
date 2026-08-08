@@ -4,7 +4,9 @@ Complete reference for ClawMem's MCP server tools. These let AI agents search, r
 
 ## Retrieval
 
-**Internal-collection visibility (v0.21.0):** the retrieval tools `search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` exclude the system-internal `_clawmem` collection (observations/deductions/handoffs) by default. Opt-ins: pass `includeInternal: true` (all six tools), or — on the tools that expose a `collection` parameter (`search`, `vsearch`, `query`) — name `_clawmem` explicitly in the filter. `find_similar` auto-includes internal results when the REFERENCE document is itself internal. `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are NOT filtered — system memory is their substrate by design.
+**Internal-collection visibility (v0.21.0):** the retrieval tools `search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` — plus `memory_rank` since v0.36.0 — exclude the system-internal `_clawmem` collection (observations/deductions/handoffs) by default. Opt-ins: pass `includeInternal: true` (all seven tools), or — on the tools that expose a `collection` parameter (`search`, `vsearch`, `query`, `memory_rank`) — name `_clawmem` explicitly in the filter. `find_similar` auto-includes internal results when the REFERENCE document is itself internal. `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are NOT filtered — system memory is their substrate by design.
+
+**Shared causal pipeline + the WHY observation lane (v0.32.0):** the causal surfaces — `memory_retrieve`'s causal mode, `intent_search`, `query_plan`'s graph clauses, and REST `/retrieve`'s causal mode — run one shared intent-aware pipeline (anchors → intent-weighted RRF → bounded one-hop causal traversal in BOTH directions → adaptive traversal → MPFP → rerank), so their behavior no longer drifts; they differ only in declared stages and visibility policy. On the default-filtered callers (`memory_retrieve` causal, `query_plan` graph), a WHY-classified query additionally anchors into `_clawmem` **observation documents only** (`observations/` path with an observation type — never handoffs or deductions) and follows causal edges one bounded hop each way (≤3 per anchor, ≤10 total); one-hop hits carry `causal: [{anchorDocid, direction: "cause"|"effect"}]` in results. Candidate eligibility (active, non-invalidated, effective-time window, collection policy) is enforced inside every anchor/traversal/MPFP query — ineligible rows never consume beam slots or propagation mass. **Exception:** entity co-occurrence expansion derives from provenance-free aggregates and cannot honor row-level eligibility; it is a legacy stage that runs only on direct `intent_search`, pending provenance-aware co-occurrence.
 
 **Scoring regimes (v0.22.0 vector · v0.24.0 FTS):** the direct retrieval routes — `vsearch` and `memory_retrieve`'s semantic/discovery modes (v0.22.0), and `search` (v0.24.0) — rank non-recency queries by their RAW channel score: vector cosine (`scoreBasis: "vector-cosine"`) on the vector routes, the monotonic BM25 transform (`scoreBasis: "fts-bm25"`) on `search`. Raw values are channel-specific and NOT comparable across channels, across embedding models, or to composite scores. Document metadata — including pin — participates only inside groups of exactly-equal raw scores. On these routes `minScore` filters the raw score and has NO default (omitted = no filter; an explicit `0` is honored). Recency-intent queries ("latest…", "recently…", "yesterday…") keep the composite regime and report `scoreBasis: "composite"` — `vsearch`'s recency branch keeps its 0.3 composite default floor, `search`'s keeps 0 — as do `query`, `query_plan`, and `memory_retrieve`'s keyword/hybrid/causal/complex modes. `find_similar` has always ranked by raw cosine. Rationale — both splits are measured, not aesthetic: on judged sets against the live vault, raw cosine ranked 16/19 targets #1 (MRR 0.912) vs composite 1/19 (0.307); raw-FTS ranked 33/43 keyword targets #1 (MRR 0.848) vs composite 6/43 (0.415), with composite losing even on the fresh-doc-favorable slice (0.348 vs 0.801).
 
@@ -27,7 +29,7 @@ Complete reference for ClawMem's MCP server tools. These let AI agents search, r
 
 Auto-routing:
 - Timeline queries ("last session", "yesterday") → session history
-- Causal queries ("why did we", "what caused") → intent_search with graph traversal
+- Causal queries ("why did we", "what caused") → the shared intent-aware causal pipeline with graph traversal (behavioral parity with `intent_search`; default-filtered, plus the WHY observation lane)
 - Discovery queries ("similar to", "related to") → find_similar
 - Complex queries (multi-topic) → query_plan
 - Everything else → full hybrid search
@@ -88,7 +90,7 @@ Intent-classified search with graph traversal. Use directly for "why", "when", "
 | `query` | string | required | Search query |
 | `limit` | number | 10 | Max results |
 | `force_intent` | enum | — | Override: `WHY`, `WHEN`, `ENTITY`, `WHAT` |
-| `enable_graph_traversal` | boolean | true | Multi-hop graph expansion |
+| `enable_graph_traversal` | boolean | true | Master graph switch: `false` disables adaptive traversal, MPFP, entity expansion, AND the one-hop causal step (anchor search + rerank remain) |
 | `vault` | string | — | Named vault |
 
 ### query_plan
@@ -102,6 +104,21 @@ Multi-topic decomposition. Use for complex queries spanning multiple subjects.
 | `compact` | boolean | true | Compact output |
 | `includeInternal` | boolean | false | Include system-internal `_clawmem` docs |
 | `vault` | string | — | Named vault |
+
+### memory_rank
+
+Ranking diagnostic (v0.36.0): runs the real FTS + composite scoring pipeline for a query and returns each result's per-factor breakdown plus raw-vs-composite rank shifts. FTS-only candidates — no vector or LLM stage. Read-only; scores and ordering are exactly what production computes.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `query` | string | required | Query to explain ranking for |
+| `limit` | number | 10 | Results to explain per view (1–50, integer) |
+| `collection` | string | — | Filter to collection (single name or comma-separated) |
+| `weightProfile` | enum | `default` | `default` = hook/`memory_retrieve` weights (0.50/0.25/0.25); `query` = the `query` tool's (0.70/0.15/0.15). Recency-intent queries use the recency weights regardless, as in production |
+| `includeInternal` | boolean | false | Include system-internal `_clawmem` docs — excluded by default |
+| `vault` | string | — | Named vault; an unknown name returns the available list |
+
+Output is the **union** of the composite top-`limit` and the raw top-`limit`: a raw winner the composite ordering pushed below the cutoff stays visible, flagged `demotedRawWinner` (text marker `⚠ demoted raw winner`) with its true composite rank. Each item carries `searchScore`, `compositeScore`, `compositeRank`, `rawRank` (production raw ordering, including its pin → legacy-composite → path tie contract), `rankShift` (positive = composite promoted the doc), and a `breakdown` with every factor: weights applied, recency and blended-confidence inputs, quality/length/frequency/canonical multipliers, `pinBoost` (signed — negative means the 1.0 pin cap clamped a high scorer down; see [composite-scoring.md](../concepts/composite-scoring.md#pin-boost)), and the co-activation multiplier. The factors are captured inside the scorer, never re-derived, so they reproduce `compositeScore` exactly.
 
 ## Document access
 
@@ -142,7 +159,22 @@ k-NN vector neighbors of a reference document.
 
 ### find_causal_links
 
-Trace causal decision chains from a document.
+Evidence-preserving directed causal edge traversal from a document. Each result is
+an edge record with invariant `sourceDocId`/`targetDocId` (the physical edge) plus
+separate traversal provenance (`predecessorDocId`, `depth`, `direction`), carrying
+up to 3 fact-pair witnesses (`sourceFactOrdinal`/`targetFactOrdinal`, fact
+snapshots, reasoning, confidence, `strongestAt`/`lastSeenAt`) and an honest
+`evidenceCount`. Pre-cut edges without stored witnesses surface one synthesized
+`legacy` display witness from edge metadata when it is valid.
+
+**Multi-hop CHAIN quality is experimental**: records at `depth > 1` are per-edge
+evidence along a traversal, not a verified causal chain.
+
+Bounds: one combined 50-edge budget across both directions with a truthful
+`truncated` flag, and the complete serialized result (text and structured copies
+together) is capped at 64 KiB — truncation drops whole edges from both
+representations symmetrically in the deterministic order
+(depth, weight DESC, sourceDocId, targetDocId, direction).
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -279,6 +311,17 @@ Detailed statistics: content type distribution, staleness, embedding coverage.
 |-------|------|---------|-------------|
 | `vault` | string | — | Named vault |
 
+### memory_stats
+
+Deterministic lifecycle + ranking-metadata aggregates per collection (v0.36.0). Complements `index_stats` (embedding coverage / content types). Pure SQL, fail-loud, read-only. Includes system collections — nothing is filtered.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `collection` | string | — | Restrict to one collection; an unknown name returns the available list |
+| `vault` | string | — | Named vault; an unknown name returns the available list |
+
+Per collection: counts by active state; **origin×active cross-tabs** (`fs` / `api` / legacy-`NULL` rows from the v0.34.0 ownership model — each total/active/inactive); pinned count; accrual (created last 7d/30d) and created-at span; and mean/median/min/max distributions over `access_count`, `confidence`, `quality_score`, and **effective-time age in days** (`authored_at ?? modified_at`, the same axis recency ranking decays on). Counts and cross-tabs cover ALL rows; the distributions cover ACTIVE rows only — ranking never sees inactive rows, so mixing them in would misstate the corpus the scorer operates on. Deactivation reasons are grouped at the end (`null` reason = pre-v0.31.0 rows). Empty distributions (e.g. an inactive-only collection) return `null` fields, rendered `n/a` in text.
+
 ### build_graphs
 
 Build temporal backbone and semantic graph.
@@ -352,6 +395,8 @@ Query the SPO knowledge graph for an entity's temporal relationships.
 | `vault` | string | — | Named vault |
 
 Uses entity resolution (FTS search) first, falls back to slug normalization. Returns triples with subject, predicate, object, valid_from, valid_to, confidence, and current status.
+
+**Evidence (v0.32.0):** each fact carries `evidenceCount` — the number of UNIQUE evidence sources (distinct `(source document, source fact)` pairs; identical re-sightings collapse) — plus up to 5 `sources` of `{ docId, collection, path, fact, at }` ordered most-recent-first. Evidence with no source document renders as `unattributed`. Text output appends `[evidence ×N; sources: …]` when evidence exists.
 
 ### diary_write
 

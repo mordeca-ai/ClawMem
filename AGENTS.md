@@ -54,12 +54,12 @@ clawmem doctor                              # full health check (clawmem status 
 | `postcompact-inject` | SessionStart (compact) | re-injects authoritative state after compaction → `<vault-postcompact>` |
 | `curator-nudge` | SessionStart | surfaces curator actions; nudges when the report is stale |
 | `precompact-extract` | PreCompact | extracts decisions / file paths / open questions before compaction |
-| `decision-extractor` | Stop | LLM → observations + causal links + contradiction detection + SPO triples |
+| `decision-extractor` | Stop | LLM → observations + contradiction detection + SPO triples (+ the causal witness writer when `CLAWMEM_CAUSAL_WRITER` is `shadow`/`on` — default `off`) |
 | `handoff-generator` | Stop | LLM session summary → handoffs |
 | `feedback-loop` | Stop | tracks referenced notes → confidence boosts, co-activations, utility signals |
 
 **Default behavior:** read injected `<vault-context>` first; if sufficient, answer immediately.
-**Blind spots (by design):** hooks filter `_clawmem/` artifacts, enforce score thresholds, cap token budget — **absence in `<vault-context>` does NOT mean absence in memory.** If expected memory wasn't surfaced, escalate to Tier 3. Note the MCP retrieval tools themselves exclude `_clawmem` by default since v0.21.0 — pass `includeInternal: true` when system-internal memory (observations/handoffs/deductions) is the target.
+**Blind spots (by design):** hooks filter `_clawmem/` artifacts, enforce score thresholds, cap token budget — **absence in `<vault-context>` does NOT mean absence in memory.** If expected memory wasn't surfaced, escalate to Tier 3. Note the default-filtered MCP retrieval tools (`search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, `find_similar`; `memory_rank` since v0.36.0) exclude `_clawmem` by default since v0.21.0 — pass `includeInternal: true` when system-internal memory (observations/handoffs/deductions) is the target. `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are NOT filtered — system memory is their substrate by design. Since v0.32.0, WHY-classified queries on the filtered causal routes additionally reach `_clawmem` *observation* documents (never handoffs/deductions) through a bounded observation lane, so causal answers can surface their reasoning artifacts without `includeInternal`.
 **Profiles:** `speed` / `balanced` (default) / `deep` set the kept-score ratio (65% / 55% / 45%) + an activation floor; only `deep` adds query expansion + reranking to the hook path. → [docs/concepts/hooks-vs-mcp.md](docs/concepts/hooks-vs-mcp.md).
 
 ### Tier 3 — agent-initiated (one targeted MCP call)
@@ -86,7 +86,7 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
     Decomposes into 2-4 typed clauses (bm25/vector/graph), runs them in parallel, merges via RRF.
 2.  Progressive disclosure -> multi_get("path1,path2") for full content of top hits
 3.  Spot checks         -> search(query) (BM25, 0 GPU)  or  vsearch(query) (vector, 1 GPU)
-4.  Chain tracing       -> find_causal_links(docid, direction="both", depth=5)
+4.  Causal edges        -> find_causal_links(docid, direction="both", depth=5)
 5.  Entity facts        -> kg_query(entity)  (SPO triples; NOT causal "why" — that's intent_search)
 6.  Temporal context    -> timeline(docid, before=5, after=5)
 ```
@@ -101,7 +101,7 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `vsearch` | Vector semantic — conceptual/fuzzy when vocabulary unknown. ~100ms, 1 GPU. |
 | `get` / `multi_get` | Single doc by path/`#docid` / multiple by glob or comma-list. |
 | `find_similar` | "what else relates to X" — k-NN vector neighbors beyond keyword overlap. |
-| `find_causal_links` | Trace decision chains ("what led to X") over observation docs. |
+| `find_causal_links` | Evidence-preserving causal edge traversal ("what led to X"): directed edge records with fact-pair witnesses + reasoning. Multi-hop CHAIN quality is experimental — depth > 1 is per-edge evidence, not a verified chain. |
 | `kg_query` | Entity SPO triples with temporal validity. Entity facts, NOT causal "why". |
 | `session_log` | "last time" / "yesterday" / "what did we do". Do NOT use `query` for cross-session. |
 | `profile` | User profile (static facts + dynamic context). |
@@ -112,11 +112,13 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `timeline` | Temporal neighborhood around a doc. Progressive disclosure: search → timeline → get. |
 | `memory_evolution_status` | How a doc's A-MEM metadata evolved over time. |
 | `lifecycle_status` / `lifecycle_sweep` / `lifecycle_restore` | Lifecycle stats / archive stale (dry-run default, archives only — ClawMem never deletes rows) / restore. |
-| `index_stats` / `status` / `reindex` | Doc counts + embedding coverage / quick health / force re-index (does NOT embed). |
+| `index_stats` / `status` / `reindex` | Doc counts + embedding coverage / quick health / re-index (does NOT embed). |
+| `memory_stats` | Lifecycle + ranking-metadata aggregates per collection: origin×active cross-tabs, pinned, accrual, access/confidence/quality/effective-age distributions. Deeper than `index_stats`; includes system collections. |
+| `memory_rank` | "Why did X outrank Y" — real-pipeline composite breakdown per result (weights, recency, confidence, multipliers, signed pinΔ, co-activation) + raw-vs-composite rank shifts; demoted raw winners stay visible. Diagnostic, not a retrieval tool. |
 | `beads_sync` / `vault_sync` / `list_vaults` | Beads from Dolt / index a dir into a named vault / list vaults. |
 | `diary_write` / `diary_read` | Diary entries — non-hooked envs only (in Claude Code hooks capture this). |
 
-**Multi-vault:** all tools accept an optional `vault` param (omit for single-vault mode). **Progressive disclosure:** ALWAYS `compact=true` first → review snippets/scores → `get` / `multi_get` for full content. → full param docs: [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md).
+**Multi-vault:** all tools accept an optional `vault` param (omit for single-vault mode). Automatic hook surfacing reads only the general vault unless `retrieval.surface_secondary_vaults` is enabled (default off, v0.35.0). **Progressive disclosure:** ALWAYS `compact=true` first → review snippets/scores → `get` / `multi_get` for full content. → full param docs: [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md).
 
 ---
 
@@ -167,6 +169,8 @@ compositeScore = (0.50·searchScore + 0.25·recencyScore + 0.25·confidenceScore
 - **`memory_snooze`** — PROACTIVELY when a memory keeps surfacing but isn't relevant now, user says "not now"/"later", or content is time-boxed.
 - **`memory_forget`** — only when genuinely wrong or permanently obsolete. Prefer snooze for temporary suppression.
 - **ClawMem never physically deletes a document row (v0.30.0).** Every lifecycle operation above is reversible: pin/snooze are metadata, forget and archive deactivate, contradiction handling only erodes confidence. Retention archives — `lifecycle_restore` brings it back — and `purge_after_days` is inert. Through v0.29.0 it permanently deleted archived rows from a non-dry-run sweep and from the SessionStart hook, unreported.
+- **DB-born memories survive filesystem reconciliation (v0.34.0).** Every row records its lifecycle owner (`origin`: `fs` = filesystem-indexed, `api` = hook/`saveMemory`/beads/REST-born; `NULL` = legacy — exempt and adopted on next touch, never inferred). Absence reconciliation deactivates only `fs` rows, so a hook-written memory sharing a collection with indexed files is never deactivated for lacking a file. Opposite-origin path collisions are rejected visibly in both directions (no silent takeover; `saveMemory` also refuses paths held by inactive documents), and `clawmem mine` imports are additive (`api` rows; a later mine never deactivates earlier batches). One consequence: a row whose file was already deleted before upgrading is no longer auto-deactivated — retire it with `memory_forget` or a lifecycle sweep if unwanted.
+- **Forget and archive now survive re-indexing (v0.31.0).** Documents record *why* they were deactivated, and the indexer reactivates only what it deactivated for absence. Through v0.30.0 a forget on a file-backed document was undone by the next `clawmem update` — on a machine running the watcher, that meant the next `.md` change in the collection. Do NOT tell a user to re-run forget after indexing; it sticks.
 - **Contradiction auto-resolution (judge-gated, v0.29.0):** contradiction analysis runs ONLY when a judge is configured via `CLAWMEM_JUDGE_*` — with no judge it is DISABLED (audited no-op; the stock expansion model cannot meet the judge contract, so do NOT tell a user erosion happens out of the box). With a judge: a new decision contradicting an old one lowers the old one's confidence automatically (−0.25, floor 0.2). It stays retrievable; only its ranking drops. Removing it from retrieval outright (`invalidated_at`) is a separate, **opt-in** step behind `CLAWMEM_CONTRADICTION_INVALIDATE`, and applies **only to `content_type='observation'`** — a superseded decision is eroded, never retired, so do NOT tell a user that contradiction handling will retire a prior decision. Unarmed it logs `WOULD invalidate`, writes a durable `judge_events` row, and mutates nothing further. Do NOT suggest arming it without the vault-specific calibration in [docs/guides/contradiction-invalidation.md](docs/guides/contradiction-invalidation.md). *(Both were inert before v0.28.0 — the hook classified, but two contract defects discarded every verdict before it could mutate a document; before v0.29.0 the prescribed stock model could not emit a valid verdict at all.)*
 
 ---
@@ -205,7 +209,7 @@ Maintenance agent for Tier-3 work the main agent neglects. Install: `clawmem set
 
 ## Integrations
 
-- **Claude Code** — `clawmem setup hooks && clawmem setup mcp`. Hooks = 90% auto; 31 MCP tools = 10%.
+- **Claude Code** — `clawmem setup hooks && clawmem setup mcp`. Hooks = 90% auto; 33 MCP tools = 10%.
 - **OpenClaw** — native memory plugin (`kind: memory`, v0.10.0+): `clawmem setup openclaw`. → [docs/guides/openclaw-plugin.md](docs/guides/openclaw-plugin.md).
 - **Hermes** — `MemoryProvider` plugin: copy `src/hermes/` into `$HERMES_HOME/plugins/clawmem/`. → [docs/guides/hermes-plugin.md](docs/guides/hermes-plugin.md).
 - **REST API** — `clawmem serve [--port 7438]`. → [docs/reference/rest-api.md](docs/reference/rest-api.md).

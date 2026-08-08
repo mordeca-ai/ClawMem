@@ -62,7 +62,20 @@ Both `generateMemoryLinks()` and `buildSemanticGraph()` insert `semantic` edges.
 | Outbound (source→target) | All: semantic, supporting, contradicts, causal, temporal |
 | Inbound (target→source) | Only: semantic, entity |
 
-This is intentional — temporal and causal edges are directional by nature.
+This is intentional — temporal and causal edges are directional by nature. Backward causal reach
+("why did B happen?" → the cause A) is provided by the shared causal pipeline's **bounded one-hop
+causal step** (v0.32.0, `src/causal-retrieval.ts`), not by widening this asymmetry: it walks
+`relation_type='causal'` in both directions for one hop, capped at 3 hits per anchor and 10
+unique endpoints.
+
+### Candidate eligibility (v0.32.0)
+
+`adaptiveTraversal` and `mpfpTraversal` accept a `CandidateEligibility` policy — collection
+allow/exclude and an effective-time window on `COALESCE(authored_at, modified_at)`. The core
+predicates (`active = 1`, `invalidated_at IS NULL`) are baked into every neighbor/edge query and
+cannot be waived: ineligible rows never enter beam selection, per-node top-k, or Forward Push
+mass — previously an inactive or invalidated document could consume budget while being hidden
+from output.
 
 ## When to run build_graphs
 
@@ -72,14 +85,19 @@ This is intentional — temporal and causal edges are directional by nature.
 
 ## When to run find_causal_links
 
-Use after `intent_search` to walk the full causal chain from a specific document:
+Use after `intent_search` to read the causal edges around a specific document —
+directed edge records with fact-pair witness evidence:
 
 ```
 # 1. Find the anchor
 intent_search("why did we switch to PostgreSQL")
 # → top result: decisions/2026-02-15-db-migration.md (#a1b2c3)
 
-# 2. Trace the chain
+# 2. Read the surrounding causal edges
 find_causal_links(docid="#a1b2c3", direction="both", depth=5)
-# → shows what caused this decision and what it caused
+# → directed edge records (sourceDocId → targetDocId) with witnesses + reasoning
 ```
+
+Each record is evidence for ONE edge. Multi-hop chain quality is experimental:
+`depth > 1` results are per-edge evidence along a traversal, not a verified
+end-to-end chain.

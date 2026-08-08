@@ -417,7 +417,14 @@ async function backfillAmem(store: Store, llm: LlamaCpp): Promise<void> {
   for (const doc of docs) {
     try {
       const note = await store.constructMemoryNote(llm, doc.id);
-      await store.storeMemoryNote(doc.id, note);
+      // A refused (empty) note leaves amem_* NULL, which is exactly the state this backfill
+      // selects on — so skip the link pass and say so, rather than reporting an enrichment
+      // that did not happen and will be retried on the next run.
+      const noteStored = await store.storeMemoryNote(doc.id, note);
+      if (!noteStored) {
+        console.log(`[consolidation] Skipped doc ${doc.id} (${doc.title}) — enrichment produced nothing; still eligible for backfill`);
+        continue;
+      }
       await store.generateMemoryLinks(llm, doc.id);
       console.log(`[consolidation] Enriched doc ${doc.id} (${doc.title})`);
     } catch (err) {

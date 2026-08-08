@@ -176,7 +176,7 @@ ClawMem integrates via hooks (`settings.json`) and an MCP stdio server. Hooks ha
 
 ```bash
 clawmem setup hooks    # Install lifecycle hooks (SessionStart, UserPromptSubmit, Stop, PreCompact)
-clawmem setup mcp      # Register MCP server in ~/.claude.json (31 tools)
+clawmem setup mcp      # Register MCP server in ~/.claude.json (33 tools)
 ```
 
 **Automatic (90%):** `context-surfacing` injects relevant memory on every prompt. `postcompact-inject` re-injects state after compaction. `decision-extractor`, `handoff-generator`, `feedback-loop` capture session state on stop.
@@ -215,7 +215,7 @@ ClawMem coexists cleanly with OpenClaw's [Active Memory](https://docs.openclaw.a
 
 > **OpenClaw v2026.4.11+ recommended (required for ClawMem v0.10.0+).** v2026.4.11 introduced a new plugin discovery contract that requires each plugin directory to ship a `package.json` with `openclaw.extensions` declared, and that rejects symlinked plugin directories. ClawMem v0.10.0 includes both fixes. Older ClawMem versions (< v0.10.0) on OpenClaw v2026.4.11+ will fail to discover silently — upgrade ClawMem, then re-run `clawmem setup openclaw`. See [docs/guides/upgrading.md](docs/guides/upgrading.md#v090--v0100).
 
-**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 31 MCP tools but bypasses OpenClaw's plugin lifecycle, so you lose token budget awareness, native compaction orchestration, and the `agent_end` message pipeline. The native OpenClaw plugin is recommended for new setups; MCP is available as an additional or standalone integration.
+**Alternative:** OpenClaw agents can also use ClawMem's MCP server directly (`clawmem setup mcp`), with or without hooks. This gives full access to all 33 MCP tools but bypasses OpenClaw's plugin lifecycle, so you lose token budget awareness, native compaction orchestration, and the `agent_end` message pipeline. The native OpenClaw plugin is recommended for new setups; MCP is available as an additional or standalone integration.
 
 #### Hermes Agent
 
@@ -321,7 +321,7 @@ ClawMem uses three inference services — **embedding**, **LLM** (query expansio
 
 ### MCP Server
 
-ClawMem exposes 31 MCP tools via the [Model Context Protocol](https://modelcontextprotocol.io) and an optional HTTP REST API. Any MCP-compatible client or HTTP client can use it.
+ClawMem exposes 33 MCP tools via the [Model Context Protocol](https://modelcontextprotocol.io) and an optional HTTP REST API. Any MCP-compatible client or HTTP client can use it.
 
 **Claude Code (automatic):**
 
@@ -533,7 +533,7 @@ clawmem status                                  Quick index status
 
 Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 
-**Internal-collection visibility (v0.21.0):** the retrieval tools `search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` exclude the system-internal `_clawmem` collection by default — pass `includeInternal: true` (or name `_clawmem` in an explicit `collection` filter where the tool has one) to include it. `find_similar` auto-includes internal neighbors when the reference document is itself internal; `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are unfiltered by design. Full contract (including the `degraded` under-fill markers): [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md).
+**Internal-collection visibility (v0.21.0):** the retrieval tools `search`, `vsearch`, `query`, `query_plan`, `memory_retrieve`, and `find_similar` (plus `memory_rank` since v0.36.0) exclude the system-internal `_clawmem` collection by default — pass `includeInternal: true` (or name `_clawmem` in an explicit `collection` filter where the tool has one) to include it. `find_similar` auto-includes internal neighbors when the reference document is itself internal; `intent_search`, `find_causal_links`, `kg_query`, `session_log`, and `timeline` are unfiltered by design. Full contract (including the `degraded` under-fill markers): [docs/reference/mcp-tools.md](docs/reference/mcp-tools.md).
 
 | Tool | Description |
 |---|---|
@@ -602,6 +602,8 @@ Registered by `clawmem setup mcp`. Available to any MCP-compatible client.
 | `status` | Index health with content type distribution |
 | `reindex` | Trigger vault re-scan |
 | `index_stats` | Detailed stats: types, staleness, access counts, sessions |
+| `memory_stats` | Lifecycle + ranking-metadata aggregates per collection (v0.36.0): origin×active cross-tabs, pinned, accrual, deactivation reasons, and access/confidence/quality/effective-age distributions (mean/median/min/max over active rows). Deeper than `index_stats`; includes system collections. |
+| `memory_rank` | Ranking diagnostic (v0.36.0): real-pipeline composite breakdown per result — weights, recency, confidence blend, quality/length/frequency/canonical multipliers, signed pinΔ, co-activation — plus raw-vs-composite rank shifts; demoted raw winners stay visible. FTS-only candidates; read-only. |
 | `session_log` | USE THIS for "last time", "yesterday", "what happened", "what did we do". Returns session history with handoffs and file changes. DO NOT use `query()` for cross-session questions — this tool has session-specific data that search cannot find. |
 | `profile` | Current static + dynamic user profile |
 | `lifecycle_status` | Document lifecycle statistics: active, archived, forgotten, pinned, snoozed counts and policy summary |

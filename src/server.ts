@@ -12,11 +12,12 @@
 
 import type { Server } from "bun";
 import type { Store, SearchResult, TimelineResult } from "./store.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, attachRrfScores } from "./search-utils.ts";
+import { enrichResults } from "./search-utils.ts";
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { listCollections } from "./collections.ts";
-import { classifyIntent, type IntentType } from "./intent.ts";
+import { runCausalRetrieval, hasCausalSignal, hasTimelineSignal } from "./causal-retrieval.ts";
+import { capCausalWire } from "./causal-reader.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import {
   DEFAULT_EMBED_MODEL,
@@ -325,20 +326,39 @@ function handleProfile(_req: Request, _url: URL, store: Store): Response {
 function handleCausalLinks(_req: Request, url: URL, store: Store): Response {
   const docid = url.pathname.split("/").pop();
   if (!docid) return jsonError("docid is required");
+  // s342 D4: every exit is byte-bounded — the caller-controlled docid is
+  // display-bounded before ANY echo (error bodies included).
+  const docidEcho = docid.slice(0, 256);
 
   const resolved = store.findDocumentByDocid(docid);
-  if (!resolved) return jsonError(`Document not found: ${docid}`, 404);
+  if (!resolved) return jsonError(`Document not found: ${docidEcho}`, 404);
 
+  // s342: anchor eligibility — the reader enforces the same predicate on every
+  // recursive expansion; an invalidated anchor resolves to nothing here.
   const doc = store.db.prepare(
-    "SELECT id FROM documents WHERE hash = ? AND active = 1 LIMIT 1"
+    "SELECT id FROM documents WHERE hash = ? AND active = 1 AND invalidated_at IS NULL LIMIT 1"
   ).get(resolved.hash) as { id: number } | undefined;
-  if (!doc) return jsonError(`Document not found: ${docid}`, 404);
+  if (!doc) return jsonError(`Document not found: ${docidEcho}`, 404);
 
-  const direction = (queryParam(url, "direction", "both") as "causes" | "caused_by" | "both") || "both";
+  // Validate against the enum — never echo caller-controlled junk into the body.
+  const rawDirection = queryParam(url, "direction", "both") ?? "both";
+  if (rawDirection !== "causes" && rawDirection !== "caused_by" && rawDirection !== "both") {
+    return jsonError("direction must be causes | caused_by | both");
+  }
+  const direction = rawDirection as "causes" | "caused_by" | "both";
   const depth = queryInt(url, "depth", 5);
 
-  const links = store.findCausalLinks(doc.id, direction, depth);
-  return jsonResponse({ docid, direction, depth, count: links.length, links });
+  // Evidence-preserving directed edge records; the COMPLETE body is capped at
+  // CAUSAL_READER_MAX_BYTES with whole-edge truncation in the reader's
+  // deterministic total order, and the overflow envelope backstops the ceiling
+  // unconditionally.
+  const { edges, truncated } = store.findCausalLinks(doc.id, direction, depth);
+  const body = capCausalWire(edges, truncated, (kept, isTruncated) => ({
+    docid: docidEcho, direction, depth, count: kept.length, truncated: isTruncated, links: kept,
+  }), () => ({
+    docid: docidEcho, direction, depth, count: 0, truncated: true, overflow: true, links: [],
+  }));
+  return jsonResponse(body);
 }
 
 // --- Similar Documents ---
@@ -486,7 +506,7 @@ async function handleForget(_req: Request, url: URL, store: Store): Promise<Resp
   ).get(resolved.hash) as { id: number; collection: string; path: string } | undefined;
   if (!doc) return jsonError(`Document not found: ${docid}`, 404);
 
-  store.deactivateDocument(doc.collection, doc.path);
+  store.deactivateDocument(doc.collection, doc.path, "forget");
   return jsonResponse({ docid, forgotten: true });
 }
 
@@ -586,8 +606,10 @@ async function handleBuildGraphs(req: Request, _url: URL, store: Store): Promise
 
 function classifyRetrievalMode(query: string): "keyword" | "semantic" | "causal" | "timeline" | "hybrid" {
   const q = query.toLowerCase();
-  if (/\b(last session|yesterday|prior session|previous session|last time we|handoff|what happened last|what did we do)\b/i.test(q)) return "timeline";
-  if (/\b(why did|why was|what caused|what led to|reason for|decided to|decision about|trade.?off|chose to)\b/i.test(q) || /^why\b/i.test(q)) return "causal";
+  // Shared signal source with the MCP classifier (causal-retrieval.ts). The REST copy used to
+  // recognize neither "why were" nor "because we", so those queries never routed causal here.
+  if (hasTimelineSignal(q)) return "timeline";
+  if (hasCausalSignal(q)) return "causal";
   if (q.length < 50 && (/[A-Z][A-Z0-9_]{2,}/.test(query) || /[\w-]+\.\w{2,4}\b/.test(q.trim()))) return "keyword";
   if (/\b(how does|explain|concept|overview|understand|what is the purpose)\b/i.test(q)) return "semantic";
   return "hybrid";
@@ -626,17 +648,18 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
   }
 
   if (mode === "causal") {
-    // Intent-aware RRF: boost vector for causal queries
+    // Shared intent-aware causal pipeline (v0.32.0). REST's shipped posture is preserved as an
+    // EXPLICIT allowAll policy — nothing is internally filtered here, matching every other REST
+    // mode. The graph stages (adaptive traversal, MPFP, causal one-hop, rerank) are NEW REST
+    // capability, documented in docs/reference/rest-api.md; entity expansion stays off — its
+    // only home is direct intent_search. A REST-wide visibility option is a later slice.
     const llm = getDefaultLlamaCpp();
-    const intent = await classifyIntent(query, llm, store.db);
-    const bm25 = store.searchFTS(query, limit * 2, undefined, collections);
-    let vec: SearchResult[] = [];
-    try {
-      vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch (e) { rethrowIfFatalVectorError(e); /* vector unavailable */ }
-    const weights = intent.intent === "WHEN" ? [1.5, 1.0] : [1.0, 1.5];
-    const fused = reciprocalRankFusion([bm25.map(toRanked), vec.map(toRanked)], weights);
-    results = attachRrfScores(fused, [...bm25, ...vec]);
+    const causal = await runCausalRetrieval(store, llm, query, {
+      stages: { traversal: true, mpfp: true, entityExpansion: false, rerank: true, causalOneHop: true },
+      baseEligibility: { allowCollections: collections },
+      whyObservationLane: false,
+    });
+    results = causal.results;
   } else if (mode === "keyword") {
     results = store.searchFTS(query, limit * 2, undefined, collections);
   } else if (mode === "semantic") {

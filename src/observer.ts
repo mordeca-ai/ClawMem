@@ -393,7 +393,11 @@ function extractMultiple(xml: string, tag: string, parentTag?: string): string[]
 // =============================================================================
 
 export async function extractObservations(
-  messages: TranscriptMessage[]
+  messages: TranscriptMessage[],
+  /** s342 D2: the Stop handler threads its remaining whole-handler budget here
+   *  so extraction cannot outlive `CLAWMEM_STOP_BUDGET_MS`. Omitted → the
+   *  retry helper's default wall-clock cap applies (non-hook callers). */
+  opts?: { timeoutMs?: number }
 ): Promise<Observation[]> {
   if (messages.length < 4) return [];
 
@@ -405,6 +409,7 @@ export async function extractObservations(
     llm: getDefaultLlamaCpp(),
     maxTokens: GENERATION_MAX_TOKENS,
     temperature: GENERATION_TEMPERATURE,
+    timeoutMs: opts?.timeoutMs,
     label: "observer.extractObservations",
     parse: (text) => {
       // Parse all <observation>...</observation> blocks

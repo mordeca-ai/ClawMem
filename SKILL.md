@@ -63,10 +63,14 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
     intent, candidateLimit. BM25 strong-signal bypass skips expansion when top hit >= 0.85
     with gap >= 0.15 (disabled when intent is provided).
 1b. Causal/why/when/entity -> intent_search(query, enable_graph_traversal=true)
-    MAGMA intent classification + intent-weighted RRF + multi-hop graph traversal.
+    MAGMA intent classification + intent-weighted RRF + multi-hop graph traversal + a bounded
+    one-hop causal step in BOTH directions (v0.32.0 — the only backward cause→effect reach).
     Use DIRECTLY (not as a fallback) for "why" / "when" / "how did X lead to Y" / entity links.
     Override: force_intent="WHY"|"WHEN"|"ENTITY"|"WHAT".
-    (1a vs 1b are parallel options, chosen by query type — not sequential.)
+    (1a vs 1b are parallel options, chosen by query type — not sequential. memory_retrieve's
+    causal mode runs the SAME shared pipeline since v0.32.0, default-filtered plus a WHY
+    observation lane, so auto-routing is no longer weaker than calling intent_search directly;
+    one-hop hits carry causal: [{anchorDocid, direction}].)
 1c. Multi-topic         -> query_plan(query, compact=true)
     Decomposes into 2-4 typed clauses (bm25/vector/graph), runs them in parallel, merges via RRF.
 2.  Progressive disclosure -> multi_get("path1,path2") for full content of top hits
@@ -89,7 +93,7 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `get` / `multi_get` | Single doc by path/`#docid` / multiple by glob or comma-list. |
 | `find_similar` | "what else relates to X" — k-NN vector neighbors beyond keyword overlap. |
 | `find_causal_links` | Trace decision chains ("what led to X") over observation docs. |
-| `kg_query` | Entity SPO triples with temporal validity. Entity facts, NOT causal "why" (use `intent_search`). |
+| `kg_query` | Entity SPO triples with temporal validity + per-fact evidence (`evidenceCount`, up to 5 sources; v0.32.0). Entity facts, NOT causal "why" (use `intent_search`). |
 | `session_log` | "last time" / "yesterday" / "what did we do". Do NOT use `query` for cross-session. |
 | `profile` | User profile (static facts + dynamic context). |
 | `memory_pin` | Lifecycle retention + priority among relevance-equivalent results (+0.3 composite boost on composite surfaces; exact-tie precedence on raw routes — vector + `search` non-recency). Use PROACTIVELY for constraints, architecture decisions, corrections. |
@@ -100,6 +104,8 @@ All other retrieval is handled by Tier 2 hooks. **Do NOT call MCP tools speculat
 | `memory_evolution_status` | How a doc's A-MEM metadata evolved over time. |
 | `lifecycle_status` / `lifecycle_sweep` / `lifecycle_restore` | Lifecycle stats / archive stale (dry-run default, archives only — ClawMem never deletes rows) / restore auto-archived. |
 | `index_stats` / `status` / `reindex` | Doc counts + embedding coverage / quick health / force re-index (does NOT embed). |
+| `memory_stats` | Lifecycle + ranking-metadata aggregates per collection: origin×active cross-tabs, pinned, accrual, access/confidence/quality/effective-age distributions. Deeper than `index_stats`. |
+| `memory_rank` | "Why did X outrank Y" — real-pipeline composite breakdown (weights, multipliers, signed pinΔ, co-activation) + raw-vs-composite rank shifts. Diagnostic, not retrieval. |
 | `beads_sync` / `vault_sync` / `list_vaults` | Beads issues from Dolt / index a dir into a named vault / list vaults. |
 
 **Multi-vault:** all tools accept an optional `vault` param (omit for single-vault mode). **Progressive disclosure:** ALWAYS `compact=true` first → review snippets/scores → `get` / `multi_get` for full content.

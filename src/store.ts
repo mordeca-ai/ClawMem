@@ -53,9 +53,8 @@ import {
   generateMemoryLinks,
   evolveMemories,
   postIndexEnrich,
-  inferCausalLinks,
-  type ObservationWithDoc,
 } from "./amem.ts";
+import { parseLegacyEdgeWitness } from "./causal-reader.ts";
 import {
   enrichDocumentEntities,
   searchEntities,
@@ -426,6 +425,7 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
       confidence REAL NOT NULL DEFAULT 0.5,
       access_count INTEGER NOT NULL DEFAULT 0,
       content_hash TEXT,
+      origin TEXT,
       FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
       UNIQUE(collection, path)
     )
@@ -459,10 +459,93 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
     // recovered + embedded at embed time (mirrors the z7o4y title fix).
     ["description", "ALTER TABLE documents ADD COLUMN description TEXT"],
     ["authored_at", "ALTER TABLE documents ADD COLUMN authored_at TEXT"],
+    // §55.6 D9: WHY a row was deactivated. `active` is written by three unrelated owners —
+    // absence reconciliation, forget, and archival — and the indexer used to reactivate all
+    // three indiscriminately, so a forget on a file-backed document was silently undone by
+    // the next reindex. NULL = legacy row (pre-migration), treated as 'absent'.
+    ["deactivated_reason", "ALTER TABLE documents ADD COLUMN deactivated_reason TEXT"],
+    // Origin-aware reconciliation: WHO owns the row's lifecycle. 'fs' = created/maintained
+    // by the filesystem indexer (reconciled against disk); 'api' = DB-born (hooks,
+    // saveMemory, beads sync, REST) — these have no backing file BY DESIGN, so the absence
+    // reconciler must never deactivate them. NULL = ambiguous legacy row; exempt, adopted by
+    // the next writer to TOUCH it (indexer → 'fs', saveMemory → 'api'), never inferred —
+    // content_hash proves nothing about ownership (mined imports write it too).
+    ["origin", "ALTER TABLE documents ADD COLUMN origin TEXT"],
   ];
   for (const [col, sql] of migrations) {
     if (!colNames.has(col)) {
       try { db.exec(sql); } catch { /* column may already exist */ }
+    }
+  }
+
+  // The loop above swallows every ALTER error, so a real failure (SQLITE_BUSY, disk) is
+  // indistinguishable from "already there" — and the follow-up query would then raise
+  // `no such column`, which the handler below treats as benign. Check explicitly instead,
+  // or a genuinely failed migration ships as silence.
+  const hasDeactivationReason = (
+    db.prepare("PRAGMA table_info(documents)").all() as { name: string }[]
+  ).some(c => c.name === "deactivated_reason");
+  if (!hasDeactivationReason) {
+    console.warn(
+      `[clawmem] could not add the deactivated_reason column on this open. Forget and archival ` +
+      `remain reversible by indexing until it succeeds; it is retried on the next open.`,
+    );
+  }
+
+  // §55.6 D9 migration. Both halves are read-guarded so an already-migrated DB takes NO
+  // write lock here (same reason as the last_accessed_at backfill below).
+  try {
+    if (!hasDeactivationReason) throw new Error("deactivated_reason column absent");
+    // (a) Backfill provenance for rows archival already marked. Legacy rows deactivated by
+    //     forget are indistinguishable from absence at this point, so they stay NULL and keep
+    //     today's reactivate-on-return behaviour rather than being stranded — from here
+    //     forward, forget is durable.
+    const needsReasonBackfill = db.prepare(
+      `SELECT 1 FROM documents WHERE active = 0 AND archived_at IS NOT NULL AND deactivated_reason IS NULL LIMIT 1`
+    ).get();
+    if (needsReasonBackfill) {
+      db.exec(`UPDATE documents SET deactivated_reason = 'archive' WHERE active = 0 AND archived_at IS NOT NULL AND deactivated_reason IS NULL`);
+    }
+    // (b) REPAIR, not merely prevent: released versions could reactivate an archived row while
+    //     leaving archived_at set — an internally inconsistent state with no legitimate meaning.
+    //     Restore those to a consistent archived state and report, since silently re-archiving
+    //     rows a user may have been reading would be its own surprise.
+    //
+    //     Count and update run in ONE transaction: two processes opening the store concurrently
+    //     would otherwise both read the same count while only one performed the repair, and the
+    //     loser would report a repair it did not make.
+    const repaired = db.transaction(() => {
+      const row = db.prepare(
+        `SELECT COUNT(*) AS n FROM documents WHERE active = 1 AND archived_at IS NOT NULL`
+      ).get() as { n: number } | undefined;
+      const n = row?.n ?? 0;
+      if (n > 0) {
+        db.prepare(`UPDATE documents SET active = 0, deactivated_reason = 'archive' WHERE active = 1 AND archived_at IS NOT NULL`).run();
+      }
+      return n;
+    })();
+    if (repaired > 0) {
+      console.warn(
+        `[clawmem] repaired ${repaired} archived document(s) that a previous reindex had ` +
+        `reactivated while still marked archived. Use lifecycle_restore to bring any of them back.`,
+      );
+    }
+  } catch (err) {
+    // Do NOT fail open silently. A read-only handle or a pre-migration schema is expected and
+    // benign; anything else (SQLITE_BUSY, a genuine SQL fault) means this process is running
+    // WITHOUT the migration, and the user needs to know rather than discovering it as behaviour.
+    const msg = err instanceof Error ? err.message : String(err);
+    // A missing column is NOT benign here — it is already reported above with its own message,
+    // so absorbing it a second time would double-report; anything else that is not a read-only
+    // handle or a pre-migration table is a real failure the user must see.
+    const alreadyReported = /deactivated_reason column absent/.test(msg);
+    const benign = alreadyReported || /readonly|read-only|no such table/i.test(msg);
+    if (!benign) {
+      console.warn(
+        `[clawmem] deactivation-provenance migration did not run on this open (${msg}). ` +
+        `Forget/archive may still be reversible by indexing until it succeeds; it is retried on ` +
+        `the next open.`,
+      );
     }
   }
 
@@ -478,6 +561,24 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
       db.exec(`UPDATE documents SET last_accessed_at = modified_at WHERE last_accessed_at IS NULL`);
     }
   } catch { /* ignore if already backfilled */ }
+
+  // Origin migration verification. Verified explicitly like deactivated_reason above: the
+  // migration loop swallows ALTER errors, and reconciliation semantics must never silently
+  // depend on a column that never arrived. There is deliberately NO content_hash-based
+  // backfill: mined imports (`clawmem mine`) also write content_hash through the indexing
+  // pipeline, so its presence proves nothing about ownership — a backfill would mis-stamp
+  // DB-born imports as 'fs' (1,353 such rows measured in one live vault). Legacy rows stay
+  // NULL (exempt) and are adopted by the next writer to TOUCH them: the indexer stamps its
+  // origin on every path including unchanged files; saveMemory stamps 'api'.
+  const hasOrigin = (
+    db.prepare("PRAGMA table_info(documents)").all() as { name: string }[]
+  ).some(c => c.name === "origin");
+  if (!hasOrigin) {
+    console.warn(
+      `[clawmem] could not add the origin column on this open. Filesystem-absence ` +
+      `reconciliation is disabled until it succeeds; it is retried on the next open.`,
+    );
+  }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
@@ -815,6 +916,124 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   // MPFP composite index for efficient neighbor loading (GPT 5.4 recommendation)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_relations_mpfp ON memory_relations(source_id, relation_type, weight DESC, target_id)`);
 
+  // s342 causal writer (C4′): per-invocation audit runs. run_key is UNIQUE NOT
+  // NULL so a key collision fails loudly BEFORE inference results are written.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS causal_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_key TEXT NOT NULL UNIQUE,
+      session_id TEXT,
+      source TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      model TEXT,
+      prompt_version TEXT,
+      prompt_sha256 TEXT,
+      response_sha256 TEXT,
+      outcome TEXT NOT NULL,
+      new_doc_count INTEGER NOT NULL DEFAULT 0,
+      window_doc_count INTEGER NOT NULL DEFAULT 0,
+      candidate_count INTEGER NOT NULL DEFAULT 0,
+      admitted_count INTEGER NOT NULL DEFAULT 0,
+      edges_written INTEGER NOT NULL DEFAULT 0,
+      edges_refused INTEGER NOT NULL DEFAULT 0,
+      edges_errored INTEGER NOT NULL DEFAULT 0,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      duration_ms INTEGER
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_causal_runs_ts ON causal_runs(started_at DESC, id DESC)`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS causal_run_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL REFERENCES causal_runs(id) ON DELETE CASCADE,
+      scope TEXT NOT NULL CHECK (scope IN ('document','pair','write')),
+      event_type TEXT NOT NULL,
+      source_doc_id INTEGER,
+      target_doc_id INTEGER,
+      source_fact_ordinal INTEGER,
+      target_fact_ordinal INTEGER,
+      confidence REAL,
+      detail TEXT,
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_causal_run_events_run ON causal_run_events(run_id, id)`);
+
+  // s342: append-only fact-pair witness sightings on causal edges. Identity is
+  // the ORDINAL pair (facts are display snapshots); a live row must carry
+  // visible evidence + full attribution; legacy rows (ordinals = -1) keep their
+  // explicitly different compatibility contract. Witnesses are dependent
+  // evidence of the edge — the composite FK cascades with it, never a second
+  // lifecycle identity. Audit retention deletes runs only: run_id detaches via
+  // SET NULL while denormalized model/prompt/run_key attribution survives.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS causal_witness_sightings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_id INTEGER NOT NULL,
+      target_id INTEGER NOT NULL,
+      relation_type TEXT NOT NULL DEFAULT 'causal' CHECK (relation_type = 'causal'),
+      source_fact_ordinal INTEGER NOT NULL,
+      target_fact_ordinal INTEGER NOT NULL,
+      source_fact TEXT,
+      target_fact TEXT,
+      reasoning TEXT NOT NULL DEFAULT '',
+      confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+      model_identity TEXT NOT NULL DEFAULT '',
+      prompt_version TEXT NOT NULL DEFAULT '',
+      run_key TEXT NOT NULL,
+      run_id INTEGER REFERENCES causal_runs(id) ON DELETE SET NULL,
+      legacy INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      CHECK ((legacy = 0 AND source_fact_ordinal >= 0 AND target_fact_ordinal >= 0)
+          OR (legacy = 1 AND source_fact_ordinal = -1 AND target_fact_ordinal = -1)),
+      CHECK (legacy = 1 OR (length(COALESCE(source_fact,'')) > 0
+                        AND length(COALESCE(target_fact,'')) > 0
+                        AND length(reasoning) > 0
+                        AND length(model_identity) > 0
+                        AND length(prompt_version) > 0
+                        AND length(run_key) > 0)),
+      FOREIGN KEY (source_id, target_id, relation_type)
+        REFERENCES memory_relations(source_id, target_id, relation_type) ON DELETE CASCADE
+    )
+  `);
+  // ONE live sighting per (edge, ordinal pair, invocation); recurrence across
+  // runs APPENDS under its own run_key. Plain columns — a valid targeted
+  // ON CONFLICT target for the partial-index upsert.
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_cws_live ON causal_witness_sightings
+    (source_id, target_id, source_fact_ordinal, target_fact_ordinal, run_key)
+    WHERE legacy = 0`);
+  // EXACTLY ONE legacy row per physical edge — repeated materialization throws.
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_cws_one_legacy ON causal_witness_sightings
+    (source_id, target_id) WHERE legacy = 1`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cws_edge ON causal_witness_sightings
+    (source_id, target_id, confidence DESC, created_at DESC, id DESC)`);
+
+  // s342: NON-PRUNED archive for operator-retired causal edges — the supported,
+  // reversible restoration path (`clawmem migrate causal-witnesses --restore-edge`).
+  // Full row image, no FKs: the archive must survive everything, including audit
+  // retention. An archive table (vs a retired_at column) keeps every existing
+  // graph reader predicate unchanged.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS retired_causal_edges (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_id INTEGER NOT NULL,
+      target_id INTEGER NOT NULL,
+      relation_type TEXT NOT NULL,
+      weight REAL,
+      metadata TEXT,
+      created_at TEXT,
+      contradict_confidence REAL,
+      retired_at TEXT NOT NULL,
+      retired_run_key TEXT NOT NULL,
+      operator_note TEXT,
+      fingerprint TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_retired_causal_edge ON retired_causal_edges
+    (source_id, target_id, relation_type)`);
+
   // A-MEM: Memory evolution tracking
   db.exec(`
     CREATE TABLE IF NOT EXISTS memory_evolution (
@@ -920,6 +1139,41 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_object ON entity_triples(object_entity_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_predicate ON entity_triples(predicate)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_entity_triples_valid ON entity_triples(valid_from, valid_to)`);
+
+  // Per-source evidence for SPO triples (v0.32.0). One row per distinct
+  // (triple, source_doc, source_fact) — the base row's inline source_doc_id/source_fact stay
+  // frozen as the first sighting. Uniqueness is null-normalized: a plain UNIQUE treats NULLs as
+  // distinct, which would let unattributed evidence duplicate unboundedly.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entity_triple_provenance (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      triple_id INTEGER NOT NULL REFERENCES entity_triples(id),
+      source_doc_id INTEGER REFERENCES documents(id),
+      source_fact TEXT,
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_etp_evidence ON entity_triple_provenance
+    (triple_id, COALESCE(source_doc_id, -1), COALESCE(source_fact, ''))`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_etp_triple_recent ON entity_triple_provenance
+    (triple_id, created_at DESC, id DESC)`);
+  // Idempotent backfill, READ-GUARDED (v0.16.0 discipline: a writable open on a healthy DB
+  // must not wait on busy_timeout) — the INSERT runs only when at least one triple still lacks
+  // a provenance row, so steady-state opens perform zero writes here. EVERY legacy triple gets
+  // a row: one whose inline evidence is entirely NULL gets a single unattributed row (the
+  // null-normalized unique index caps it at one), so evidenceCount is honest for legacy facts.
+  const needsEvidenceBackfill = db.prepare(`
+    SELECT 1 FROM entity_triples t
+    WHERE NOT EXISTS (SELECT 1 FROM entity_triple_provenance p WHERE p.triple_id = t.id)
+    LIMIT 1
+  `).get();
+  if (needsEvidenceBackfill) {
+    db.exec(`
+      INSERT OR IGNORE INTO entity_triple_provenance (triple_id, source_doc_id, source_fact, created_at)
+      SELECT id, source_doc_id, source_fact, COALESCE(created_at, datetime('now'))
+      FROM entity_triples
+    `);
+  }
 
   // Entity FTS5 for fuzzy name lookup
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(entity_id, name, entity_type)`);
@@ -1425,7 +1679,7 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[]) => SearchResult[];
+  searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => SearchResult[];
   searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => Promise<SearchResult[]>;
   searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => Promise<VecSearchDetailedResult>;
 
@@ -1445,14 +1699,15 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null, origin?: DocumentOrigin) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; pinned: number; snoozed_until: string | null; confidence: number } | null;
   findAnyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; active: number } | null;
-  reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
+  reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => boolean;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
-  deactivateDocument: (collectionName: string, path: string) => void;
+  deactivateDocument: (collectionName: string, path: string, reason: DeactivationReason) => void;
   getActiveDocumentPaths: (collectionName: string) => string[];
+  getReconcilableDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
@@ -1507,12 +1762,11 @@ export type Store = {
 
   // A-MEM: Self-Evolving Memory
   constructMemoryNote: (llm: any, docId: number) => Promise<any>;
-  storeMemoryNote: (docId: number, note: any) => void;
+  storeMemoryNote: (docId: number, note: any) => boolean;
   generateMemoryLinks: (llm: any, docId: number, kNeighbors?: number) => Promise<number>;
   evolveMemories: (llm: any, memoryId: number, triggeredBy: number) => Promise<boolean>;
   postIndexEnrich: (llm: any, docId: number, isNew: boolean) => Promise<void>;
-  inferCausalLinks: (llm: any, observations: ObservationWithDoc[]) => Promise<number>;
-  findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => CausalLink[];
+  findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => CausalEdgesResult;
   getEvolutionTimeline: (docId: number, limit?: number) => EvolutionEntry[];
 
   // Entity resolution + co-occurrence
@@ -1523,7 +1777,7 @@ export type Store = {
   // SPO knowledge graph
   addTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, options?: { validFrom?: string; validTo?: string; confidence?: number; sourceDocId?: number; sourceFact?: string }) => number;
   invalidateTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, endedDate?: string) => number;
-  queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both" }) => { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean }[];
+  queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both"; includeProvenance?: boolean; provenanceLimit?: number }) => { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean; evidenceCount?: number; sources?: { docId: number | null; collection: string | null; path: string | null; fact: string | null; at: string }[] }[];
   getTripleStats: () => { totalTriples: number; currentFacts: number; expiredFacts: number; predicateTypes: string[] };
 
   // Recall tracking
@@ -1625,7 +1879,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[]) => searchFTS(db, query, limit, collectionId, collections, dateRange, excludeCollections),
+    searchFTS: (query: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }) => searchFTS(db, query, limit, collectionId, collections, dateRange, excludeCollections, opts),
     searchVec: (query: string, model: string, limit?: number, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number) => searchVec(db, query, model, limit, collectionId, collections, dateRange, deadlineMs),
     searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => searchVecDetailed(db, query, model, limit, opts),
 
@@ -1645,14 +1899,15 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, description),
+    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null, origin?: DocumentOrigin) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, description, origin),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
     findAnyDocument: (collectionName: string, path: string) => findAnyDocument(db, collectionName, path),
     reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => reactivateDocument(db, documentId, title, hash, modifiedAt),
     updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
     updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
-    deactivateDocument: (collectionName: string, path: string) => deactivateDocument(db, collectionName, path),
+    deactivateDocument: (collectionName: string, path: string, reason: DeactivationReason) => deactivateDocument(db, collectionName, path, reason),
     getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
+    getReconcilableDocumentPaths: (collectionName: string) => getReconcilableDocumentPaths(db, collectionName),
 
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
@@ -1783,7 +2038,6 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     generateMemoryLinks: (llm: any, docId: number, kNeighbors?: number) => generateMemoryLinks({ db, dbPath: resolvedPath } as Store, llm, docId, kNeighbors),
     evolveMemories: (llm: any, memoryId: number, triggeredBy: number) => evolveMemories({ db, dbPath: resolvedPath } as Store, llm, memoryId, triggeredBy),
     postIndexEnrich: (llm: any, docId: number, isNew: boolean) => postIndexEnrich({ db, dbPath: resolvedPath } as Store, llm, docId, isNew),
-    inferCausalLinks: (llm: any, observations: ObservationWithDoc[]) => inferCausalLinks({ db, dbPath: resolvedPath } as Store, llm, observations),
     findCausalLinks: (docId: number, direction?: 'causes' | 'caused_by' | 'both', maxDepth?: number) => findCausalLinks(db, docId, direction, maxDepth),
     getEvolutionTimeline: (docId: number, limit?: number) => getEvolutionTimeline(db, docId, limit),
 
@@ -1800,21 +2054,39 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         ? "object_entity_id = ? AND object_literal IS NULL"
         : "object_entity_id IS NULL AND object_literal = ?";
       const objParam = objectEntityId ?? objectLiteral;
-      const existing = db.prepare(
-        `SELECT id FROM entity_triples WHERE subject_entity_id = ? AND predicate = ? AND ${objClause} AND valid_to IS NULL`
-      ).get(subjectEntityId, pred, objParam) as { id: number } | null;
-      if (existing) return existing.id;
+      // Evidence rides in the same transaction as the base row — a triple must never exist
+      // without a provenance row. An entirely-unattributed sighting still writes its
+      // null-normalized row (the unique index collapses repeats to one), so evidenceCount
+      // stays honest rather than under-reporting unattributed corroboration as zero.
+      const insertEvidence = (tripleId: number) => {
+        db.prepare(`
+          INSERT OR IGNORE INTO entity_triple_provenance (triple_id, source_doc_id, source_fact, created_at)
+          VALUES (?, ?, ?, ?)
+        `).run(tripleId, options?.sourceDocId ?? null, options?.sourceFact ?? null, now);
+      };
+      const txn = db.transaction(() => {
+        const existing = db.prepare(
+          `SELECT id FROM entity_triples WHERE subject_entity_id = ? AND predicate = ? AND ${objClause} AND valid_to IS NULL`
+        ).get(subjectEntityId, pred, objParam) as { id: number } | null;
+        if (existing) {
+          insertEvidence(existing.id);
+          return existing.id;
+        }
 
-      const result = db.prepare(`
-        INSERT INTO entity_triples (subject_entity_id, predicate, object_entity_id, object_literal, valid_from, valid_to, confidence, source_doc_id, source_fact, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        subjectEntityId, pred, objectEntityId, objectLiteral,
-        options?.validFrom ?? null, options?.validTo ?? null,
-        options?.confidence ?? 1.0, options?.sourceDocId ?? null,
-        options?.sourceFact ?? null, now
-      );
-      return Number(result.lastInsertRowid);
+        const result = db.prepare(`
+          INSERT INTO entity_triples (subject_entity_id, predicate, object_entity_id, object_literal, valid_from, valid_to, confidence, source_doc_id, source_fact, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          subjectEntityId, pred, objectEntityId, objectLiteral,
+          options?.validFrom ?? null, options?.validTo ?? null,
+          options?.confidence ?? 1.0, options?.sourceDocId ?? null,
+          options?.sourceFact ?? null, now
+        );
+        const tripleId = Number(result.lastInsertRowid);
+        insertEvidence(tripleId);
+        return tripleId;
+      });
+      return txn.immediate() as number;
     },
 
     invalidateTriple: (subjectEntityId: string, predicate: string, objectEntityId: string | null, objectLiteral: string | null, endedDate?: string) => {
@@ -1830,10 +2102,10 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
       return result.changes;
     },
 
-    queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both" }) => {
+    queryEntityTriples: (entityId: string, options?: { asOf?: string; direction?: "outgoing" | "incoming" | "both"; includeProvenance?: boolean; provenanceLimit?: number }) => {
       const direction = options?.direction ?? "both";
       const asOf = options?.asOf;
-      const results: { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean }[] = [];
+      const results: { id: number; direction: string; subject: string; predicate: string; object: string; validFrom: string | null; validTo: string | null; confidence: number; current: boolean; evidenceCount?: number; sources?: { docId: number | null; collection: string | null; path: string | null; fact: string | null; at: string }[] }[] = [];
 
       if (direction === "outgoing" || direction === "both") {
         let query = `SELECT t.id, t.predicate, t.object_entity_id, t.object_literal, t.valid_from, t.valid_to, t.confidence,
@@ -1866,6 +2138,39 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         }
         for (const row of db.prepare(query).all(...params) as any[]) {
           results.push({ id: row.id, direction: "incoming", subject: row.sub_name, predicate: row.predicate, object: row.obj_name, validFrom: row.valid_from, validTo: row.valid_to, confidence: row.confidence, current: row.valid_to === null });
+        }
+      }
+
+      // Provenance is OPT-IN: the context-surfacing hook calls this per detected prompt entity
+      // and discards evidence fields — the default path must not pay these two queries.
+      if (options?.includeProvenance && results.length > 0) {
+        const provLimit = Math.max(1, options.provenanceLimit ?? 5);
+        const tripleIds = [...new Set(results.map(r => r.id))];
+        const ph = tripleIds.map(() => "?").join(",");
+        const counts = new Map<number, number>();
+        for (const row of db.prepare(
+          `SELECT triple_id, COUNT(*) AS n FROM entity_triple_provenance WHERE triple_id IN (${ph}) GROUP BY triple_id`
+        ).all(...tripleIds) as { triple_id: number; n: number }[]) {
+          counts.set(row.triple_id, row.n);
+        }
+        const sourcesByTriple = new Map<number, { docId: number | null; collection: string | null; path: string | null; fact: string | null; at: string }[]>();
+        for (const row of db.prepare(`
+          SELECT triple_id, source_doc_id, source_fact, created_at, collection, path FROM (
+            SELECT p.triple_id, p.source_doc_id, p.source_fact, p.created_at,
+                   d.collection AS collection, d.path AS path,
+                   ROW_NUMBER() OVER (PARTITION BY p.triple_id ORDER BY p.created_at DESC, p.id DESC) AS rn
+            FROM entity_triple_provenance p
+            LEFT JOIN documents d ON d.id = p.source_doc_id
+            WHERE p.triple_id IN (${ph})
+          ) WHERE rn <= ? ORDER BY triple_id, rn
+        `).all(...tripleIds, provLimit) as { triple_id: number; source_doc_id: number | null; source_fact: string | null; created_at: string; collection: string | null; path: string | null }[]) {
+          const list = sourcesByTriple.get(row.triple_id) ?? [];
+          list.push({ docId: row.source_doc_id, collection: row.collection, path: row.path, fact: row.source_fact, at: row.created_at });
+          sourcesByTriple.set(row.triple_id, list);
+        }
+        for (const r of results) {
+          r.evidenceCount = counts.get(r.id) ?? 0;
+          r.sources = sourcesByTriple.get(r.id) ?? [];
         }
       }
 
@@ -2105,7 +2410,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
           SELECT COUNT(*) AS n FROM documents WHERE id IN (${placeholders}) AND active = 1
         `).get(...ids) as { n: number } | undefined;
         db.prepare(`
-          UPDATE documents SET active = 0, archived_at = ?
+          UPDATE documents SET active = 0, archived_at = ?, deactivated_reason = 'archive'
           WHERE id IN (${placeholders}) AND active = 1
         `).run(now, ...ids);
         return row?.n ?? 0;
@@ -2562,6 +2867,16 @@ export function insertContent(db: Database, hash: string, content: string, creat
 /**
  * Insert a new document into the documents table.
  */
+/**
+ * Who owns a document row's lifecycle (origin-aware reconciliation).
+ * 'fs'  — created/maintained by the filesystem indexer; reconciled against disk.
+ * 'api' — DB-born (hooks, saveMemory, beads sync, REST); no backing file BY DESIGN, so
+ *         filesystem absence means nothing and the reconciler must never deactivate it.
+ * NULL  — ambiguous legacy row (pre-migration); exempt from reconciliation, adopted by the
+ *         next writer to touch it (indexer → 'fs', saveMemory → 'api'). Never inferred.
+ */
+export type DocumentOrigin = "fs" | "api";
+
 export function insertDocument(
   db: Database,
   collectionName: string,
@@ -2570,14 +2885,17 @@ export function insertDocument(
   hash: string,
   createdAt: string,
   modifiedAt: string,
-  description?: string | null
+  description?: string | null,
+  origin: DocumentOrigin = "api"
 ): void {
   // Guard: gray-matter can coerce YAML values to Date/boolean/null — SQLite rejects these
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
+  // origin defaults to 'api': a caller this parameter has not reached yet becomes exempt
+  // from filesystem reconciliation — stale-active at worst, never a destroyed DB-born row.
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, description)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt, description ?? null);
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, description, origin)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt, description ?? null, origin);
 }
 
 // =============================================================================
@@ -2656,7 +2974,44 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
   bodyHasher.update(params.body);
   const bodyHash = bodyHasher.digest("hex");
 
+  // --- Ownership + lifecycle preflight (before ANY write, including dedup's counters) ---
+  // Rejecting later would leak writes: an orphaned content row on a rejected insert, or a
+  // dedup counter bump on a row the caller had no claim to. Rules: an ACTIVE
+  // filesystem-owned row is never overwritten (this function's contract excludes file-backed
+  // indexing — API content masquerading as the unchanged file would never be re-read past
+  // the indexer's content-hash short-circuit, and file removal would absence-deactivate it).
+  // An INACTIVE row at the path is a lifecycle state — forget/archive are memory decisions
+  // (§55.6 D9) and an absence-deactivated row's recovery is a deliberate operation — so it
+  // is neither overwritten nor resurrected; it also occupies UNIQUE(collection, path), where
+  // a blind insert would orphan the content row on the rethrow. NULL-origin ACTIVE rows are
+  // claimable — saveMemory touching one IS the proof of API ownership; content_hash proves
+  // nothing (mined imports write it too).
+  const pathRow = db.prepare(
+    `SELECT origin, active, deactivated_reason FROM documents WHERE collection = ? AND path = ?`
+  ).get(params.collection, params.path) as
+    { origin: string | null; active: number; deactivated_reason: string | null } | null;
+  if (pathRow) {
+    if (pathRow.active === 1 && pathRow.origin === "fs") {
+      throw new Error(
+        `saveMemory: path collision with a filesystem-owned document ` +
+        `(${params.collection}/${params.path}) — refusing to overwrite. ` +
+        `Write API memories to a path the filesystem indexer does not own.`,
+      );
+    }
+    if (pathRow.active === 0) {
+      throw new Error(
+        `saveMemory: path is occupied by an inactive document ` +
+        `(${params.collection}/${params.path}, deactivated_reason=${pathRow.deactivated_reason ?? "null"}) — ` +
+        `lifecycle decisions are not overwritten. Write to a new path, or restore the ` +
+        `document deliberately first.`,
+      );
+    }
+  }
+
   // --- Dedup check: same normalized_hash within window ---
+  // Candidates are restricted to API-claimable rows: a filesystem-owned row is never a dedup
+  // target (it also never carries a normalized_hash today — belt and suspenders), and a
+  // NULL-origin candidate is adopted 'api' by the counter update (touch-adoption).
   const dedupRow = db.prepare(`
     SELECT id, duplicate_count
     FROM documents
@@ -2664,6 +3019,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
       AND collection = ?
       AND content_type = ?
       AND normalized_hash = ?
+      AND (origin IS NULL OR origin = 'api')
       AND datetime(created_at) >= datetime('now', ?)
     ORDER BY created_at DESC
     LIMIT 1
@@ -2679,107 +3035,141 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
     // incoming authorship advances authored_at monotonically (CASE, not scalar
     // MAX — MAX(NULL, x) is NULL in SQLite and could never populate an
     // initially unknown row); absent incoming leaves the column untouched.
+    //
+    // The UPDATE re-checks ownership ATOMICALLY: between the SELECT above and this
+    // statement, another process (the indexer) may adopt a NULL candidate as 'fs' —
+    // stamping 'api' over that fresh declaration would be a silent ownership overwrite.
+    // Zero changes means the candidate was claimed mid-flight; the call falls through to
+    // the transactional write phase, which revalidates the requested path (insert, an
+    // API-owned update, or rejection via the conflict handling).
+    let dedupChanges: number;
     if (authoredAt) {
-      db.prepare(`
+      dedupChanges = db.prepare(`
         UPDATE documents
         SET duplicate_count = duplicate_count + 1,
             last_seen_at = ?,
+            origin = 'api',
             authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END
-        WHERE id = ?
-      `).run(now, authoredAt, authoredAt, dedupRow.id);
+        WHERE id = ? AND active = 1 AND (origin IS NULL OR origin = 'api')
+      `).run(now, authoredAt, authoredAt, dedupRow.id).changes;
     } else {
-      db.prepare(`
+      dedupChanges = db.prepare(`
         UPDATE documents
         SET duplicate_count = duplicate_count + 1,
-            last_seen_at = ?
-        WHERE id = ?
-      `).run(now, dedupRow.id);
+            last_seen_at = ?,
+            origin = 'api'
+        WHERE id = ? AND active = 1 AND (origin IS NULL OR origin = 'api')
+      `).run(now, dedupRow.id).changes;
     }
+
+    if (dedupChanges > 0) {
+      return {
+        action: 'deduplicated',
+        docId: dedupRow.id,
+        duplicateCount: dedupRow.duplicate_count + 1,
+      };
+    }
+    // Candidate lost to a concurrent ownership claim — fall through to the write phase.
+  }
+
+  // --- Write phase (transactional) ---
+  // Content insert + document insert + the conflict path run in ONE transaction, so a race
+  // rejection (the indexer claiming the path between preflight and insert) rolls the content
+  // row back instead of leaking an orphan. Bun's Database.transaction nests via savepoints,
+  // so a caller-held transaction is safe.
+  const writePhase = db.transaction((): SaveMemoryResult => {
+    // Store content
+    db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+      .run(bodyHash, params.body, now);
+
+    // Insert document row
+    try {
+      db.prepare(`
+        INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
+                               content_type, confidence, quality_score, normalized_hash,
+                               duplicate_count, revision_count, last_seen_at, topic_key, description, authored_at,
+                               origin)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, 'api')
+      `).run(
+        params.collection,
+        params.path,
+        params.title,
+        bodyHash,
+        now,
+        now,
+        params.contentType,
+        params.confidence ?? 0.5,
+        params.qualityScore ?? 0.5,
+        normHash,
+        now,
+        params.topicKey ?? null,
+        params.description ?? null,
+        authoredAt,
+      );
+    } catch (err: any) {
+      // UNIQUE(collection, path) conflict — update existing row
+      if (err?.message?.includes("UNIQUE constraint")) {
+        const existing = db.prepare(
+          "SELECT id, origin FROM documents WHERE collection = ? AND path = ? AND active = 1"
+        ).get(params.collection, params.path) as { id: number; origin: string | null } | null;
+
+        if (existing) {
+          // Race guard for the ownership preflight above: the indexer may have claimed this
+          // path between the preflight and the insert. Same rule — an explicit 'fs' owner is
+          // never overwritten (the throw rolls this transaction back, content row included);
+          // NULL stays claimable and the update below stamps 'api'.
+          if (existing.origin === "fs") {
+            throw new Error(
+              `saveMemory: path collision with a filesystem-owned document ` +
+              `(${params.collection}/${params.path}) — refusing to overwrite. ` +
+              `Write API memories to a path the filesystem indexer does not own.`,
+            );
+          }
+          // §51.1: same monotonic authored_at advancement as the dedup branch. The update
+          // also stamps origin='api': saveMemory touching the row IS proof of API ownership,
+          // healing legacy NULL-origin rows on their next write.
+          const authoredSet = authoredAt
+            ? ", authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END"
+            : "";
+          const updateVals: (string | number | null)[] = [
+            bodyHash, params.title, now, params.contentType,
+            params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
+            now,
+          ];
+          if (authoredAt) updateVals.push(authoredAt, authoredAt);
+          updateVals.push(existing.id);
+          db.prepare(`
+            UPDATE documents
+            SET hash = ?, title = ?, modified_at = ?, content_type = ?,
+                confidence = ?, quality_score = ?, normalized_hash = ?,
+                revision_count = revision_count + 1, last_seen_at = ?, origin = 'api'${authoredSet}
+            WHERE id = ?
+          `).run(...updateVals);
+
+          const updated = db.prepare("SELECT revision_count FROM documents WHERE id = ?")
+            .get(existing.id) as { revision_count: number } | null;
+
+          return {
+            action: 'updated',
+            docId: existing.id,
+            revisionCount: updated?.revision_count ?? 1,
+          };
+        }
+      }
+      throw err;
+    }
+
+    // Get the inserted row ID
+    const newDoc = db.prepare(
+      "SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1"
+    ).get(params.collection, params.path) as { id: number } | null;
 
     return {
-      action: 'deduplicated',
-      docId: dedupRow.id,
-      duplicateCount: dedupRow.duplicate_count + 1,
+      action: 'inserted',
+      docId: newDoc?.id ?? -1,
     };
-  }
-
-  // --- Insert new document ---
-  // Store content
-  db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
-    .run(bodyHash, params.body, now);
-
-  // Insert document row
-  try {
-    db.prepare(`
-      INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
-                             content_type, confidence, quality_score, normalized_hash,
-                             duplicate_count, revision_count, last_seen_at, topic_key, description, authored_at)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)
-    `).run(
-      params.collection,
-      params.path,
-      params.title,
-      bodyHash,
-      now,
-      now,
-      params.contentType,
-      params.confidence ?? 0.5,
-      params.qualityScore ?? 0.5,
-      normHash,
-      now,
-      params.topicKey ?? null,
-      params.description ?? null,
-      authoredAt,
-    );
-  } catch (err: any) {
-    // UNIQUE(collection, path) conflict — update existing row
-    if (err?.message?.includes("UNIQUE constraint")) {
-      const existing = db.prepare(
-        "SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1"
-      ).get(params.collection, params.path) as { id: number } | null;
-
-      if (existing) {
-        // §51.1: same monotonic authored_at advancement as the dedup branch.
-        const authoredSet = authoredAt
-          ? ", authored_at = CASE WHEN authored_at IS NULL OR authored_at < ? THEN ? ELSE authored_at END"
-          : "";
-        const updateVals: (string | number | null)[] = [
-          bodyHash, params.title, now, params.contentType,
-          params.confidence ?? 0.5, params.qualityScore ?? 0.5, normHash,
-          now,
-        ];
-        if (authoredAt) updateVals.push(authoredAt, authoredAt);
-        updateVals.push(existing.id);
-        db.prepare(`
-          UPDATE documents
-          SET hash = ?, title = ?, modified_at = ?, content_type = ?,
-              confidence = ?, quality_score = ?, normalized_hash = ?,
-              revision_count = revision_count + 1, last_seen_at = ?${authoredSet}
-          WHERE id = ?
-        `).run(...updateVals);
-
-        const updated = db.prepare("SELECT revision_count FROM documents WHERE id = ?")
-          .get(existing.id) as { revision_count: number } | null;
-
-        return {
-          action: 'updated',
-          docId: existing.id,
-          revisionCount: updated?.revision_count ?? 1,
-        };
-      }
-    }
-    throw err;
-  }
-
-  // Get the inserted row ID
-  const newDoc = db.prepare(
-    "SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1"
-  ).get(params.collection, params.path) as { id: number } | null;
-
-  return {
-    action: 'inserted',
-    docId: newDoc?.id ?? -1,
-  };
+  });
+  return writePhase();
 }
 
 // =============================================================================
@@ -2938,12 +3328,22 @@ export function reactivateDocument(
   title: string,
   hash: string,
   modifiedAt: string
-): void {
+): boolean {
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
   // The reset_embed_on_hash_change trigger resets embed_state/attempts/error iff the
   // hash actually changes, so re-adding unchanged content preserves its valid vectors.
-  db.prepare(`UPDATE documents SET active = 1, title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(safeTitle, hash, modifiedAt, documentId);
+  //
+  // §55.6 D9: every successful active=1 writer clears the deactivation provenance — but this
+  // generic reactivator must not overrule a lifecycle decision. `updateProfile` calls it on any
+  // inactive profile row during a routine `clawmem update` (src/profile.ts), so without the
+  // predicate a forgotten profile came back on the next index — and an archived one came back
+  // still carrying `archived_at`, recreating the exact inconsistent state the migration repairs.
+  // Restoring an archived document is `restoreArchivedDocuments`' job, not this function's.
+  const result = db.prepare(
+    `UPDATE documents SET active = 1, title = ?, hash = ?, modified_at = ?, deactivated_reason = NULL
+     WHERE id = ? AND (deactivated_reason IS NULL OR deactivated_reason = 'absent')`,
+  ).run(safeTitle, hash, modifiedAt, documentId);
+  return result.changes > 0;
 }
 
 /**
@@ -2978,11 +3378,26 @@ export function updateDocument(
 }
 
 /**
- * Deactivate a document (mark as inactive but don't delete).
+ * Why a document was deactivated (§55.6 D9). Only `'absent'` is reversible by the indexer;
+ * `'forget'` and `'archive'` are lifecycle decisions it must never undo.
  */
-export function deactivateDocument(db: Database, collectionName: string, path: string): void {
-  db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = ? AND active = 1`)
-    .run(collectionName, path);
+export type DeactivationReason = "absent" | "forget" | "archive";
+
+/**
+ * Deactivate a document (mark as inactive but don't delete).
+ *
+ * `reason` is required because this one function serves two unrelated owners — the indexer's
+ * absence loop and the MCP/REST forget path — and the indexer's reactivate branch keys on it.
+ * Defaulting it would silently re-open the bug it exists to close.
+ */
+export function deactivateDocument(
+  db: Database,
+  collectionName: string,
+  path: string,
+  reason: DeactivationReason,
+): void {
+  db.prepare(`UPDATE documents SET active = 0, deactivated_reason = ? WHERE collection = ? AND path = ? AND active = 1`)
+    .run(reason, collectionName, path);
 }
 
 /**
@@ -2993,6 +3408,33 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
     SELECT path FROM documents WHERE collection = ? AND active = 1
   `).all(collectionName) as { path: string }[];
   return rows.map(r => r.path);
+}
+
+/**
+ * Paths eligible for filesystem-absence reconciliation: active rows the filesystem indexer
+ * owns (origin = 'fs'). DB-born rows (origin = 'api' — hooks, saveMemory, beads, REST) have
+ * no backing file BY DESIGN; treating their absence from disk as deletion destroyed
+ * hook-written memories (measured in one production vault: 2,430 of 2,437 DB-born rows
+ * deactivated). NULL-origin legacy rows are exempt too — fail-safe.
+ *
+ * Failure posture is fail-SAFE: on a pre-migration schema (the one error this function
+ * recognizes) it returns NO paths — reconciliation simply does not run until the migration
+ * lands, and the open-time warning reports that state. There is no inference fallback:
+ * content_hash proves nothing about ownership (mined imports write it too). Every other
+ * error propagates (the caller's transaction rolls back); no failure may widen the
+ * enumeration.
+ */
+export function getReconcilableDocumentPaths(db: Database, collectionName: string): string[] {
+  try {
+    const rows = db.prepare(`
+      SELECT path FROM documents WHERE collection = ? AND active = 1 AND origin = 'fs'
+    `).all(collectionName) as { path: string }[];
+    return rows.map(r => r.path);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/no such column.*origin/i.test(msg)) throw err;
+    return [];
+  }
 }
 
 export { formatQueryForEmbedding, formatDocForEmbedding };
@@ -3183,7 +3625,14 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
   // Normalize: remove leading # if present
   const shortHash = docid.startsWith('#') ? docid.slice(1) : docid;
 
-  if (shortHash.length < 1) return null;
+  // Structural validation BEFORE the value reaches LIKE: a docid is a hex
+  // prefix of a sha256 hash, 6–64 chars (the documented short-docid contract).
+  // Anything else returns not-found — this closes real holes on EVERY docid
+  // surface (destructive REST forget included): `_`/`%` are LIKE wildcards
+  // that matched arbitrary documents, a 1-char prefix is ambiguity-by-design,
+  // and an unbounded value made SQLite's LIKE throw ("pattern too complex")
+  // instead of answering.
+  if (!/^[0-9a-fA-F]{6,64}$/.test(shortHash)) return null;
 
   // Look up documents where hash starts with the short hash
   const doc = db.prepare(`
@@ -3699,7 +4148,7 @@ export function ftsScoreFromBm25(bm25Score: number): number {
   return m / (1 + m);
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[]): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -3743,6 +4192,14 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     const exPlaceholders = excludeCollections.map(() => '?').join(',');
     sql += ` AND d.collection NOT IN (${exPlaceholders})`;
     params.push(...excludeCollections);
+  }
+
+  // WHY observation lane (v0.32.0): the structural predicate is applied IN the candidate
+  // selection, so `limit` is satisfied with eligible observation documents by construction —
+  // a post-filter over a fixed overfetch could be starved by higher-ranked non-observation
+  // internal artifacts.
+  if (opts?.observationsOnly) {
+    sql += ` AND d.path LIKE 'observations/%' AND d.observation_type IS NOT NULL`;
   }
 
   // bm25 lower is better; sort ascending.
@@ -3968,6 +4425,10 @@ export interface VecSearchDetailedOpts {
   deadlineMs?: number;
   /** Override the hard MATCH-depth cap (default 4096). Primarily for tests. */
   escalationCap?: number;
+  /** WHY observation lane (v0.32.0): restrict candidates to `_clawmem` observation documents
+   * (path 'observations/%' + observation_type set) inside the hydration SQL, so the escalation
+   * loop fills `limit` with eligible observations by construction. */
+  observationsOnly?: boolean;
 }
 
 export interface VecSearchDetailedResult {
@@ -4029,6 +4490,9 @@ function hydrateVecResultsClassified(
     // §51.1: content-time predicate — authorship when known, filing time otherwise.
     docSql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
     params.push(opts.dateRange.start, opts.dateRange.end);
+  }
+  if (opts.observationsOnly) {
+    docSql += ` AND d.path LIKE 'observations/%' AND d.observation_type IS NOT NULL`;
   }
 
   const docRows = db.prepare(docSql).all(...params) as {
@@ -4105,14 +4569,18 @@ export function searchVecDetailedWithVector(
   let raw: { hash_seq: string; distance: number }[] = [];
   let classified: ReturnType<typeof hydrateVecResultsClassified> = { results: [], allowedDocs: 0, excludedDocsSeen: 0 };
 
-  // Escalation loop (exclusion-enabled callers only): grow MATCH depth x3 until `limit`
-  // allowed DOCUMENTS (post-dedup) hydrate, the effective cap is hit, or the deadline passes.
-  // Without exclusion this runs exactly once at limit*3 — today's semantics.
+  // Escalation loop (filtering callers only): grow MATCH depth x3 until `limit` allowed
+  // DOCUMENTS (post-dedup) hydrate, the effective cap is hit, or the deadline passes.
+  // `observationsOnly` filters in the hydration SQL exactly like a collection exclusion does,
+  // so it engages the same escalation — otherwise nearer non-observation internals could
+  // starve the observation lane out of its first limit*3 raw candidates. Without any
+  // filtering this runs exactly once at limit*3 — today's semantics.
+  const filteringActive = exclude.size > 0 || !!opts.observationsOnly;
   for (;;) {
     raw = matchStmt.all(queryVec.embedding, k) as { hash_seq: string; distance: number }[];
     classified = hydrateVecResultsClassified(db, raw, limit, opts, exclude);
     const done =
-      exclude.size === 0 ||
+      !filteringActive ||
       classified.allowedDocs >= limit ||
       k >= effectiveCap ||
       raw.length < k || // MATCH returned fewer than requested: table exhausted below k
@@ -4128,7 +4596,7 @@ export function searchVecDetailedWithVector(
   let degradedReason: VecSearchDetailedResult["degradedReason"];
   const underfilled = classified.allowedDocs < limit;
   const hardCapPreventedExhaustion = tableRows > hardCap && k >= hardCap;
-  if (exclude.size > 0 && underfilled && hardCapPreventedExhaustion) {
+  if (filteringActive && underfilled && hardCapPreventedExhaustion) {
     degraded = true;
     degradedReason = classified.excludedDocsSeen >= (limit - classified.allowedDocs)
       ? "excluded-dominant"
@@ -5612,110 +6080,340 @@ export async function buildSemanticGraph(
 // A-MEM: Causal Graph Traversal
 // =============================================================================
 
-export type CausalLink = {
+/** One projected fact-pair witness on a causal edge (s342). Legacy witnesses
+ *  (ordinals = -1) carry pre-cut evidence whose fact ordinals are unknowable. */
+export type CausalWitness = {
+  sourceFactOrdinal: number;
+  targetFactOrdinal: number;
+  sourceFact: string | null;
+  targetFact: string | null;
+  reasoning: string;
+  confidence: number;
+  /** created_at of the max-confidence sighting for this ordinal pair. */
+  strongestAt: string;
+  /** most recent sighting created_at for this ordinal pair — distinct from strongestAt. */
+  lastSeenAt: string;
+  legacy: boolean;
+};
+
+/** Directed causal edge record: invariant physical edge identity
+ *  (sourceDocId → targetDocId) with traversal provenance kept SEPARATE
+ *  (predecessorDocId/depth/direction) — consumers never invert fields. */
+export type CausalEdgeRecord = {
+  sourceDocId: number;
+  targetDocId: number;
+  /** The far endpoint this hop reached (== targetDocId outbound, sourceDocId inbound). */
   docId: number;
   title: string;
   filepath: string;
+  predecessorDocId: number;
   depth: number;
+  direction: 'causes' | 'caused_by';
   weight: number;
-  reasoning: string | null;
+  /** Distinct ordinal-pair witnesses on this edge (witnesses lists the top 3). */
+  evidenceCount: number;
+  witnesses: CausalWitness[];
+  /** true when witnesses were synthesized in-memory from pre-cut edge metadata. */
+  legacy: boolean;
 };
 
+export type CausalEdgesResult = { edges: CausalEdgeRecord[]; truncated: boolean };
+
+/** Combined budget across BOTH directions; the reader fetches budget+1 per
+ *  direction as an overflow probe so `truncated` is truthful. */
+export const CAUSAL_READER_MAX_EDGES = 50;
+export const CAUSAL_READER_MAX_WITNESSES = 3;
+
+type RawEdge = {
+  sourceDocId: number;
+  targetDocId: number;
+  docId: number;
+  title: string;
+  filepath: string;
+  predecessorDocId: number;
+  depth: number;
+  direction: 'causes' | 'caused_by';
+  weight: number;
+  metadata: string | null;
+  edgeCreatedAt: string | null;
+};
+
+/** Deterministic total order for results AND truncation:
+ *  (depth, weight DESC, sourceDocId, targetDocId, direction). */
+function compareCausalEdges(a: RawEdge, b: RawEdge): number {
+  return a.depth - b.depth
+    || b.weight - a.weight
+    || a.sourceDocId - b.sourceDocId
+    || a.targetDocId - b.targetDocId
+    || a.direction.localeCompare(b.direction);
+}
+
+/** Iterative bounded traversal, level-synchronous across BOTH directions so the
+ *  retained set is the globally-first `probeLimit` edges under the reader's
+ *  total order — (depth, weight DESC, sourceDocId, targetDocId, direction) —
+ *  never an ID-arrival-order sample of one direction. Per level, each
+ *  direction's SQL contributes its top `remaining` edges by weight (sufficient:
+ *  the global top-R at one depth needs at most R from either direction), the
+ *  level competes as one pool, and only KEPT edges extend the next frontier —
+ *  a dropped edge never sponsors deeper traversal it wouldn't explain.
+ *
+ *  Eligibility (`active = 1 AND invalidated_at IS NULL`) is enforced on EVERY
+ *  expansion, so an invalidated document stops traversal through it — never
+ *  just hidden from output. Each node expands at most once per direction
+ *  (cycle-safe); distinct edges all surface, so diamond paths keep every real
+ *  edge. Titles are display-bounded so base responses stay under the wire
+ *  ceiling by construction. */
+function collectCausalEdges(
+  db: Database,
+  anchorId: number,
+  dirs: Array<'causes' | 'caused_by'>,
+  maxDepth: number,
+  probeLimit: number,
+): RawEdge[] {
+  const edges: RawEdge[] = [];
+  const seen = new Set<string>();
+  const state = dirs.map(dir => ({
+    dir,
+    frontier: [anchorId] as number[],
+    expanded: new Set<number>([anchorId]),
+  }));
+
+  for (let depth = 1; depth <= maxDepth && edges.length < probeLimit; depth++) {
+    const remaining = probeLimit - edges.length;
+    const level: RawEdge[] = [];
+    for (const st of state) {
+      if (st.frontier.length === 0) continue;
+      const outbound = st.dir === 'causes';
+      const nearCol = outbound ? 'source_id' : 'target_id';
+      const farCol = outbound ? 'target_id' : 'source_id';
+      const placeholders = st.frontier.map(() => '?').join(',');
+      const rows = db.prepare(
+        `SELECT mr.source_id, mr.target_id, mr.weight, mr.metadata,
+                mr.created_at AS edge_created_at,
+                d.title, d.collection || '/' || d.path AS filepath
+         FROM memory_relations mr
+         JOIN documents d ON d.id = mr.${farCol}
+         WHERE mr.${nearCol} IN (${placeholders})
+           AND mr.relation_type = 'causal'
+           AND d.active = 1 AND d.invalidated_at IS NULL
+         ORDER BY COALESCE(mr.weight, 1.0) DESC, mr.source_id, mr.target_id
+         LIMIT ?`,
+      ).all(...st.frontier, remaining) as Array<{
+        source_id: number; target_id: number; weight: number | null;
+        metadata: string | null; edge_created_at: string | null;
+        title: string; filepath: string;
+      }>;
+      for (const row of rows) {
+        const far = outbound ? row.target_id : row.source_id;
+        const near = outbound ? row.source_id : row.target_id;
+        level.push({
+          sourceDocId: row.source_id,
+          targetDocId: row.target_id,
+          docId: far,
+          title: row.title.slice(0, 300),
+          filepath: row.filepath,
+          predecessorDocId: near,
+          depth,
+          direction: st.dir,
+          weight: row.weight ?? 1.0,
+          metadata: row.metadata,
+          edgeCreatedAt: row.edge_created_at,
+        });
+      }
+    }
+
+    // One pool per level: both directions compete under the total order.
+    level.sort(compareCausalEdges);
+    const kept: RawEdge[] = [];
+    for (const e of level) {
+      if (edges.length + kept.length >= probeLimit) break;
+      const key = `${e.sourceDocId}:${e.targetDocId}:${e.direction}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      kept.push(e);
+    }
+    edges.push(...kept);
+
+    let anyFrontier = false;
+    for (const st of state) {
+      const next: number[] = [];
+      for (const e of kept) {
+        if (e.direction !== st.dir) continue;
+        if (!st.expanded.has(e.docId)) {
+          st.expanded.add(e.docId);
+          next.push(e.docId);
+        }
+      }
+      next.sort((a, b) => a - b);
+      st.frontier = next;
+      if (next.length > 0) anyFrontier = true;
+    }
+    if (!anyFrontier) break;
+  }
+  return edges;
+}
+
+type ProjectedWitnessRow = {
+  source_id: number; target_id: number;
+  source_fact_ordinal: number; target_fact_ordinal: number;
+  source_fact: string | null; target_fact: string | null;
+  reasoning: string; confidence: number; legacy: number;
+  created_at: string; last_seen_at: string;
+  pair_rank: number; evidence_count: number;
+};
+
+/** SQL-side witness projection: per ordinal pair the max-confidence sighting
+ *  wins (tie → latest created_at, then highest id), pairs rank by projected
+ *  confidence, and only the top CAUSAL_READER_MAX_WITNESSES rows per edge —
+ *  plus an honest per-edge evidence_count — cross into JS. Sightings are
+ *  append-only forever (recurrence appends by design), so the reader must
+ *  never hydrate an edge's complete history into memory. */
+function projectedWitnessSql(edgeTupleCount: number): string {
+  const valueTuples = Array.from({ length: edgeTupleCount }, () => '(?, ?)').join(',');
+  return `
+    WITH pair_proj AS (
+      SELECT source_id, target_id, source_fact_ordinal, target_fact_ordinal,
+             source_fact, target_fact, reasoning, confidence, legacy, created_at,
+             ROW_NUMBER() OVER (
+               PARTITION BY source_id, target_id, source_fact_ordinal, target_fact_ordinal
+               ORDER BY confidence DESC, created_at DESC, id DESC) AS rn,
+             MAX(created_at) OVER (
+               PARTITION BY source_id, target_id, source_fact_ordinal, target_fact_ordinal) AS last_seen_at
+      FROM causal_witness_sightings
+      WHERE (source_id, target_id) IN (VALUES ${valueTuples})
+    ),
+    ranked AS (
+      SELECT *,
+             ROW_NUMBER() OVER (
+               PARTITION BY source_id, target_id
+               ORDER BY confidence DESC, source_fact_ordinal, target_fact_ordinal) AS pair_rank,
+             COUNT(*) OVER (PARTITION BY source_id, target_id) AS evidence_count
+      FROM pair_proj WHERE rn = 1
+    )
+    SELECT source_id, target_id, source_fact_ordinal, target_fact_ordinal,
+           source_fact, target_fact, reasoning, confidence, legacy, created_at,
+           last_seen_at, pair_rank, evidence_count
+    FROM ranked WHERE pair_rank <= ${CAUSAL_READER_MAX_WITNESSES}`;
+}
+
+/** Lazy read-through for untouched pre-cut edges: synthesize one legacy display
+ *  witness — via the SAME validity rule the writer and census apply
+ *  (`parseLegacyEdgeWitness`), so no surface calls an edge valid that another
+ *  refuses. Never written; invalid evidence yields NO witness. */
+function synthesizeLegacyWitness(edge: RawEdge): CausalWitness | null {
+  const parsed = parseLegacyEdgeWitness({ weight: edge.weight, metadata: edge.metadata });
+  if (!parsed) return null;
+  return {
+    sourceFactOrdinal: -1,
+    targetFactOrdinal: -1,
+    sourceFact: parsed.sourceFact,
+    targetFact: parsed.targetFact,
+    reasoning: parsed.reasoning,
+    confidence: parsed.confidence,
+    strongestAt: edge.edgeCreatedAt ?? '',
+    lastSeenAt: edge.edgeCreatedAt ?? '',
+    legacy: true,
+  };
+}
+
+/**
+ * s342 causal reader: evidence-preserving directed edge traversal.
+ *
+ * Returns directed edge records — invariant sourceDocId/targetDocId with
+ * traversal predecessor/depth/direction separate — each carrying up to
+ * CAUSAL_READER_MAX_WITNESSES projected fact-pair witnesses. One combined
+ * CAUSAL_READER_MAX_EDGES budget spans both directions, with an overflow probe
+ * for a truthful `truncated` flag. Multi-hop CHAIN quality is explicitly
+ * experimental (canon fence): depth > 1 records are per-edge evidence, never a
+ * verified chain.
+ */
 export function findCausalLinks(
   db: Database,
   docId: number,
   direction: 'causes' | 'caused_by' | 'both' = 'both',
   maxDepth: number = 5
-): CausalLink[] {
+): CausalEdgesResult {
   if (maxDepth < 1) maxDepth = 1;
   if (maxDepth > 10) maxDepth = 10;
 
-  let query: string;
+  // Anchor eligibility: an inactive or invalidated anchor yields nothing.
+  const anchor = db.prepare(
+    `SELECT 1 FROM documents WHERE id = ? AND active = 1 AND invalidated_at IS NULL`,
+  ).get(docId);
+  if (!anchor) return { edges: [], truncated: false };
 
-  if (direction === 'causes') {
-    // Outbound: documents this one causes
-    query = `
-      WITH RECURSIVE causal_chain(doc_id, depth, path) AS (
-        -- Base case: immediate causal links outbound
-        SELECT target_id, 1, json_array(?)
-        FROM memory_relations
-        WHERE source_id = ? AND relation_type = 'causal'
+  const probeLimit = CAUSAL_READER_MAX_EDGES + 1;
+  const dirs: Array<'causes' | 'caused_by'> =
+    direction === 'both' ? ['causes', 'caused_by'] : [direction];
 
-        UNION ALL
+  const collected = collectCausalEdges(db, docId, dirs, maxDepth, probeLimit);
+  collected.sort(compareCausalEdges);
+  const truncated = collected.length > CAUSAL_READER_MAX_EDGES;
+  const kept = truncated ? collected.slice(0, CAUSAL_READER_MAX_EDGES) : collected;
 
-        -- Recursive case: follow the chain
-        SELECT mr.target_id, cc.depth + 1, json_insert(cc.path, '$[#]', cc.doc_id)
-        FROM memory_relations mr
-        JOIN causal_chain cc ON mr.source_id = cc.doc_id
-        WHERE cc.depth < ?
-          AND mr.relation_type = 'causal'
-          AND mr.target_id NOT IN (SELECT value FROM json_each(cc.path))
-      )
-      SELECT DISTINCT
-        cc.doc_id as docId,
-        d.title,
-        d.collection || '/' || d.path as filepath,
-        cc.depth,
-        COALESCE(mr.weight, 1.0) as weight,
-        json_extract(mr.metadata, '$.reasoning') as reasoning
-      FROM causal_chain cc
-      JOIN documents d ON d.id = cc.doc_id
-      LEFT JOIN memory_relations mr ON (mr.source_id = ? AND mr.target_id = cc.doc_id AND mr.relation_type = 'causal')
-      WHERE d.active = 1
-      ORDER BY cc.depth, weight DESC
-    `;
-    return db.prepare(query).all(docId, docId, maxDepth, docId) as CausalLink[];
-  } else if (direction === 'caused_by') {
-    // Inbound: documents that cause this one
-    query = `
-      WITH RECURSIVE causal_chain(doc_id, depth, path) AS (
-        -- Base case: immediate causal links inbound
-        SELECT source_id, 1, json_array(?)
-        FROM memory_relations
-        WHERE target_id = ? AND relation_type = 'causal'
-
-        UNION ALL
-
-        -- Recursive case: follow the chain
-        SELECT mr.source_id, cc.depth + 1, json_insert(cc.path, '$[#]', cc.doc_id)
-        FROM memory_relations mr
-        JOIN causal_chain cc ON mr.target_id = cc.doc_id
-        WHERE cc.depth < ?
-          AND mr.relation_type = 'causal'
-          AND mr.source_id NOT IN (SELECT value FROM json_each(cc.path))
-      )
-      SELECT DISTINCT
-        cc.doc_id as docId,
-        d.title,
-        d.collection || '/' || d.path as filepath,
-        cc.depth,
-        COALESCE(mr.weight, 1.0) as weight,
-        json_extract(mr.metadata, '$.reasoning') as reasoning
-      FROM causal_chain cc
-      JOIN documents d ON d.id = cc.doc_id
-      LEFT JOIN memory_relations mr ON (mr.target_id = ? AND mr.source_id = cc.doc_id AND mr.relation_type = 'causal')
-      WHERE d.active = 1
-      ORDER BY cc.depth, weight DESC
-    `;
-    return db.prepare(query).all(docId, docId, maxDepth, docId) as CausalLink[];
-  } else {
-    // Both directions
-    const outbound = findCausalLinks(db, docId, 'causes', maxDepth);
-    const inbound = findCausalLinks(db, docId, 'caused_by', maxDepth);
-
-    // Merge and deduplicate
-    const seen = new Set<number>();
-    const merged: CausalLink[] = [];
-
-    for (const link of [...outbound, ...inbound]) {
-      if (!seen.has(link.docId)) {
-        seen.add(link.docId);
-        merged.push(link);
-      }
+  // Witness hydration: ONE query over the retained edge set, projected in SQL —
+  // at most CAUSAL_READER_MAX_WITNESSES rows per edge reach JS regardless of
+  // how many sightings history has accumulated.
+  const witnessesByEdge = new Map<string, ProjectedWitnessRow[]>();
+  const distinctEdges = [...new Map(kept.map(e => [`${e.sourceDocId}:${e.targetDocId}`, e])).values()];
+  if (distinctEdges.length > 0) {
+    const params = distinctEdges.flatMap(e => [e.sourceDocId, e.targetDocId]);
+    const rows = db.prepare(projectedWitnessSql(distinctEdges.length)).all(...params) as ProjectedWitnessRow[];
+    for (const row of rows) {
+      const key = `${row.source_id}:${row.target_id}`;
+      const list = witnessesByEdge.get(key) ?? [];
+      list.push(row);
+      witnessesByEdge.set(key, list);
     }
-
-    return merged.sort((a, b) => a.depth - b.depth || b.weight - a.weight);
   }
+
+  const edges: CausalEdgeRecord[] = kept.map(edge => {
+    const projected = witnessesByEdge.get(`${edge.sourceDocId}:${edge.targetDocId}`);
+    if (projected && projected.length > 0) {
+      projected.sort((a, b) => a.pair_rank - b.pair_rank);
+      return {
+        sourceDocId: edge.sourceDocId,
+        targetDocId: edge.targetDocId,
+        docId: edge.docId,
+        title: edge.title,
+        filepath: edge.filepath,
+        predecessorDocId: edge.predecessorDocId,
+        depth: edge.depth,
+        direction: edge.direction,
+        weight: edge.weight,
+        evidenceCount: projected[0]!.evidence_count,
+        witnesses: projected.map(w => ({
+          sourceFactOrdinal: w.source_fact_ordinal,
+          targetFactOrdinal: w.target_fact_ordinal,
+          sourceFact: w.source_fact,
+          targetFact: w.target_fact,
+          reasoning: w.reasoning,
+          confidence: w.confidence,
+          strongestAt: w.created_at,
+          lastSeenAt: w.last_seen_at,
+          legacy: w.legacy === 1,
+        })),
+        legacy: false,
+      };
+    }
+    const synthesized = synthesizeLegacyWitness(edge);
+    return {
+      sourceDocId: edge.sourceDocId,
+      targetDocId: edge.targetDocId,
+      docId: edge.docId,
+      title: edge.title,
+      filepath: edge.filepath,
+      predecessorDocId: edge.predecessorDocId,
+      depth: edge.depth,
+      direction: edge.direction,
+      weight: edge.weight,
+      evidenceCount: synthesized ? 1 : 0,
+      witnesses: synthesized ? [synthesized] : [],
+      legacy: true,
+    };
+  });
+
+  return { edges, truncated };
 }
 
 // =============================================================================
@@ -5879,7 +6577,7 @@ function restoreArchivedDocumentsFn(
   return db.transaction(() => {
     const row = db.prepare(`SELECT COUNT(*) AS n FROM documents ${where}`)
       .get(...params) as { n: number } | undefined;
-    db.prepare(`UPDATE documents SET active = 1, archived_at = NULL ${where}`).run(...params);
+    db.prepare(`UPDATE documents SET active = 1, archived_at = NULL, deactivated_reason = NULL ${where}`).run(...params);
     return row?.n ?? 0;
   })();
 }

@@ -215,15 +215,39 @@ function expandBraces(pattern: string): string[] {
   return match[1]!.split(",").map(s => s.trim());
 }
 
+/**
+ * Collections that are never reconciled against a filesystem root (§55.6 D5).
+ *
+ * `_clawmem` holds DB-created memory — observations, handoffs, deductions — which has no file
+ * behind it. Reconciling it against any root deactivates every row and nothing brings them back.
+ * §55.1 required reserving it for one tool; enforcing it in the reconciler covers every present
+ * and future caller instead.
+ */
+export const RESERVED_COLLECTIONS = new Set(["_clawmem"]);
+
 export async function indexCollection(
   store: Store,
   collectionName: string,
   collectionPath: string,
   pattern: string = "**/*.md",
-  options?: { forceEnrich?: boolean; defaultContentType?: string }
+  options?: { forceEnrich?: boolean; force?: boolean; importMode?: boolean; defaultContentType?: string }
 ): Promise<IndexStats> {
+  if (RESERVED_COLLECTIONS.has(collectionName)) {
+    throw new Error(
+      `Collection '${collectionName}' is database-created memory and has no filesystem source; ` +
+      `it cannot be reconciled against a root.`,
+    );
+  }
   const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0 };
   const activePaths = new Set<string>();
+
+  // importMode: an additive DB-born ingest routed through the filesystem pipeline via a
+  // TRANSIENT staging root (`clawmem mine`). Rows are stamped origin 'api' — on insert AND on
+  // every update path, so a re-imported changed chunk never flips to 'fs' — and the
+  // whole-collection absence reconciliation below is skipped: absence from one run's staging
+  // snapshot means nothing, and a later import into the same collection must never deactivate
+  // earlier batches.
+  const rowOrigin = options?.importMode ? "api" as const : "fs" as const;
 
   // Get LLM instance for A-MEM enrichment
   const llm = getDefaultLlamaCpp();
@@ -272,11 +296,36 @@ export async function indexCollection(
       if (existing) {
         // Check if content changed via content hash
         const existingRow = store.db.prepare(
-          "SELECT content_hash, authored_at FROM documents WHERE id = ?"
-        ).get(existing.id) as { content_hash: string | null; authored_at: string | null } | null;
+          "SELECT content_hash, authored_at, origin FROM documents WHERE id = ?"
+        ).get(existing.id) as { content_hash: string | null; authored_at: string | null; origin: string | null } | null;
 
-        if (existingRow?.content_hash === contentHash) {
+        // Ownership-collision boundary: a row explicitly owned by the OPPOSITE origin is
+        // never silently taken over — the same rule saveMemory enforces for API writes onto
+        // filesystem rows, applied symmetrically (an import colliding with a real file, or a
+        // file appearing at an API row's path). Skip the write and surface it; NULL is the
+        // only claimable state, adopted by the first writer to touch it.
+        if (existingRow?.origin != null && existingRow.origin !== rowOrigin) {
+          console.warn(
+            `[indexer] ownership collision: ${collectionName}/${relativePath} is ` +
+            `'${existingRow.origin}'-owned; ${rowOrigin === "api" ? "import" : "filesystem"} write skipped`,
+          );
+          continue;
+        }
+
+        // §55.6 D7: `--force` re-parses and rewrites every file by bypassing this
+        // content-hash short-circuit. It replaces a blanket `UPDATE documents SET active = 0`
+        // that deactivated EVERY row in the vault — including `_clawmem` rows, which have no
+        // filesystem source and so were never reconstructed, with no `archived_at` and
+        // therefore no supported restore.
+        if (existingRow?.content_hash === contentHash && !options?.force) {
           stats.unchanged++;
+          // Origin adoption on the unchanged path: legacy NULL rows heal to their owner HERE
+          // — there is no open-time backfill (content_hash proves nothing about ownership;
+          // mined imports write it too), and this short-circuit is the only write path an
+          // unchanged file ever takes.
+          if (existingRow.origin === null) {
+            store.db.prepare("UPDATE documents SET origin = ? WHERE id = ?").run(rowOrigin, existing.id);
+          }
           // §51.1 D5: unchanged-row adoption — a NULL row whose frontmatter
           // already declares authored_at adopts it metadata-only (no modified_at
           // bump, no A-MEM). The frontmatter-block substring pre-check gates the
@@ -328,7 +377,7 @@ export async function indexCollection(
 
         if (datedOnly) {
           store.updateDocumentMeta(existing.id, { authored_at: meta.authored_at });
-          store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, existing.id);
+          store.db.prepare("UPDATE documents SET content_hash = ?, origin = ? WHERE id = ?").run(contentHash, rowOrigin, existing.id);
           stats.dated++;
           continue;
         }
@@ -352,17 +401,43 @@ export async function indexCollection(
         });
 
         // Update content_hash for next incremental check
-        store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, existing.id);
+        store.db.prepare("UPDATE documents SET content_hash = ?, origin = ? WHERE id = ?").run(contentHash, rowOrigin, existing.id);
 
         // Defer A-MEM enrichment until after commit
         enrichQueue.push({ docId: existing.id, isNew: false });
 
         stats.updated++;
       } else {
-        // Check for inactive (previously removed) doc at same path — reactivate instead of inserting
-        const inactive = store.db.prepare(
-          "SELECT id, hash FROM documents WHERE collection = ? AND path = ? AND active = 0"
-        ).get(collectionName, relativePath) as { id: number; hash: string } | null;
+        // Check for an inactive doc at the same path — reactivate instead of inserting.
+        // §55.6 D9: ONLY a row this reconciler deactivated for absence may come back. A row
+        // deactivated by `memory_forget` or by lifecycle archival is a memory decision, and
+        // reactivating it silently undid that decision — measured: a forget on a file-backed
+        // document survived only until the next `.md` change in its collection.
+        // NULL = legacy pre-migration row, treated as 'absent' so it is not stranded.
+        const inactiveRow = store.db.prepare(
+          "SELECT id, hash, deactivated_reason, origin FROM documents WHERE collection = ? AND path = ? AND active = 0"
+        ).get(collectionName, relativePath) as { id: number; hash: string; deactivated_reason: string | null; origin: string | null } | null;
+
+        // Forgotten / archived: leave it alone. Skipping the file — rather than falling through
+        // to the insert branch — is load-bearing: inserting would create a SECOND row at the
+        // same (collection, path) and resurrect the content under a new id, which is the same
+        // bug wearing a different shape.
+        if (inactiveRow && inactiveRow.deactivated_reason !== null && inactiveRow.deactivated_reason !== "absent") {
+          continue;
+        }
+
+        // Ownership-collision boundary (same rule as the active branch): an inactive row
+        // explicitly owned by the opposite origin is neither reactivated nor shadowed by a
+        // second insert at its path. Skip the file; resolving the collision is a deliberate
+        // operator action, never an indexing side effect.
+        if (inactiveRow && inactiveRow.origin != null && inactiveRow.origin !== rowOrigin) {
+          console.warn(
+            `[indexer] ownership collision: ${collectionName}/${relativePath} (inactive) is ` +
+            `'${inactiveRow.origin}'-owned; ${rowOrigin === "api" ? "import" : "filesystem"} write skipped`,
+          );
+          continue;
+        }
+        const inactive = inactiveRow;
 
         const { body, meta } = parseDocument(content, relativePath, options?.defaultContentType);
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
@@ -372,9 +447,9 @@ export async function indexCollection(
         store.insertContent(docHash, body, now);
 
         if (inactive) {
-          // Reactivate existing row
-          store.db.prepare("UPDATE documents SET active = 1, hash = ?, title = ?, modified_at = ?, content_hash = ? WHERE id = ?")
-            .run(docHash, title, mtime.toISOString(), contentHash, inactive.id);
+          // Reactivate existing row. §55.6 D9: clear the provenance on the way back.
+          store.db.prepare("UPDATE documents SET active = 1, hash = ?, title = ?, modified_at = ?, content_hash = ?, origin = ?, deactivated_reason = NULL WHERE id = ?")
+            .run(docHash, title, mtime.toISOString(), contentHash, rowOrigin, inactive.id);
           store.updateDocumentMeta(inactive.id, {
             domain: meta.domain,
             workstream: meta.workstream,
@@ -389,7 +464,7 @@ export async function indexCollection(
           enrichQueue.push({ docId: inactive.id, isNew: false });
         } else {
           // Truly new document
-          store.insertDocument(collectionName, relativePath, title, docHash, now, mtime.toISOString(), meta.description ?? null);
+          store.insertDocument(collectionName, relativePath, title, docHash, now, mtime.toISOString(), meta.description ?? null, rowOrigin);
           const newDoc = store.findActiveDocument(collectionName, relativePath);
           if (newDoc) {
             store.updateDocumentMeta(newDoc.id, {
@@ -412,12 +487,22 @@ export async function indexCollection(
       }
     }
 
-    // Deactivate documents that no longer exist on disk
-    const storedPaths = store.getActiveDocumentPaths(collectionName);
-    for (const storedPath of storedPaths) {
-      if (!activePaths.has(storedPath)) {
-        store.deactivateDocument(collectionName, storedPath);
-        stats.removed++;
+    // Deactivate documents that no longer exist on disk. Origin-aware: only rows the
+    // filesystem indexer owns (origin = 'fs') are enumerated — DB-born rows (hooks,
+    // saveMemory, beads, REST; origin = 'api') have no backing file BY DESIGN, and
+    // reconciling them against disk deactivated them on every pass. NULL-origin legacy
+    // rows are exempt too (fail-safe; they are adopted by the next writer to touch them —
+    // there is no backfill, and content_hash proves nothing about ownership since mined
+    // imports write it too). Skipped entirely in importMode: the
+    // staging root is transient, so absence from it means nothing.
+    if (!options?.importMode) {
+      const storedPaths = store.getReconcilableDocumentPaths(collectionName);
+      for (const storedPath of storedPaths) {
+        if (!activePaths.has(storedPath)) {
+          // §55.6 D9: record WHY. Only 'absent' is reversible by a later reconciliation.
+          store.deactivateDocument(collectionName, storedPath, "absent");
+          stats.removed++;
+        }
       }
     }
 

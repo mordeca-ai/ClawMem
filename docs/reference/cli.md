@@ -41,7 +41,9 @@ clawmem mine <dir> -c convos --backfill-dates  # v0.27.0: derive authored_at for
                                                # source transcripts — dry-run report by default
 clawmem mine <dir> -c convos --backfill-dates --apply     # Execute the backfill (metadata-only: modified_at,
                                                # stored confidence, and embeddings are never touched)
-clawmem reindex                                # Force re-scan all collections
+clawmem reindex                                # Re-scan all collections
+clawmem reindex --force                        # Re-read every file, bypassing the content-hash skip
+clawmem reindex --enrich                       # Full A-MEM pipeline on all documents
 clawmem embed                   # Embed all un-embedded fragments (geometry-canary preflight runs first)
 clawmem embed --force           # Re-embed everything (clears existing vectors; aborts BEFORE clearing if the canary preflight fails)
 clawmem embed --force --force-geometry        # v0.21.0: proceed despite a failed/unavailable canary — vault is tainted until a verified rebuild
@@ -236,6 +238,45 @@ clawmem lifecycle restore --query <term> | --collection <name> | --all
 on any path** (v0.30.0) — `purge_after_days` is inert, and a sweep that sees it configured
 says so. To reclaim disk space, act on the SQLite file out-of-band; that is deliberately
 outside ClawMem's mutation contract.
+
+## Causal witness migration (s342)
+
+```bash
+clawmem migrate causal-witnesses --preflight [--out <manifest.json>]
+clawmem migrate causal-witnesses --resolve-unmaterializable keep-weight|retire-edge \
+    --manifest <file> --edge <src>:<tgt> [--edge ...] [--note <text>] [--apply]
+clawmem migrate causal-witnesses --restore-edge <src>:<tgt> [--apply]
+```
+
+Operator surface for pre-cut causal edges the writer refuses to touch (zero witness
+sightings + metadata that cannot yield a valid witness). `--preflight` runs the census —
+scoped to edges whose BOTH endpoints are observation-lane documents, so Beads dependency
+edges and other producers never enter it — and classifies each edge as *materializable*
+(valid old-writer metadata; resolves itself lazily, no action needed) or *unresolved*.
+Run it (and resolve or accept the result) **before** setting `CLAWMEM_CAUSAL_WRITER=on`.
+
+Resolution is explicit-selection only (`--edge` per edge; bulk "all qualifying" does not
+exist), refuses *materializable* entries outright (valid old-writer evidence is never
+retired here), and is manifest-bound: `--apply` recomputes each row's version-tagged
+full-row fingerprint under the write lock and refuses rows that changed since the preview
+(`STALE`). `keep-weight` writes the single operator-ratified legacy witness carrying the
+edge's current weight; `retire-edge` moves the complete row into the non-pruned
+`retired_causal_edges` archive and deletes it from the active graph in one transaction.
+`--restore-edge` is the reversal: a plain fail-closed INSERT — if another edge now
+occupies the key, the restore is refused and both the occupying edge and the archive row
+stay untouched.
+
+## Causal writer audit (s342)
+
+```bash
+clawmem causal-audit [--limit N] [--json]      # recent causal_runs (mode, outcome, counts, timing)
+clawmem causal-audit --run <run_key> [--json]  # one run + its scoped events
+```
+
+Read-only inspection over `causal_runs`/`causal_run_events` — the shadow-mode calibration
+surface. Every invocation in `shadow`/`on` writes one run row (no-call outcomes such as
+`skipped_budget`/`no_candidates` included) with document/pair/write-scope events carrying a
+named disposition per filter.
 
 ## Offline eval harness
 

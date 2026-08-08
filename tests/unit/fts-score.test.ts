@@ -111,10 +111,11 @@ describe("attachRrfScores", () => {
     expect(out[0]!.score).toBeCloseTo(0.1, 6);
   });
 
-  it("originals order controls duplicate-channel preference (query_plan passes vec first)", () => {
-    // The query_plan graph clause historically preferred the vector variant on duplicate
-    // paths (Map construction let later entries overwrite); it preserves that by passing
-    // [...vec, ...bm25]. The other four sites pass FTS first, matching their old .find().
+  it("originals order controls duplicate-channel preference", () => {
+    // Pure-function property: first occurrence wins. (Through v0.31.0 the query_plan graph
+    // clause passed [...vec, ...bm25] to preserve a historical vec-first accident; since
+    // v0.32.0 every causal surface routes through the shared pipeline, which passes FTS
+    // first like the other sites. The property itself is unchanged.)
     const fts = orig("clawmem://u/a.md", 0.9, "fts");
     const vec = orig("clawmem://u/a.md", 0.5, "vec");
     const vecFirst = attachRrfScores([fusedEntry("clawmem://u/a.md", 0.1)], [vec, fts]);

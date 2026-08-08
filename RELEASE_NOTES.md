@@ -4,6 +4,396 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.0 — the ranking pipeline and vault lifecycle become inspectable
+
+Two read-only diagnostic MCP tools. Composite ranking and lifecycle state were
+previously observable only from the outside: you saw the final ordering and the final
+counts, and answering "why did this doc outrank that one" or "how do this collection's
+rows distribute across origin, activity, and age" meant re-deriving scorer behaviour by
+hand.
+
+### memory_stats — lifecycle + ranking-metadata aggregates
+
+Deterministic SQL aggregates per collection: counts by active state, origin×active
+cross-tabs (`fs` / `api` / legacy-`NULL` rows from the v0.34.0 ownership model), pinned
+counts, accrual (7d/30d) and created-at span, deactivation reasons, and
+mean/median/min/max distributions over `access_count`, `confidence`, `quality_score`,
+and effective-time age (`authored_at ?? modified_at` — the same axis recency ranking
+decays on since v0.27.0). Counts and cross-tabs cover all rows; distributions cover
+ACTIVE rows only, since ranking never sees inactive rows. Complements `index_stats`
+(embedding coverage / content types); nothing is filtered — system collections
+included. Fail-loud by contract: a stats tool that silently dropped a section would
+report a smaller vault as if it were the whole truth.
+
+### memory_rank — composite ranking explanation
+
+Runs the real FTS + composite pipeline for a query and returns each result's
+per-factor breakdown — weights applied (`default` | `query` profile, with the
+recency-intent override behaving exactly as in production), recency and
+blended-confidence inputs, quality/length/frequency/canonical multipliers, signed pin
+delta, co-activation — plus raw-vs-composite rank shifts.
+
+The details that matter:
+
+- **The breakdown is captured inside the scorer, never recomputed.** The recorded
+  factors reproduce `compositeScore` exactly, and `explain` changes no score and no
+  ordering — the diagnostic cannot drift from the thing it explains.
+- **Raw ordering is production's** — `search`'s non-recency regime including its
+  pin → legacy-composite → path tie contract — not a re-sort of the composite-ordered
+  array, which would let exact raw ties inherit composite order and make the
+  diagnostic circular.
+- **Output is the union of the composite top-N and the raw top-N.** A raw winner the
+  composite ordering demoted below the cutoff stays visible (`demotedRawWinner`,
+  `⚠ demoted raw winner` marker) with its true composite rank — the exact signature a
+  ranking investigation looks for, and the one a composite-only view would hide.
+- **The pin cap is reported truthfully.** On composite surfaces the pin boost is
+  `min(1.0, score + 0.3)` — and quality (×1.3), frequency (×1.10), and canonical
+  (×1.14) multipliers can push a pre-pin composite above 1.0, so the cap can CLAMP a
+  pinned doc below its unpinned twin. `memory_rank` renders that as a negative `pinΔ`
+  rather than hiding it. Known defect, queued behind a judged golden set; scoring
+  behaviour is deliberately unchanged in this release.
+- Ranks are keyed by filepath — docids are content-hash prefixes, so identical-content
+  documents at different paths share a docid and would otherwise overwrite each
+  other's rank.
+- Both tools return structured errors carrying the available list on unknown
+  `collection` or `vault` names. `memory_rank` joins the default-`_clawmem`-filtered
+  tools (`includeInternal: true` reaches system memory); `memory_stats` filters
+  nothing.
+- `memory_rank` candidates are FTS-only — no vector or LLM stage; deterministic and
+  cheap enough to run casually.
+- No schema change, no migration, no reindex, no re-embed.
+
+## v0.35.0 — secondary-vault surfacing is now opt-in
+
+Multi-vault deployments: the `context-surfacing` hook used to merge results from a
+configured secondary vault into every prompt's injected context, unconditionally. Anything
+indexed into that vault could surface in any session — vault separation held for explicit
+queries but not for the automatic feed, and there was no switch.
+
+Automatic cross-vault surfacing is now a config gate, **default OFF**: out of the box the
+hook reads only the general vault, and a configured secondary vault stays isolated unless
+deliberately queried (a `vault`-parameter MCP call) or deliberately opted back in:
+
+```yaml
+# ~/.config/clawmem/config.yaml            # or env, which wins:
+retrieval:                                 # CLAWMEM_SURFACE_SECONDARY_VAULTS=true
+  surface_secondary_vaults: true
+```
+
+The details that matter:
+
+- The automatic secondary lane is the configured named `skill` vault (the same one the
+  recall mirror attributes usage to); the knob does not fan out across every named vault.
+- The gate governs the automatic hook feed only. Explicit `vault` MCP calls, `list_vaults`,
+  `vault_sync`, and Stop-hook usage attribution are unchanged.
+- Opted in, behaviour is exactly the old one — including best-effort fail-open when the
+  secondary vault is unavailable.
+- One gate, one producer: every downstream secondary-vault path in the hook keys off the
+  tag the gated block sets, so OFF starves them all — including the recall mirror, which
+  then writes nothing into the secondary vault.
+- Config is process-cached: restart long-lived processes (watcher, MCP server) after
+  changing it; hooks are per-event processes and pick it up on their next run.
+- If secondary-vault content *also* reaches the general vault as an ordinary indexed
+  collection, that is a separate route this gate does not touch — remove the collection
+  from the general config if full isolation is the goal.
+- No schema migration, no reindex, no re-embed. Only the literal `true` (env) / boolean
+  `true` (yaml) enables.
+
+## v0.34.0 — origin-aware reconciliation: DB-born memories survive filesystem indexing
+
+The filesystem absence reconciler treated every active row in a collection as
+filesystem-owned: any stored path missing from disk was deactivated `absent` on every pass.
+Rows created directly in the database — hook observations, `saveMemory` output, beads sync,
+REST writes — have no backing file BY DESIGN, so sharing a collection with indexed files
+destroyed them wholesale (measured in one production vault: 2,430 of 2,437 DB-born rows
+inactive). Every document row now records its lifecycle owner, and reconciliation only ever
+touches rows the indexer actually owns.
+
+### The ownership model
+
+A new `documents.origin` column: `fs` (created/maintained by the filesystem indexer;
+reconciled against disk), `api` (DB-born; absence on disk means nothing), `NULL` (ambiguous
+legacy row — exempt). Ownership is DECLARED by writers or ADOPTED on first touch, never
+inferred: the indexer stamps `fs` on every path it takes — insert, update, reactivation, and
+the unchanged short-circuit — while `saveMemory` and `insertDocument` default-stamp `api`.
+There is deliberately no migration backfill: `content_hash` proves nothing about ownership
+(mined imports write it through the same pipeline), so legacy rows heal only when a writer
+touches them. On a pre-migration schema the reconciler enumerates nothing at all —
+fail-closed, reported by an open-time warning — and any other enumeration error propagates
+instead of widening the enumeration.
+
+### Ownership boundaries, both directions
+
+A path collision across origins is rejected visibly, never resolved by silent takeover.
+`saveMemory` preflights the requested path before ANY write: an active filesystem-owned path
+throws, and an inactive row at the path throws too — lifecycle decisions are not overwritten,
+per the v0.31.0 rules. Its write phase is transactional, so a mid-flight indexer claim rolls
+the whole write back rather than leaking orphaned content, and dedup only counts against
+API-claimable candidates through an ownership-conditional atomic update, so a concurrent
+claim is never overwritten. Symmetrically, the indexer skips (and warns about) a file
+appearing at an API-owned path — active or inactive — instead of adopting it.
+
+### `clawmem mine` is additive now
+
+Mine imports run in a new `importMode`: rows are stamped `api` on every write path, and
+absence reconciliation is skipped entirely — the staging snapshot is transient, so a later
+mine into the same collection no longer deactivates earlier batches.
+
+### Upgrading
+
+The `origin` column is added automatically on first open; no action is required. Two
+behaviour changes to know about: a row whose file was already deleted BEFORE upgrading is no
+longer auto-deactivated (nothing proves the indexer owned it — retire it with `memory_forget`
+or a lifecycle sweep if unwanted), and a `saveMemory` write to a path occupied by a
+filesystem-owned or inactive document now fails loudly instead of silently overwriting.
+
+## v0.33.0 — the causal writer returns, evidence-first
+
+v0.32.0 rebuilt causal *reading* and noted that restoring causal *inference* was a separate,
+future piece of work. This is that piece. A new causal witness writer runs inside the
+`decision-extractor` Stop hook — off by default, shadow-first — and the causal graph it builds
+is evidence-preserving end to end: documents are the nodes, and every edge carries the specific
+fact pair that justified it.
+
+### The causal witness writer
+
+When enabled (`CLAWMEM_CAUSAL_WRITER=shadow|on`), each Stop-hook invocation considers this
+session's new observation documents against a small temporal window of recent ones
+(`CLAWMEM_CAUSAL_WINDOW`, default 5, effective-time ordered) and makes ONE strict single-shot
+model call proposing causal pairs. Admission is unforgiving: every proposed pair must cite fact
+ordinals that exist in the *persisted* documents (caller arrays are never trusted), must include
+at least one endpoint from this invocation (history is never re-inferred), and self-pairs,
+duplicates, out-of-range ordinals, and sub-threshold confidences are each rejected with their own
+audit event. What survives is written append-only as **fact-pair witness sightings** — repeat
+observations of the same causal claim accumulate instead of being dropped — and the edge weight
+is derived (`MAX` of witness confidences) in the same transaction. Placeholder reasoning is
+rejected, so every edge a reader sees can show *why* it exists.
+
+Every invocation in shadow/on mode writes a durable run record (`causal_runs` /
+`causal_run_events`) — including early exits, skipped phases, and invalid configuration — with
+retention mirroring the judge audit (90 days / 10k runs; sightings survive pruning). Inspect it
+with the new `clawmem causal-audit` CLI. Shadow mode runs the full pipeline and audits everything
+while writing zero graph state: run it for a while and read the audit before arming `on`.
+
+### Pre-cut edges: preflight, resolve, restore
+
+Causal edges written by the pre-v0.30 writer carry old-format metadata. The reader synthesizes
+witness evidence from the valid ones in memory for display (nothing is written on read); the
+armed writer materializes that evidence durably the first time it touches such an edge; edges
+whose metadata cannot yield a valid witness make the writer fail closed rather than guess. `clawmem migrate causal-witnesses --preflight` reports a
+census and emits a binding manifest; `--resolve-unmaterializable keep-weight|retire-edge` acts
+only on explicitly selected edges whose full row image still matches the manifest fingerprint;
+retirement is archive-style and reversible (`--restore-edge`, fail-closed: a restore never
+overwrites an occupied key). CLI audit rows are born terminal-pessimistic — a crash mid-operation
+can leave an honest `cli_error`, never a stranded `in_progress` or a fabricated success.
+
+### The Stop hook now runs to a deadline
+
+`CLAWMEM_STOP_BUDGET_MS` (default 25000) is a whole-handler deadline captured at entry. Every
+model-bearing phase — observation extraction, contradiction candidate retrieval *including its
+embedding call*, the contradiction judge, dedup embeddings, and the causal step — checks
+remaining budget before starting and is skipped (audited, loudly logged) rather than started
+unbounded. Previously a slow inference server could push the hook past the host's timeout, losing
+the entire extraction; now the hook degrades phase by phase and always reaches persistence.
+
+### Security: document-id lookups are structurally validated
+
+Found by this release's boundary tests: docid resolution used its input in a SQL `LIKE` pattern
+without escaping, so the wildcards `_` and `%` matched **arbitrary documents** through every
+docid surface — including the destructive REST `/documents/{docid}/forget`, where a single `_`
+deactivated whichever document the pattern happened to match first. Docids are now validated
+against `^[0-9a-fA-F]{6,64}$` (after `#` strip) before any query; wildcards, non-hex, and
+undersized prefixes return not-found everywhere. Oversized docids no longer throw. If you expose
+the REST API beyond localhost, upgrade for this alone.
+
+### `find_causal_links` returns evidence, not just links
+
+The tool (MCP + REST `/causal-links`) now returns directed **edge records**: invariant
+source/target, traversal provenance (predecessor, depth, direction), and up to 3 fact-pair
+witnesses per edge with reasoning, confidence, and sighting counts — projected in SQL, capped by
+a byte ceiling (64 KiB) that drops whole edges from the tail rather than truncating mid-record.
+Traversal is level-synchronous and returns the globally strongest 50 edges under a total order,
+not the first 50 found. Depth > 1 remains per-edge evidence, not a verified chain.
+
+### Migration
+
+Automatic on first open, additive only: four new tables (`causal_runs`, `causal_run_events`,
+`causal_witness_sightings`, `retired_causal_edges`) with their indexes. No data backfill, no
+manual step. The writer defaults to `off`, so nothing changes in write behavior until you arm it
+— and before setting `on`, run the preflight (above).
+
+### Verification
+
+Cross-model adversarial pass (codex / GPT-5.x), both gates in one pinned session: the design was
+reviewed to zero remaining findings across seven turns (13→9→9→8→3→2→0), then the implementation
+against that contract across seven more (13→5→4→6→3→1→0). Production-boundary tests drive the
+real CLI subprocesses (conflict, whole-run lock, rejected finalization), the real MCP handlers,
+and the real REST server (docid injection attempts, byte-ceiling overflow, destructive-route
+validation). Full suite at clearance: 1977 tests, 0 failures.
+
+### What didn't change
+
+The v0.32.0 reader pipeline (shared causal retrieval, observation lane, one-hop traversal) is
+untouched. `includeInternal` semantics are unchanged. With `CLAWMEM_CAUSAL_WRITER=off` (the
+default) the Stop hook makes no causal model call and writes no causal rows — the only new
+default-on behaviors are the budget deadline and the docid validation.
+
+---
+
+## v0.32.0 — causal answers reach their reasoning
+
+Three defects found while reviewing the causal layer's foundations: the recommended causal
+retrieval route could not reach the documents causal edges actually connect; the four causal
+surfaces had drifted into four different pipelines; and the SPO knowledge graph wrote evidence it
+never showed while silently dropping repeat sightings.
+
+### One causal pipeline behind every causal surface
+
+`memory_retrieve`'s causal mode, `intent_search`, `query_plan`'s graph clauses, and REST
+`/retrieve`'s causal mode were four independent implementations of "intent-classified retrieval
+plus graph expansion", each missing different stages — the documented claim that causal queries
+route to `intent_search`'s pipeline was true of none of them. They now share one implementation
+and differ only in declared stages and visibility policy, so parity holds by construction. REST's
+causal route gains graph traversal (it was anchor-only RRF), and the REST classifier now
+recognizes the same causal phrasings as MCP — "why were" and "because we" never routed causal
+over REST before. `intent_search` keeps its documented unfiltered contract verbatim, and its
+`enable_graph_traversal: false` now disables every graph stage, including the new one-hop step.
+
+### WHY queries reach observation documents — and can walk a causal edge backward
+
+The default-filtered routes excluded the `_clawmem` collection categorically, and every causal
+edge endpoint lives there — so causal graph structure was reachable by nobody through the
+recommended default route. Independently, neither traversal engine could follow a causal edge
+backward (inbound edges were restricted to semantic/entity), so "why did B happen?" anchored at B
+could never reach cause A.
+
+WHY-classified queries on the filtered routes now anchor into `_clawmem` **observation documents
+specifically** — never handoffs or deductions — and follow causal edges one bounded hop in both
+directions (at most 3 per anchor, 10 total), with each hit labeled `cause` or `effect` relative
+to its anchor. Candidate eligibility (active, non-invalidated, inside any effective-time window,
+collection policy) is now enforced inside every anchor, traversal, and MPFP query — previously an
+inactive or invalidated document could still consume beam slots and steer expansion even though it
+was hidden from output. Entity co-occurrence expansion cannot honor row-level eligibility (its
+aggregates carry no source-document provenance) and is therefore confined to direct
+`intent_search`, its only shipped home, with the limitation documented.
+
+### The knowledge graph shows its evidence
+
+`entity_triples` recorded `source_doc_id` and `source_fact` on first sighting, but no query
+surfaced either — and a repeat sighting of a known fact was dropped entirely, so corroboration
+accumulated nowhere. A new `entity_triple_provenance` table now accumulates unique evidence
+sources per fact, written in the same transaction as the fact itself. `kg_query` reports
+`evidenceCount` plus up to 5 most-recent sources per fact (evidence with no source document
+renders as `unattributed`). Provenance in `queryEntityTriples` is opt-in, so the prompt-hook path
+pays nothing new.
+
+**Migration** (automatic, on first open): one evidence row is backfilled per existing triple that
+carries inline evidence. The backfill is idempotent and read-guarded — steady-state opens perform
+no writes.
+
+### Verification
+
+Cross-model adversarial pass (codex / GPT-5.x): the remediation design was reviewed to zero
+remaining findings across five turns before implementation, and the implementation reviewed to
+zero remaining findings against it. Production-boundary tests drive the real MCP handlers and the
+real REST server: backward one-hop retrieval, decision-typed observation endpoints, lane
+exclusions for handoffs/deductions, breadth caps, the graph master switch, REST classifier parity,
+evidence dedup/ordering/atomicity, and migration idempotence across reopen.
+
+### What didn't change
+
+The causal *writer* — batching, edge schema, per-edge witnesses — is untouched; restoring causal
+inference itself is a separate, future piece of work. Direct `intent_search` remains unfiltered by
+design; REST remains unfiltered in every mode; `includeInternal` semantics are unchanged;
+`confidence` does not move on repeat sightings; hooks issue no new queries.
+
+### Upgrading
+
+No manual migration step — the provenance backfill runs on first open, idempotent and
+read-guarded. The v0.31.0 mixed-version caution applies unchanged: when long-lived writers run
+concurrently, restart daemons and reconnect open agent sessions together, so no old-code process
+keeps writing after the vault has migrated. A stale writer inserts facts without evidence rows —
+repaired by a later open's backfill — and keeps dropping repeat sightings outright, which is not
+recoverable: the evidence row is simply never written.
+
+---
+
+## v0.31.0 — forget stays forgotten
+
+Three defects on the indexing boundary, all of which destroyed or reversed memory silently. Each
+was found by observing the database rather than by reading call sites, and each is fixed by making
+the affected write refuse rather than by adding a confirmation step.
+
+### `memory_forget` was undone by the next reindex
+
+Forgetting a document that has a file behind it did not stick. The indexer reactivated **any**
+inactive row it found at a path present on disk, without asking why that row was inactive — and
+`active` is written by three unrelated owners: absence reconciliation, `memory_forget`, and
+lifecycle archival. On a machine running `clawmem watch`, a forget therefore survived only until
+the next `.md` change anywhere in that collection. Archived documents came back too, still carrying
+`archived_at`, leaving them simultaneously active and archived.
+
+Documents now record **why** they were deactivated (`deactivated_reason`), and only what was
+deactivated for absence can be revived automatically. A forgotten or archived document stays that
+way, and its file is skipped rather than re-inserted — re-inserting would have left the row
+forgotten while making its content live again under a new id. The generic reactivation helper
+enforces the same rule, so automatic profile regeneration during `clawmem update` no longer revives
+a forgotten profile either. Restoring an archived document remains `lifecycle_restore`'s job.
+
+**Migration** (automatic, on first open): existing archived rows are backfilled as `'archive'`, and
+any row a previous version left in the inconsistent active-and-archived state is restored to
+archived, with a count reported on stderr. Use `lifecycle_restore` to bring any of those back.
+Legacy rows deactivated by forget before this release are indistinguishable from absence and remain
+reactivatable once; from this release forward, forget is durable.
+
+### `clawmem reindex --force` orphaned every database-created memory
+
+`--force` began with a blanket `UPDATE documents SET active = 0` across the entire vault, then
+rebuilt only the *configured* collections. Observations, handoffs, and deductions live in
+`_clawmem` and have no file behind them, so nothing ever brought them back. The deactivation set no
+`archived_at`, which meant `lifecycle_restore` could not see them either — they were invisible to
+the only supported restore path.
+
+`--force` now does what its name implies: it re-reads and rewrites every file, bypassing the
+content-hash short-circuit that normally skips unchanged documents. It no longer deactivates
+anything up front; documents still absent from disk are deactivated by the ordinary reconciliation
+pass, one collection at a time, exactly as they are without the flag. Separately, `_clawmem` is now refused by the indexer outright — database-created
+memory has no filesystem source and cannot be reconciled against one, by any caller.
+
+### A failed enrichment blanked learned A-MEM notes
+
+`constructMemoryNote` fails open to an empty note when the inference endpoint is unavailable, and
+the note was then stored unconditionally. A transient outage during a routine reindex therefore
+blanked `amem_keywords`, `amem_tags`, and `amem_context` on every document it touched. Writing an
+empty note over a *never-enriched* row was quieter but no better: it made a failure
+indistinguishable from completed enrichment, so backfill never retried that document.
+
+An empty note is now never written, whatever the row holds — including a note whose entries are
+only whitespace, which carries no information but would still have masked the row from backfill.
+The store reports whether the note actually landed, and both callers honour that: the enrichment
+log distinguishes a refused write from a completed one, and the consolidation backfill skips the
+link pass and leaves the document eligible for a later retry. `NULL` is preserved as the retryable
+"not enriched yet" state.
+
+### Upgrading
+
+No manual migration step. The migration runs on open, is idempotent, and performs its count and
+repair in one transaction so concurrent opens cannot double-report. If it cannot run — a locked
+database, for instance — it says so on stderr and is retried on the next open rather than failing
+silently. If it reports repaired documents, those were archived rows a previous version had
+incorrectly reactivated.
+
+One operational requirement when long-lived writers run concurrently — the watcher,
+`clawmem serve`, or an MCP server in an agent session that stays open across the upgrade:
+restart them together (daemons restarted; open sessions reconnected via `/mcp` or closed), so no
+old-code process keeps writing after the first new-code open has migrated the vault. An old-code
+writer records no deactivation reason, and the new indexer deliberately treats reason-less
+deactivation as legacy absence — a forget issued through a stale session can be reactivated by
+the next re-index, which is this release's bug reintroduced by the stale process. A
+single-session setup with no daemons needs nothing.
+
+---
+
 ## v0.30.0 — ClawMem stops deleting rows
 
 ClawMem's governing rule for agent-mediated memory mutation is that nothing an agent does should be unrecoverable. Every mutation surface honored that except one: `purgeArchivedDocuments` physically `DELETE`d rows. This release removes physical deletion from the package entirely rather than gating it, because a gate cannot work here — see below.

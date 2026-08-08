@@ -103,6 +103,8 @@ Documents frequently surfaced together in the same session get up to 15% boost.
 
 On composite surfaces, pinned documents receive a +0.3 additive boost (capped at 1.0 total). Pin's contract is **lifecycle retention + prioritization among relevance-equivalent results** — on the raw routes (the vector tools since v0.22.0, and non-recency `search` since v0.24.0) it therefore breaks exact raw-score ties only and never lifts a document over a more relevant one.
 
+**Known cap inversion (v0.36.0 finding):** the 1.0 cap can bind. Quality (×1.3), frequency (×1.10), and canonical (×1.14) multipliers can push a pre-pin composite above 1.0, and `min(1.0, score + 0.3)` then CLAMPS the pinned document DOWN — an unpinned twin with the same signals would outrank it. (Co-activation applies after the cap, so a co-activated pinned doc can still exceed 1.0.) `memory_rank` reports this truthfully as a negative `pinΔ`. A fix is queued behind a judged golden set; until then, treat pins on very-high-scoring documents as retention guarantees, not ranking guarantees.
+
 ### Length normalization
 
 ```
@@ -136,3 +138,7 @@ Absolute composite scores vary across vaults due to several factors:
 Context-surfacing handles this with adaptive ratio-based thresholds instead of fixed absolute values. The hook computes the best composite score in the result set, then keeps results within a percentage of that best score (e.g., 55% for balanced). An activation floor prevents surfacing when even the best result is too weak. See [profiles](hooks-vs-mcp.md#adaptive-thresholds) for the specific values per profile.
 
 MCP tools use fixed absolute `minScore` thresholds since agents control those limits directly.
+
+## Inspecting a live ranking
+
+Since v0.36.0 the `memory_rank` MCP tool runs the real FTS + composite pipeline for a query and returns every factor on this page as numbers — the weights applied, recency and blended-confidence inputs, quality/length/frequency/canonical multipliers, signed pin delta, and co-activation — plus each result's raw-vs-composite rank shift, with raw winners the composite ordering demoted kept visible. The factors are captured inside the scorer (they reproduce the composite score exactly), so the explanation cannot drift from the implementation. See [mcp-tools.md](../reference/mcp-tools.md#memory_rank).
