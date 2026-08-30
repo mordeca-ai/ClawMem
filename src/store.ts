@@ -1430,6 +1430,22 @@ export class VecReadModelMismatchError extends FatalVectorError {
   }
 }
 
+/**
+ * WRITE-path sibling of VecReadModelMismatchError (master-harness-vn4rz.21). The read guard
+ * (assertQueryEmbedModelConsistent) refuses to SERVE a query against a vault whose stored geometry
+ * disagrees with the active endpoint; this one refuses to WRITE a second model name into a vault
+ * that already holds a different one. The 2026-08-09 incident wrote 2,899 vectors from a foreign
+ * llama.cpp Q8_0 endpoint at the SAME dimension, so neither the dimension guard nor the read guard
+ * could stop it — only detection existed after the fact. Naming the endpoint is load-bearing: the
+ * operator's first question is always "which server did this".
+ */
+export class VecWriteModelMismatchError extends FatalVectorError {
+  constructor(public readonly storedModels: string[], public readonly writeModel: string, public readonly endpoint: string) {
+    super(`Refusing to write vectors: embedding-model mismatch on the WRITE path. The vault's vectors were embedded with ${storedModels.map(m => `"${m}"`).join(", ")} (expected) but endpoint ${endpoint} produced "${writeModel}" (actual). Writing a second model into one vector space (even at the same dimension) makes cosine similarity meaningless and poisons the vault. Nothing was written. Point CLAWMEM_EMBED_URL at the vault's model, or run 'clawmem embed --force' to clear and rebuild the whole vault with the current model.`);
+    this.name = "VecWriteModelMismatchError";
+  }
+}
+
 // Fail-open surfacing for a read-path model mismatch: warn LOUDLY once per process, then let the
 // caller degrade to BM25. For hooks that MUST NOT throw — context-surfacing (UserPromptSubmit) and
 // the Stop hooks (decision-extractor) — a throwing hook breaks that turn. Explicit query paths use
@@ -4765,6 +4781,51 @@ export function getVectorConsistency(db: Database): {
   })();
 }
 
+// W2 write-path model-consistency cache (master-harness-vn4rz.21), keyed on SQLite's `data_version`
+// exactly like the read-path cache above, so a CROSS-PROCESS rebuild (another `clawmem embed --force`
+// re-embedding with a different model) invalidates a stale OK verdict. Same-connection writes do NOT
+// bump `data_version`, so our own in-run inserts keep the memo hot — one DISTINCT per (model, run)
+// instead of one per fragment. The memo key includes the model, so an in-process model swap misses
+// the cache and is re-checked rather than riding a stale entry.
+const verifiedWriteEmbedModels = new WeakMap<Database, { dataVersion: number; model: string }>();
+
+/** The embedding endpoint identity for operator-facing errors — the URL when remote, else the
+ *  in-process embedder. Read at throw time so the message names the server that actually produced
+ *  the foreign vectors. */
+function embedEndpointLabel(): string {
+  return process.env.CLAWMEM_EMBED_URL || "the local in-process embedder";
+}
+
+/**
+ * WRITE-path counterpart of assertQueryEmbedModelConsistent (master-harness-vn4rz.21). Called inside
+ * every vector-write transaction, so EVERY writer — the embed CLI, a future daemon, the MCP server,
+ * a test harness — is fenced by construction rather than by each caller remembering to preflight.
+ * The CLI's `cmdEmbed` already preflights the endpoint, but that check lives in the command layer:
+ * any other caller of the store's write API bypassed it entirely, which is the asymmetry the
+ * 2026-08-09 poisoning exploited.
+ *
+ * Refuses when the vault holds vectors under a DIFFERENT single model, or is already heterogeneous.
+ * No-ops when: the vault has no vectors yet (fresh, or just cleared by `embed --force`), or the
+ * write carries no model name (an endpoint that reports none cannot be discriminated — mirrors the
+ * `probe.model &&` condition the CLI implicit-path check already uses).
+ */
+function assertWriteEmbedModelConsistent(db: Database, writeModel: string): void {
+  if (!writeModel) return; // endpoint reported no model name — nothing to compare (see doc comment)
+
+  const dataVersion = (db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version;
+  const cached = verifiedWriteEmbedModels.get(db);
+  if (cached && cached.dataVersion === dataVersion && cached.model === writeModel) return;
+
+  const storedModels = getVecModels(db);
+  if (storedModels.length === 0) return; // nothing embedded yet — nothing to be inconsistent with
+
+  if (!(storedModels.length === 1 && storedModels[0] === writeModel)) {
+    throw new VecWriteModelMismatchError(storedModels, writeModel, embedEndpointLabel());
+  }
+
+  verifiedWriteEmbedModels.set(db, { dataVersion, model: writeModel });
+}
+
 /**
  * Insert a single embedding into both content_vectors and vectors_vec tables.
  * The hash_seq key is formatted as "hash_seq" for the vectors_vec table.
@@ -4799,6 +4860,11 @@ export function insertEmbedding(
   // no other holder can interleave a reclaim between the check and the INSERTs.
   db.transaction(() => {
     assertLeaseHeld(db, leaseGuard);
+    // W2 write-path geometry fence (master-harness-vn4rz.21): inside the SAME immediate-lock
+    // transaction as the write, so the check and the INSERT are atomic — a concurrent writer
+    // cannot commit a foreign model between the read of content_vectors and these INSERTs.
+    // Throwing here rolls the transaction back: nothing is written.
+    assertWriteEmbedModelConsistent(db, model);
     db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run(hashSeq);
     db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(hashSeq, embedding);
     db.prepare(
@@ -4843,6 +4909,16 @@ export function insertEmbeddingsBatch(db: Database, writes: EmbeddingWrite[], le
   );
   db.transaction(() => {
     assertLeaseHeld(db, leaseGuard);
+    // W2 write-path geometry fence (master-harness-vn4rz.21). Checked per row rather than once
+    // per batch: a batch can carry rows from a flapping endpoint that changed model mid-flight,
+    // and the memo keyed on (data_version, model) makes the repeat rows a WeakMap hit, not a
+    // DISTINCT scan. One refusal rolls back the WHOLE batch — nothing is written.
+    // Intra-batch heterogeneity: a fresh/just-cleared vault has no stored model to compare
+    // against, so a batch from an endpoint that flapped mid-flight would slip past the vault
+    // comparison below. Two models inside ONE batch is drift by definition.
+    const batchModels = [...new Set(writes.map(w => w.model).filter(m => !!m))].sort();
+    if (batchModels.length > 1) throw new VecModelMismatchError(batchModels[0]!, batchModels[1]!);
+    for (const w of writes) assertWriteEmbedModelConsistent(db, w.model);
     for (const w of writes) {
       const hashSeq = `${w.hash}_${w.seq}`;
       deleteVec.run(hashSeq);

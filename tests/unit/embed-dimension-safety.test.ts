@@ -45,6 +45,23 @@ function seed(store: Store, col: string, path: string, body: string): string {
 }
 const vec = (dim: number) => new Float32Array(Array.from({ length: dim }, (_, i) => (i === 0 ? 1 : 0)));
 
+/**
+ * Construct a POISONED (heterogeneous) vault the way history actually did: a pre-guard clawmem
+ * writing a second model name into an existing vector space. Since master-harness-vn4rz.21 the
+ * store's WRITE path refuses exactly this (VecWriteModelMismatchError), which is the point — so a
+ * fixture that needs the corrupt state must lay it down at the SQL layer, below the guard. The live
+ * vault reached this state on 2026-08-09 through a writer that predates the guard, so this is a
+ * faithful fixture, not a backdoor.
+ */
+function seedForeignModelVectorRaw(store: Store, hash: string, seq: number, pos: number, embedding: Float32Array, model: string, canonicalId?: string): void {
+  const hashSeq = `${hash}_${seq}`;
+  store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(hashSeq, embedding);
+  store.db.prepare(
+    `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id, embed_input_fp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(hash, seq, pos, model, new Date().toISOString(), "full", null, canonicalId ?? null, null);
+}
+
+
 describe("ensureVecTable — throw, never drop", () => {
   it("throws VecDimensionMismatchError on a dimension change and leaves the table + rows intact", () => {
     const store = createStore(":memory:");
@@ -251,7 +268,7 @@ describe("getVecModels — stored vault models (codex T5 HIGH-2 / T6 MED-1)", ()
     // A second, different model present → heterogeneous vault (must be detectable,
     // NOT hidden behind a majority value).
     const h2 = seed(store, "c", "b.md", "doc b");
-    store.insertEmbedding(h2, 0, 1, vec(4), "other-2560", new Date().toISOString(), "full", null, "c/b.md");
+    seedForeignModelVectorRaw(store, h2, 0, 1, vec(4), "other-2560", "c/b.md");
     expect(store.getVecModels().length).toBe(2);
     expect(store.getVecModels()).toContain("granite-2560");
     expect(store.getVecModels()).toContain("other-2560");
@@ -399,7 +416,7 @@ describe("searchVec — read-path embedding-model consistency (W1)", () => {
     const hA = seed(store, "c", "a.md", "doc a body");
     store.insertEmbedding(hA, 0, 1, vec(4), "model-A", new Date().toISOString(), "full", null, "c/a.md");
     const hB = seed(store, "c", "b.md", "doc b body");
-    store.insertEmbedding(hB, 0, 1, vec(4), "model-B", new Date().toISOString(), "full", null, "c/b.md");
+    seedForeignModelVectorRaw(store, hB, 0, 1, vec(4), "model-B", "c/b.md");
     expect(store.getVecModels().length).toBe(2);
 
     setDefaultLlamaCpp(mockEmbedLlm("model-A") as any); // endpoint matches ONE of the two
