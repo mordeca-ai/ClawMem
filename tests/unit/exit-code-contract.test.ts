@@ -180,7 +180,14 @@ describe("(1) embed abort branches exit non-zero", () => {
       const now = new Date().toISOString();
       s.ensureVecTable(DIM_A);
       s.insertEmbedding(h1, 0, 1, new Float32Array(fakeEmbedVector("a", DIM_A)), "m1", now, "full", undefined, "testcol/a.md");
-      s.insertEmbedding(h2, 0, 1, new Float32Array(fakeEmbedVector("b", DIM_A)), "m2", now, "full", undefined, "testcol/b.md");
+      // The CLI refused to create this state already; since master-harness-vn4rz.21 the STORE
+      // write path refuses it too (VecWriteModelMismatchError), so the second model goes in at
+      // the SQL layer — the way a pre-guard clawmem poisoned the live vault on 2026-08-09.
+      const hashSeq = `${h2}_0`;
+      s.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(hashSeq, new Float32Array(fakeEmbedVector("b", DIM_A)));
+      s.db.prepare(
+        `INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at, fragment_type, fragment_label, canonical_id, embed_input_fp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(h2, 0, 1, "m2", now, "full", null, "testcol/b.md", null);
     });
     const r = await withServer({ dim: DIM_A, model: "m1" }, srv => runCli(v, ["embed"], srv.url));
     expect(r.stderr).toContain("Vault already contains mixed embedding models");

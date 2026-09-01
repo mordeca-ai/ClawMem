@@ -4,6 +4,32 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.2 — write-path embed-geometry preflight
+
+The read path has refused to *serve* a query against a vault whose stored embedding geometry
+disagrees with the active endpoint since W1 (`assertQueryEmbedModelConsistent`). The vector-WRITE
+chokepoints had no counterpart: the only model preflight lived in `cmdEmbed`'s command layer, so
+every other caller of `insertEmbedding` / `insertEmbeddingsBatch` — a daemon, the MCP server, a
+repair script, a future writer — bypassed it entirely. That asymmetry is what the 2026-08-09
+incident exploited: 2,899 vectors from a foreign `ggml-org` Q8_0 endpoint at the SAME 768
+dimensions, invisible to the dimension guard and unstoppable by the read guard.
+
+- `VecWriteModelMismatchError` (a `FatalVectorError`) naming the ENDPOINT plus the expected and
+  actual model names — "which server did this" is always the first operator question.
+- `assertWriteEmbedModelConsistent`, mirroring the read guard's shape and its `data_version`-keyed
+  memo, called INSIDE both write transactions so the check and the INSERT are atomic: a refusal
+  rolls the transaction back with nothing written.
+- Intra-batch heterogeneity check: two models inside ONE batch is drift by definition, and is
+  refused even on a fresh vault that has no stored geometry to compare against.
+- No-ops where it must: a vault with no vectors yet (fresh, or just cleared by `embed --force`),
+  and an endpoint that reports no model name at all (nothing to discriminate).
+
+Verified by `tests/unit/embed-write-geometry-preflight.test.ts` (10 tests). Both mechanisms were
+watched go RED independently before landing — neutering `assertWriteEmbedModelConsistent` fails 3
+tests, neutering the intra-batch heterogeneity check fails 1 — and GREEN again on restore. The
+guard's positive control is a full `clawmem embed --force` rebuild of a 153,274-vector vault
+running every batch insert through it with zero refusals.
+
 ## v0.36.1 — CLI exit-code contract: aborts, partial embeds, doctor, and --fail-on-empty
 
 CLI exit-code contract: no command may decline the work it was asked to do and still exit 0.
