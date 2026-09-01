@@ -3012,14 +3012,17 @@ async function cmdDoctor() {
   //    (cache-bypassed, coverage-enforced) and checks calibration + per-pair discrimination.
   try {
     const s = getStore();
-    const { probeRerankHealth } = await import("./health/rerank-health.ts");
+    const { probeRerankHealth, rerankFailureAdvice } = await import("./health/rerank-health.ts");
     const health = await probeRerankHealth(s, { timeoutMs: 8000 });
     if (health.ok) {
-      console.log(`${c.green}✓${c.reset} Reranker: discriminates (coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min margin ${health.minMargin.toFixed(2)} ≥ ${health.thresholds.discrimMargin})`);
+      console.log(`${c.green}✓${c.reset} Reranker: discriminates (coverage ${health.pairsScored}/${health.pairsTotal}, 0 inversions, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min logit margin ${health.minLogitMargin.toFixed(2)} ≥ ${health.thresholds.discrimLogitMargin})`);
     } else {
-      console.log(`${c.red}✗${c.reset} Reranker: degenerate / not discriminating (coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toExponential(1)}, min margin ${health.minMargin.toFixed(2)})`);
+      console.log(`${c.red}✗${c.reset} Reranker: FAILED discrimination probe (coverage ${health.pairsScored}/${health.pairsTotal}, ${health.inversions} inverted, max score ${health.maxScore.toExponential(1)}, min logit margin ${health.minLogitMargin.toFixed(2)})`);
       for (const f of health.failures.slice(0, 4)) console.log(`   ${c.dim}${f}${c.reset}`);
-      console.log(`   ${c.dim}Likely the deprecated zerank-2 GGUF (no score head) — re-deploy the seq-cls sidecar. See CLAUDE.md "SOTA upgrade".${c.reset}`);
+      // The zerank-2 prescription belongs ONLY to the calibration-floor arm — that collapse to ~0 is
+      // its signature. Attaching it to a margin/ordering failure told an operator to re-deploy a
+      // healthy service while the line above printed "max score 1.0e+0" (master-harness-1nvlz).
+      console.log(`   ${c.dim}${rerankFailureAdvice(health)}${c.reset}`);
       issues++;
     }
   } catch (err) {
@@ -3095,7 +3098,13 @@ async function cmdDoctor() {
     } else if (summary.validated < summary.nMin || summary.validatedSeq0 < summary.seq0Target) {
       const seq0Part = summary.validatedSeq0 < summary.seq0Target ? `; seq-0 quota UNMET (${summary.validatedSeq0}/${summary.seq0Target} validated — primary fragments are the surprisal/graph/health anchors)` : "";
       console.log(`${c.red}✗${c.reset} Sampled vectors: DEGRADED — validation could not complete (${summary.validated}/${summary.target} validated, min ${summary.nMin}${seq0Part}; ${summary.unreconstructable} unreconstructable, ${summary.inconclusiveLegacy} legacy-inconclusive; ${summary.attempts} attempts over ${summary.eligible} eligible)`);
-      console.log(`   ${c.dim}Splitter/metadata drift or legacy rows below threshold — re-embed or investigate.${c.reset}`);
+      // Do NOT prescribe a re-embed here. A complete `clawmem embed --force` over all 153,274
+      // fragments (rc=0, 0 failed, every vector rewritten) was run 2026-09-01 under
+      // master-harness-vn4rz.29 and this finding did not move: 4/16 validated + 20 unreconstructable
+      // before, 3/16 + 21 after — sampling noise over 24 attempts. The unreconstructable rows are a
+      // splitter/metadata RECONSTRUCTION drift inside the sampler (src/canary.ts), not stale vectors,
+      // so a rebuild is known-useless work (master-harness-1nvlz).
+      console.log(`   ${c.dim}The sampler could not reconstruct these rows' exact embed input. A full 'clawmem embed --force' does NOT clear this — it was tried (master-harness-vn4rz.29, all 153,274 fragments rewritten) and the counts did not move. Investigate splitter/metadata reconstruction drift in src/canary.ts against the canonical document; legacy-tier rows lack the provenance to reconstruct at all.${c.reset}`);
       issues++;
       process.exitCode = 1;
     } else {
@@ -3267,17 +3276,17 @@ async function cmdRerankHealth(args: string[]) {
   });
   const timeoutMs = values["timeout-ms"] ? parseInt(values["timeout-ms"] as string, 10) : undefined;
   const store = getStore();
-  const { probeRerankHealth } = await import("./health/rerank-health.ts");
+  const { probeRerankHealth, rerankFailureAdvice } = await import("./health/rerank-health.ts");
   const health = await probeRerankHealth(store, timeoutMs ? { timeoutMs } : {});
 
   if (values.json) {
     console.log(JSON.stringify(health));
   } else if (health.ok) {
-    console.log(`${c.green}✓ Reranker healthy${c.reset} — coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min margin ${health.minMargin.toFixed(2)} ≥ ${health.thresholds.discrimMargin}`);
+    console.log(`${c.green}✓ Reranker healthy${c.reset} — coverage ${health.pairsScored}/${health.pairsTotal}, 0 inversions, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min logit margin ${health.minLogitMargin.toFixed(2)} ≥ ${health.thresholds.discrimLogitMargin}`);
   } else {
-    console.log(`${c.red}✗ Reranker degenerate / not discriminating${c.reset} — coverage ${health.pairsScored}/${health.pairsTotal}, max score ${health.maxScore.toExponential(1)}, min margin ${health.minMargin.toFixed(2)}`);
+    console.log(`${c.red}✗ Reranker FAILED discrimination probe${c.reset} — coverage ${health.pairsScored}/${health.pairsTotal}, ${health.inversions} inverted, max score ${health.maxScore.toExponential(1)}, min logit margin ${health.minLogitMargin.toFixed(2)}`);
     for (const f of health.failures) console.log(`  - ${f}`);
-    console.log(`Likely the deprecated zerank-2 GGUF (no score head) — re-deploy the seq-cls sidecar. See CLAUDE.md "SOTA upgrade".`);
+    console.log(rerankFailureAdvice(health));
   }
   // Non-zero exit on degeneracy so systemd OnFailure= / a scheduled check can alert. Use exitCode
   // (not process.exit) so main()'s finally { closeStore() } still runs.

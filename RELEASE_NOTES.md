@@ -4,6 +4,50 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.3 — reranker health: logit-space margin, and prescriptions that match the evidence
+
+Doctor called a *healthy* reranker "degenerate / not discriminating" and told the operator to
+re-deploy the sidecar — one line below printing `max score 1.0e+0` and `coverage 8/8`. Two
+independent defects, both in the instrument, neither in the reranker.
+
+- **The margin was computed in the wrong space.** The endpoint returns sigmoid-squashed relevance
+  in [0,1] and the sigmoid saturates. On the live `bge-reranker-v2-m3-q4_k_m`, golden pair 6
+  separates by **4.06 logits** — an enormous, correct separation — yet both docs sit in the
+  saturated tail, compressing it to **0.039** against a fixed additive threshold of 0.25. The old
+  0.25 was calibrated on a model whose scores sat in the sigmoid's LINEAR region; it was never
+  scale-invariant, and the model change merely exposed that. `RERANK_DISCRIM_MARGIN` is replaced by
+  `RERANK_DISCRIM_LOGIT_MARGIN` (deliberate rename — the units changed, so a stale import must break
+  loudly), with the margin taken in logit space via a clamped `toLogit`. `RerankHealthResult.minMargin`
+  becomes `minLogitMargin` for the same reason.
+- **Ordering is now the primary, scale-free assertion.** `rel > neg` was passing on every pair the
+  whole time and no threshold choice can make that verdict wrong. Inversions are counted and reported.
+- **The sigmoid inverse is clamped** at 1e-9. The endpoint routinely returns scores that round to
+  1.0; an unclamped `logit(1)` is +Infinity, and `Infinity - Infinity` is NaN — a check that
+  silently cannot fail. Scores outside [0,1] are treated as already-logit and pass through.
+- **The zerank-2 / seq-cls-sidecar prescription is gated to the calibration-floor arm.** That
+  collapse to ~0 is the score-head-less GGUF's signature, and the calibration arm is what detects
+  it; it was previously emitted for ANY probe failure. Margin, ordering and coverage failures now
+  get their own honest advice via `rerankFailureAdvice`, none of which prescribes a re-deploy.
+- **`Sampled vectors: DEGRADED` no longer prescribes a re-embed.** A complete `clawmem embed --force`
+  over all 153,274 fragments was run (rc=0, 0 failed, every vector rewritten) and the finding did not
+  move — 4/16 validated + 20 unreconstructable before, 3/16 + 21 after, sampling noise over 24
+  attempts. The cause is splitter/metadata reconstruction drift inside the sampler (`src/canary.ts`),
+  not stale vectors, and the message now says so.
+
+Threshold derivation (recorded in `src/health/rerank-health.ts`): the shipped 8-pair golden set
+replayed through the production path against the live 8091 proxy, 3 runs — per-pair logit margins
+1.17 / 9.98 / 5.11 / 11.80 / 11.56 / 7.66 / 4.06 / 7.06, 0/8 inverted, tightest pair stable within
+~10%. A degenerate reranker yields exactly 0 and an inverted one a negative margin, so the gap the
+guard must straddle is [0, 1.17]; **0.5** sits ~2.3x below the live minimum and near that gap's
+geometric middle (≈1.65:1 odds separation).
+
+Verified both directions: `tests/unit/rerank-health.test.ts` (40 tests, +19), watched go RED with
+the clamp and ordering assertions neutered (4 fail) and with the prescription gate un-gated (3 fail),
+GREEN again on restore. Live positive control: `clawmem rerank-health` against the real 8091 proxy —
+`coverage 8/8, 0 inversions, max score 1.00, min logit margin 1.17 ≥ 0.5`. Live negative control: a
+throwaway stub `/v1/rerank` returning constant ~1e-11 (RED, zerank-2 prescription emitted) and one
+returning inverted ordering (RED, zerank-2 prescription correctly withheld).
+
 ## v0.36.2 — write-path embed-geometry preflight
 
 The read path has refused to *serve* a query against a vault whose stored embedding geometry

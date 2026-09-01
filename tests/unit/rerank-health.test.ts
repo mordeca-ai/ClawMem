@@ -5,7 +5,13 @@
 import { test, expect, describe, afterEach, beforeEach } from "bun:test";
 import { createStore, RerankCoverageError, RerankMalformedResponseError } from "../../src/store.ts";
 import { blendRerank, RERANK_DEGENERATE_FLOOR } from "../../src/search-utils.ts";
-import { probeRerankHealth, type GoldenTriple } from "../../src/health/rerank-health.ts";
+import {
+  probeRerankHealth,
+  rerankFailureAdvice,
+  toLogit,
+  RERANK_LOGIT_CLAMP_EPS,
+  type GoldenTriple,
+} from "../../src/health/rerank-health.ts";
 
 // ---------------------------------------------------------------------------
 // blendRerank — degenerate-floor trip, onFallback emit, options overload
@@ -347,5 +353,130 @@ describe("probeRerankHealth", () => {
     expect(res.ok).toBe(false);
     expect(res.coverageOk).toBe(false);
     expect(res.failures.some((f) => f.includes("coverage"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// master-harness-1nvlz — logit-space discrimination + honest, arm-routed advice
+//
+// The bug these lock down: the margin was computed in SIGMOID space and compared to a fixed
+// additive threshold. The sigmoid saturates, so a pair the live model separated by 4.06 LOGITS
+// compressed to 0.035 and doctor declared a correctly-ordering reranker "degenerate" — then
+// prescribed re-deploying the sidecar while printing "max score 1.0e+0" one line above.
+// ---------------------------------------------------------------------------
+describe("toLogit (sigmoid inverse, clamped)", () => {
+  test("inverts the proxy's sigmoid exactly — reproduces the raw endpoint logits", () => {
+    // Measured pairs (proxy 8091 score → raw 8090 logit), 2026-09-01 live capture. Asserted as a
+    // round trip because the captured scores are printed to 4dp, which is coarser than the logit.
+    const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
+    for (const rawLogit of [-0.6606, -1.966, 7.3493, 3.1873]) {
+      expect(toLogit(sigmoid(rawLogit))).toBeCloseTo(rawLogit, 6);
+    }
+    // and the 4dp-rounded live captures land in the right neighbourhood
+    expect(toLogit(0.3406)).toBeCloseTo(-0.66, 2);
+    expect(toLogit(0.9994)).toBeGreaterThan(7);
+  });
+
+  test("s = 1.0 clamps instead of returning Infinity (the NaN-poisoning trap)", () => {
+    const l = toLogit(1);
+    expect(Number.isFinite(l)).toBe(true);
+    expect(l).toBeCloseTo(Math.log(1 / RERANK_LOGIT_CLAMP_EPS - 1), 3);
+    // and the margin arithmetic stays finite/decidable rather than NaN
+    expect(Number.isNaN(toLogit(1) - toLogit(1))).toBe(false);
+  });
+
+  test("s = 0 clamps symmetrically", () => {
+    expect(Number.isFinite(toLogit(0))).toBe(true);
+    expect(toLogit(0)).toBeCloseTo(-toLogit(1), 6);
+  });
+
+  test("scores outside [0,1] are already logit space and pass through unchanged", () => {
+    expect(toLogit(7.3493)).toBe(7.3493);
+    expect(toLogit(-1.966)).toBe(-1.966);
+  });
+
+  test("non-finite input does not throw", () => {
+    expect(Number.isNaN(toLogit(NaN))).toBe(true);
+  });
+});
+
+describe("probeRerankHealth — logit-space margin (1nvlz)", () => {
+  const triples: GoldenTriple[] = [{ query: "q", relevant: "r", hardNegative: "n" }];
+  function pairStore(rel: number, neg: number) {
+    return {
+      rerank: async (_q: string, d: { file: string; text: string }[]) =>
+        d.map((x) => ({ file: x.file, score: x.file.endsWith("-rel") ? rel : neg })),
+    } as unknown as Parameters<typeof probeRerankHealth>[0];
+  }
+
+  test("REGRESSION: saturated-tail pair that the OLD sigmoid margin failed now PASSES", async () => {
+    // Live golden pair 6 ("is the http put method idempotent"): sigmoid margin 0.039 (< the old
+    // 0.25 threshold → false RED), logit margin 4.06 (→ correctly green).
+    const res = await probeRerankHealth(pairStore(0.9994, 0.9604), { triples });
+    expect(res.ok).toBe(true);
+    expect(res.inversions).toBe(0);
+    expect(res.minLogitMargin).toBeGreaterThan(4); // ~4.2 from the 4dp-rounded capture
+    expect(res.minLogitMargin).toBeGreaterThan(res.thresholds.discrimLogitMargin);
+  });
+
+  test("ordering is correct but the separation is genuinely thin → margin failure, NOT an inversion", async () => {
+    // logit(0.52) - logit(0.50) = 0.080 < 0.5
+    const res = await probeRerankHealth(pairStore(0.52, 0.5), { triples });
+    expect(res.ok).toBe(false);
+    expect(res.inversions).toBe(0);
+    expect(res.calibrationFailed).toBe(false);
+    expect(res.failures.some((f) => f.includes("logit margin"))).toBe(true);
+    expect(res.failures.some((f) => f.includes("INVERTED"))).toBe(false);
+  });
+
+  test("genuine inversion is caught by the scale-free ordering assertion", async () => {
+    const res = await probeRerankHealth(pairStore(0.1, 0.9), { triples });
+    expect(res.ok).toBe(false);
+    expect(res.inversions).toBe(1);
+    expect(res.calibrationFailed).toBe(false);
+    expect(res.failures.some((f) => f.includes("INVERTED"))).toBe(true);
+    expect(res.minLogitMargin).toBeLessThan(0);
+  });
+
+  test("collapse (~1e-11 constant) trips the calibration arm and flags calibrationFailed", async () => {
+    const res = await probeRerankHealth(pairStore(1e-11, 1e-11), { triples });
+    expect(res.ok).toBe(false);
+    expect(res.calibrationFailed).toBe(true);
+  });
+
+  test("clamp keeps a both-saturated pair decidable (margin 0, not NaN)", async () => {
+    const res = await probeRerankHealth(pairStore(1, 1), { triples });
+    expect(res.ok).toBe(false);
+    expect(Number.isNaN(res.minLogitMargin)).toBe(false);
+    expect(res.minLogitMargin).toBe(0);
+    expect(res.inversions).toBe(1); // rel > neg is false
+  });
+});
+
+describe("rerankFailureAdvice — the zerank-2 prescription is gated to the calibration arm", () => {
+  const base = { calibrationFailed: false, inversions: 0, pairsScored: 8, pairsTotal: 8 };
+
+  test("calibration collapse → zerank-2 / seq-cls-sidecar prescription", () => {
+    const advice = rerankFailureAdvice({ ...base, calibrationFailed: true });
+    expect(advice).toContain("zerank-2");
+    expect(advice).toContain("seq-cls sidecar");
+  });
+
+  test("thin-margin failure → honest message, NO re-deploy prescription", () => {
+    const advice = rerankFailureAdvice(base);
+    expect(advice).not.toContain("zerank-2");
+    expect(advice.toLowerCase()).toContain("do not re-deploy");
+  });
+
+  test("inversion failure → ordering message, NO re-deploy prescription", () => {
+    const advice = rerankFailureAdvice({ ...base, inversions: 3 });
+    expect(advice).not.toContain("zerank-2");
+    expect(advice).toContain("hard negative");
+  });
+
+  test("coverage failure → coverage message, NO re-deploy prescription", () => {
+    const advice = rerankFailureAdvice({ ...base, pairsScored: 5 });
+    expect(advice).not.toContain("zerank-2");
+    expect(advice).toContain("did not score every probe doc");
   });
 });
