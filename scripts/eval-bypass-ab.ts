@@ -364,7 +364,7 @@ async function buildArm(name: ArmName): Promise<ArmCtx> {
   const health = await probeRerankHealth(probeStore, {});
   probeStore.close();
   if (!health.ok) { console.error(`ABORT: rerank-health failed — ${health.failures.join("; ")} (an inert reranker invalidates the A/B)`); process.exit(2); }
-  console.log(`rerank-health ok (minMargin ${health.minMargin.toFixed(3)}, ${health.pairsScored}/${health.pairsTotal} pairs)`);
+  console.log(`rerank-health ok (min logit margin ${health.minLogitMargin.toFixed(3)}, ${health.pairsScored}/${health.pairsTotal} pairs)`);
 }
 
 const armA = await buildArm("A");
