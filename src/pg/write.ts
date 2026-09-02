@@ -195,10 +195,23 @@ export async function insertEmbedding(w: EmbeddingWrite): Promise<void> {
 // ===========================================================================
 
 /** The CLOSED ADR-0058 content_type enum (ADR-0162 §5), plus 'unknown'. */
+/**
+ * The admitted content_type enum — 17 real types + the 'unknown' sink.
+ *
+ * Kept ALPHABETICALLY ORDERED and set-equal to the CHECK constraint in
+ * migrations/003_content_type_enum_extend.sql. That is not a convention, it is
+ * a tested invariant: tests/integration/pg-content-type-enum.test.ts parses the
+ * value list out of 003 and asserts set-equality, because a value admitted here
+ * but not there is a runtime constraint violation on the write path, and a
+ * value admitted there but not here is silently narrowed to 'unknown'.
+ *
+ * eval-run / observation / plan / retro were added by the ADR-0058 amendment of
+ * 2026-09-02 (operator verdict, BJ 2026-09-02, Review Hub item 2940ea7c).
+ */
 export const CONTENT_TYPES = [
-  "antipattern", "conversation", "decision", "deductive", "handoff", "hub",
-  "milestone", "note", "preference", "problem", "progress", "project", "research",
-  "unknown",
+  "antipattern", "conversation", "decision", "deductive", "eval-run", "handoff", "hub",
+  "milestone", "note", "observation", "plan", "preference", "problem", "progress",
+  "project", "research", "retro", "unknown",
 ] as const;
 export type ContentTypeFacet = (typeof CONTENT_TYPES)[number];
 
@@ -207,19 +220,68 @@ export const TRUST_TIERS = ["authored", "distilled", "ingested-verbatim", "deriv
 export const SENSITIVITIES = ["public", "private", "crypt", "nsfw", "unknown"] as const;
 
 /**
- * Narrow a raw content_type onto the closed enum. Out-of-enum values become
- * 'unknown' AND the raw string is preserved in documents.content_type_raw, so
- * the retag backlog ADR-0162 §5 mandates is a query, not archaeology. Nothing is
- * silently discarded.
+ * Observed synonyms that CONFORM onto an admitted value (ADR-0058 amendment,
+ * 2026-09-02; operator verdict BJ 2026-09-02, Review Hub item 2940ea7c).
+ *
+ * Mirrored by the backfill VALUES list in
+ * migrations/003_content_type_enum_extend.sql. Two invariants are tested, not
+ * merely intended:
+ *
+ *  - every VALUE here is a member of CONTENT_TYPES (a mapping onto a
+ *    non-admitted value would produce a row the CHECK constraint rejects);
+ *  - no KEY here is a member of CONTENT_TYPES (a key that is already admitted
+ *    is unreachable — rule 2 of narrowContentType wins first — so its presence
+ *    means someone made a mistake, not that the mapping is redundant).
+ *
+ * NOT PRESENT ON PURPOSE: `session-transcript`. It belongs to the `monchujo`
+ * origin corpus owned by master-harness-vn4rz.8 and must keep landing as
+ * 'unknown' with its raw preserved. Do not add it.
+ */
+export const CONTENT_TYPE_CONFORM: Readonly<Record<string, ContentTypeFacet>> = {
+  "planning": "plan",
+  "queue-plan": "plan",
+  "run": "eval-run",
+  "run-report": "eval-run",
+  "synthesis": "deductive",
+  "research-synthesis": "deductive",
+  "memo": "deductive",
+  "reference": "hub",
+  "runbook": "hub",
+  "operations": "handoff",
+};
+
+/**
+ * Narrow a raw content_type onto the admitted enum, with a CONFORM layer.
+ *
+ * The enum is no longer closed-by-retag. ADR-0162 §5 said "gaps resolve by
+ * retag, not extension"; the ADR-0058 amendment of 2026-09-02 (operator
+ * verdict, BJ 2026-09-02, Review Hub item 2940ea7c) REVERSED that: the enum
+ * extends, and observed synonyms conform onto one admitted value each.
+ *
+ * Precedence, in order:
+ *
+ *  1. falsy raw            -> 'unknown', raw null (nothing was ever declared)
+ *  2. raw IS admitted      -> itself, raw null (no mapping decision was made,
+ *                             so there is nothing to keep an audit trail of)
+ *  3. raw is a conform key -> the MAPPED value, and the ORIGINAL string is
+ *                             preserved in content_type_raw. The conform is a
+ *                             mapping decision; it stays auditable and
+ *                             reversible precisely because the raw survives.
+ *  4. otherwise            -> 'unknown', raw preserved (the real retag backlog)
+ *
+ * Nothing is ever silently discarded in any branch.
  */
 export function narrowContentType(raw: string | null | undefined): {
   contentType: ContentTypeFacet;
   raw: string | null;
 } {
   if (!raw) return { contentType: "unknown", raw: null };
-  return (CONTENT_TYPES as readonly string[]).includes(raw)
-    ? { contentType: raw as ContentTypeFacet, raw: null }
-    : { contentType: "unknown", raw };
+  if ((CONTENT_TYPES as readonly string[]).includes(raw)) {
+    return { contentType: raw as ContentTypeFacet, raw: null };
+  }
+  const conformed = CONTENT_TYPE_CONFORM[raw];
+  if (conformed !== undefined) return { contentType: conformed, raw };
+  return { contentType: "unknown", raw };
 }
 
 export interface Facets {

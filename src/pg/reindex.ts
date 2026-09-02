@@ -206,12 +206,20 @@ export async function reindexCollection(
     const { body, meta } = parseDocument(raw, rel);
     const title = meta.title ?? extractTitle(raw, rel);
 
-    // The retag backlog (ADR-0162 §5): counted here so the closed-enum decision
-    // has a number attached to it rather than a shrug.
+    // The retag backlog: counted here so the enum decision has a number attached
+    // to it rather than a shrug.
+    //
+    // Since the ADR-0058 amendment (2026-09-02) a preserved content_type_raw no
+    // longer implies "needs a retag" — a CONFORMED value also keeps its raw, as
+    // the audit trail of the mapping decision, but it is RESOLVED, not backlog.
+    // The backlog is therefore exactly the rows that landed in the 'unknown'
+    // sink WITH a raw string, which is the residue neither admitted nor
+    // conformed (e.g. 'session-transcript').
     const ct = meta.content_type as string | undefined;
     if (ct) {
       const { narrowContentType } = await import("./write.ts");
-      if (narrowContentType(ct).raw) {
+      const narrowed = narrowContentType(ct);
+      if (narrowed.contentType === "unknown" && narrowed.raw) {
         stats.contentTypeRetagBacklog[ct] = (stats.contentTypeRetagBacklog[ct] ?? 0) + 1;
       }
     }
