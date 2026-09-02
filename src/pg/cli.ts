@@ -14,6 +14,10 @@ import { resolvePgConfig } from "./config.ts";
 import { isVault, type Vault } from "./vaults.ts";
 import { reindex } from "./reindex.ts";
 import { assertSchemaGeometry, getVecModels } from "./write.ts";
+import {
+  dropLegacyDocumentRows, dropPartitionsBefore, listPartitions, loadOriginCollection,
+} from "./origin.ts";
+import { listCollections } from "../collections.ts";
 
 function flagValue(argv: string[], name: string): string | undefined {
   const i = argv.indexOf(name);
@@ -124,10 +128,87 @@ async function main() {
       }
       break;
     }
+    // ---------------------------------------------------------------------
+    // ORIGIN TIER (master-harness-vn4rz.8) — the ONE sanctioned copy path.
+    // Kept as its own verb rather than folded into `reindex` precisely so the
+    // copy/reindex boundary is visible at the command line: `reindex` may never
+    // copy, `origin-load` may never reindex.
+    // ---------------------------------------------------------------------
+    case "origin-load": {
+      const name = flagValue(argv, "--collection");
+      if (!name) throw new Error("origin-load requires --collection <name>");
+      const c = listCollections().find(x => x.name === name);
+      if (!c) throw new Error(`no collection ${name} in the clawmem index config`);
+      const limitRaw = flagValue(argv, "--limit");
+      const s = await loadOriginCollection({
+        collection: c.name, root: c.path, pattern: c.pattern,
+        month: flagValue(argv, "--month"),
+        limit: limitRaw ? Number(limitRaw) : undefined,
+        skipEmbed: argv.includes("--no-embed"),
+        embedBatchSize: argv.includes("--batch-size")
+          ? Number(flagValue(argv, "--batch-size")) : undefined,
+        vault,
+        onProgress: m => console.log(m),
+      });
+      console.log(
+        `${s.collection}: ${s.recordsWritten} records written of ${s.filesSeen} seen, ` +
+        `${s.hashesAlreadyEmbedded} hashes already embedded (not re-embedded), ` +
+        `${s.fragmentsEmbedded} fragments embedded, ${s.embedFailures} embed failures, ` +
+        `${(s.wallClockMs / 1000).toFixed(1)}s`);
+      console.log("  per-partition:");
+      for (const [k, v] of Object.entries(s.perMonth).sort())
+        console.log(`    ${k.padEnd(32)} ${String(v).padStart(7)}`);
+      // ALWAYS printed, including when it is zero. The DEFAULT partition is a
+      // monitored number, not a catch-all nobody revisits (migration 004,
+      // DESIGN DECISION (b)); a reader of a green run has to see the count.
+      console.log(
+        `  DEFAULT partition (origin_documents_unassigned): ${s.unassigned} record(s) ` +
+        `with no resolvable authored_at`);
+      for (const p of s.unassignedPaths) console.log(`    ${p}`);
+      const backlog = Object.entries(s.recordTypeBacklog);
+      console.log(
+        `  record_type outside the closed origin vocabulary: ` +
+        (backlog.length ? backlog.map(([k, v]) => `${k}=${v}`).join(", ") : "(none)") +
+        ` -- stored as 'unknown' with the raw value in record_type_raw`);
+      break;
+    }
+    case "origin-partitions": {
+      for (const p of await listPartitions(vault)) {
+        console.log(
+          `${p.partition_name.padEnd(32)} ${p.is_default ? "DEFAULT" : p.bound_expr}  ` +
+          `${(Number(p.total_bytes) / 1048576).toFixed(1)} MiB`);
+      }
+      break;
+    }
+    case "origin-drop-legacy": {
+      const name = flagValue(argv, "--collection");
+      if (!name) throw new Error("origin-drop-legacy requires --collection <name>");
+      const apply = argv.includes("--apply");
+      const r = await dropLegacyDocumentRows(name, vault, { apply });
+      console.log(
+        `${name}: ${r.inDocuments} rows in documents, ${r.inOrigin} in origin_documents, ` +
+        `${r.missing} unmatched. ${apply ? `DELETED ${r.deleted}` : "DRY RUN (pass --apply)"}`);
+      break;
+    }
+    case "origin-retention": {
+      const before = flagValue(argv, "--before");
+      if (!before) throw new Error("origin-retention requires --before YYYY-MM-DD");
+      const apply = argv.includes("--apply");
+      const r = await dropPartitionsBefore(before, vault, { apply });
+      console.log(`cutoff ${before} -- DETACH CONCURRENTLY + DROP (never a DELETE sweep)`);
+      console.log(`  ${apply ? "dropped" : "would drop"}: ${r.dropped.join(", ") || "(none)"}`);
+      console.log(`  kept:    ${r.kept.join(", ") || "(none)"}`);
+      console.log(
+        `  refused (DEFAULT partition has no upper bound; dropping it is unbounded ` +
+        `data loss, never retention): ${r.refusedDefault.join(", ") || "(none)"}`);
+      if (!apply) console.log("  DRY RUN -- pass --apply to execute");
+      break;
+    }
     default:
       console.error(
-        "usage: bun src/pg/cli.ts <migrate|status|reindex> [--vault sfw|nsfw] " +
-        "[--collection a,b] [--limit N] [--no-embed]",
+        "usage: bun src/pg/cli.ts <migrate|status|reindex|origin-load|origin-partitions|" +
+        "origin-drop-legacy|origin-retention> [--vault sfw|nsfw] " +
+        "[--collection a,b] [--limit N] [--no-embed] [--month YYYY-MM] [--before DATE] [--apply]",
       );
       process.exit(2);
   }
