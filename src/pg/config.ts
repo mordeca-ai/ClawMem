@@ -39,6 +39,55 @@ export function embedDim(): number {
   return n;
 }
 
+/**
+ * THE SCHEMA KNOB (master-harness-vn4rz.7 pass C, Task 3.1).
+ *
+ * Every statement in src/pg/write.ts names its tables UNQUALIFIED and resolves
+ * them through the connection's `search_path`. Before this knob existed the
+ * integration suite could not point the real exported functions at a throwaway
+ * schema, so it RE-EXPRESSED the write transaction instead — a test that
+ * re-implements the code under test proves nothing about that code, and a
+ * future drift between write.ts and the copy would not have been caught. That
+ * was pass B's self-reported weakest link.
+ *
+ * The knob is deliberately NOT a parameter threaded through every write
+ * signature: search_path is a *connection* property, so the right place to set
+ * it is where the connection is checked out (src/pg/client.ts::withClient),
+ * once, for every helper at the same time.
+ *
+ * Precedence: the programmatic override (setPgSchema) wins over the
+ * CLAWMEM_PG_SCHEMA env var; null/empty means "the server's default
+ * search_path", which is what production uses.
+ */
+const SCHEMA_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+let schemaOverride: string | null | undefined;
+
+/** Programmatic override, for tests. Pass null to restore env/default behavior. */
+export function setPgSchema(schema: string | null): void {
+  if (schema !== null) assertSchemaIdent(schema);
+  schemaOverride = schema;
+}
+
+function assertSchemaIdent(raw: string): void {
+  if (!SCHEMA_IDENT.test(raw)) {
+    // A schema name reaches SQL as an IDENTIFIER, which cannot be parameterized.
+    // Rejecting anything but a plain identifier is what keeps that safe even
+    // though client.ts also quotes it.
+    throw new Error(
+      `Invalid PostgreSQL schema name ${JSON.stringify(raw)}: must match ${SCHEMA_IDENT}`,
+    );
+  }
+}
+
+/** The schema every pooled connection should resolve unqualified tables in. */
+export function pgSchema(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = schemaOverride !== undefined ? schemaOverride : (env.CLAWMEM_PG_SCHEMA ?? null);
+  if (raw === null || raw === "") return null;
+  assertSchemaIdent(raw);
+  return raw;
+}
+
 export interface PgConfig {
   /** libpq connection string. */
   connectionString: string;

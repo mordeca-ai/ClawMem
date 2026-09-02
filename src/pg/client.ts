@@ -6,7 +6,7 @@
  */
 
 import pg from "pg";
-import { resolvePgConfig } from "./config.ts";
+import { pgSchema, resolvePgConfig } from "./config.ts";
 
 const { Pool, types } = pg;
 
@@ -34,9 +34,30 @@ export function getPool(): pg.Pool {
   return pool;
 }
 
+/**
+ * Check a client out of the pool with its `search_path` PINNED (vn4rz.7 pass C).
+ *
+ * Every write helper names its tables unqualified, so the schema they land in
+ * is whatever search_path the pooled session happens to carry. Pooled sessions
+ * are REUSED, so a previous checkout's `SET search_path` would otherwise leak
+ * into the next caller. Setting it unconditionally on every checkout — to the
+ * configured schema, or explicitly back to DEFAULT — makes the resolution
+ * deterministic instead of order-dependent, and is what lets the integration
+ * suite run the REAL exported functions against a throwaway schema.
+ *
+ * Cost is one extra round trip per checkout against a loopback socket; the
+ * alternative is a class of silently-wrote-to-the-wrong-schema bug.
+ */
 export async function withClient<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
   const c = await getPool().connect();
   try {
+    const schema = pgSchema();
+    // A schema name is an identifier and cannot be a bind parameter. config.ts
+    // has already rejected anything that is not a bare identifier; quoting here
+    // is the second, independent layer.
+    await c.query(
+      schema ? `SET search_path TO ${c.escapeIdentifier(schema)}, public` : "SET search_path TO DEFAULT",
+    );
     return await fn(c);
   } finally {
     c.release();
