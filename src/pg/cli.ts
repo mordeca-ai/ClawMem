@@ -61,6 +61,24 @@ async function main() {
           `${s.fragmentsEmbedded} embedded, ${s.embedFailures} embed failures, ` +
           `${(s.wallClockMs / 1000).toFixed(1)}s`,
         );
+        // Reported HERE, in the reindex summary, and deliberately NOT in
+        // `clawmem status` / `pg status` (master-harness-vn4rz.34). Both status
+        // verbs are pure reads of stored row state; "this document's frontmatter
+        // did not parse" is a SCAN-TIME fact with no column behind it. Surfacing
+        // it there would mean either a schema migration to persist it, or turning
+        // a cheap status read into a full filesystem walk of every collection.
+        // Neither is warranted for a signal whose natural moment is the scan that
+        // produced it — which is also why contentTypeRetagBacklog below reports
+        // here rather than inventing a second channel.
+        const fmFailures = Object.entries(s.frontmatterParseFailures);
+        if (fmFailures.length > 0) {
+          console.log(
+            `  UNPARSEABLE FRONTMATTER: ${fmFailures.length} document(s) — metadata ` +
+            `(title/description/tags/domain/workstream) was DROPPED, content_type was ` +
+            `INFERRED from the filename, and the raw YAML was embedded as body prose:`,
+          );
+          for (const [path, msg] of fmFailures) console.log(`    ${path}: ${msg}`);
+        }
         const backlog = Object.entries(s.contentTypeRetagBacklog);
         if (backlog.length > 0) {
           console.log(

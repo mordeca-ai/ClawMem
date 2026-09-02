@@ -29,6 +29,7 @@ import { readFileSync, statSync } from "fs";
 import { join } from "path";
 import {
   authoredAtFromFrontmatter, computeQualityScore, extractTitle, hashContent, parseDocument,
+  type FrontmatterParseFailure,
 } from "../indexer.ts";
 import { listCollections } from "../collections.ts";
 import { getDefaultLlamaCpp, formatDocForEmbedding } from "../llm.ts";
@@ -63,6 +64,18 @@ export interface ReindexStats {
   embedFailures: number;
   /** content_type values that fell outside the closed ADR-0058 enum, with counts. */
   contentTypeRetagBacklog: Record<string, number>;
+  /**
+   * Documents whose frontmatter block was present but UNPARSEABLE, path → the
+   * YAML parser's own message (master-harness-vn4rz.34).
+   *
+   * Same shape and same reporting channel as contentTypeRetagBacklog above:
+   * counted here so "N documents in this collection have unparseable
+   * frontmatter, and here they are" is answerable from the reindex summary
+   * instead of being swallowed. These documents lost title/description/tags/
+   * domain/workstream, got a filename-INFERRED content_type (and so the wrong
+   * decay curve), and had their raw YAML embedded as body prose.
+   */
+  frontmatterParseFailures: Record<string, string>;
   wallClockMs: number;
 }
 
@@ -94,6 +107,27 @@ function deriveFacets(collection: string, meta: { domain?: string }, relPath: st
   };
 }
 
+/**
+ * Fold one document's frontmatter-parse outcome into the collection summary
+ * (master-harness-vn4rz.34).
+ *
+ * Extracted rather than inlined so the COUNTING is unit-testable without a
+ * database — the guard this belongs to is worthless if nobody can prove the
+ * number reaches the summary.
+ *
+ * A no-op when `err` is undefined, which covers BOTH "parsed cleanly" and
+ * "declared no frontmatter". Only a document that declared a block the parser
+ * refused is counted.
+ */
+export function noteFrontmatterFailure(
+  stats: Pick<ReindexStats, "frontmatterParseFailures">,
+  relPath: string,
+  err: FrontmatterParseFailure | undefined,
+): void {
+  if (!err) return;
+  stats.frontmatterParseFailures[relPath] = err.message;
+}
+
 export async function reindexCollection(
   name: string,
   root: string,
@@ -117,7 +151,8 @@ export async function reindexCollection(
 
   const stats: ReindexStats = {
     collection: name, filesSeen: files.length, documentsWritten: 0,
-    fragmentsEmbedded: 0, embedFailures: 0, contentTypeRetagBacklog: {}, wallClockMs: 0,
+    fragmentsEmbedded: 0, embedFailures: 0, contentTypeRetagBacklog: {},
+    frontmatterParseFailures: {}, wallClockMs: 0,
   };
 
   /**
@@ -203,7 +238,10 @@ export async function reindexCollection(
       continue;
     }
     const hash = hashContent(raw);
-    const { body, meta } = parseDocument(raw, rel);
+    const { body, meta, frontmatterError } = parseDocument(raw, rel);
+    // parseDocument already emitted the per-file warning; this is the COUNT
+    // that reaches the summary (vn4rz.34).
+    noteFrontmatterFailure(stats, rel, frontmatterError);
     const title = meta.title ?? extractTitle(raw, rel);
 
     // The retag backlog: counted here so the enum decision has a number attached
