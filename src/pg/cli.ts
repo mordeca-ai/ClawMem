@@ -52,7 +52,7 @@ async function main() {
         collections: cols ? cols.split(",").map(s => s.trim()) : undefined,
         limit: limitRaw ? Number(limitRaw) : undefined,
         skipEmbed: argv.includes("--no-embed"),
-        embedBatchSize: Number(flagValue(argv, "--batch-size") ?? 16),
+        embedBatchSize: argv.includes("--batch-size") ? Number(flagValue(argv, "--batch-size")) : undefined,
         onProgress: m => console.log(m),
       });
       for (const s of stats) {

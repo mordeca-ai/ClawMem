@@ -32,6 +32,8 @@ import {
 } from "../indexer.ts";
 import { listCollections } from "../collections.ts";
 import { getDefaultLlamaCpp, formatDocForEmbedding } from "../llm.ts";
+import { splitDocument } from "../splitter.ts";
+import { canonicalDocId } from "../store.ts";
 import { embedDim } from "./config.ts";
 import { insertEmbeddingsBatch, upsertDocument, type EmbeddingWrite } from "./write.ts";
 
@@ -46,7 +48,7 @@ export interface ReindexOptions {
   collections?: string[];
   /** Stop after N documents. For the validate-small-before-batch smoke pass. */
   limit?: number;
-  /** Documents per embed round trip. */
+  /** FRAGMENTS per embed round trip (sqlite's default is 50). */
   embedBatchSize?: number;
   /** Skip embedding entirely (schema/parity smoke without touching yoshiee). */
   skipEmbed?: boolean;
@@ -100,7 +102,7 @@ export async function reindexCollection(
 ): Promise<ReindexStats> {
   const t0 = Date.now();
   const log = opts.onProgress ?? (() => {});
-  const batchSize = opts.embedBatchSize ?? 16;
+  const batchSize = opts.embedBatchSize ?? Number(process.env.CLAWMEM_EMBED_BATCH_SIZE ?? 50);
   const dim = embedDim();
   const llm = getDefaultLlamaCpp();
 
@@ -118,35 +120,76 @@ export async function reindexCollection(
     fragmentsEmbedded: 0, embedFailures: 0, contentTypeRetagBacklog: {}, wallClockMs: 0,
   };
 
-  const pending: { hash: string; text: string; title: string }[] = [];
+  /**
+   * FRAGMENT-LEVEL EMBEDDING (delta amendment 1, master-harness-vn4rz.7 pass B).
+   *
+   * The first cut of this reindexer wrote ONE vector per document (seq=0 over the
+   * whole body). sqlite does not: its embed path calls splitDocument() and writes
+   * one row per semantic fragment, keyed (hash, seq), which is why the same 370
+   * memory-topics documents hold 1,496 vectors there (max seq 17) and held only
+   * 370 here. Document-count parity stayed GREEN across that gap — a doc-count
+   * check structurally cannot see it — while within-document retrieval
+   * granularity was silently destroyed. Exactly the silent-wrong-answer class.
+   *
+   * The fix reuses the EXISTING splitter through buildDocEmbedTask() rather than
+   * re-implementing fragmentation, so the PG and sqlite paths cannot drift: same
+   * fragment set, same seq ordering, same `pos` (fragment start line), same
+   * fragment_type / fragment_label / canonical_id / embed_input_fp semantics, and
+   * the same `label || title` rule feeding formatDocForEmbedding.
+   */
+  type PendingFragment = {
+    hash: string; seq: number; pos: number; text: string;
+    fragmentType: string; fragmentLabel: string | null; canonicalId: string;
+  };
+  const pending: PendingFragment[] = [];
   const hashesDone = new Set<string>();
 
-  const flush = async () => {
-    if (pending.length === 0 || opts.skipEmbed) { pending.length = 0; return; }
-    const texts = pending.map(p => formatDocForEmbedding(p.text, p.title));
+  /**
+   * Embed + write exactly ONE batch of fragments. sqlite chunks its flattened
+   * fragment queue at a fixed batchSize; a single document can contribute up to
+   * MAX_FRAGMENTS_PER_DOC fragments, so flushing "whatever accumulated" would
+   * send ragged, sometimes oversized batches. Chunking here keeps the request
+   * shape identical to the sqlite path's.
+   */
+  const embedAndWrite = async (chunk: PendingFragment[]) => {
+    const pending = chunk;
+    const texts = pending.map(p => p.text);
     const results = await llm.embedBatch(texts);
     const writes: EmbeddingWrite[] = [];
     for (let i = 0; i < pending.length; i++) {
       const r = results[i];
+      const frag = pending[i]!;
       if (!r?.embedding) { stats.embedFailures++; continue; }
       if (r.embedding.length !== dim) {
         // Loud, immediate. Never truncate, never pad.
         throw new Error(
           `Embed endpoint returned ${r.embedding.length} dimensions for ` +
-          `${pending[i]!.title}; the schema column is vector(${dim}). Refusing to write.`,
+          `${frag.canonicalId} seq=${frag.seq}; the schema column is vector(${dim}). ` +
+          `Refusing to write.`,
         );
       }
       writes.push({
-        hash: pending[i]!.hash, seq: 0, pos: 0,
+        hash: frag.hash, seq: frag.seq, pos: frag.pos,
         embedding: r.embedding, model: r.model,
-        embedInputFp: hashContent(texts[i]!),
+        fragmentType: frag.fragmentType,
+        fragmentLabel: frag.fragmentLabel,
+        canonicalId: frag.canonicalId,
+        // SHA-256 over the UTF-8 bytes of the exact formatted embed input,
+        // matching src/clawmem.ts's contract byte for byte.
+        embedInputFp: hashContent(frag.text),
       });
     }
     if (writes.length > 0) {
       await insertEmbeddingsBatch(writes);
       stats.fragmentsEmbedded += writes.length;
     }
-    pending.length = 0;
+  };
+
+  const flush = async (force: boolean) => {
+    if (opts.skipEmbed) { pending.length = 0; return; }
+    while (pending.length >= batchSize || (force && pending.length > 0)) {
+      await embedAndWrite(pending.splice(0, Math.min(batchSize, pending.length)));
+    }
   };
 
   let n = 0;
@@ -195,14 +238,35 @@ export async function reindexCollection(
 
     if (!hashesDone.has(hash)) {
       hashesDone.add(hash);
-      pending.push({ hash, text: body, title });
+      // Inlines src/clawmem.ts::buildDocEmbedTask rather than importing it:
+      // src/clawmem.ts calls main() at MODULE SCOPE, so importing it executes the
+      // whole sqlite CLI against whatever argv this process happens to carry. The
+      // shared thing that matters — splitDocument — is imported directly from
+      // ../splitter.ts, so there is still exactly one splitter.
+      //
+      // `body` is the frontmatter-STRIPPED text, matching what the sqlite path
+      // stores in content.doc — so the frontmatter fragment is SYNTHESIZED from
+      // title/description (the master-harness-z7o4y fix) rather than re-parsed out
+      // of a body that no longer has any frontmatter to find.
+      const frontmatter: Record<string, unknown> = { title };
+      if (meta.description) frontmatter.description = meta.description;
+      const fragments = splitDocument(body, frontmatter);
+      const canonicalId = canonicalDocId(name, rel);
+      for (let seq = 0; seq < fragments.length; seq++) {
+        const frag = fragments[seq]!;
+        pending.push({
+          hash, seq, pos: frag.startLine,
+          text: formatDocForEmbedding(frag.content, frag.label || title),
+          fragmentType: frag.type, fragmentLabel: frag.label, canonicalId,
+        });
+      }
       if (pending.length >= batchSize) {
-        await flush();
-        log(`[${name}] ${stats.documentsWritten}/${files.length} docs, ${stats.fragmentsEmbedded} embedded`);
+        await flush(false);
+        log(`[${name}] ${stats.documentsWritten}/${files.length} docs, ${stats.fragmentsEmbedded} fragments embedded`);
       }
     }
   }
-  await flush();
+  await flush(true);
 
   stats.wallClockMs = Date.now() - t0;
   return stats;
