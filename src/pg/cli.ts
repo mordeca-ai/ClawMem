@@ -90,6 +90,20 @@ async function main() {
         // Neither is warranted for a signal whose natural moment is the scan that
         // produced it — which is also why contentTypeRetagBacklog below reports
         // here rather than inventing a second channel.
+        // Same channel, same reason as the two reports below: a file the scan
+        // silently dropped is as much a defect as one whose parse it silently
+        // swallowed (master-harness-vn4rz.7 pass D). Reported even though it is
+        // the EXPECTED steady state — the number going to zero on a collection
+        // that used to report one is itself the signal.
+        const skipped = Object.entries(s.skippedOutOfScope);
+        if (skipped.length > 0) {
+          console.log(
+            `  out of default scope: ${skipped.length} file(s) matched the glob but ` +
+            `were NOT indexed (master-harness ADR-0071 — leading '_' segments such as ` +
+            `_superseded/ / _reviews/, dotted segments, and EXCLUDED_DIRS):`,
+          );
+          for (const [path, why] of skipped) console.log(`    ${path}: ${why}`);
+        }
         const fmFailures = Object.entries(s.frontmatterParseFailures);
         if (fmFailures.length > 0) {
           console.log(

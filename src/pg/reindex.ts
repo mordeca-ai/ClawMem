@@ -22,6 +22,15 @@
  * re-implementing them, so a PG-indexed document and a sqlite-indexed document
  * are parsed identically and any parity gap is a WRITE-path gap, not a parse
  * gap.
+ *
+ * SCOPE is reused the same way: shouldExclude() is IMPORTED from indexer.ts, not
+ * restated here, so the out-of-default-scope convention (master-harness ADR-0071:
+ * a leading `_` segment — _superseded/, _quarantine/, _reviews/ — plus dotted
+ * segments and EXCLUDED_DIRS) cannot drift between the two write paths. Pass D
+ * added this: the parse helpers had been reused but the SCOPE predicate was
+ * missed, so the PG vault held 54 documents the sqlite vault correctly refused —
+ * 36 superseded ADRs among them, live and retrievable and indistinguishable at
+ * query time from current content (master-harness-vn4rz.7 pass D).
  */
 
 import { Glob } from "bun";
@@ -29,6 +38,7 @@ import { readFileSync, statSync } from "fs";
 import { join } from "path";
 import {
   authoredAtFromFrontmatter, computeQualityScore, extractTitle, hashContent, parseDocument,
+  shouldExclude,
   type FrontmatterParseFailure,
 } from "../indexer.ts";
 import { listCollections } from "../collections.ts";
@@ -76,6 +86,19 @@ export interface ReindexStats {
    * decay curve), and had their raw YAML embedded as body prose.
    */
   frontmatterParseFailures: Record<string, string>;
+  /**
+   * Files the glob matched but shouldExclude() rejected as out-of-default-scope,
+   * path -> the segment that triggered the rejection (master-harness-vn4rz.7 pass D).
+   *
+   * Same shape and same reporting channel as contentTypeRetagBacklog and
+   * frontmatterParseFailures above, and for the same reason: a SILENTLY skipped
+   * file is the same class of defect as a silently swallowed parse error. "N files
+   * in this collection were out of scope, and here they are, and here is why" must
+   * be answerable from the reindex summary. The count is also the regression signal
+   * — it going to zero on a collection that used to report a number means either
+   * the archive moved or the predicate stopped firing.
+   */
+  skippedOutOfScope: Record<string, string>;
   wallClockMs: number;
 }
 
@@ -119,6 +142,35 @@ function deriveFacets(collection: string, meta: { domain?: string }, relPath: st
  * "declared no frontmatter". Only a document that declared a block the parser
  * refused is counted.
  */
+/**
+ * Fold one file's SCOPE decision into the collection summary, returning whether
+ * the caller must skip it (master-harness-vn4rz.7 pass D).
+ *
+ * Extracted rather than inlined for the same reason noteFrontmatterFailure below
+ * is: the guard is worthless if nobody can prove the number reaches the summary,
+ * and that proof must not require a database.
+ *
+ * THE DECISION IS shouldExclude's, ALWAYS. This function never re-states the
+ * exclusion rule — even the human-readable reason is derived by asking
+ * shouldExclude which individual segment it objects to, so there is exactly one
+ * definition of scope shared with the sqlite write path and no second copy that
+ * can drift out from under it.
+ */
+export function noteOutOfScope(
+  stats: Pick<ReindexStats, "skippedOutOfScope">,
+  relPath: string,
+): boolean {
+  if (!shouldExclude(relPath)) return false;
+  // Ask the predicate itself which segment is the offender rather than
+  // re-deriving it from EXCLUDED_DIRS / the "_" and "." conventions.
+  const segment = relPath.split("/").find(seg => shouldExclude(seg));
+  stats.skippedOutOfScope[relPath] =
+    segment === undefined
+      ? "out-of-default-scope path"
+      : `out-of-default-scope segment: "${segment}"`;
+  return true;
+}
+
 export function noteFrontmatterFailure(
   stats: Pick<ReindexStats, "frontmatterParseFailures">,
   relPath: string,
@@ -152,7 +204,7 @@ export async function reindexCollection(
   const stats: ReindexStats = {
     collection: name, filesSeen: files.length, documentsWritten: 0,
     fragmentsEmbedded: 0, embedFailures: 0, contentTypeRetagBacklog: {},
-    frontmatterParseFailures: {}, wallClockMs: 0,
+    frontmatterParseFailures: {}, skippedOutOfScope: {}, wallClockMs: 0,
   };
 
   /**
@@ -236,6 +288,14 @@ export async function reindexCollection(
 
   let n = 0;
   for (const rel of files) {
+    // SCOPE GATE, before anything is read, parsed, embedded or written. The glob
+    // in a collection's config is a broad net; shouldExclude is what keeps
+    // _superseded/, _reviews/, dotted dirs and EXCLUDED_DIRS out of the vault —
+    // the sqlite indexer has always called it, and this path failing to was the
+    // pass-D defect (54 documents, 36 of them superseded ADRs, live and
+    // retrievable). Skipped files do NOT consume `limit`: the smoke pass should
+    // examine N real documents, not N glob hits.
+    if (noteOutOfScope(stats, rel)) continue;
     if (opts.limit !== undefined && n >= opts.limit) break;
     const abs = join(root, rel);
     let raw: string;
