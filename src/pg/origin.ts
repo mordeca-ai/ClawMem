@@ -444,13 +444,49 @@ export async function listPartitions(vault: Vault = "sfw"): Promise<PartitionRow
 }
 
 /**
- * RETENTION — ADR-0162 §5. DETACH CONCURRENTLY, then DROP. Never a DELETE sweep.
+ * RETENTION — ADR-0162 §5. DETACH then DROP. NEVER a DELETE sweep.
  *
  * Why this is a CLI verb and not a plpgsql function: ALTER TABLE ... DETACH
  * PARTITION ... CONCURRENTLY cannot run inside a transaction block, and every
- * plpgsql function body is one. A function could offer only the plain DETACH,
- * which takes ACCESS EXCLUSIVE on the parent — precisely the lock cost §5 cites
- * the concurrent form to avoid. So the verb runs here, outside a transaction.
+ * plpgsql function body is one. So the verb runs here, outside a transaction,
+ * where the concurrent form is at least reachable.
+ *
+ * ===========================================================================
+ * ADR-0162 §5 ASKS FOR TWO THINGS POSTGRES WILL NOT GIVE AT THE SAME TIME.
+ *
+ * §5 mandates, in the same list:
+ *   - "Always a `DEFAULT` partition", and
+ *   - "Retention is `DETACH … CONCURRENTLY` then `DROP`, never a `DELETE` sweep."
+ *
+ * PostgreSQL 16 refuses the combination outright:
+ *
+ *   ERROR: cannot detach partitions concurrently when a default partition exists
+ *
+ * (The concurrent detach runs in two transactions; in between, a row that
+ * belongs to the detaching partition's range could legally be routed to the
+ * default, so the server will not attempt it.) Observed on the vn4rz.8
+ * retention drill against the live table.
+ *
+ * WHAT THIS FUNCTION DOES ABOUT IT, and it is a choice worth stating:
+ *
+ *   - It keeps the DEFAULT partition. §5's own reason for it — a record whose
+ *     partition key cannot be resolved must have somewhere to land rather than
+ *     aborting the load — is a CORRECTNESS requirement, and the concurrent
+ *     detach is a LOCK-DURATION optimisation. Correctness wins.
+ *   - It therefore falls back to a plain `DETACH PARTITION` + `DROP TABLE`,
+ *     which takes ACCESS EXCLUSIVE on the parent for the duration of a catalog
+ *     update — brief, but a full lock on a live table.
+ *   - It PRINTS which mode it used and why, every time. A retention run that
+ *     silently took a heavier lock than the ADR advertises is exactly the kind
+ *     of quiet divergence this whole arc exists to stop.
+ *   - It NEVER falls back to a DELETE sweep. That is the invariant §5 actually
+ *     protects (dead tuples + deferred index reclamation), and it is untouched.
+ *
+ * NAMED FOR AN ADR AMENDMENT rather than decided silently: ADR-0162 §5's
+ * "always a DEFAULT partition" and "retention is DETACH … CONCURRENTLY" are
+ * mutually exclusive on PostgreSQL 16. One of them has to be relaxed, and this
+ * code relaxes the second while saying so out loud.
+ * ===========================================================================
  *
  * TWO REFUSALS, both deliberate:
  *  - The DEFAULT partition is NEVER dropped. It has no upper bound, so dropping
@@ -461,15 +497,37 @@ export async function listPartitions(vault: Vault = "sfw"): Promise<PartitionRow
  *
  * DRY RUN BY DEFAULT. `apply` is opt-in.
  */
+export interface RetentionResult {
+  dropped: string[];
+  kept: string[];
+  refusedDefault: string[];
+  /** Which detach form is available, and the reason. Printed, never inferred. */
+  detachMode: "concurrent" | "plain-access-exclusive";
+  detachModeReason: string;
+}
+
 export async function dropPartitionsBefore(
   cutoffIsoDate: string,
   vault: Vault = "sfw",
   opts: { apply?: boolean } = {},
-): Promise<{ dropped: string[]; kept: string[]; refusedDefault: string[] }> {
+): Promise<RetentionResult> {
   const cutoff = new Date(`${cutoffIsoDate}T00:00:00Z`);
   if (isNaN(cutoff.getTime())) throw new Error(`unparseable cutoff: ${cutoffIsoDate}`);
   const parts = await listPartitions(vault);
   const dropped: string[] = [], kept: string[] = [], refusedDefault: string[] = [];
+
+  // Decided UP FRONT from the catalog, not discovered from a thrown error. An
+  // exception-driven fallback would only be exercised on the day it matters.
+  const hasDefault = parts.some(p => p.is_default);
+  const detachMode = hasDefault ? "plain-access-exclusive" : "concurrent";
+  const detachModeReason = hasDefault
+    ? "a DEFAULT partition exists, and PostgreSQL refuses DETACH ... CONCURRENTLY " +
+      "in that case (\"cannot detach partitions concurrently when a default partition " +
+      "exists\"). Using plain DETACH + DROP, which takes ACCESS EXCLUSIVE on the parent " +
+      "for a brief catalog update. Still NEVER a DELETE sweep -- that is the invariant " +
+      "ADR-0162 §5 actually protects."
+    : "no DEFAULT partition present, so the concurrent detach ADR-0162 §5 prefers is " +
+      "available and is used.";
 
   for (const p of parts) {
     if (p.is_default) { refusedDefault.push(p.partition_name); continue; }
@@ -483,12 +541,13 @@ export async function dropPartitionsBefore(
     if (opts.apply) {
       await withClient(vault, async c => {
         await c.query(
-          `ALTER TABLE origin_documents DETACH PARTITION ${quoteIdent(p.partition_name)} CONCURRENTLY`);
+          `ALTER TABLE origin_documents DETACH PARTITION ${quoteIdent(p.partition_name)}` +
+          (detachMode === "concurrent" ? " CONCURRENTLY" : ""));
         await c.query(`DROP TABLE ${quoteIdent(p.partition_name)}`);
       });
     }
   }
-  return { dropped, kept, refusedDefault };
+  return { dropped, kept, refusedDefault, detachMode, detachModeReason };
 }
 
 /** Identifiers here come from pg_class, but quoting is not optional on the way back in. */

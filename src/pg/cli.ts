@@ -195,7 +195,8 @@ async function main() {
       if (!before) throw new Error("origin-retention requires --before YYYY-MM-DD");
       const apply = argv.includes("--apply");
       const r = await dropPartitionsBefore(before, vault, { apply });
-      console.log(`cutoff ${before} -- DETACH CONCURRENTLY + DROP (never a DELETE sweep)`);
+      console.log(`cutoff ${before} -- DETACH + DROP (never a DELETE sweep)`);
+      console.log(`  detach mode: ${r.detachMode} -- ${r.detachModeReason}`);
       console.log(`  ${apply ? "dropped" : "would drop"}: ${r.dropped.join(", ") || "(none)"}`);
       console.log(`  kept:    ${r.kept.join(", ") || "(none)"}`);
       console.log(
