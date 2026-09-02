@@ -11,6 +11,7 @@
 import { applyMigrations } from "./migrate.ts";
 import { closePool, withClient } from "./client.ts";
 import { resolvePgConfig } from "./config.ts";
+import { isVault, type Vault } from "./vaults.ts";
 import { reindex } from "./reindex.ts";
 import { assertSchemaGeometry, getVecModels } from "./write.ts";
 
@@ -19,25 +20,44 @@ function flagValue(argv: string[], name: string): string | undefined {
   return i >= 0 ? argv[i + 1] : undefined;
 }
 
+/**
+ * Which vault the command targets (master-harness-0ynkd). Defaults to "sfw" so
+ * every existing invocation is byte-identical; `--vault nsfw` reads the
+ * CLAWMEM_PG_NSFW_* namespace instead. Deliberately NOT inferred from anything:
+ * pointing a migration at the wrong database is exactly the class of mistake
+ * this bead is closing, so the operator says it out loud.
+ */
+function vaultFlag(argv: string[]): Vault {
+  const raw = flagValue(argv, "--vault");
+  if (raw === undefined) return "sfw";
+  if (!isVault(raw)) {
+    throw new Error(`--vault must be "sfw" or "nsfw", got ${JSON.stringify(raw)}`);
+  }
+  return raw;
+}
+
 async function main() {
   const [cmd, ...argv] = process.argv.slice(2);
-  const cfg = resolvePgConfig();
+  const vault = vaultFlag(argv);
+  const cfg = resolvePgConfig(vault);
 
   switch (cmd) {
     case "migrate": {
-      const r = await applyMigrations();
+      const r = await applyMigrations(undefined, vault);
+      console.log(`vault:   ${vault}`);
       console.log(`target:  ${cfg.safeLabel}`);
       console.log(`applied: ${r.applied.length ? r.applied.join(", ") : "(none)"}`);
       console.log(`already: ${r.skipped.length ? r.skipped.join(", ") : "(none)"}`);
       break;
     }
     case "status": {
-      await withClient(async c => {
+      await withClient(vault, async c => {
         const dim = await assertSchemaGeometry(c);
         const models = await getVecModels(c);
         const { rows } = await c.query<{ collection: string; n: string }>(
           "SELECT collection, count(*)::text AS n FROM documents WHERE active GROUP BY 1 ORDER BY 1",
         );
+        console.log(`vault:      ${vault}`);
         console.log(`target:     ${cfg.safeLabel}`);
         console.log(`embed dim:  ${dim}`);
         console.log(`vec models: ${models.length ? models.join(", ") : "(none embedded yet)"}`);
@@ -91,7 +111,10 @@ async function main() {
       break;
     }
     default:
-      console.error("usage: bun src/pg/cli.ts <migrate|status|reindex> [--collection a,b] [--limit N] [--no-embed]");
+      console.error(
+        "usage: bun src/pg/cli.ts <migrate|status|reindex> [--vault sfw|nsfw] " +
+        "[--collection a,b] [--limit N] [--no-embed]",
+      );
       process.exit(2);
   }
   await closePool();

@@ -24,6 +24,7 @@ import { fileURLToPath } from "url";
 import type { PoolClient } from "pg";
 import { embedDim } from "./config.ts";
 import { withClient } from "./client.ts";
+import type { Vault } from "./vaults.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const MIGRATIONS_DIR = join(HERE, "..", "..", "migrations");
@@ -100,12 +101,24 @@ async function assertNoInvalidIndexes(c: PoolClient): Promise<void> {
   }
 }
 
-export async function applyMigrations(dir: string = MIGRATIONS_DIR): Promise<ApplyResult> {
+/**
+ * Apply every pending migration to ONE vault's database.
+ *
+ * `vault` is explicit (master-harness-0ynkd) because provisioning the nsfw
+ * vault is a first-class operation, not an accident of which env var happened
+ * to be exported: `bun src/pg/cli.ts migrate --vault nsfw` reads the
+ * CLAWMEM_PG_NSFW_* namespace and applies the SAME migration files, which is
+ * what makes the two schemas comparable rather than merely similar.
+ */
+export async function applyMigrations(
+  dir: string = MIGRATIONS_DIR,
+  vault: Vault = "sfw",
+): Promise<ApplyResult> {
   const files = loadMigrations(dir);
   const applied: string[] = [];
   const skipped: string[] = [];
 
-  await withClient(async c => {
+  await withClient(vault, async c => {
     await ensureTrackingTable(c);
     const { rows } = await c.query<{ version: string; checksum: string }>(
       "SELECT version, checksum FROM schema_migrations",

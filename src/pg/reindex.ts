@@ -175,6 +175,8 @@ export async function reindexCollection(
   type PendingFragment = {
     hash: string; seq: number; pos: number; text: string;
     fragmentType: string; fragmentLabel: string | null; canonicalId: string;
+    /** Collection-relative source path — carried for vault routing (0ynkd). */
+    relPath: string;
   };
   const pending: PendingFragment[] = [];
   const hashesDone = new Set<string>();
@@ -204,6 +206,11 @@ export async function reindexCollection(
         );
       }
       writes.push({
+        // master-harness-0ynkd: the collection (and the document's relative
+        // path) is what routes a fragment's vectors to the same vault as its
+        // document. reindex already knows both; threading them through is the
+        // whole reason EmbeddingWrite.collection could be made REQUIRED.
+        collection: name, path: frag.relPath,
         hash: frag.hash, seq: frag.seq, pos: frag.pos,
         embedding: r.embedding, model: r.model,
         fragmentType: frag.fragmentType,
@@ -300,6 +307,7 @@ export async function reindexCollection(
           hash, seq, pos: frag.startLine,
           text: formatDocForEmbedding(frag.content, frag.label || title),
           fragmentType: frag.type, fragmentLabel: frag.label, canonicalId,
+          relPath: rel,
         });
       }
       if (pending.length >= batchSize) {

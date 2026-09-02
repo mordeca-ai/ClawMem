@@ -28,12 +28,15 @@
 
 import type { PoolClient } from "pg";
 import { withTransaction, toVectorLiteral } from "./client.ts";
-import { embedDim } from "./config.ts";
+import { embedDim, resolvePgConfig } from "./config.ts";
+import { resolveVault, type Vault } from "./vaults.ts";
 import {
   PgSchemaGeometryError,
   PgVecBatchModelMismatchError,
+  PgVecBatchVaultMismatchError,
   PgVecDimensionMismatchError,
   PgVecWriteModelMismatchError,
+  PgWrongDatabaseError,
 } from "./errors.ts";
 
 /** Arbitrary but stable key for the write-geometry advisory lock. */
@@ -41,6 +44,35 @@ const GEOMETRY_LOCK_KEY = 0x1a2b3c4d;
 
 function embedEndpointLabel(): string {
   return process.env.CLAWMEM_EMBED_URL || "the local in-process embedder";
+}
+
+// ===========================================================================
+// The belt: prove the SESSION is where the routing thinks it is
+// ===========================================================================
+
+/**
+ * Assert this transaction's session is attached to the database the vault's
+ * configuration names — INSIDE the transaction, before any INSERT.
+ *
+ * Routing (src/pg/vaults.ts) decides which vault a write belongs to; the pool
+ * (src/pg/client.ts) decides which connection string serves that vault. Neither
+ * can see whether the connection string actually lands where it says: libpq
+ * connects to the role-named database when the URL carries no path, a stale
+ * shell export outranks the config, a copy-pasted URL keeps the wrong /dbname.
+ * Every one of those routes a private write into the general database with the
+ * routing layer reporting success. So the session is asked directly.
+ *
+ * Cost is one round trip per write transaction over a loopback socket. The
+ * alternative is a privacy defect that no test of the routing layer can catch.
+ */
+export async function assertVaultDatabase(c: PoolClient, vault: Vault): Promise<string> {
+  const expected = resolvePgConfig(vault).database;
+  const { rows } = await c.query<{ db: string }>("SELECT current_database() AS db");
+  const actual = rows[0]?.db ?? "";
+  if (actual !== expected) {
+    throw new PgWrongDatabaseError(vault, expected, actual);
+  }
+  return actual;
 }
 
 // ===========================================================================
@@ -109,6 +141,16 @@ export async function assertWriteEmbedModelConsistent(
 }
 
 export interface EmbeddingWrite {
+  /**
+   * REQUIRED (master-harness-0ynkd). A fragment's vectors must land in the same
+   * vault as the document they belong to, and the only thing that determines a
+   * vault is the collection (+ path). Making this optional would let a caller
+   * omit it and get "sfw" by accident — the exact defect this bead exists to
+   * kill — so it is required and TypeScript refuses the call site instead.
+   */
+  collection: string;
+  /** Collection-relative source path, when known. Feeds the PRIVATE_ROOTS tripwire. */
+  path?: string | null;
   hash: string;
   seq: number;
   pos: number;
@@ -143,7 +185,31 @@ function assertDimension(w: EmbeddingWrite, expected: number): void {
 export async function insertEmbeddingsBatch(writes: EmbeddingWrite[]): Promise<void> {
   if (writes.length === 0) return;
 
-  await withTransaction(async c => {
+  // Vault FIRST: resolved from the batch's own members, before a connection is
+  // even checked out. A batch is written in ONE transaction against ONE
+  // database, so a batch spanning two vaults is not a thing that can be
+  // honoured — and splitting it silently would route half the caller's content
+  // somewhere they never asked for. Refuse it, loudly, in the same shape and
+  // for the same reason as the intra-batch model-mismatch check below.
+  const vaults = new Map<Vault, string[]>();
+  for (const w of writes) {
+    const v = resolveVault(w.collection, w.path ?? undefined);
+    const seen = vaults.get(v);
+    if (seen) seen.push(w.collection);
+    else vaults.set(v, [w.collection]);
+  }
+  const distinct = [...vaults.keys()];
+  if (distinct.length > 1) {
+    throw new PgVecBatchVaultMismatchError(
+      distinct[0]!,
+      distinct[1]!,
+      [...new Set(writes.map(w => w.collection))].sort(),
+    );
+  }
+  const vault = distinct[0]!;
+
+  await withTransaction(vault, async c => {
+    await assertVaultDatabase(c, vault);
     await c.query("SELECT pg_advisory_xact_lock($1)", [GEOMETRY_LOCK_KEY]);
 
     const dim = await assertSchemaGeometry(c);
@@ -350,7 +416,16 @@ export async function upsertDocument(d: DocumentWrite): Promise<number> {
   const { contentType, raw } = narrowContentType(d.contentTypeRaw);
   const f = d.facets ?? {};
 
-  return withTransaction(async c => {
+  // THE WRITE PATH ROUTES; the caller does not get a say (master-harness-0ynkd).
+  // upsertDocument resolves the vault ITSELF rather than taking one, because a
+  // vault parameter is a decision a caller can get wrong — and every caller
+  // getting it right forever is not a property anyone can verify. Routing here
+  // means there is exactly one place the decision is made, and exactly one place
+  // to audit it.
+  const vault = resolveVault(d.collection, d.path);
+
+  return withTransaction(vault, async c => {
+    await assertVaultDatabase(c, vault);
     await c.query(
       `INSERT INTO content (hash, doc) VALUES ($1, $2)
        ON CONFLICT ON CONSTRAINT content_pkey DO UPDATE SET doc = EXCLUDED.doc`,
@@ -425,7 +500,11 @@ export interface EntityNodeWrite {
 }
 
 export async function upsertEntityNode(e: EntityNodeWrite): Promise<void> {
-  await withTransaction(async c => {
+  // Explicit "sfw": entity nodes carry no document body and today only the
+  // general corpus produces them. Naming the vault rather than defaulting to it
+  // is the point of withTransaction's required first parameter — when the nsfw
+  // vault grows an entity graph, this line is where that decision gets made.
+  await withTransaction("sfw", async c => {
     await c.query(
       `INSERT INTO entity_nodes (entity_id, entity_type, name, description, canonical_id, mention_count, last_seen)
        VALUES ($1, $2, $3, $4, $5, $6, now())
@@ -454,7 +533,8 @@ export interface MemoryEvolutionWrite {
 }
 
 export async function insertMemoryEvolution(m: MemoryEvolutionWrite): Promise<number> {
-  return withTransaction(async c => {
+  // Explicit "sfw" — see upsertEntityNode.
+  return withTransaction("sfw", async c => {
     const { rows } = await c.query<{ id: string }>(
       `INSERT INTO memory_evolution
          (memory_id, triggered_by, version, previous_keywords, new_keywords,

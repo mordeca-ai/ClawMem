@@ -41,6 +41,11 @@ const URL_ = process.env.CLAWMEM_PG_URL;
 const DIM = 768;
 const VAULT_MODEL = "embeddinggemma";
 const FOREIGN_MODEL = "ggml-org/embeddinggemma-300M-GGUF-Q8_0"; // the 2026-08-09 poisoner
+// EmbeddingWrite.collection became REQUIRED at master-harness-0ynkd (it is what
+// routes a fragment's vectors to the same vault as its document). "docs" is an
+// ordinary sfw collection — deliberately NOT a PRIVATE_ROOTS member, so these
+// pre-existing model/geometry assertions keep exercising the sfw path unchanged.
+const SFW_COLLECTION = "docs";
 
 const d = URL_ ? describe : describe.skip;
 
@@ -104,6 +109,7 @@ d("PG write path", () => {
   ): Promise<void> {
     await insertEmbeddingsBatch(
       writes.map<EmbeddingWrite>(w => ({
+        collection: SFW_COLLECTION,
         hash: w.hash, seq: w.seq, pos: w.pos ?? 0,
         model: w.model, embedding: w.embedding,
       })),
@@ -529,11 +535,11 @@ d("PG write path", () => {
   it("round-trips the FULL content_vectors shape: (hash,seq) key, pos, and every fragment column", async () => {
     await seedContent("h_fragshape", "# frag doc");
     const writes: EmbeddingWrite[] = [
-      { hash: "h_fragshape", seq: 0, pos: 1, embedding: vec(0.11), model: VAULT_MODEL,
+      { collection: SFW_COLLECTION, hash: "h_fragshape", seq: 0, pos: 1, embedding: vec(0.11), model: VAULT_MODEL,
         fragmentType: "full", fragmentLabel: null, canonicalId: "cid_frag", embedInputFp: "fp0" },
-      { hash: "h_fragshape", seq: 1, pos: 14, embedding: vec(0.12), model: VAULT_MODEL,
+      { collection: SFW_COLLECTION, hash: "h_fragshape", seq: 1, pos: 14, embedding: vec(0.12), model: VAULT_MODEL,
         fragmentType: "section", fragmentLabel: "Why this exists", canonicalId: "cid_frag", embedInputFp: "fp1" },
-      { hash: "h_fragshape", seq: 2, pos: 40, embedding: vec(0.13), model: VAULT_MODEL,
+      { collection: SFW_COLLECTION, hash: "h_fragshape", seq: 2, pos: 40, embedding: vec(0.13), model: VAULT_MODEL,
         fragmentType: "frontmatter", fragmentLabel: "title", canonicalId: "cid_frag", embedInputFp: "fp2" },
     ];
     await insertEmbeddingsBatch(writes);
@@ -583,10 +589,10 @@ d("PG write path", () => {
 
     const batch: EmbeddingWrite[] = [];
     for (let seq = 0; seq < 17; seq++) {
-      batch.push({ hash: "h_multi", seq, pos: seq * 10, embedding: vec(0.2), model: VAULT_MODEL });
+      batch.push({ collection: SFW_COLLECTION, hash: "h_multi", seq, pos: seq * 10, embedding: vec(0.2), model: VAULT_MODEL });
     }
     // one poisoned fragment, buried in the middle of a realistic-size batch
-    batch[9] = { hash: "h_multi", seq: 9, pos: 90, embedding: vec(0.2), model: FOREIGN_MODEL };
+    batch[9] = { collection: SFW_COLLECTION, hash: "h_multi", seq: 9, pos: 90, embedding: vec(0.2), model: FOREIGN_MODEL };
 
     await expect(insertEmbeddingsBatch(batch)).rejects.toThrow(PgVecBatchModelMismatchError);
     expect(await vectorCount()).toBe(0); // the WHOLE batch rolled back, not 16 of 17
@@ -595,7 +601,7 @@ d("PG write path", () => {
   it("ACCEPTS the same multi-fragment batch once it is homogeneous (the guard is not an off switch)", async () => {
     const batch: EmbeddingWrite[] = [];
     for (let seq = 0; seq < 17; seq++) {
-      batch.push({ hash: "h_multi", seq, pos: seq * 10, embedding: vec(0.2), model: VAULT_MODEL });
+      batch.push({ collection: SFW_COLLECTION, hash: "h_multi", seq, pos: seq * 10, embedding: vec(0.2), model: VAULT_MODEL });
     }
     await insertEmbeddingsBatch(batch);
     expect(await vectorCount()).toBe(17);
@@ -709,6 +715,7 @@ d("PG write path", () => {
 
     const attempts = Array.from({ length: 24 }, (_, i) =>
       insertEmbeddingsBatch([{
+        collection: SFW_COLLECTION,
         hash: `conc_${i}`, seq: 0, pos: 0, embedding: vec(0.5),
         model: i % 2 === 0 ? VAULT_MODEL : FOREIGN_MODEL,
       }]),

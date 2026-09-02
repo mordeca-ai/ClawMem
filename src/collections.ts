@@ -32,6 +32,12 @@ export interface Collection {
   content_type?: string;  // Default content_type for docs WITHOUT explicit frontmatter
                           // (kills filename inference for this collection — rvzn8.2:
                           // frontmatter-less ADRs were inferring `note` and decaying at 60d)
+  vault?: "sfw" | "nsfw"; // Which PG vault this collection's documents are written to
+                          // (master-harness-0ynkd, ADR-0162 §1). Absent = "sfw".
+                          // This is the DATA half of routing; the hard-coded
+                          // PRIVATE_ROOTS tripwire in src/pg/vaults.ts is the
+                          // guarantee half, and it overrides a wrong declaration
+                          // by REFUSING the write rather than by re-routing it.
 }
 
 /**
@@ -215,6 +221,11 @@ export function addCollection(
     context: config.collections[name]?.context, // Preserve existing context
     // Explicit arg wins; otherwise preserve an existing default (same posture as context).
     content_type: contentType ?? config.collections[name]?.content_type,
+    // Preserve the vault declaration (master-harness-0ynkd). Dropping it here would
+    // silently downgrade a private collection to the default "sfw" on the next
+    // `clawmem collection add` — which the PRIVATE_ROOTS tripwire would then refuse,
+    // but only after the config had already been rewritten wrong.
+    vault: config.collections[name]?.vault,
   };
 
   saveConfig(config);
