@@ -31,6 +31,7 @@ import { setPgSchema } from "../../src/pg/config.ts";
 import {
   CONTENT_TYPES,
   CONTENT_TYPE_CONFORM,
+  isRetagBacklog,
   narrowContentType,
   upsertDocument,
 } from "../../src/pg/write.ts";
@@ -433,5 +434,38 @@ dbDescribe("003 against an ephemeral database", () => {
       { content_type: "unknown", content_type_raw: SEED_UNMAPPABLE },
       { content_type: "unknown", content_type_raw: "totally-invented-nonsense-9f2" },
     ]);
+  });
+});
+
+describe("the retag-backlog metric (ADR-0162 §3 monitored metric)", () => {
+  // The ADR-0058 2026-09-02 amendment pulled "carries a raw" and "is backlog"
+  // apart. Before the conform layer they were the same condition; a metric still
+  // reading `.raw` would now count every CONFORMED row as backlog and silently
+  // overstate the one number the ADR asks us to watch. These are the assertions
+  // that make that regression loud instead of invisible.
+
+  it("counts the residue: unknown WITH a raw", () => {
+    expect(isRetagBacklog(narrowContentType("session-transcript"))).toBe(true);
+    expect(isRetagBacklog(narrowContentType("a-value-nobody-has-ever-written"))).toBe(true);
+  });
+
+  it("does NOT count a CONFORMED row, even though it keeps its raw", () => {
+    for (const [raw, admitted] of Object.entries(CONTENT_TYPE_CONFORM)) {
+      const narrowed = narrowContentType(raw);
+      // the precondition that makes this test non-trivial: a conformed row DOES
+      // carry a raw, so a `.raw`-based metric would have counted it.
+      expect(narrowed.raw).toBe(raw);
+      expect(narrowed.contentType).toBe(admitted);
+      expect(isRetagBacklog(narrowed)).toBe(false);
+    }
+  });
+
+  it("does NOT count an admitted value or a missing one", () => {
+    for (const admitted of CONTENT_TYPES) {
+      expect(isRetagBacklog(narrowContentType(admitted))).toBe(false);
+    }
+    expect(isRetagBacklog(narrowContentType(undefined))).toBe(false);
+    expect(isRetagBacklog(narrowContentType(null))).toBe(false);
+    expect(isRetagBacklog(narrowContentType(""))).toBe(false);
   });
 });

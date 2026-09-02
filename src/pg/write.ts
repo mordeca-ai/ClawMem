@@ -284,6 +284,27 @@ export function narrowContentType(raw: string | null | undefined): {
   return { contentType: "unknown", raw };
 }
 
+/**
+ * Is this narrowing result part of the retag backlog ADR-0162 §3 makes a MONITORED
+ * METRIC?
+ *
+ * This predicate lives beside `narrowContentType` deliberately: it is the same
+ * decision, and the ADR-0058 2026-09-02 amendment is exactly what pulled the two
+ * apart. Before the conform layer, "carries a raw" and "needs a retag" were the same
+ * condition, so the metric could read `.raw` directly. They are no longer the same —
+ * a CONFORMED row also keeps its raw, as the audit trail of the mapping decision, but
+ * it is resolved rather than backlog. A metric that kept reading `.raw` would count
+ * every conformed row as backlog and start silently lying about the one number the
+ * ADR asks us to watch. Keeping the predicate here means the next edit to the conform
+ * rules has to walk past its own metric.
+ *
+ * The backlog is exactly the residue: landed in the `unknown` sink WITH a raw string,
+ * i.e. neither admitted nor conformed (`session-transcript` today).
+ */
+export function isRetagBacklog(narrowed: { contentType: ContentTypeFacet; raw: string | null }): boolean {
+  return narrowed.contentType === "unknown" && narrowed.raw !== null;
+}
+
 export interface Facets {
   domain?: string;
   audience?: (typeof AUDIENCES)[number];
