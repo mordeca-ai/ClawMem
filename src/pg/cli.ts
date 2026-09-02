@@ -1,0 +1,86 @@
+#!/usr/bin/env bun
+/**
+ * `bun src/pg/cli.ts <migrate|reindex|status>` — the PG-path entry point
+ * (master-harness-vn4rz.7).
+ *
+ * Deliberately a SEPARATE entry point from src/clawmem.ts: the PG path is
+ * additive and must not be reachable by accident from the sqlite CLI while both
+ * writers coexist (ADR-0162 §6).
+ */
+
+import { applyMigrations } from "./migrate.ts";
+import { closePool, withClient } from "./client.ts";
+import { resolvePgConfig } from "./config.ts";
+import { reindex } from "./reindex.ts";
+import { assertSchemaGeometry, getVecModels } from "./write.ts";
+
+function flagValue(argv: string[], name: string): string | undefined {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
+}
+
+async function main() {
+  const [cmd, ...argv] = process.argv.slice(2);
+  const cfg = resolvePgConfig();
+
+  switch (cmd) {
+    case "migrate": {
+      const r = await applyMigrations();
+      console.log(`target:  ${cfg.safeLabel}`);
+      console.log(`applied: ${r.applied.length ? r.applied.join(", ") : "(none)"}`);
+      console.log(`already: ${r.skipped.length ? r.skipped.join(", ") : "(none)"}`);
+      break;
+    }
+    case "status": {
+      await withClient(async c => {
+        const dim = await assertSchemaGeometry(c);
+        const models = await getVecModels(c);
+        const { rows } = await c.query<{ collection: string; n: string }>(
+          "SELECT collection, count(*)::text AS n FROM documents WHERE active GROUP BY 1 ORDER BY 1",
+        );
+        console.log(`target:     ${cfg.safeLabel}`);
+        console.log(`embed dim:  ${dim}`);
+        console.log(`vec models: ${models.length ? models.join(", ") : "(none embedded yet)"}`);
+        for (const r of rows) console.log(`  ${r.collection.padEnd(28)} ${r.n.padStart(7)}`);
+      });
+      break;
+    }
+    case "reindex": {
+      const cols = flagValue(argv, "--collection");
+      const limitRaw = flagValue(argv, "--limit");
+      const stats = await reindex({
+        collections: cols ? cols.split(",").map(s => s.trim()) : undefined,
+        limit: limitRaw ? Number(limitRaw) : undefined,
+        skipEmbed: argv.includes("--no-embed"),
+        embedBatchSize: Number(flagValue(argv, "--batch-size") ?? 16),
+        onProgress: m => console.log(m),
+      });
+      for (const s of stats) {
+        console.log(
+          `${s.collection}: ${s.documentsWritten} docs written, ` +
+          `${s.fragmentsEmbedded} embedded, ${s.embedFailures} embed failures, ` +
+          `${(s.wallClockMs / 1000).toFixed(1)}s`,
+        );
+        const backlog = Object.entries(s.contentTypeRetagBacklog);
+        if (backlog.length > 0) {
+          console.log(
+            `  retag backlog (content_type outside the closed ADR-0058 enum, ` +
+            `stored as 'unknown' with the raw value in content_type_raw): ` +
+            backlog.map(([k, v]) => `${k}=${v}`).join(", "),
+          );
+        }
+      }
+      break;
+    }
+    default:
+      console.error("usage: bun src/pg/cli.ts <migrate|status|reindex> [--collection a,b] [--limit N] [--no-embed]");
+      process.exit(2);
+  }
+  await closePool();
+}
+
+main().catch(async e => {
+  console.error(e instanceof Error ? e.message : String(e));
+  await closePool();
+  process.exit(1);
+});

@@ -1,0 +1,220 @@
+/**
+ * REINDEX (not copy) into PostgreSQL — master-harness-vn4rz.7, ADR-0162 §6.
+ *
+ * ===========================================================================
+ * REINDEX-NOT-COPY IS A HARD RULE.
+ *
+ * Every document is re-read and re-embedded FROM ITS FILE-AUTHORED SOURCE. No
+ * row is ever copied out of sqlite. Two reasons, both load-bearing:
+ *
+ *  1. The sqlite rows carry a decade of accumulated ALTER TABLE drift and
+ *     filename-inferred content_types (rvzn8.2). Copying them would import the
+ *     drift into the schema built to end it.
+ *  2. §3's facets can be assigned at near-zero marginal cost only at the moment
+ *     the source is re-parsed. A copy has nothing to assign them from.
+ *
+ * The sqlite database is therefore READ ONLY as a COUNT baseline, by
+ * tools/clawmem-pg-parity, and never as a data source.
+ * ===========================================================================
+ *
+ * Parsing reuses src/indexer.ts's helpers verbatim (hashContent, parseDocument,
+ * extractTitle, computeQualityScore, authoredAtFromFrontmatter) rather than
+ * re-implementing them, so a PG-indexed document and a sqlite-indexed document
+ * are parsed identically and any parity gap is a WRITE-path gap, not a parse
+ * gap.
+ */
+
+import { Glob } from "bun";
+import { readFileSync, statSync } from "fs";
+import { join } from "path";
+import {
+  authoredAtFromFrontmatter, computeQualityScore, extractTitle, hashContent, parseDocument,
+} from "../indexer.ts";
+import { listCollections } from "../collections.ts";
+import { getDefaultLlamaCpp, formatDocForEmbedding } from "../llm.ts";
+import { embedDim } from "./config.ts";
+import { insertEmbeddingsBatch, upsertDocument, type EmbeddingWrite } from "./write.ts";
+
+/** Mirrors indexer.ts's brace expansion — Bun.Glob has no brace support. */
+function expandBraces(pattern: string): string[] {
+  const m = pattern.match(/^\{(.+)\}$/);
+  return m ? m[1]!.split(",").map(s => s.trim()) : [pattern];
+}
+
+export interface ReindexOptions {
+  /** Restrict to these collection names. Empty/undefined = every collection. */
+  collections?: string[];
+  /** Stop after N documents. For the validate-small-before-batch smoke pass. */
+  limit?: number;
+  /** Documents per embed round trip. */
+  embedBatchSize?: number;
+  /** Skip embedding entirely (schema/parity smoke without touching yoshiee). */
+  skipEmbed?: boolean;
+  onProgress?: (msg: string) => void;
+}
+
+export interface ReindexStats {
+  collection: string;
+  filesSeen: number;
+  documentsWritten: number;
+  fragmentsEmbedded: number;
+  embedFailures: number;
+  /** content_type values that fell outside the closed ADR-0058 enum, with counts. */
+  contentTypeRetagBacklog: Record<string, number>;
+  wallClockMs: number;
+}
+
+/**
+ * Facet assignment. Deliberately CONSERVATIVE: a facet is set only when the
+ * source declares it, otherwise 'unknown' (ADR-0162 §3 — "every facet carries an
+ * explicit unknown value", and the unknown counts are a MONITORED METRIC, not a
+ * shrug). Guessing audience/trust_tier from a path would manufacture a
+ * classification nobody made and bury it in the data.
+ *
+ * `provenance` records WHO assigned the values and by WHAT rule, at load time,
+ * so the classification decision stays retrievable (§3).
+ */
+function deriveFacets(collection: string, meta: { domain?: string }, relPath: string) {
+  return {
+    domain: meta.domain ?? "unknown",
+    audience: "unknown" as const,
+    trustTier: "unknown" as const,
+    sensitivity: "unknown" as const,
+    sourceRef: null,
+    provenance: {
+      assigned_by: "clawmem pg reindex (master-harness-vn4rz.7)",
+      assigned_at: new Date().toISOString(),
+      rule: "domain from frontmatter when declared, else unknown; audience/trust_tier/" +
+            "sensitivity left unknown pending an explicit classification pass",
+      collection,
+      source_path: relPath,
+    },
+  };
+}
+
+export async function reindexCollection(
+  name: string,
+  root: string,
+  pattern: string,
+  opts: ReindexOptions = {},
+): Promise<ReindexStats> {
+  const t0 = Date.now();
+  const log = opts.onProgress ?? (() => {});
+  const batchSize = opts.embedBatchSize ?? 16;
+  const dim = embedDim();
+  const llm = getDefaultLlamaCpp();
+
+  const seen = new Set<string>();
+  const files: string[] = [];
+  for (const p of expandBraces(pattern)) {
+    for (const f of new Glob(p).scanSync({ cwd: root, followSymlinks: false, absolute: false })) {
+      if (!seen.has(f)) { seen.add(f); files.push(f); }
+    }
+  }
+  files.sort();
+
+  const stats: ReindexStats = {
+    collection: name, filesSeen: files.length, documentsWritten: 0,
+    fragmentsEmbedded: 0, embedFailures: 0, contentTypeRetagBacklog: {}, wallClockMs: 0,
+  };
+
+  const pending: { hash: string; text: string; title: string }[] = [];
+  const hashesDone = new Set<string>();
+
+  const flush = async () => {
+    if (pending.length === 0 || opts.skipEmbed) { pending.length = 0; return; }
+    const texts = pending.map(p => formatDocForEmbedding(p.text, p.title));
+    const results = await llm.embedBatch(texts);
+    const writes: EmbeddingWrite[] = [];
+    for (let i = 0; i < pending.length; i++) {
+      const r = results[i];
+      if (!r?.embedding) { stats.embedFailures++; continue; }
+      if (r.embedding.length !== dim) {
+        // Loud, immediate. Never truncate, never pad.
+        throw new Error(
+          `Embed endpoint returned ${r.embedding.length} dimensions for ` +
+          `${pending[i]!.title}; the schema column is vector(${dim}). Refusing to write.`,
+        );
+      }
+      writes.push({
+        hash: pending[i]!.hash, seq: 0, pos: 0,
+        embedding: r.embedding, model: r.model,
+        embedInputFp: hashContent(texts[i]!),
+      });
+    }
+    if (writes.length > 0) {
+      await insertEmbeddingsBatch(writes);
+      stats.fragmentsEmbedded += writes.length;
+    }
+    pending.length = 0;
+  };
+
+  let n = 0;
+  for (const rel of files) {
+    if (opts.limit !== undefined && n >= opts.limit) break;
+    const abs = join(root, rel);
+    let raw: string;
+    try {
+      raw = readFileSync(abs, "utf-8");
+    } catch {
+      continue;
+    }
+    const hash = hashContent(raw);
+    const { body, meta } = parseDocument(raw, rel);
+    const title = meta.title ?? extractTitle(raw, rel);
+
+    // The retag backlog (ADR-0162 §5): counted here so the closed-enum decision
+    // has a number attached to it rather than a shrug.
+    const ct = meta.content_type as string | undefined;
+    if (ct) {
+      const { narrowContentType } = await import("./write.ts");
+      if (narrowContentType(ct).raw) {
+        stats.contentTypeRetagBacklog[ct] = (stats.contentTypeRetagBacklog[ct] ?? 0) + 1;
+      }
+    }
+
+    await upsertDocument({
+      collection: name,
+      path: rel,
+      title,
+      hash,
+      body: raw,
+      contentTypeRaw: ct ?? null,
+      description: meta.description ?? null,
+      tags: meta.tags ?? null,
+      workstream: meta.workstream ?? null,
+      authoredAt: authoredAtFromFrontmatter((meta as { authored_at?: unknown }).authored_at) ?? null,
+      modifiedAt: statSync(abs).mtime,
+      qualityScore: computeQualityScore(body, meta),
+      contentHash: hash,
+      origin: "fs",
+      facets: deriveFacets(name, meta, rel),
+    });
+    stats.documentsWritten++;
+    n++;
+
+    if (!hashesDone.has(hash)) {
+      hashesDone.add(hash);
+      pending.push({ hash, text: body, title });
+      if (pending.length >= batchSize) {
+        await flush();
+        log(`[${name}] ${stats.documentsWritten}/${files.length} docs, ${stats.fragmentsEmbedded} embedded`);
+      }
+    }
+  }
+  await flush();
+
+  stats.wallClockMs = Date.now() - t0;
+  return stats;
+}
+
+/** Reindex every configured collection (or the named subset). */
+export async function reindex(opts: ReindexOptions = {}): Promise<ReindexStats[]> {
+  const wanted = new Set(opts.collections ?? []);
+  const out: ReindexStats[] = [];
+  for (const c of listCollections()) {
+    if (wanted.size > 0 && !wanted.has(c.name)) continue;
+    out.push(await reindexCollection(c.name, c.path, c.pattern, opts));
+  }
+  return out;
+}

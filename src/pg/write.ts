@@ -27,14 +27,14 @@
  */
 
 import type { PoolClient } from "pg";
-import { withTransaction, toVectorLiteral } from "./client.js";
-import { embedDim } from "./config.js";
+import { withTransaction, toVectorLiteral } from "./client.ts";
+import { embedDim } from "./config.ts";
 import {
   PgSchemaGeometryError,
   PgVecBatchModelMismatchError,
   PgVecDimensionMismatchError,
   PgVecWriteModelMismatchError,
-} from "./errors.js";
+} from "./errors.ts";
 
 /** Arbitrary but stable key for the write-geometry advisory lock. */
 const GEOMETRY_LOCK_KEY = 0x1a2b3c4d;
@@ -56,7 +56,10 @@ function embedEndpointLabel(): string {
  */
 export async function assertSchemaGeometry(c: PoolClient): Promise<number> {
   const { rows } = await c.query<{ dims: number | null }>(`
-    SELECT atttypmod - 4 AS dims
+    -- pgvector stores the dimension DIRECTLY in atttypmod, with none of the
+    -- varlena +4 offset that varchar/numeric use. Subtracting 4 here silently
+    -- yields 764 for a vector(768) column and refuses every legitimate write.
+    SELECT atttypmod AS dims
       FROM pg_attribute
      WHERE attrelid = 'content_vectors'::regclass
        AND attname = 'embedding'
