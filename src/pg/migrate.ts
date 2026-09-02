@@ -22,8 +22,8 @@ import { readdirSync, readFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import type { PoolClient } from "pg";
-import { embedDim } from "./config.js";
-import { withClient } from "./client.js";
+import { embedDim } from "./config.ts";
+import { withClient } from "./client.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const MIGRATIONS_DIR = join(HERE, "..", "..", "migrations");

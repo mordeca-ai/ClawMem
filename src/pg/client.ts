@@ -6,7 +6,7 @@
  */
 
 import pg from "pg";
-import { resolvePgConfig } from "./config.js";
+import { resolvePgConfig } from "./config.ts";
 
 const { Pool, types } = pg;
 
