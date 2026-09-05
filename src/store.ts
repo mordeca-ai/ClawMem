@@ -4400,8 +4400,17 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
     }
   }
 
+  // master-harness-hxa17: the sort must be TOTAL, not just by distance. Cosine distances tie
+  // exactly and often (one live query carried a 19-fragment group at distance
+  // 0.5426244139671326 against a limit of 20), so with a distance-only comparator which tied
+  // docs survive .slice(limit) is decided by SQL row order. Under the OLD computed-expression
+  // predicate that order was `SCAN d USING INDEX idx_documents_effective_time` — i.e. it tracked
+  // documents-table effective-time order and re-rolled on any documents write. That made recall
+  // on a tie boundary silently write-order dependent. `seen` is keyed by filepath, so filepath is
+  // unique here and (bestDist, filepath) is a total order: the row order stops being observable
+  // and the result is deterministic across query plans and across vault writes.
   return Array.from(seen.values())
-    .sort((a, b) => a.bestDist - b.bestDist)
+    .sort((a, b) => a.bestDist - b.bestDist || (a.row.filepath < b.row.filepath ? -1 : a.row.filepath > b.row.filepath ? 1 : 0))
     .slice(0, limit)
     .map(({ row, bestDist }) => {
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
