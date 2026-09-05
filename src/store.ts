@@ -4805,19 +4805,27 @@ function embedEndpointLabel(): string {
  * 2026-08-09 poisoning exploited.
  *
  * Refuses when the vault holds vectors under a DIFFERENT single model, or is already heterogeneous.
- * No-ops when: the vault has no vectors yet (fresh, or just cleared by `embed --force`), or the
- * write carries no model name (an endpoint that reports none cannot be discriminated — mirrors the
- * `probe.model &&` condition the CLI implicit-path check already uses).
+ * No-ops ONLY when the vault has no vectors yet (fresh, or just cleared by `embed --force`) —
+ * there is nothing to be inconsistent with.
+ *
+ * UNNAMED WRITES (master-harness-yidbh). This used to open with an unconditional
+ * `if (!writeModel) return;`, a fail-OPEN inside the fail-at-WRITE fence: an endpoint that
+ * reports no model could push unnamed rows into a vault already holding a NAMED identity,
+ * minting a second identity (["", "embeddinggemma"]) that then makes the READ guard refuse
+ * every query — a fail-at-READ door sitting inside the write fence. An unnamed write is now
+ * REFUSED against a populated vault, exactly like any other mismatch. It stays PERMITTED on a
+ * FRESH vault, because an endpoint that reports no model is undiscriminable and there is
+ * nothing there to poison — the vault's identity simply becomes "" until re-embedded.
  */
 function assertWriteEmbedModelConsistent(db: Database, writeModel: string): void {
-  if (!writeModel) return; // endpoint reported no model name — nothing to compare (see doc comment)
-
   const dataVersion = (db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version;
   const cached = verifiedWriteEmbedModels.get(db);
   if (cached && cached.dataVersion === dataVersion && cached.model === writeModel) return;
 
   const storedModels = getVecModels(db);
-  if (storedModels.length === 0) return; // nothing embedded yet — nothing to be inconsistent with
+  // Fresh vault (or just cleared by `embed --force`) — nothing to be inconsistent with. This is
+  // also the ONLY case in which an unnamed (empty) write model is accepted.
+  if (storedModels.length === 0) return;
 
   if (!(storedModels.length === 1 && storedModels[0] === writeModel)) {
     throw new VecWriteModelMismatchError(storedModels, writeModel, embedEndpointLabel());

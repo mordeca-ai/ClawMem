@@ -264,7 +264,80 @@ export type RerankDocument = {
 
 // HuggingFace model URIs for node-llama-cpp
 // Format: hf:<user>/<repo>/<file>
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+export const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+
+// =============================================================================
+// Canonical embedding-model IDENTITY (master-harness-yidbh)
+// =============================================================================
+//
+// RESOLUTION vs IDENTITY. `DEFAULT_EMBED_MODEL` above is a *resolution* handle: the hf:
+// URI resolveModel() needs to fetch weights. It is NOT a model identity. Historically the
+// same physical model was RECORDED in content_vectors.model under whichever string the
+// producing arm happened to hold — the hf: URI from the in-process arm, the endpoint's
+// echoed name from the remote arm, or (worse) the endpoint URL. One physical model, four
+// names, all at the same dimension, therefore invisible to the dimension guard: that is
+// the defect class that recurred three times (master-harness-92t7, ich.2, 54rlt).
+//
+// canonicalEmbedModelId() is the single normalization point. Every producer of an
+// EmbeddingResult runs its model string through it, so exactly one identity per physical
+// model reaches the store's write fence (assertWriteEmbedModelConsistent) and, for free,
+// the read fence (assertQueryEmbedModelConsistent compares the endpoint-returned model,
+// which now arrives canonical).
+//
+// The alias table below is the ONLY place the knowledge "these two strings name the same
+// physical model" lives. There is deliberately NO fuzzy matching, NO suffix stripping, NO
+// derivation: an unknown string passes through lowercased+trimmed and UNCHANGED, so two
+// genuinely different models can never collapse into one. Adding an entry is an explicit,
+// reviewable assertion of physical equivalence — never a guess.
+
+/** Thrown when a value that can never be a model identity (e.g. an endpoint URL) is offered
+ *  as one. Reaching this is a programming error, not user input: recording a URL would mint
+ *  yet another identity for the same model. */
+export class EmbedModelIdentityError extends Error {
+  constructor(public readonly raw: string) {
+    super(`Not a valid embedding-model identity: ${JSON.stringify(raw)} — a URL is an endpoint, not a model name`);
+    this.name = "EmbedModelIdentityError";
+  }
+}
+
+/**
+ * Known variant spellings of ONE physical model → its kebab-canonical id (ADR-0077 / ADR-0074).
+ *
+ * Every entry must be justifiable by pointing at where the string comes from:
+ *  - the hf: URI  — src/llm.ts DEFAULT_EMBED_MODEL, recorded by the in-process node-llama-cpp arm
+ *  - "embeddinggemma" — echoed by the ollama endpoints when the request pins that name; the
+ *    string BOTH live vaults already store (~/.cache/clawmem, ~/.cache-clawmem-nsfw)
+ *  - "embeddinggemma:latest" — ollama's own canonical tag for the same 768-dim weights
+ *    (`/api/tags` lists it; ollama echoes the requested string verbatim, so a caller pinning
+ *    the tagged form writes a different identity for the identical model)
+ *
+ * NOT a rule: ":latest" is NOT stripped generically. For models where a pinned tag is a
+ * genuinely different snapshot, tag-stripping would merge distinct geometries. Table only.
+ */
+const EMBED_MODEL_ALIASES: Record<string, string> = {
+  "hf:ggml-org/embeddinggemma-300m-gguf/embeddinggemma-300m-q8_0.gguf": "embeddinggemma",
+  "embeddinggemma": "embeddinggemma",
+  "embeddinggemma:latest": "embeddinggemma",
+};
+
+/**
+ * Normalize a raw embedding-model string to the identity that gets RECORDED in
+ * content_vectors.model.
+ *
+ * - blank/null/undefined → "" (an unnamed identity; the store's write fence decides what to
+ *   do with it — permitted only into a vault that holds no vectors yet)
+ * - an http(s) URL → throws EmbedModelIdentityError (door closed by construction)
+ * - a known alias → its canonical id
+ * - anything else → lowercased + trimmed, otherwise UNCHANGED (never invented, never derived)
+ */
+export function canonicalEmbedModelId(raw: string | null | undefined): string {
+  if (raw === null || raw === undefined) return "";
+  const trimmed = raw.trim();
+  if (trimmed === "") return "";
+  if (/^https?:\/\//i.test(trimmed)) throw new EmbedModelIdentityError(raw);
+  const lowered = trimmed.toLowerCase();
+  return EMBED_MODEL_ALIASES[lowered] ?? lowered;
+}
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
@@ -470,6 +543,9 @@ export class LlamaCpp implements LLM {
   private rerankContext: Awaited<ReturnType<LlamaModel["createRankingContext"]>> | null = null;
 
   private embedModelUri: string;
+  /** The canonical identity RECORDED for vectors produced by the in-process arm.
+   *  Resolved ONCE here (not per fragment) — embedLocalBatch is a hot path. */
+  private readonly embedModelId: string;
   private generateModelUri: string;
   private rerankModelUri: string;
   private modelCacheDir: string;
@@ -515,6 +591,7 @@ export class LlamaCpp implements LLM {
 
   constructor(config: LlamaCppConfig = {}) {
     this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
+    this.embedModelId = canonicalEmbedModelId(this.embedModelUri);
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
@@ -871,7 +948,7 @@ export class LlamaCpp implements LLM {
       const embedding = await context.getEmbeddingFor(safeText);
       return {
         embedding: Array.from(embedding.vector),
-        model: this.embedModelUri,
+        model: this.embedModelId,
       };
     } catch (error) {
       console.error("[embed] Local embedding error:", error);
@@ -888,7 +965,7 @@ export class LlamaCpp implements LLM {
         try {
           const safeText = this.truncateForLocalEmbed(text);
           const embedding = await context.getEmbeddingFor(safeText);
-          results.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
+          results.push({ embedding: Array.from(embedding.vector), model: this.embedModelId });
         } catch (err) {
           console.error("[embed] Local batch embedding error:", err);
           results.push(null);
@@ -1189,7 +1266,8 @@ export class LlamaCpp implements LLM {
         };
         return {
           embedding: data.data[0]!.embedding,
-          model: data.model || this.remoteEmbedUrl!,
+          // NEVER fall back to the URL — an endpoint is not a model identity.
+          model: canonicalEmbedModelId(data.model || this.remoteEmbedModel),
         };
       } catch (error) {
         // An abort/timeout is an intentional caller-driven cancellation (the
@@ -1244,7 +1322,8 @@ export class LlamaCpp implements LLM {
           usage?: { total_tokens?: number; prompt_tokens?: number };
         };
         this.lastBatchTokens = data.usage?.total_tokens ?? data.usage?.prompt_tokens ?? 0;
-        const modelName = data.model || this.remoteEmbedUrl!;
+        // NEVER fall back to the URL — an endpoint is not a model identity.
+        const modelName = canonicalEmbedModelId(data.model || this.remoteEmbedModel);
         const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
         for (const item of data.data) {
           results[item.index] = { embedding: item.embedding, model: modelName };

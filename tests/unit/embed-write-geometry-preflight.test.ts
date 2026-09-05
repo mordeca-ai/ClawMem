@@ -163,10 +163,32 @@ describe("write-path geometry preflight — GREEN (unchanged behavior)", () => {
     expect(store.getVecModels()).toEqual([FOREIGN_MODEL]);
   });
 
-  it("allows a write with NO model name (an endpoint that reports none is undiscriminable)", () => {
+  // master-harness-yidbh flipped the populated-vault half of this case. It previously read
+  // "allows a write with NO model name (an endpoint that reports none is undiscriminable)" and
+  // asserted the write LANDED — an unconditional fail-OPEN inside the fail-at-WRITE fence, which
+  // let an unnamed row mint a SECOND identity ["", VAULT_MODEL] and thereby make the READ guard
+  // refuse every query. The undiscriminable-endpoint rationale only holds where there is nothing
+  // to poison, i.e. a fresh vault; that half is kept, the populated half is now a refusal.
+  it("allows a write with NO model name on a FRESH vault (nothing to poison)", () => {
+    const store = createStore(":memory:");
+    store.ensureVecTable(4);
+    const h = seed(store, "c", "a.md", "doc a");
+    store.insertEmbedding(h, 0, 1, vec(4), "", new Date().toISOString());
+    expect(store.getVectorConsistency().vvCount).toBe(1);
+    // getVecModels() filters `model != ''`, so an unnamed row registers as NO identity at all
+    // (see open_risks: unnamed rows remain invisible to the fence in the other direction).
+    expect(store.getVecModels()).toEqual([]);
+  });
+
+  it("REFUSES a write with NO model name into a POPULATED vault (would mint a 2nd identity)", () => {
     const { store, hashes } = vaultWithGeometry();
-    store.insertEmbedding(hashes[1]!, 0, 1, vec(4, 0.5), "", new Date().toISOString());
-    expect(store.getVectorConsistency().vvCount).toBe(2);
+    const before = store.getVectorConsistency();
+    expect(() =>
+      store.insertEmbedding(hashes[1]!, 0, 1, vec(4, 0.5), "", new Date().toISOString())
+    ).toThrow(VecWriteModelMismatchError);
+    const after = store.getVectorConsistency();
+    expect(after.vvCount).toBe(before.vvCount);
+    expect(store.getVecModels()).toEqual([VAULT_MODEL]);
   });
 });
 

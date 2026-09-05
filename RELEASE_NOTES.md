@@ -4,6 +4,49 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.4 — canonical embed-model identity: one physical model, one recorded name
+
+One physical embedding model was being RECORDED under four different names, depending only on
+which arm produced the vector. `content_vectors.model` is written from `EmbeddingResult.model`,
+and the four producers disagreed: the in-process node-llama-cpp arm wrote the raw
+`hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf` resolution URI, the remote
+arm wrote whatever the endpoint echoed back, and when a reply omitted `model` it wrote the
+endpoint URL. Every one of those is the same 768-dimension geometry, so the dimension guard
+could never see the difference — which is why this class recurred three times through three
+different doors.
+
+The pin that was supposed to prevent it never could: `CLAWMEM_EMBED_MODEL` is wired to
+`remoteEmbedModel`, not `embedModel`, so it only ever named the remote *request* and left the
+local arm on its hardcoded default. The moment the configured endpoint hiccups, the transport
+fallback embeds locally and mints a second identity for a model that has not changed.
+
+- **Resolution and identity are now separate concerns.** `DEFAULT_EMBED_MODEL` remains a
+  resolution handle for `resolveModel()`; the new `canonicalEmbedModelId()` is the single
+  normalization point for what gets recorded.
+- **An explicit alias table** maps known variant spellings of one physical model to one
+  kebab-canonical id (ADR-0077 / ADR-0074): the hf: URI, `embeddinggemma`, and ollama's own
+  `embeddinggemma:latest` tag all collapse to `embeddinggemma`. There is deliberately no fuzzy
+  matching and no suffix stripping — an unknown model passes through lowercased and otherwise
+  unchanged, so two genuinely different models can never be merged. Adding an entry is an
+  explicit, reviewable assertion of physical equivalence.
+- **Applied at all four producers**, so exactly one identity per model reaches the write fence
+  and, for free, the read fence. An http(s) URL offered as an identity now throws
+  `EmbedModelIdentityError`, making that door unrepresentable rather than merely unused.
+- **Closed a fail-open inside the write fence.** `assertWriteEmbedModelConsistent` used to
+  return early for an unnamed write model; an unnamed row pushed into a vault holding a named
+  identity minted a second identity and made the read guard refuse every query. Unnamed writes
+  are now permitted only into a vault that holds no vectors.
+
+`embeddinggemma` is the canonical id on purpose: it is exactly what existing vaults already
+store, so this upgrade needs no re-embed and no migration.
+
+Proven against a copy of a real 6,939-vector vault: before this change the in-process arm's
+768-dim vector was refused with `VecWriteModelMismatchError` (the fail-closed that wedged a
+nightly re-embed for roughly four weeks); after it, the same vector is accepted and the vault
+still holds exactly one identity. 2,173 tests pass.
+
+---
+
 ## v0.36.3 — reranker health: logit-space margin, and prescriptions that match the evidence
 
 Doctor called a *healthy* reranker "degenerate / not discriminating" and told the operator to
