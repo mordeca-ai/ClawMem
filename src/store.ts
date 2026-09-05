@@ -4332,8 +4332,23 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
   const hashSeqs = vecResults.map(r => r.hash_seq);
   const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
 
-  // Build query for document lookup (includes fragment metadata)
-  const placeholders = hashSeqs.map(() => '?').join(',');
+  // Build query for document lookup (includes fragment metadata).
+  //
+  // master-harness-hxa17: the predicate used to be `WHERE cv.hash || '_' || cv.seq IN (...)`
+  // — a COMPUTED expression no index can serve, so EXPLAIN QUERY PLAN read
+  // `SCAN d USING INDEX idx_documents_effective_time` (a full scan of `documents`) and this
+  // "cheap, local half" cost MORE than the sqlite-vec ANN search it hydrates (~230 ms for a
+  // 180-fragment input). Filtering on the INDEXED column `cv.hash` instead — using the
+  // DISTINCT hashes implied by the requested hash_seq list — makes the plan
+  // `SEARCH d USING INDEX idx_documents_hash (hash=?)` and drops it to <100 ms. A hash may
+  // carry fragments we did NOT ask for, so the non-requested ones are dropped by a JS-side
+  // membership test against the original hash_seq set; everything downstream is unchanged.
+  const requestedHashSeqs = new Set(hashSeqs);
+  const hashes = [...new Set(hashSeqs.map(hs => {
+    const i = hs.lastIndexOf('_');
+    return i === -1 ? hs : hs.slice(0, i);
+  }))];
+  const placeholders = hashes.map(() => '?').join(',');
   let docSql = `
     SELECT
       cv.hash || '_' || cv.seq as hash_seq,
@@ -4349,9 +4364,9 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL
     JOIN content ON content.hash = d.hash
-    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+    WHERE cv.hash IN (${placeholders})
   `;
-  const params: string[] = [...hashSeqs];
+  const params: string[] = [...hashes];
 
   if (collections && collections.length > 0) {
     const colPlaceholders = collections.map(() => '?').join(',');
@@ -4369,11 +4384,11 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
     params.push(dateRange.start, dateRange.end);
   }
 
-  const docRows = db.prepare(docSql).all(...params) as {
+  const docRows = (db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
     display_path: string; title: string; body: string; modified_at: string;
     fragment_type: string | null; fragment_label: string | null;
-  }[];
+  }[]).filter(row => requestedHashSeqs.has(row.hash_seq));
 
   // Combine with distances and dedupe by filepath (keep best-scoring fragment per doc)
   const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
