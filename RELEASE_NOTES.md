@@ -4,6 +4,24 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.5 — clawmem passive recall: fix the hydrate path, not the cap (hxa17)
+
+Passive recall was DOWN fleet-wide: both retrieval arms exceeded their latency caps at the median, so sessions ran with zero semantic recall injected. Root cause was not the ANN search, the embed round-trip, the rerank endpoint or the expansion model — it was `hydrateVecResults`, the step its own comment called "the cheap, local half ... pure primary-key SQLite lookups". It cost MORE than the sqlite-vec search it hydrates.
+
+Two defects, both measured against the live vault (158,864 vectors / 19,639 documents):
+
+- `collections.loadConfig()` did readFileSync + `YAML.parse` twice on every call with no cache, and `getContextForFile()` calls it twice per result row — from `searchFTS` as well as `hydrateVecResults`, so all six retrieval legs paid it. Up to ~360 calls per prompt re-parsing one small unchanged file. Now memoized on (path, mtimeMs, size), returning a fresh deep copy every call because callers read-modify-write the config; `saveConfig()` invalidates, and `CLAWMEM_DISABLE_CONFIG_CACHE=true` is the ops bypass. 60x `loadConfig` 253 ms -> 2.9 ms.
+
+- `hydrateVecResults` filtered on the computed expression `cv.hash || '_' || cv.seq`, which no index can serve, so the planner fell back to `SCAN d USING INDEX idx_documents_effective_time` — a full scan of `documents`. It now filters on the indexed `cv.hash` using the distinct hashes implied by the requested list and drops non-requested fragments in JS. Plan becomes `SEARCH d USING INDEX idx_documents_hash`; the SQL goes 226 ms -> 22 ms on a 180-fragment input.
+
+The final sort is also now TOTAL. Cosine distances tie exactly and often — one live query carried a 19-fragment group at distance 0.5426244139671326 against a limit of 20 — so with a distance-only comparator, which tied documents survived `.slice(limit)` was decided by SQL row order, which under the old plan tracked documents-table effective-time order and re-rolled on any write. Recall on a tie boundary was silently write-order dependent. Breaking exact ties on filepath makes row order unobservable and the result deterministic across query plans and across vault writes. This is a deliberate behavior change against the previous engine: tied documents now sort lexicographically rather than by effective time.
+
+END TO END: median 8797 ms -> 3895 ms against an 8500 ms hook cap (builder), independently re-measured by the orchestrator at 7118 ms -> 2933 ms under host load 4.76, with every post-fix run faster than every pre-fix run. Attribution is separated and each half proven by break -> RED -> restore -> GREEN: the config memo accounts for ~2500 ms (flipping the bypass on returns the median to 6394 ms) and the predicate for the rest (reverting it restores both the SCAN plan and a 262 ms hydrate).
+
+No latency cap was raised and no threshold moved — the caps are unchanged and the substrate was fixed to meet them. Suite 2177 pass / 0 fail (baseline 2173/0), including a new hermetic regression test for the tie-break that is proven able to fail.
+
+---
+
 ## v0.36.4 — canonical embed-model identity: one physical model, one recorded name
 
 One physical embedding model was being RECORDED under four different names, depending only on
