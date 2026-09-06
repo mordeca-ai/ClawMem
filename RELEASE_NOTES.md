@@ -4,6 +4,59 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.6 — concurrent createStore(): fix the cold DELETE->WAL transition race (Issue #13 follow-up)
+
+Concurrent `createStore()` on a fresh database no longer fails with SQLITE_BUSY.
+
+The Issue #13 fix put `PRAGMA busy_timeout` before `PRAGMA journal_mode = WAL`
+so the WAL transition could wait instead of failing immediately. That ordering
+is necessary but it is NOT sufficient, and the gap was live: `PRAGMA journal_mode
+= WAL` returns SQLITE_BUSY *despite* a 15s busy_timeout, because SQLite does not
+run the busy handler for that particular lock upgrade — a connection already
+holding a shared lock that needs to escalate to exclusive is a potential
+deadlock, so SQLite returns immediately rather than waiting.
+
+Measured on the pre-fix tree: the regression test that asserts concurrent init
+does NOT hit SQLITE_BUSY was itself losing that race, 8 of 48 isolated reps
+(16.7%). Statement-level isolation attributed 100% of the failures to that one
+PRAGMA. So the guard was telling the truth — this is a real defect on the path
+every `clawmem hook` subprocess and every parallel before_reset fan-out takes,
+not test flakiness.
+
+`setWalJournalMode()` now wraps both call sites (`initializeDatabase()` and the
+readonly branch of `createStore()`) with two cooperating halves, both load-bearing:
+
+  - READ-FIRST — query `PRAGMA journal_mode` and skip the write entirely when the
+    database is already in WAL. An already-WAL database needs no exclusive lock
+    at all (0/30 reps fail), so in the steady state — every open after the first —
+    the contending statement is never issued. Roughly three quarters of openers
+    take this path.
+  - BOUNDED JITTERED RETRY — on SQLITE_BUSY from the actual DELETE->WAL
+    transition, back off (5ms doubling, capped at 200ms, jittered) and re-loop,
+    re-checking the read-first condition each pass, until the caller's budget is
+    spent, then rethrow. A non-BUSY error is never swallowed and never retried.
+
+Read-first alone is not enough — two openers can both read `delete` and both
+attempt the transition. Measured at 40 reps x 5 concurrent openers: unconditional
+write 4/40 reps fail; read-first alone 3/40 still fail; read-first plus retry
+0/40, with the retry firing on exactly the cases read-first could not absorb.
+
+The regression test was also STRENGTHENED rather than merely satisfied: the
+worker now takes a start-barrier epoch so the openers actually collide instead of
+drifting apart on process-startup jitter, and the opener count is configurable
+(`CLAWMEM_TEST_CONCURRENT_INIT_WORKERS`, default 5, previously hardcoded 3). The
+source-text ordering gates moved with the statement into the helper and gained
+two assertions they did not have: that no raw `PRAGMA journal_mode =` write can
+bypass the helper, and that inside the helper the read precedes the write.
+
+Verification: 30/30 isolated reps green with the fix; 9/15 RED against pristine
+`store.ts` with the same strengthened test, so the check is non-vacuous. Unit
+tier 1987 pass / 0 fail against a 1979 / 0 baseline (+8, the new helper unit
+tests). Full suite 2186 pass / 0 fail. `tsc --noEmit` output byte-identical to
+the baseline.
+
+---
+
 ## v0.36.5 — clawmem passive recall: fix the hydrate path, not the cap (hxa17)
 
 Passive recall was DOWN fleet-wide: both retrieval arms exceeded their latency caps at the median, so sessions ran with zero semantic recall injected. Root cause was not the ANN search, the embed round-trip, the rerank endpoint or the expansion model — it was `hydrateVecResults`, the step its own comment called "the cheap, local half ... pure primary-key SQLite lookups". It cost MORE than the sqlite-vec search it hydrates.
