@@ -373,6 +373,76 @@ function loadVecExtension(db: Database): void {
   }
 }
 
+/** Backoff ceiling for the WAL-transition retry loop (ms). */
+const WAL_RETRY_MAX_DELAY_MS = 200;
+
+/**
+ * Result of {@link setWalJournalMode} — returned so callers (and tests) can
+ * observe whether the read-first fast path or the contended retry path ran.
+ */
+export interface WalJournalModeResult {
+  /** "already-wal": no write issued. "transitioned": the DELETE->WAL write succeeded. */
+  outcome: "already-wal" | "transitioned";
+  /** Total loop passes, including the successful one (>= 1). */
+  attempts: number;
+  /** Number of SQLITE_BUSY backoff sleeps performed (attempts - 1). */
+  retries: number;
+}
+
+/**
+ * Put `db` into WAL journal mode, tolerating the concurrent cold-start race.
+ *
+ * Two halves, BOTH load-bearing (measured, Issue #13 follow-up master-harness-3xw7n):
+ *
+ *  1. Read-first. `PRAGMA journal_mode = WAL` against a database that is ALREADY
+ *     in WAL mode is a true no-op that takes no exclusive lock, so querying the
+ *     current mode and skipping the write removes the lock attempt entirely for
+ *     the steady-state case (measured: 147 of 197 concurrent openers take this
+ *     path). Read-first ALONE is not sufficient — two cold openers can both read
+ *     "delete" and both attempt the transition (measured: 3/40 reps still failed).
+ *
+ *  2. Bounded jittered retry. The DELETE->WAL transition takes an exclusive lock
+ *     that SQLite acquires on its deadlock-avoidance path: it does NOT invoke the
+ *     busy handler, so `PRAGMA busy_timeout` (set first, and still required for
+ *     every other contending statement) cannot absorb it and SQLITE_BUSY returns
+ *     immediately. Exponential backoff + jitter, re-checking the read-first
+ *     condition each pass, absorbs exactly those cases (measured: 0/40 reps fail,
+ *     retry fired 3 times).
+ *
+ * Non-BUSY errors are rethrown immediately and never swallowed; BUSY is rethrown
+ * once the wall-clock budget is exhausted. The loop is never unbounded.
+ *
+ * @param db        open connection; `PRAGMA busy_timeout` MUST already be set on it
+ * @param budgetMs  wall-clock retry budget; on exhaustion the original error is rethrown
+ */
+export function setWalJournalMode(db: Database, budgetMs: number = 15000): WalJournalModeResult {
+  const startedAt = Date.now();
+  let delayMs = 5;
+  let attempts = 0;
+
+  for (;;) {
+    attempts++;
+
+    // Read-first: an already-WAL database needs no exclusive lock at all.
+    const current = (db.query("PRAGMA journal_mode").get() as { journal_mode?: string } | null)?.journal_mode;
+    if (typeof current === "string" && current.toLowerCase() === "wal") {
+      return { outcome: "already-wal", attempts, retries: attempts - 1 };
+    }
+
+    try {
+      db.exec("PRAGMA journal_mode = WAL");
+      return { outcome: "transitioned", attempts, retries: attempts - 1 };
+    } catch (err) {
+      const e = err as Error & { code?: string };
+      const isBusy = e.code === "SQLITE_BUSY" || /database is locked/i.test(e.message ?? "");
+      if (!isBusy || Date.now() - startedAt >= budgetMs) throw err;
+      const jitterMs = Math.floor(Math.random() * delayMs);
+      Bun.sleepSync(delayMs + jitterMs);
+      delayMs = Math.min(delayMs * 2, WAL_RETRY_MAX_DELAY_MS);
+    }
+  }
+}
+
 function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   // Set busy_timeout FIRST so subsequent PRAGMAs (journal_mode in particular,
   // which acquires a write lock when switching or initializing WAL state) wait
@@ -388,7 +458,7 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
   // value (5000ms or opts.busyTimeout) after DDL completes. Issue #13.
   db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
   loadVecExtension(db);
-  db.exec("PRAGMA journal_mode = WAL");
+  setWalJournalMode(db, busyTimeoutMs);
   db.exec("PRAGMA foreign_keys = ON");
 
   // Drop legacy tables that are now managed in YAML
@@ -1848,7 +1918,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     // but the ordering invariant should hold regardless. Issue #13.
     db.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
     loadVecExtension(db);
-    db.exec("PRAGMA journal_mode = WAL");
+    setWalJournalMode(db, opts?.busyTimeout ?? 5000);
     db.exec("PRAGMA query_only = ON");
   }
   // For the writable branch: initializeDatabase() set opts.busyTimeout (default 15000) during DDL —
