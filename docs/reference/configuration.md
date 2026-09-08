@@ -28,7 +28,9 @@ Full provider matrix and behavior: [../guides/cloud-embedding.md](../guides/clou
 |---|---|---|
 | `CLAWMEM_EMBED_API_KEY` | (none) | API key for cloud embedding providers (Bearer token). Enables cloud mode: skips client-side truncation, sends `truncate: true` + provider params, batch embedding with adaptive TPM pacing. |
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests. Override for cloud (e.g. `jina-embeddings-v5-text-small`). |
-| `CLAWMEM_EMBED_MAX_CHARS` | `6000` | Max chars per embedding input (local only; fits EmbeddingGemma's 2048 tokens). Set `1100` for granite-278m (512 tokens). Cloud providers skip truncation. |
+| `CLAWMEM_EMBED_MAX_CHARS` | *derived* | Max chars per embedding input (local endpoints only; cloud providers skip truncation). Unset = derived from the endpoint's advertised `context_length` (ollama `POST /api/show`) x `CLAWMEM_EMBED_CHARS_PER_TOKEN`, falling back to 2048 tokens -> 4096 chars. Setting it pins the cap (e.g. `1100` for granite-278m). |
+| `CLAWMEM_EMBED_CHARS_PER_TOKEN` | `2` | Conservative chars-per-token for the derived embed char budget. Lower = truncate more (the safe direction). |
+| `CLAWMEM_EMBED_CONTEXT_PROBE_TIMEOUT_MS` | `5000` | Deadline for the memoized `/api/show` context probe; never widens the caller's fetch deadline. |
 | `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud pacing. Match your tier (e.g. Jina Free 100000, Paid 2000000, Premium 50000000). |
 | `CLAWMEM_EMBED_DIMENSIONS` | (none) | Output dimensions for OpenAI `text-embedding-3-*` Matryoshka models (e.g. `512`, `1024`). Sent only when the URL contains `openai.com`. |
 

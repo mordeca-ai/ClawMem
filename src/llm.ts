@@ -16,6 +16,12 @@ async function getNodeLlamaCpp() {
   return _nodeLlamaCpp;
 }
 
+import {
+  EMBED_CHARS_PER_TOKEN,
+  EMBED_CONTEXT_PROBE_TIMEOUT_MS,
+  FALLBACK_EMBED_CONTEXT_TOKENS,
+} from "./limits.ts";
+
 // Re-export type aliases for internal use (structural, no runtime cost)
 type Llama = any;
 type LlamaModel = any;
@@ -532,6 +538,90 @@ export function resolveEmbedModelTokenCeiling(modelName: string | null | undefin
     if (lower.includes(rule.match)) return rule.ceiling;
   }
   return DEFAULT_EMBED_MODEL_TOKEN_CEILING;
+}
+
+/**
+ * vn4rz.42 — advertised embed-context probe.
+ *
+ * Memoized per (endpoint, model) for the life of the process: `null` means
+ * "asked and could not determine", which is cached just as firmly as a hit so
+ * a non-ollama endpoint is probed once, not once per fragment. Exported reset
+ * hook exists purely so tests can exercise more than one endpoint.
+ */
+const embedContextCache = new Map<string, Promise<number | null>>();
+
+/** Test seam: drop the memoized /api/show results. */
+export function resetEmbedContextCache(): void {
+  embedContextCache.clear();
+}
+
+/** Conservative chars-per-token, env-overridable. */
+export function resolveEmbedCharsPerToken(): number {
+  const raw = parseFloat(process.env.CLAWMEM_EMBED_CHARS_PER_TOKEN || "");
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return EMBED_CHARS_PER_TOKEN;
+}
+
+/**
+ * Pull `context_length` for `model` out of an ollama `POST /api/show` response.
+ * The key is architecture-prefixed (e.g. `gemma3.context_length`,
+ * `bert.context_length`), so match on the SUFFIX rather than guessing the
+ * architecture. Returns null when the endpoint is not ollama, is unreachable,
+ * or reports no context length — the caller then uses the named fallback.
+ */
+export function resolveEmbedContextProbeTimeoutMs(ceilingMs?: number): number {
+  const raw = parseInt(process.env.CLAWMEM_EMBED_CONTEXT_PROBE_TIMEOUT_MS || "", 10);
+  const base = Number.isFinite(raw) && raw > 0 ? raw : EMBED_CONTEXT_PROBE_TIMEOUT_MS;
+  // The probe sits IN FRONT of the embed fetch, so it must never widen the
+  // caller's deadline: a hung endpoint has to still fail at ~remoteFetchTimeoutMs
+  // (the 1d1fn guarantee), not at that plus a probe timeout.
+  return ceilingMs && ceilingMs > 0 ? Math.min(base, ceilingMs) : base;
+}
+
+export async function fetchAdvertisedEmbedContext(
+  baseUrl: string,
+  model: string,
+  headers: Record<string, string> = {},
+  timeoutMs: number = resolveEmbedContextProbeTimeoutMs()
+): Promise<number | null> {
+  try {
+    const resp = await fetch(`${baseUrl.replace(/\/+$/, "")}/api/show`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify({ model }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as { model_info?: Record<string, unknown> };
+    const info = data?.model_info;
+    if (!info || typeof info !== "object") return null;
+    for (const [key, value] of Object.entries(info)) {
+      if (!key.endsWith(".context_length") && key !== "context_length") continue;
+      const n = typeof value === "number" ? value : parseInt(String(value), 10);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return null;
+  } catch {
+    // A probe failure is NEVER an embed failure — it must not trip the remote
+    // breaker and must not throw into the embed path.
+    return null;
+  }
+}
+
+/** Memoized wrapper around fetchAdvertisedEmbedContext. */
+export function advertisedEmbedContext(
+  baseUrl: string,
+  model: string,
+  headers: Record<string, string> = {},
+  timeoutMs?: number
+): Promise<number | null> {
+  const key = `${baseUrl}\u0000${model}`;
+  let pending = embedContextCache.get(key);
+  if (!pending) {
+    pending = fetchAdvertisedEmbedContext(baseUrl, model, headers, timeoutMs ?? resolveEmbedContextProbeTimeoutMs());
+    embedContextCache.set(key, pending);
+  }
+  return pending;
 }
 
 export class LlamaCpp implements LLM {
@@ -1086,8 +1176,25 @@ export class LlamaCpp implements LLM {
   // at 900 tokens so this only applies to the formatting wrapper.
   // Override via CLAWMEM_EMBED_MAX_CHARS (e.g. 1100 for granite-278m, 512-token context).
   // Cloud providers (API key set) skip truncation entirely.
+  /**
+   * Explicit operator override (CLAWMEM_EMBED_MAX_CHARS). When set it wins over
+   * everything, including the endpoint's advertised context — an operator who
+   * pins a number means it. `null` = not set, derive instead (vn4rz.42).
+   */
+  private readonly embedMaxCharsOverride: number | null = (() => {
+    const raw = parseInt(process.env.CLAWMEM_EMBED_MAX_CHARS || "", 10);
+    return Number.isFinite(raw) && raw > 0 ? raw : null;
+  })();
+
+  /**
+   * Synchronous character cap. Used directly by the in-process (local) embed
+   * arm, and as the pre-probe floor on the remote arm. Derived from the named
+   * fallback context rather than a hardcoded guess (vn4rz.42 replaced the old
+   * literal 6000); the remote path refines this from the endpoint's ADVERTISED
+   * context_length in resolveEmbedCharBudget().
+   */
   private readonly maxRemoteEmbedChars: number =
-    parseInt(process.env.CLAWMEM_EMBED_MAX_CHARS || "6000", 10);
+    this.embedMaxCharsOverride ?? Math.floor(FALLBACK_EMBED_CONTEXT_TOKENS * resolveEmbedCharsPerToken());
 
   private isCloudEmbedding(): boolean {
     return !!this.remoteEmbedApiKey;
@@ -1158,17 +1265,61 @@ export class LlamaCpp implements LLM {
     return await this.detokenize(tokens.slice(0, maxTokens));
   }
 
+  /**
+   * Token ceiling for the configured remote embed model, preferring what the
+   * ENDPOINT advertises over any local table (vn4rz.42). Order:
+   *   1. CLAWMEM_EMBED_MAX_TOKENS  — explicit operator override
+   *   2. the endpoint's advertised `*.context_length` (memoized /api/show)
+   *   3. the per-model table / named fallback (resolveEmbedModelTokenCeiling)
+   */
+  private async resolveEmbedTokenCeiling(): Promise<number> {
+    const envOverride = parseInt(process.env.CLAWMEM_EMBED_MAX_TOKENS || "", 10);
+    if (Number.isFinite(envOverride) && envOverride > 0) return envOverride;
+    if (this.remoteEmbedUrl) {
+      const advertised = await advertisedEmbedContext(
+        this.remoteEmbedUrl,
+        this.remoteEmbedModel,
+        this.getEmbedHeaders(),
+        resolveEmbedContextProbeTimeoutMs(this.remoteFetchTimeoutMs)
+      );
+      if (advertised !== null) return advertised;
+    }
+    return resolveEmbedModelTokenCeiling(this.remoteEmbedModel);
+  }
+
+  /**
+   * Character budget for one outbound embed input, derived from the token
+   * ceiling above via a deliberately conservative chars-per-token ratio.
+   * An explicit CLAWMEM_EMBED_MAX_CHARS always wins.
+   */
+  private async resolveEmbedCharBudget(): Promise<{ chars: number; tokens: number }> {
+    const tokens = await this.resolveEmbedTokenCeiling();
+    if (this.embedMaxCharsOverride !== null) {
+      return { chars: this.embedMaxCharsOverride, tokens };
+    }
+    return { chars: Math.max(1, Math.floor(tokens * resolveEmbedCharsPerToken())), tokens };
+  }
+
   private async truncateForEmbed(text: string): Promise<string> {
     // Cloud providers handle their own context window limits
     if (this.isCloudEmbedding()) return text;
 
-    // Cheap char-based pre-slice (belt-and-suspenders) — bounds the input
-    // before tokenizing and is also the fallback below if the tokenizer is
-    // unavailable/throws.
-    const charCapped = text.length > this.maxRemoteEmbedChars
-      ? text.slice(0, this.maxRemoteEmbedChars) : text;
+    // vn4rz.42: bound the input BEFORE the fetch, against a budget derived from
+    // the model's advertised context. An oversized body must cost ~0s here
+    // rather than stalling the endpoint until the 60s deadline fires and trips
+    // the remote-embed breaker for every fragment behind it.
+    const { chars: charBudget, tokens: tokenCeiling } = await this.resolveEmbedCharBudget();
 
-    const tokenCeiling = resolveEmbedModelTokenCeiling(this.remoteEmbedModel);
+    const charCapped = text.length > charBudget ? text.slice(0, charBudget) : text;
+    if (charCapped.length < text.length) {
+      // D4: a silent truncation is its own invisible-defect class. One line per
+      // truncated input, on the operator-visible stream.
+      console.error(
+        `[embed] truncated oversized input: ${text.length} -> ${charCapped.length} chars ` +
+        `(model=${this.remoteEmbedModel}, context=${tokenCeiling} tokens, ` +
+        `${resolveEmbedCharsPerToken()} chars/token)`
+      );
+    }
 
     // Cheap short-circuit: a tokenizer can never produce more tokens than
     // input characters (every token spans >= 1 character), so if the

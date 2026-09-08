@@ -75,7 +75,7 @@ The adaptive pacer computes delay as `(batchTokens / (TPM_LIMIT × 0.85)) × 60s
 
 ## Truncation behavior
 
-- **Local embedding** (no API key): Input truncated to `CLAWMEM_EMBED_MAX_CHARS` (default 6000) before sending. This prevents oversized inputs from exceeding the model's token context.
+- **Local embedding** (no API key): Input truncated BEFORE the outbound fetch to a budget derived from the model's advertised `context_length` (ollama `POST /api/show`, memoized per endpoint+model) times a conservative chars-per-token ratio; `CLAWMEM_EMBED_MAX_CHARS` pins it explicitly when set. This prevents oversized inputs (notably the splitter's un-chunked `full` fragment) from stalling the endpoint until the fetch deadline fires and trips the remote-embed breaker.
 - **Cloud embedding** (API key set): Client-side truncation is skipped. Server-side truncation is requested via `truncate: true`.
 
 To override the local truncation limit:
