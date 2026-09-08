@@ -4,6 +4,30 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.9 — embed input budget derived from the model's advertised context
+
+`truncateForEmbed` capped remote embed input at a hardcoded `CLAWMEM_EMBED_MAX_CHARS`
+default of 6000 chars — a guess calibrated for EmbeddingGemma at roughly 3 chars/token,
+applied regardless of which embed model was configured. With `CLAWMEM_NO_LOCAL_MODELS=true`
+(the deployed configuration here) the token-aware refinement always throws and falls back
+to that guess, so dense or code-heavy content at ~2 chars/token was still being sent at
+~3000 tokens against a 2048-token context window.
+
+The budget is now DERIVED: `POST /api/show` is probed once per (endpoint, model) for the
+advertised `context_length`, memoized including the failure result, and converted with a
+deliberately conservative `EMBED_CHARS_PER_TOKEN` so under-estimating chars can only ever
+truncate more. A named `FALLBACK_EMBED_CONTEXT_TOKENS` (2048) applies when the probe is
+unavailable, and `CLAWMEM_EMBED_MAX_CHARS` still pins the budget outright.
+
+Truncation stays a single prefix slice — not chunking — so fragment counts and the vector
+space are unchanged, and it happens before the outbound fetch so an oversized input costs
+no wall-clock. Each truncation now logs `original -> bounded` chars with the model and
+context, because a silent truncation is its own invisible-defect class.
+
+NOT a fix for unbounded input reaching the wire: input was already capped at 6000 chars
+before this change (v0.10.15, bd-5r0rd). What is fixed is that the cap was a
+model-independent guess.
+
 ## v0.36.8 — PG reindex retires documents whose source file is gone
 
 The PG reindex now deactivates documents whose source file is gone.
