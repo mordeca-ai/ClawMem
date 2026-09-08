@@ -1,0 +1,43 @@
+-- 002_vector_index_hnsw.sql — the SEEDED vector index (master-harness-vn4rz.7).
+--
+-- ============================================================================
+-- THE INDEX FAMILY IS NOT DECIDED HERE, AND MUST NOT BE.
+--
+-- ADR-0162 §2 explicitly REFUSES to choose HNSW vs IVFFlat, because the Postgres
+-- canon behind the postgres-engineer skill contains zero rules on pgvector and
+-- cannot supply a recall or build-time number. §2 fixes the METHOD instead:
+-- build both families on a real slice of our own embeddings, measure recall@k
+-- against an exact `ORDER BY <distance>` ground truth ON OUR OWN BOX, sweep
+-- FILTER SELECTIVITY across the six §3 facet predicates (not just k), and record
+-- the operating point with the measurement that chose it.
+--
+--   That probe is **master-harness-vn4rz.32**, and it DEPENDS ON THIS BEAD.
+--   vn4rz.32 decides the family. This file only seeds one so the write path has
+--   something to write against.
+--
+-- The parameters below (m=16, ef_construction=128, ef_search=100) are ADR-0162
+-- §2's own *seeded starting point*, quoted from AWS pgvector-in-production
+-- guidance. THEY ARE NOT MEASURED ON OUR DATA. Do not cite them as such.
+--
+-- Note also that today's sqlite vector search is BRUTE FORCE (vec0, no ANN index
+-- at all — src/store.ts:1553-1558). Any index here is therefore a strict
+-- improvement over the status quo, not a parity requirement, and recall < 1.0 is
+-- a NEW tradeoff that vn4rz.32 must price rather than a regression to fix.
+-- ============================================================================
+--
+-- CONCURRENTLY, per ADR-0162 §2 (`mastering-postgresql-17#18`): no write lock on
+-- a live table, ~2x build time, AND IT CAN FAIL LEAVING AN INVALID INDEX. An
+-- INVALID hnsw index is silently ignored by the planner, which degrades to a
+-- brute-force scan with NO ERROR — exactly the shape of silent-wrong-answer this
+-- bead is written to avoid. src/pg/migrate.ts checks pg_index.indisvalid after
+-- this migration and REFUSES to record it as applied if the index came back
+-- invalid.
+--
+-- CONCURRENTLY cannot run inside a transaction block, so the runner executes
+-- this file OUTSIDE its per-migration transaction. That is what the
+-- `-- clawmem:no-transaction` directive on the next line declares.
+-- clawmem:no-transaction
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS content_vectors_embedding_hnsw_idx
+  ON content_vectors USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 128);

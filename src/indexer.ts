@@ -18,6 +18,34 @@ import { normalizeIsoTimestamp } from "./normalize.ts";
 // Types
 // =============================================================================
 
+/**
+ * A frontmatter block that WAS present and that the YAML parser REFUSED.
+ *
+ * This is deliberately distinct from "the document declared no frontmatter":
+ * an absent block is a legitimate authoring choice, a rejected block is a
+ * defect in the document that silently costs it its metadata. Before
+ * master-harness-vn4rz.34 the two were indistinguishable to every caller,
+ * because parseDocument's `catch` swallowed the error whole.
+ */
+export interface FrontmatterParseFailure {
+  /** The relativePath parseDocument was called with — i.e. the offending document. */
+  path: string;
+  /** gray-matter / js-yaml's own message, first line, verbatim. */
+  message: string;
+}
+
+export interface ParsedDocument {
+  body: string;
+  meta: DocumentMeta;
+  /**
+   * Set ONLY when a frontmatter block failed to parse. Absent means either
+   * "parsed cleanly" or "no frontmatter declared" — a caller that needs to
+   * tell a parse FAILURE from a declared absence keys off this field's
+   * presence, not off `meta` being empty.
+   */
+  frontmatterError?: FrontmatterParseFailure;
+}
+
 export interface DocumentMeta {
   title?: string;
   description?: string;
@@ -125,13 +153,26 @@ export function extractTitle(content: string, filename: string): string {
 // Frontmatter Parsing
 // =============================================================================
 
-export function parseDocument(content: string, relativePath: string, defaultContentType?: string): { body: string; meta: DocumentMeta } {
+export function parseDocument(content: string, relativePath: string, defaultContentType?: string): ParsedDocument {
   // gray-matter coerces YAML values: `title: 2023-09-27` → Date, `title: true` → boolean.
   // All frontmatter fields must be runtime-checked to prevent SQLite binding errors.
   const str = (v: unknown): string | undefined =>
     typeof v === "string" ? v || undefined : undefined;
   try {
-    const { data, content: body } = matter(content);
+    // The `{}` is load-bearing, not noise (master-harness-vn4rz.34).
+    //
+    // gray-matter memoizes by content string — but ONLY on the no-options call
+    // path (`if (!options) { ...matter.cache[content]... }`), and it writes the
+    // cache entry BEFORE parsing. So when the YAML parser throws, the
+    // half-built, EMPTY result stays cached: every later call on identical
+    // content returns that empty parse and never throws again. The failure
+    // would then be warned about and counted exactly once per process, and any
+    // subsequent document with byte-identical content would be silently
+    // mis-parsed with `frontmatterError` absent — i.e. the guard below would
+    // report a clean parse for a malformed document.
+    // Passing an options object takes the uncached path. Parsing is otherwise
+    // unchanged: gray-matter fills every default from `{}`.
+    const { data, content: body } = matter(content, {});
     return {
       body,
       meta: {
@@ -151,15 +192,39 @@ export function parseDocument(content: string, relativePath: string, defaultCont
         authored_at: authoredAtFromFrontmatter(data.authored_at),
       },
     };
-  } catch {
-    // If frontmatter parsing fails, treat entire content as body.
-    // authored_at stays undefined (= leave any stored value untouched):
-    // a parse failure is not a declared absence.
+  } catch (err) {
+    // A frontmatter block WAS present and the YAML parser refused it.
+    //
+    // The fallback BEHAVIOUR is unchanged (master-harness-vn4rz.34 deliberately
+    // changed visibility, not parsing semantics): the whole content stays as
+    // body, content_type falls back to the per-collection default or filename
+    // inference, and authored_at stays undefined (= leave any stored value
+    // untouched) because a parse failure is not a declared absence.
+    //
+    // What changed is that the failure is no longer SILENT. It used to be a
+    // bare `catch {}`, and that cost three things at once, none of them
+    // observable by anyone:
+    //   1. title/description/tags/domain/workstream were dropped;
+    //   2. content_type was NOT dropped — it fell through to filename
+    //      inference, so the document got a CONFIDENTLY WRONG declared type
+    //      rather than an absent one, and with it the wrong decay curve
+    //      (cf. ADR-0143's amendment: inference mis-typed 100 of 118 ADRs);
+    //   3. the raw YAML stayed in the body and was embedded as prose,
+    //      polluting the vector layer with metadata text.
+    // A malformed document must STAY malformed and become VISIBLE — the fix is
+    // never to widen the parser or pre-sanitize the YAML.
+    const message = (err instanceof Error ? err.message : String(err)).split("\n")[0]!;
+    console.warn(
+      `[indexer] frontmatter parse FAILED path=${relativePath} error=${JSON.stringify(message)} ` +
+      `— title/description/tags/domain/workstream DROPPED, content_type fell back to inference, ` +
+      `raw frontmatter retained in body (will be embedded as prose)`,
+    );
     return {
       body: content,
       meta: {
         content_type: (defaultContentType as ContentType | undefined) || inferContentType(relativePath),
       },
+      frontmatterError: { path: relativePath, message },
     };
   }
 }

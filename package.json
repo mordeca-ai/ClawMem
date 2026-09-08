@@ -1,6 +1,6 @@
 {
   "name": "clawmem",
-  "version": "0.36.6",
+  "version": "0.36.7",
   "description": "On-device memory layer for AI agents. Claude Code, OpenClaw, and Hermes. Hooks + MCP server + hybrid RAG search.",
   "type": "module",
   "bin": {
@@ -49,8 +49,10 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
+    "@types/pg": "^8.23.1",
     "gray-matter": "^4.0.3",
     "node-llama-cpp": "^3.14.5",
+    "pg": "^8.23.0",
     "sqlite-vec": "^0.1.7-alpha.2",
     "yaml": "^2.8.2",
     "zod": "^4.2.1"
