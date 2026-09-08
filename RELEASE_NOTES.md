@@ -4,6 +4,33 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.8 — PG reindex retires documents whose source file is gone
+
+The PG reindex now deactivates documents whose source file is gone.
+
+`reindex` walked the files that exist and upserted them, but nothing ever
+retired a row whose source had been DELETED, so Postgres accumulated rows for
+files that no longer existed and diverged from the filesystem in one direction
+forever. Measured on the live vault: the `episodic-handoffs` collection held 123
+active rows against 55 files on disk — all 68 extras were handoffs the repo had
+deliberately pruned, still active and still ranking normally in recall.
+
+`reindexCollection` now treats its in-scope walk as the authoritative file set
+and sweeps the collection against it, soft-retiring absent rows via
+`deactivateAbsentDocuments` (`active = false` plus a `deactivated_reason`). Rows
+and vectors are retained, and a file that comes back is reactivated by the
+existing upsert, so the operation is recoverable and idempotent.
+
+The sweep refuses to run whenever "absent from the walk" would not mean "absent
+from disk": on a `--limit` run (a partial walk), on an empty walk (indistinguishable
+from a missing or unreadable collection root), and under the new `--no-sweep` flag.
+`deactivateAbsentDocuments` independently refuses an empty keep-set at the
+primitive, so no future caller can mass-retire a collection by accident. Every
+refusal is reported rather than silently skipped, and the per-collection reindex
+summary now carries a `N deactivated` field.
+
+---
+
 ## v0.36.7 — PostgreSQL write path (ADR-0162), inert by config default
 
 The PostgreSQL write path (ADR-0162) ships as a branch of record. It is INERT by
