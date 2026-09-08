@@ -60,6 +60,12 @@ function startEchoEmbedServer() {
     port: 0,
     hostname: "127.0.0.1",
     async fetch(req) {
+      // vn4rz.42 added a one-shot POST /api/show context probe in front of the
+      // embed fetch. This stub is not ollama — 404 it so the probe falls back to
+      // the named constant and only /v1/embeddings bodies land in `received`.
+      if (new URL(req.url).pathname === "/api/show") {
+        return new Response("not found", { status: 404 });
+      }
       const body = (await req.json()) as { input: string | string[] };
       if (Array.isArray(body.input)) received.push(...body.input);
       else received.push(body.input);

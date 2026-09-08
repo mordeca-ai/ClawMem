@@ -308,7 +308,9 @@ The session ID is resolved from `--session-id <id>`, then `CLAUDE_SESSION_ID`, t
 | `CLAWMEM_EMBED_URL` | `http://localhost:8088` | Embedding server |
 | `CLAWMEM_EMBED_API_KEY` | — | API key for cloud embedding |
 | `CLAWMEM_EMBED_MODEL` | `embedding` | Model name for embedding requests |
-| `CLAWMEM_EMBED_MAX_CHARS` | `6000` | Max chars per embedding input |
+| `CLAWMEM_EMBED_MAX_CHARS` | *derived* | Max chars per embedding input. Unset = derived from the endpoint's advertised `context_length` (ollama `/api/show`) x `CLAWMEM_EMBED_CHARS_PER_TOKEN`; falls back to 2048 tokens when unavailable. Setting it pins the cap. |
+| `CLAWMEM_EMBED_CHARS_PER_TOKEN` | `2` | Conservative chars-per-token used to convert the advertised token context into a char budget |
+| `CLAWMEM_EMBED_CONTEXT_PROBE_TIMEOUT_MS` | `5000` | Deadline for the one-shot `/api/show` context probe (also capped by `CLAWMEM_REMOTE_FETCH_TIMEOUT_MS`) |
 | `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing |
 | `CLAWMEM_EMBED_DIMENSIONS` | — | Output dimensions for OpenAI `text-embedding-3-*` models |
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server |
