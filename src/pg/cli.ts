@@ -76,15 +76,39 @@ async function main() {
         collections: cols ? cols.split(",").map(s => s.trim()) : undefined,
         limit: limitRaw ? Number(limitRaw) : undefined,
         skipEmbed: argv.includes("--no-embed"),
+        // Two-directional convergence is the DEFAULT (master-harness-vn4rz.41);
+        // --no-sweep is the opt-out, never the other way around.
+        sweep: !argv.includes("--no-sweep"),
         embedBatchSize: argv.includes("--batch-size") ? Number(flagValue(argv, "--batch-size")) : undefined,
         onProgress: m => console.log(m),
       });
       for (const s of stats) {
         console.log(
           `${s.collection}: ${s.documentsWritten} docs written, ` +
+          // The deactivation count is APPENDED AFTER "embed failures" and
+          // before the wall-clock on purpose: master-harness's
+          // tools/clawmem-pg-reindex matches a PREFIX ending at "embed
+          // failures", so an older wrapper keeps parsing a newer summary.
           `${s.fragmentsEmbedded} embedded, ${s.embedFailures} embed failures, ` +
+          `${s.documentsDeactivated} deactivated, ` +
           `${(s.wallClockMs / 1000).toFixed(1)}s`,
         );
+        // NEVER SILENTLY SKIP. A one-directional run that says nothing about
+        // being one-directional is the vn4rz.41 defect wearing a green run as
+        // camouflage, so the reason is always printed when there is one.
+        if (s.sweepSkippedReason !== null) {
+          console.log(`  sweep SKIPPED: ${s.sweepSkippedReason}`);
+        }
+        // Same channel and same reason as the three reports below: a row the
+        // sweep retired must be answerable from the summary, by path.
+        if (s.deactivatedPaths.length > 0) {
+          console.log(
+            `  deactivated: ${s.deactivatedPaths.length} document(s) whose source file ` +
+            `was ABSENT from the walk were set active=false (soft — the rows and their ` +
+            `vectors are retained, and a file that returns reactivates on the next run):`,
+          );
+          for (const path of s.deactivatedPaths) console.log(`    ${path}`);
+        }
         // Reported HERE, in the reindex summary, and deliberately NOT in
         // `clawmem status` / `pg status` (master-harness-vn4rz.34). Both status
         // verbs are pure reads of stored row state; "this document's frontmatter
@@ -209,7 +233,8 @@ async function main() {
       console.error(
         "usage: bun src/pg/cli.ts <migrate|status|reindex|origin-load|origin-partitions|" +
         "origin-drop-legacy|origin-retention> [--vault sfw|nsfw] " +
-        "[--collection a,b] [--limit N] [--no-embed] [--month YYYY-MM] [--before DATE] [--apply]",
+        "[--collection a,b] [--limit N] [--no-embed] [--no-sweep] [--month YYYY-MM] " +
+        "[--before DATE] [--apply]",
       );
       process.exit(2);
   }

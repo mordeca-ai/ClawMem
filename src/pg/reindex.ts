@@ -46,7 +46,9 @@ import { getDefaultLlamaCpp, formatDocForEmbedding } from "../llm.ts";
 import { splitDocument } from "../splitter.ts";
 import { canonicalDocId } from "../store.ts";
 import { embedDim } from "./config.ts";
-import { insertEmbeddingsBatch, upsertDocument, type EmbeddingWrite } from "./write.ts";
+import {
+  deactivateAbsentDocuments, insertEmbeddingsBatch, upsertDocument, type EmbeddingWrite,
+} from "./write.ts";
 
 /** Mirrors indexer.ts's brace expansion — Bun.Glob has no brace support. */
 function expandBraces(pattern: string): string[] {
@@ -63,6 +65,14 @@ export interface ReindexOptions {
   embedBatchSize?: number;
   /** Skip embedding entirely (schema/parity smoke without touching yoshiee). */
   skipEmbed?: boolean;
+  /**
+   * Deactivate PG rows whose source file is absent from the walk
+   * (master-harness-vn4rz.41). DEFAULT TRUE — one-directional convergence is
+   * the defect, so two-directional is the normal mode and opting out is the
+   * thing that has to be asked for. Subject to sweepDecision's guards below;
+   * `true` is a request, never a bypass.
+   */
+  sweep?: boolean;
   onProgress?: (msg: string) => void;
 }
 
@@ -99,6 +109,21 @@ export interface ReindexStats {
    * the archive moved or the predicate stopped firing.
    */
   skippedOutOfScope: Record<string, string>;
+  /**
+   * Rows retired by the absent-from-walk sweep (master-harness-vn4rz.41), and
+   * which paths they were. Same reporting channel and same rationale as the
+   * three maps above: a row silently retired is as much a thing that must be
+   * answerable from the summary as a file silently skipped.
+   */
+  documentsDeactivated: number;
+  deactivatedPaths: string[];
+  /**
+   * NON-NULL whenever the sweep did not run, carrying the specific reason.
+   * Never silently skip: a collection that converges in one direction only,
+   * with no line in the summary saying so, is the vn4rz.41 defect wearing a
+   * green run as camouflage.
+   */
+  sweepSkippedReason: string | null;
   wallClockMs: number;
 }
 
@@ -180,6 +205,53 @@ export function noteFrontmatterFailure(
   stats.frontmatterParseFailures[relPath] = err.message;
 }
 
+/**
+ * Decide whether the absent-from-walk sweep may run for this collection, and if
+ * not, WHY (master-harness-vn4rz.41).
+ *
+ * A pure function taking only the option surface and the in-scope file COUNT,
+ * extracted for exactly the reason noteOutOfScope and noteFrontmatterFailure
+ * were: the guard is worthless if nobody can prove it fires, and that proof must
+ * not require a database. Every branch below is a refusal to advance a
+ * DESTRUCTIVE conclusion from evidence that cannot support it.
+ *
+ *   - `--no-sweep` is the operator's explicit opt-out.
+ *   - A `--limit N` run has truncated the file set on purpose, so
+ *     absent-from-walk does NOT imply absent-from-disk. This is the
+ *     master-harness-vn4rz.40 precedent: a partial run may never advance a
+ *     destructive conclusion. Note this holds for `--limit 0` too — 0 is a
+ *     deliberate walk of nothing, not "unlimited".
+ *   - An EMPTY in-scope walk is indistinguishable from a missing or unreadable
+ *     collection root, and sweeping it would retire the whole collection.
+ *     deactivateAbsentDocuments refuses this at the primitive as well.
+ */
+export function sweepDecision(
+  opts: { sweep?: boolean; limit?: number },
+  inScopeCount: number,
+): { sweep: boolean; reason: string | null } {
+  if (opts.sweep === false) {
+    return { sweep: false, reason: "disabled by --no-sweep" };
+  }
+  if (opts.limit !== undefined) {
+    return {
+      sweep: false,
+      reason:
+        "partial walk: --limit N truncates the file set, so absent-from-walk " +
+        "does not imply absent-from-disk",
+    };
+  }
+  if (inScopeCount === 0) {
+    return {
+      sweep: false,
+      reason:
+        "empty walk: the glob matched no in-scope file, which is " +
+        "indistinguishable from a missing/unreadable collection root — " +
+        "refusing to deactivate an entire collection",
+    };
+  }
+  return { sweep: true, reason: null };
+}
+
 export async function reindexCollection(
   name: string,
   root: string,
@@ -204,8 +276,26 @@ export async function reindexCollection(
   const stats: ReindexStats = {
     collection: name, filesSeen: files.length, documentsWritten: 0,
     fragmentsEmbedded: 0, embedFailures: 0, contentTypeRetagBacklog: {},
-    frontmatterParseFailures: {}, skippedOutOfScope: {}, wallClockMs: 0,
+    frontmatterParseFailures: {}, skippedOutOfScope: {},
+    documentsDeactivated: 0, deactivatedPaths: [], sweepSkippedReason: null,
+    wallClockMs: 0,
   };
+
+  /**
+   * THE SCOPE GATE, IN ONE PASS UP FRONT (master-harness-vn4rz.41).
+   *
+   * It used to run inside the document loop, which meant a `--limit N` run
+   * stopped recording out-of-scope files at the moment it hit the limit and
+   * reported a truncated skippedOutOfScope map. Hoisting it makes that count
+   * COMPLETE even on a limited run — a strict improvement to the pass-D signal
+   * whose whole value is that a number going to zero is noticeable.
+   *
+   * `inScope` IS the sweep's keep-set. The keep-set is therefore derived from
+   * exactly one place: the authoritative walked file set AFTER shouldExclude.
+   * Re-deriving it anywhere else would be a second copy of the scope rule, free
+   * to drift — the defect class this file's header warns about twice.
+   */
+  const inScope = files.filter(rel => !noteOutOfScope(stats, rel));
 
   /**
    * FRAGMENT-LEVEL EMBEDDING (delta amendment 1, master-harness-vn4rz.7 pass B).
@@ -287,21 +377,26 @@ export async function reindexCollection(
   };
 
   let n = 0;
-  for (const rel of files) {
-    // SCOPE GATE, before anything is read, parsed, embedded or written. The glob
-    // in a collection's config is a broad net; shouldExclude is what keeps
-    // _superseded/, _reviews/, dotted dirs and EXCLUDED_DIRS out of the vault —
-    // the sqlite indexer has always called it, and this path failing to was the
-    // pass-D defect (54 documents, 36 of them superseded ADRs, live and
-    // retrievable). Skipped files do NOT consume `limit`: the smoke pass should
-    // examine N real documents, not N glob hits.
-    if (noteOutOfScope(stats, rel)) continue;
+  for (const rel of inScope) {
+    // The scope gate now runs UP FRONT (see `inScope` above) rather than here,
+    // so that shouldExclude's verdict — what keeps _superseded/, _reviews/,
+    // dotted dirs and EXCLUDED_DIRS out of the vault, the pass-D defect: 54
+    // documents, 36 of them superseded ADRs, live and retrievable — is recorded
+    // for EVERY globbed file even when `limit` cuts the document loop short.
+    // Iterating the already-filtered list preserves the old property that
+    // skipped files do NOT consume `limit`: the smoke pass examines N real
+    // documents, not N glob hits.
     if (opts.limit !== undefined && n >= opts.limit) break;
     const abs = join(root, rel);
     let raw: string;
     try {
       raw = readFileSync(abs, "utf-8");
     } catch {
+      // The file STAYS in the sweep's keep-set. A transient read error (a
+      // permission blip, an NFS hiccup, a file being rewritten under us) means
+      // "could not read", never "does not exist" — and only the latter may
+      // retire a row. Deactivating on a read failure would turn a five-second
+      // outage into a silent corpus deletion.
       continue;
     }
     const hash = hashContent(raw);
@@ -377,6 +472,31 @@ export async function reindexCollection(
     }
   }
   await flush(true);
+
+  // ---------------------------------------------------------------------
+  // THE ABSENT-FROM-WALK SWEEP (master-harness-vn4rz.41).
+  //
+  // Runs AFTER the walk and after the final flush, so every file that exists
+  // has already been upserted back to active=true and cannot be caught by its
+  // own sweep. If the walk throws, this line is never reached and no sweep
+  // runs — deliberately NOT wrapped in a try/catch, because a partially
+  // completed walk's keep-set is exactly the evidence that must not drive a
+  // deactivation.
+  // ---------------------------------------------------------------------
+  const decision = sweepDecision(opts, inScope.length);
+  if (!decision.sweep) {
+    stats.sweepSkippedReason = decision.reason;
+  } else {
+    const reason =
+      `absent from reindex walk (clawmem pg reindex sweep, ` +
+      `master-harness-vn4rz.41) at ${new Date().toISOString()}`;
+    const res = await deactivateAbsentDocuments(name, inScope, reason);
+    stats.documentsDeactivated = res.deactivated;
+    stats.deactivatedPaths = res.deactivatedPaths;
+    if (res.deactivated > 0) {
+      log(`[${name}] sweep deactivated ${res.deactivated} document(s) absent from the walk`);
+    }
+  }
 
   stats.wallClockMs = Date.now() - t0;
   return stats;

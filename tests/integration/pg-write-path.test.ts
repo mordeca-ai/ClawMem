@@ -25,6 +25,7 @@ import { MIGRATIONS_DIR } from "../../src/pg/migrate.ts";
 import { closePool, toVectorLiteral } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
 import {
+  deactivateAbsentDocuments,
   insertEmbeddingsBatch,
   insertMemoryEvolution,
   upsertDocument,
@@ -827,4 +828,162 @@ d("PG write path", () => {
     );
     expect(after.rows[0]!.n).toBe(before.rows[0]!.n);
   });
+
+  // =========================================================================
+  // The absent-from-walk sweep (master-harness-vn4rz.41)
+  //
+  // A THROWAWAY collection name, inside the throwaway schema this suite already
+  // creates and drops. No real collection is ever named here: the whole defect
+  // being fixed is that rows get retired, so a test that pointed at
+  // `episodic-handoffs` or `openclaw-workspace` could do the exact damage the
+  // guard exists to prevent.
+  // =========================================================================
+  const SWEEP_COLLECTION = "__vn4rz41_sweep_test";
+
+  async function seedSweepDoc(path: string): Promise<void> {
+    const hash = `h_sweep_${path.replace(/[^a-z0-9]/gi, "_")}`;
+    await seedContent(hash, `# ${path}`);
+    await upsertDocument({
+      collection: SWEEP_COLLECTION, path, title: path, hash, body: `# ${path}`,
+    });
+  }
+
+  async function sweepRows(): Promise<{ path: string; active: boolean; reason: string | null }[]> {
+    const { rows } = await withSchema(c =>
+      c.query<{ path: string; active: boolean; deactivated_reason: string | null }>(
+        `SELECT path, active, deactivated_reason FROM documents
+          WHERE collection = $1 ORDER BY path`,
+        [SWEEP_COLLECTION],
+      ),
+    );
+    return rows.map(r => ({ path: r.path, active: r.active, reason: r.deactivated_reason }));
+  }
+
+  it("deactivateAbsentDocuments retires EXACTLY the rows absent from the keep-set, and nothing else", async () => {
+    for (const p of ["a.md", "b.md", "c.md"]) await seedSweepDoc(p);
+    expect((await sweepRows()).every(r => r.active)).toBe(true);
+
+    const reason = "absent from reindex walk (test, master-harness-vn4rz.41)";
+    const res = await deactivateAbsentDocuments(SWEEP_COLLECTION, ["a.md", "b.md"], reason);
+
+    expect(res.collection).toBe(SWEEP_COLLECTION);
+    expect(res.keptPaths).toBe(2);
+    expect(res.deactivated).toBe(1);
+    expect(res.deactivatedPaths).toEqual(["c.md"]);
+
+    // The row is SOFT-retired: still present, active=false, reason recorded.
+    // Never deleted — a file that comes back must upsert straight back to
+    // active=true rather than losing its history.
+    expect(await sweepRows()).toEqual([
+      { path: "a.md", active: true, reason: null },
+      { path: "b.md", active: true, reason: null },
+      { path: "c.md", active: false, reason },
+    ]);
+  });
+
+  it("is IDEMPOTENT — a second identical sweep retires nothing more", async () => {
+    // `AND active` in the predicate is what makes this true; without it the
+    // statement would re-stamp a fresh timestamp into deactivated_reason on
+    // every run and every summary would report a phantom deactivation.
+    const again = await deactivateAbsentDocuments(
+      SWEEP_COLLECTION, ["a.md", "b.md"], "second pass reason",
+    );
+    expect(again.deactivated).toBe(0);
+    expect(again.deactivatedPaths).toEqual([]);
+    const rows = await sweepRows();
+    expect(rows.find(r => r.path === "c.md")!.reason)
+      .toBe("absent from reindex walk (test, master-harness-vn4rz.41)");
+  });
+
+  it("does NOT touch content_vectors — the document row alone gates retrieval", async () => {
+    // content_vectors joins documents on hash WITH `AND d.active`, so retiring
+    // the document row is SUFFICIENT to remove it from retrieval. Deleting the
+    // vectors as well would make the soft deactivation quietly irreversible and
+    // force a re-embed (a yoshiee round trip per fragment) for any file that
+    // comes back. The vector is inserted with raw SQL rather than through
+    // insertEmbeddingsBatch so this test asserts the SWEEP's behaviour and is
+    // not coupled to whatever model the write-model preflight has pinned by the
+    // time it runs.
+    const hash = "h_sweep_vectors";
+    await seedContent(hash, "# vectors");
+    await upsertDocument({
+      collection: SWEEP_COLLECTION, path: "vectors.md", title: "vectors", hash, body: "# vectors",
+    });
+    await withSchema(c =>
+      c.query(
+        `INSERT INTO content_vectors (hash, seq, pos, model, embedding)
+         VALUES ($1, 0, 0, $2, $3::vector)`,
+        [hash, VAULT_MODEL, toVectorLiteral(vec(0.25))],
+      ),
+    );
+
+    await deactivateAbsentDocuments(SWEEP_COLLECTION, ["a.md", "b.md"], "vector-retention check");
+
+    const doc = await withSchema(c =>
+      c.query<{ active: boolean }>(
+        "SELECT active FROM documents WHERE collection = $1 AND path = 'vectors.md'",
+        [SWEEP_COLLECTION],
+      ),
+    );
+    expect(doc.rows[0]!.active).toBe(false); // it WAS swept ...
+    const vecs = await withSchema(c =>
+      c.query<{ n: string }>("SELECT count(*)::text n FROM content_vectors WHERE hash = $1", [hash]),
+    );
+    expect(vecs.rows[0]!.n).toBe("1"); // ... and its vector survived
+    const content = await withSchema(c =>
+      c.query<{ n: string }>("SELECT count(*)::text n FROM content WHERE hash = $1", [hash]),
+    );
+    expect(content.rows[0]!.n).toBe("1");
+
+    // Put it back so the later blast-radius assertions start from all-active.
+    await upsertDocument({
+      collection: SWEEP_COLLECTION, path: "vectors.md", title: "vectors", hash, body: "# vectors",
+    });
+  });
+
+  it("a returning file REACTIVATES on the next upsert", async () => {
+    await seedSweepDoc("c.md");
+    const rows = await sweepRows();
+    expect(rows.find(r => r.path === "c.md")!.active).toBe(true);
+  });
+
+  it("deduplicates the keep-set and reports the deduplicated size", async () => {
+    const res = await deactivateAbsentDocuments(
+      SWEEP_COLLECTION,
+      ["a.md", "a.md", "b.md", "c.md", "b.md", "vectors.md"],
+      "dedup pass",
+    );
+    expect(res.keptPaths).toBe(4);
+    expect(res.deactivated).toBe(0);
+  });
+
+  it("REFUSES an empty keep-set against a REAL populated collection, writing nothing", async () => {
+    // The negative case that matters: the guard has to hold when there is
+    // something to destroy. Assert NOTHING changed, not merely that it threw.
+    const before = await sweepRows();
+    await expect(
+      deactivateAbsentDocuments(SWEEP_COLLECTION, [], "should never be written"),
+    ).rejects.toThrow(/mass-deactivation hazard/);
+    expect(await sweepRows()).toEqual(before);
+    expect(before.every(r => r.active)).toBe(true);
+  });
+
+  it("is scoped to ONE collection — a sibling collection's rows are untouched", async () => {
+    // = ANY() over paths with no collection predicate would have swept the
+    // whole database. This is the blast-radius assertion.
+    await seedContent("h_sweep_sibling", "# sibling");
+    await upsertDocument({
+      collection: `${SWEEP_COLLECTION}_sibling`, path: "a.md", title: "sib",
+      hash: "h_sweep_sibling", body: "# sibling",
+    });
+    await deactivateAbsentDocuments(SWEEP_COLLECTION, ["a.md"], "scope check");
+    const { rows } = await withSchema(c =>
+      c.query<{ active: boolean }>(
+        "SELECT active FROM documents WHERE collection = $1",
+        [`${SWEEP_COLLECTION}_sibling`],
+      ),
+    );
+    expect(rows.map(r => r.active)).toEqual([true]);
+  });
+
 });

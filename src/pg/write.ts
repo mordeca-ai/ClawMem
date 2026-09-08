@@ -486,6 +486,98 @@ export async function upsertDocument(d: DocumentWrite): Promise<number> {
 }
 
 // ===========================================================================
+// The absent-from-walk sweep (master-harness-vn4rz.41)
+// ===========================================================================
+
+export interface DeactivateAbsentResult {
+  collection: string;
+  vault: Vault;
+  /** Size of the DEDUPLICATED keep-set actually sent to the database. */
+  keptPaths: number;
+  deactivated: number;
+  /** Sorted, so a diff of two runs is stable. */
+  deactivatedPaths: string[];
+}
+
+/**
+ * Deactivate every ACTIVE document row in `collection` whose path is not in
+ * `keepPaths` (master-harness-vn4rz.41).
+ *
+ * WHY THIS EXISTS. reindexCollection walks the files that exist and upserts
+ * them. Nothing ever retired a row whose source file had been DELETED, so
+ * reindex converged in ONE direction only and PG monotonically accumulated
+ * rows for files that no longer exist. Measured on the live vault: collection
+ * `episodic-handoffs` held 123 active rows against 55 files on disk, and all 68
+ * of the surplus were confirmed absent — pruned handoffs (master-harness
+ * CLAUDE.md prunes a handoff when its work lands), which is why that collection
+ * has the corpus's highest delete rate. Those 68 rows were live and retrievable
+ * and indistinguishable at query time from content that still exists.
+ *
+ * SOFT, NEVER DESTRUCTIVE. The row is flipped to active=false with a
+ * `deactivated_reason`; it is never DELETEd, and content_vectors is never
+ * touched. The vector join already carries `AND d.active`, so retiring the
+ * document row is sufficient to remove the content from retrieval, and keeping
+ * the row means a file that comes back (a revert, a rename undone) upserts back
+ * to active=true through the existing ON CONFLICT rather than losing history.
+ *
+ * THE EMPTY-KEEP-SET GUARD LIVES HERE, AT THE PRIMITIVE, NOT AT THE CALLER.
+ * `keepPaths.length === 0` means "deactivate the entire collection", which is
+ * exactly what a missing collection root, an unreadable mount or a glob that
+ * matched nothing looks like from the walk's side — indistinguishable from a
+ * genuine empty directory. reindex.ts refuses that case too (sweepDecision),
+ * but a guard that lives only in one caller is a guard a second caller can
+ * bypass by accident, so the refusal is duplicated at the primitive on purpose.
+ */
+export async function deactivateAbsentDocuments(
+  collection: string,
+  keepPaths: readonly string[],
+  reason: string,
+): Promise<DeactivateAbsentResult> {
+  if (keepPaths.length === 0) {
+    throw new Error(
+      `deactivateAbsentDocuments refuses an EMPTY keep-set for collection ` +
+      `${JSON.stringify(collection)}: a sweep with nothing to keep would ` +
+      `deactivate the ENTIRE collection in one statement, and an empty walk is ` +
+      `indistinguishable from a missing or unreadable collection root. That is ` +
+      `a mass-deactivation hazard, not a legitimate convergence. Pass the walked ` +
+      `file set, or do not sweep.`,
+    );
+  }
+  // Deduplicate: a keep-set is a SET, and = ANY() over a list with repeats does
+  // the same work twice for no benefit. Also makes keptPaths an honest number.
+  const keep = [...new Set(keepPaths)];
+
+  // Routed the same way upsertDocument routes, and for the same reason: the
+  // write path decides, not the caller (master-harness-0ynkd). No relPath is
+  // passed because the sweep is collection-scoped — resolveVault's relPath
+  // argument only feeds the private-path tripwire and never changes which vault
+  // is returned, so a collection resolves to exactly one vault.
+  const vault = resolveVault(collection);
+
+  return withTransaction(vault, async c => {
+    await assertVaultDatabase(c, vault);
+    const { rows } = await c.query<{ path: string }>(
+      `UPDATE documents
+          SET active = false,
+              deactivated_reason = $3
+        WHERE collection = $1
+          AND active
+          AND NOT (path = ANY($2::text[]))
+        RETURNING path`,
+      [collection, keep, reason],
+    );
+    const deactivatedPaths = rows.map(r => r.path).sort();
+    return {
+      collection,
+      vault,
+      keptPaths: keep.length,
+      deactivated: deactivatedPaths.length,
+      deactivatedPaths,
+    };
+  });
+}
+
+// ===========================================================================
 // entity_nodes + memory_evolution
 // ===========================================================================
 
