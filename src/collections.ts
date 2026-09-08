@@ -5,7 +5,7 @@
  * Collections define which directories to index and their associated contexts.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import YAML from "yaml";
@@ -98,12 +98,91 @@ function ensureConfigDir(): void {
 // Core functions
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// loadConfig memoization (master-harness-hxa17)
+// ---------------------------------------------------------------------------
+//
+// loadConfig() used to readFileSync + YAML.parse the config on EVERY call (twice,
+// in fact — `config` and `raw` were two independent parses of the same string).
+// It is called once per result row by getContextForFile(), and again per row via
+// listCollections(), so a single 60-row vector hydrate paid ~120 config loads and
+// a 6-leg query paid several hundred parses of one small file. Measured: 60x
+// loadConfig() = 235 ms, of which essentially all is redundant YAML parsing.
+//
+// The memo is keyed on the config file's IDENTITY — (resolved path, mtimeMs, size) —
+// so an edit on disk invalidates it; a missing file is itself a cacheable state
+// (sentinel mtime/size of -1). On any mismatch we re-read and re-parse.
+//
+// CORRECTNESS: callers MUTATE the object they get back (addCollection and friends
+// read-modify-write it, then saveConfig it). Handing out the cached reference would
+// let one caller's mutation leak into every later reader, silently corrupting the
+// vault config. So the memo caches the parsed value and EVERY call returns a fresh
+// independent deep copy.
+
+interface ConfigCacheEntry {
+  path: string;
+  mtimeMs: number;
+  size: number;
+  value: CollectionConfig;
+}
+
+let configCache: ConfigCacheEntry | null = null;
+
+/**
+ * Ops bypass: `CLAWMEM_DISABLE_CONFIG_CACHE=true` forces the uncached path.
+ * Read at call time (same convention as ftsBypassEnabled() in src/search-utils.ts)
+ * so a harness can toggle it per invocation.
+ */
+export function configCacheDisabled(): boolean {
+  return process.env.CLAWMEM_DISABLE_CONFIG_CACHE === "true";
+}
+
+/** Drop the memo. Used by saveConfig() and by tests. */
+export function clearConfigCache(): void {
+  configCache = null;
+}
+
+/** Identity of the config file right now; (-1, -1) means "does not exist". */
+function configFileIdentity(configPath: string): { mtimeMs: number; size: number } {
+  try {
+    const st = statSync(configPath);
+    return { mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return { mtimeMs: -1, size: -1 };
+  }
+}
+
 /**
  * Load configuration from ~/.config/clawmem/config.yaml
  * Returns empty config if file doesn't exist
+ *
+ * Memoized on (path, mtimeMs, size); always returns a fresh deep copy.
  */
 export function loadConfig(): CollectionConfig {
   const configPath = getConfigFilePath();
+
+  if (configCacheDisabled()) {
+    return parseConfigFile(configPath);
+  }
+
+  const { mtimeMs, size } = configFileIdentity(configPath);
+
+  if (
+    configCache !== null &&
+    configCache.path === configPath &&
+    configCache.mtimeMs === mtimeMs &&
+    configCache.size === size
+  ) {
+    return structuredClone(configCache.value);
+  }
+
+  const value = parseConfigFile(configPath);
+  configCache = { path: configPath, mtimeMs, size, value };
+  return structuredClone(value);
+}
+
+/** The uncached read + parse. Sole source of truth for config semantics. */
+function parseConfigFile(configPath: string): CollectionConfig {
   if (!existsSync(configPath)) {
     return { collections: {} };
   }
@@ -133,13 +212,14 @@ export function loadConfig(): CollectionConfig {
       }
     }
 
-    // Parse lifecycle policy if present
-    const raw = YAML.parse(content);
-    if (raw?.lifecycle && typeof raw.lifecycle === "object") {
-      const lc = raw.lifecycle;
+    // Parse lifecycle policy if present. (Historically this re-parsed `content` a second
+    // time into `raw`; one parse is equivalent — the lifecycle fields are read off the
+    // object before `config.lifecycle` is reassigned.)
+    const lc = (config as { lifecycle?: Record<string, unknown> }).lifecycle;
+    if (lc && typeof lc === "object") {
       config.lifecycle = {
         archive_after_days: typeof lc.archive_after_days === "number" ? lc.archive_after_days : 90,
-        type_overrides: typeof lc.type_overrides === "object" && lc.type_overrides !== null ? lc.type_overrides : {},
+        type_overrides: typeof lc.type_overrides === "object" && lc.type_overrides !== null ? lc.type_overrides as Record<string, number | null> : {},
         // INERT since v0.30.0 (see src/config.ts for the same guard) — only a positive
         // finite value is accepted; a negative or infinite one previously yielded a future
         // cutoff that deleted every archived row.
@@ -149,7 +229,7 @@ export function loadConfig(): CollectionConfig {
           lc.purge_after_days > 0
             ? lc.purge_after_days
             : null,
-        exempt_collections: Array.isArray(lc.exempt_collections) ? lc.exempt_collections : [],
+        exempt_collections: Array.isArray(lc.exempt_collections) ? lc.exempt_collections as string[] : [],
         dry_run: lc.dry_run !== false,
       };
     }
@@ -173,6 +253,7 @@ export function saveConfig(config: CollectionConfig): void {
       lineWidth: 0,  // Don't wrap lines
     });
     writeFileSync(configPath, yaml, "utf-8");
+    clearConfigCache();
   } catch (error) {
     throw new Error(`Failed to write ${configPath}: ${error}`);
   }

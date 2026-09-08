@@ -4,6 +4,120 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.6 — concurrent createStore(): fix the cold DELETE->WAL transition race (Issue #13 follow-up)
+
+Concurrent `createStore()` on a fresh database no longer fails with SQLITE_BUSY.
+
+The Issue #13 fix put `PRAGMA busy_timeout` before `PRAGMA journal_mode = WAL`
+so the WAL transition could wait instead of failing immediately. That ordering
+is necessary but it is NOT sufficient, and the gap was live: `PRAGMA journal_mode
+= WAL` returns SQLITE_BUSY *despite* a 15s busy_timeout, because SQLite does not
+run the busy handler for that particular lock upgrade — a connection already
+holding a shared lock that needs to escalate to exclusive is a potential
+deadlock, so SQLite returns immediately rather than waiting.
+
+Measured on the pre-fix tree: the regression test that asserts concurrent init
+does NOT hit SQLITE_BUSY was itself losing that race, 8 of 48 isolated reps
+(16.7%). Statement-level isolation attributed 100% of the failures to that one
+PRAGMA. So the guard was telling the truth — this is a real defect on the path
+every `clawmem hook` subprocess and every parallel before_reset fan-out takes,
+not test flakiness.
+
+`setWalJournalMode()` now wraps both call sites (`initializeDatabase()` and the
+readonly branch of `createStore()`) with two cooperating halves, both load-bearing:
+
+  - READ-FIRST — query `PRAGMA journal_mode` and skip the write entirely when the
+    database is already in WAL. An already-WAL database needs no exclusive lock
+    at all (0/30 reps fail), so in the steady state — every open after the first —
+    the contending statement is never issued. Roughly three quarters of openers
+    take this path.
+  - BOUNDED JITTERED RETRY — on SQLITE_BUSY from the actual DELETE->WAL
+    transition, back off (5ms doubling, capped at 200ms, jittered) and re-loop,
+    re-checking the read-first condition each pass, until the caller's budget is
+    spent, then rethrow. A non-BUSY error is never swallowed and never retried.
+
+Read-first alone is not enough — two openers can both read `delete` and both
+attempt the transition. Measured at 40 reps x 5 concurrent openers: unconditional
+write 4/40 reps fail; read-first alone 3/40 still fail; read-first plus retry
+0/40, with the retry firing on exactly the cases read-first could not absorb.
+
+The regression test was also STRENGTHENED rather than merely satisfied: the
+worker now takes a start-barrier epoch so the openers actually collide instead of
+drifting apart on process-startup jitter, and the opener count is configurable
+(`CLAWMEM_TEST_CONCURRENT_INIT_WORKERS`, default 5, previously hardcoded 3). The
+source-text ordering gates moved with the statement into the helper and gained
+two assertions they did not have: that no raw `PRAGMA journal_mode =` write can
+bypass the helper, and that inside the helper the read precedes the write.
+
+Verification: 30/30 isolated reps green with the fix; 9/15 RED against pristine
+`store.ts` with the same strengthened test, so the check is non-vacuous. Unit
+tier 1987 pass / 0 fail against a 1979 / 0 baseline (+8, the new helper unit
+tests). Full suite 2186 pass / 0 fail. `tsc --noEmit` output byte-identical to
+the baseline.
+
+---
+
+## v0.36.5 — clawmem passive recall: fix the hydrate path, not the cap (hxa17)
+
+Passive recall was DOWN fleet-wide: both retrieval arms exceeded their latency caps at the median, so sessions ran with zero semantic recall injected. Root cause was not the ANN search, the embed round-trip, the rerank endpoint or the expansion model — it was `hydrateVecResults`, the step its own comment called "the cheap, local half ... pure primary-key SQLite lookups". It cost MORE than the sqlite-vec search it hydrates.
+
+Two defects, both measured against the live vault (158,864 vectors / 19,639 documents):
+
+- `collections.loadConfig()` did readFileSync + `YAML.parse` twice on every call with no cache, and `getContextForFile()` calls it twice per result row — from `searchFTS` as well as `hydrateVecResults`, so all six retrieval legs paid it. Up to ~360 calls per prompt re-parsing one small unchanged file. Now memoized on (path, mtimeMs, size), returning a fresh deep copy every call because callers read-modify-write the config; `saveConfig()` invalidates, and `CLAWMEM_DISABLE_CONFIG_CACHE=true` is the ops bypass. 60x `loadConfig` 253 ms -> 2.9 ms.
+
+- `hydrateVecResults` filtered on the computed expression `cv.hash || '_' || cv.seq`, which no index can serve, so the planner fell back to `SCAN d USING INDEX idx_documents_effective_time` — a full scan of `documents`. It now filters on the indexed `cv.hash` using the distinct hashes implied by the requested list and drops non-requested fragments in JS. Plan becomes `SEARCH d USING INDEX idx_documents_hash`; the SQL goes 226 ms -> 22 ms on a 180-fragment input.
+
+The final sort is also now TOTAL. Cosine distances tie exactly and often — one live query carried a 19-fragment group at distance 0.5426244139671326 against a limit of 20 — so with a distance-only comparator, which tied documents survived `.slice(limit)` was decided by SQL row order, which under the old plan tracked documents-table effective-time order and re-rolled on any write. Recall on a tie boundary was silently write-order dependent. Breaking exact ties on filepath makes row order unobservable and the result deterministic across query plans and across vault writes. This is a deliberate behavior change against the previous engine: tied documents now sort lexicographically rather than by effective time.
+
+END TO END: median 8797 ms -> 3895 ms against an 8500 ms hook cap (builder), independently re-measured by the orchestrator at 7118 ms -> 2933 ms under host load 4.76, with every post-fix run faster than every pre-fix run. Attribution is separated and each half proven by break -> RED -> restore -> GREEN: the config memo accounts for ~2500 ms (flipping the bypass on returns the median to 6394 ms) and the predicate for the rest (reverting it restores both the SCAN plan and a 262 ms hydrate).
+
+No latency cap was raised and no threshold moved — the caps are unchanged and the substrate was fixed to meet them. Suite 2177 pass / 0 fail (baseline 2173/0), including a new hermetic regression test for the tie-break that is proven able to fail.
+
+---
+
+## v0.36.4 — canonical embed-model identity: one physical model, one recorded name
+
+One physical embedding model was being RECORDED under four different names, depending only on
+which arm produced the vector. `content_vectors.model` is written from `EmbeddingResult.model`,
+and the four producers disagreed: the in-process node-llama-cpp arm wrote the raw
+`hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf` resolution URI, the remote
+arm wrote whatever the endpoint echoed back, and when a reply omitted `model` it wrote the
+endpoint URL. Every one of those is the same 768-dimension geometry, so the dimension guard
+could never see the difference — which is why this class recurred three times through three
+different doors.
+
+The pin that was supposed to prevent it never could: `CLAWMEM_EMBED_MODEL` is wired to
+`remoteEmbedModel`, not `embedModel`, so it only ever named the remote *request* and left the
+local arm on its hardcoded default. The moment the configured endpoint hiccups, the transport
+fallback embeds locally and mints a second identity for a model that has not changed.
+
+- **Resolution and identity are now separate concerns.** `DEFAULT_EMBED_MODEL` remains a
+  resolution handle for `resolveModel()`; the new `canonicalEmbedModelId()` is the single
+  normalization point for what gets recorded.
+- **An explicit alias table** maps known variant spellings of one physical model to one
+  kebab-canonical id (ADR-0077 / ADR-0074): the hf: URI, `embeddinggemma`, and ollama's own
+  `embeddinggemma:latest` tag all collapse to `embeddinggemma`. There is deliberately no fuzzy
+  matching and no suffix stripping — an unknown model passes through lowercased and otherwise
+  unchanged, so two genuinely different models can never be merged. Adding an entry is an
+  explicit, reviewable assertion of physical equivalence.
+- **Applied at all four producers**, so exactly one identity per model reaches the write fence
+  and, for free, the read fence. An http(s) URL offered as an identity now throws
+  `EmbedModelIdentityError`, making that door unrepresentable rather than merely unused.
+- **Closed a fail-open inside the write fence.** `assertWriteEmbedModelConsistent` used to
+  return early for an unnamed write model; an unnamed row pushed into a vault holding a named
+  identity minted a second identity and made the read guard refuse every query. Unnamed writes
+  are now permitted only into a vault that holds no vectors.
+
+`embeddinggemma` is the canonical id on purpose: it is exactly what existing vaults already
+store, so this upgrade needs no re-embed and no migration.
+
+Proven against a copy of a real 6,939-vector vault: before this change the in-process arm's
+768-dim vector was refused with `VecWriteModelMismatchError` (the fail-closed that wedged a
+nightly re-embed for roughly four weeks); after it, the same vector is accepted and the vault
+still holds exactly one identity. 2,173 tests pass.
+
+---
+
 ## v0.36.3 — reranker health: logit-space margin, and prescriptions that match the evidence
 
 Doctor called a *healthy* reranker "degenerate / not discriminating" and told the operator to
