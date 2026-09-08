@@ -4,6 +4,59 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.7 — PostgreSQL write path (ADR-0162), inert by config default
+
+The PostgreSQL write path (ADR-0162) ships as a branch of record. It is INERT by
+config default: nothing on a live code path imports it, and no shipped config
+selects it.
+
+This closes master-harness-vkmfi's item (1). Sixteen commits across seven CLOSED
+beads (vn4rz.7, vn4rz.8, vn4rz.34, vn4rz.35, 0ynkd, a2t8r, e7d4z) had lived only
+on `bd/vn4rz.7-pg-write-path`, unpushed. The fleet's live binary ran that code
+purely because the checkout happened to be parked on the feature branch — live
+behaviour no branch of record reproduced, that a fresh clone would not have, and
+that any `git checkout main` silently un-deployed. That is exactly what happened
+when an unrelated land moved the tree back to main. `main` and `live` now agree.
+
+WHAT LANDS
+
+  - `src/pg/` — the additive write path: client/pool, config, vault routing with
+    a hard-coded private-root tripwire, migration runner, origin tier, the
+    reindex-not-copy entry point, CLI, and a typed error surface.
+  - `migrations/001`..`006` — core schema, HNSW vector index, content_type enum
+    extension, RANGE-partitioned origin documents, FTS functions with a pinned
+    `search_path`, and monthly RANGE-partitioned telemetry.
+  - `src/indexer.ts` — unparseable frontmatter is now loud, counted and
+    distinguishable instead of swallowed by a bare `catch {}`. This is the one
+    genuinely live-affecting fix in the set, and the one that was silently
+    un-deployed by the branch move; it reaches every index and reindex path.
+  - `src/collections.ts` — an optional `vault?: "sfw" | "nsfw"` declaration,
+    preserved across `collection add` so a private collection cannot be silently
+    downgraded to the default vault by a config rewrite.
+  - `pg` + `@types/pg` dependencies.
+
+WHY IT IS INERT, MEASURED RATHER THAN ASSERTED
+
+No non-`src/pg/` source file imports `src/pg/` — the write path has no caller on
+any live entry point. The integration tier SKIPS (never fails) when
+`CLAWMEM_PG_URL` is unset, so `bun test` on a machine with no cluster stays
+green: 23 pass / 45 skip / 0 fail measured with the variable unset. Recall
+continues to serve from `index.sqlite`. The reader-side flip is deliberately NOT
+here; it belongs to the read-path cutover, which moves the readers in one change.
+
+The two live-file changes are additive: the `vault?` field is optional, and the
+indexer change replaces a silent swallow with a counted failure.
+
+COVERAGE
+
+54 unit tests across the four new/extended unit files (pg vault config, pg vault
+routing, pg reindex scope, frontmatter parse failure) pass with 525 expect()
+calls. The PG integration suites carry proven-red controls: every guard is
+exercised in both directions, and the negative cases assert that NOTHING was
+written rather than merely that a throw happened.
+
+---
+
 ## v0.36.6 — concurrent createStore(): fix the cold DELETE->WAL transition race (Issue #13 follow-up)
 
 Concurrent `createStore()` on a fresh database no longer fails with SQLITE_BUSY.
