@@ -4,6 +4,23 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.10 — Postgres vector read path
+
+Postgres vector read path (Campaign B slice 1). Adds `src/pg/search.ts` — the
+pgvector-backed similarity read behind the same retrieval shape the SQLite
+substrate implements — plus a model-identity fence that refuses a query whose
+embedding model does not match the model the target collection was indexed
+under, so a silent cross-model recall degradation is impossible rather than
+merely unlikely. Surfaces as a `pg search` verb on the `pg` CLI, with typed
+errors in `src/pg/errors.ts`. Ships a 20-case unit tier
+(`tests/unit/pg-search-vec.test.ts`) covering the fence, ordering, limit/offset
+and the empty-collection and dimension-mismatch negatives.
+
+Read-path only — no write-path or hook changes; the dual-read parity window and
+the r46 retrieval-parity run remain open work.
+
+---
+
 ## v0.36.9 — embed input budget derived from the model's advertised context
 
 `truncateForEmbed` capped remote embed input at a hardcoded `CLAWMEM_EMBED_MAX_CHARS`
