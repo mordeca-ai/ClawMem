@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.13 — typed degraded channel for the PG vector read path (GAP 7)
+
+pgSearchVecDetailed returns a typed degraded channel — no-stored-vectors / budget-exhausted-pre-embed / embed-unavailable / budget-exhausted-pre-sql — so a caller can finally tell 'we searched and nothing matched' from 'we could not look'. pgSearchVec becomes a thin back-compat wrapper over it (observable behavior unchanged); pgSearchVecDetailedInVault mirrors the vault convenience wrapper. No production caller migrated: the bead wants the typed channel to exist BEFORE any caller switches. 9 new unit cases + 5 new live-cluster integration cases; the 29 pre-existing unit and 10 pre-existing integration cases pass unmodified.
+
+---
+
 ## v0.36.12 — PG FTS trigger functions resolve their tables in the deployment's own schema (migration 007)
 
 FTS trigger functions now resolve their tables in the deployment's own schema.

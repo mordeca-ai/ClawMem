@@ -26,6 +26,7 @@ import {
   getStoredVecModels,
   normalizeCollections,
   pgSearchVec,
+  pgSearchVecDetailed,
   type PgQueryable,
   type PgVecEmbedder,
   type PgVecRow,
@@ -386,5 +387,152 @@ describe("pgSearchVec bounds both SQL legs with transaction-local GUCs", () => {
     expect(caught).toBeInstanceOf(PgVecSearchTimeoutError);
     expect((caught as PgVecSearchTimeoutError).stage).toBe("ann-scan");
     expect((caught as PgVecSearchTimeoutError).timeoutMs).toBe(5);
+  });
+});
+
+// ===========================================================================
+// THE DEGRADED CHANNEL (master-harness-2wx75 GAP 7).
+//
+// pgSearchVec collapses five distinct outcomes into the same `[]`. These cases
+// pin the typed channel that separates them, and the two CONTROLS are what make
+// the rest mean anything: `no-stored-vectors` (we could not look) and
+// genuine-empty (we looked, nothing matched) both return zero results, and they
+// MUST NOT be the same value.
+// ===========================================================================
+
+/** An embedder that reports being down: no embedding at all. */
+const deadEmbedder: PgVecEmbedder = { async embed() { return null; } };
+
+/** An embedder that takes `ms` to answer — used to burn the wall-clock budget. */
+function slowEmbedder(model: string, ms: number): PgVecEmbedder {
+  return {
+    async embed() {
+      await new Promise(r => setTimeout(r, ms));
+      return { embedding: [0.1, 0.2], model };
+    },
+  };
+}
+
+describe("pgSearchVecDetailed — degraded reasons are distinguishable", () => {
+  it("no-stored-vectors: the fence found nothing embedded in scope", async () => {
+    const c = searchClient({ storedModels: [] });
+    const out = await pgSearchVecDetailed(c, "hello", { embedder: fakeEmbedder("embeddinggemma") });
+    expect(out.degraded).toBe(true);
+    expect(out.degradedReason).toBe("no-stored-vectors");
+    expect(out.results).toEqual([]);
+    expect(out.scannedFragments).toBe(0);
+    expect(out.storedModels).toBe(0);
+    // Nothing was embedded and no ANN scan ran.
+    expect(out.embedModel).toBeUndefined();
+    expect(sqlOf(c).some(t => t.includes("<=>"))).toBe(false);
+  });
+
+  it("budget-exhausted-pre-embed: timeoutMs was spent before the embed leg", async () => {
+    const c = searchClient({ storedModels: ["embeddinggemma"], rows: [row()] });
+    const emb = fakeEmbedder("embeddinggemma");
+    const out = await pgSearchVecDetailed(c, "hello", { embedder: emb, timeoutMs: 0 });
+    expect(out.degraded).toBe(true);
+    expect(out.degradedReason).toBe("budget-exhausted-pre-embed");
+    expect(out.results).toEqual([]);
+    expect(out.scannedFragments).toBe(0);
+    // The fence DID run and DID find a model — that is what makes this reason
+    // different from no-stored-vectors.
+    expect(out.storedModels).toBe(1);
+    expect(out.embedModel).toBeUndefined();
+    expect(emb.calls).toHaveLength(0);
+    expect(sqlOf(c).some(t => t.includes("<=>"))).toBe(false);
+  });
+
+  it("embed-unavailable: the endpoint returned no embedding", async () => {
+    const c = searchClient({ storedModels: ["embeddinggemma"], rows: [row()] });
+    const out = await pgSearchVecDetailed(c, "hello", { embedder: deadEmbedder });
+    expect(out.degraded).toBe(true);
+    expect(out.degradedReason).toBe("embed-unavailable");
+    expect(out.results).toEqual([]);
+    expect(out.scannedFragments).toBe(0);
+    expect(out.storedModels).toBe(1);
+    expect(out.embedModel).toBeUndefined();
+    expect(sqlOf(c).some(t => t.includes("<=>"))).toBe(false);
+  });
+
+  it("budget-exhausted-pre-sql: the budget went to the embed round trip", async () => {
+    const c = searchClient({ storedModels: ["embeddinggemma"], rows: [row()] });
+    const out = await pgSearchVecDetailed(c, "hello", {
+      embedder: slowEmbedder("embeddinggemma", 25),
+      timeoutMs: 5,
+    });
+    expect(out.degraded).toBe(true);
+    expect(out.degradedReason).toBe("budget-exhausted-pre-sql");
+    expect(out.results).toEqual([]);
+    expect(out.scannedFragments).toBe(0);
+    expect(out.storedModels).toBe(1);
+    // The embed leg DID run and DID report a model — this is the one degraded
+    // path that knows it.
+    expect(out.embedModel).toBe("embeddinggemma");
+    expect(sqlOf(c).some(t => t.includes("<=>"))).toBe(false);
+  });
+
+  it("CONTROL — healthy: rows present is degraded:false with the pre-dedup count", async () => {
+    const c = searchClient({
+      storedModels: ["embeddinggemma"],
+      rows: [row({ path: "a.md", distance: 0.1 }), row({ path: "b.md", distance: 0.3 })],
+    });
+    const out = await pgSearchVecDetailed(c, "hello", { embedder: fakeEmbedder("embeddinggemma") });
+    expect(out.degraded).toBe(false);
+    expect(out.degradedReason).toBeUndefined();
+    expect(out.results.length).toBeGreaterThan(0);
+    expect(out.results.map(r => r.displayPath)).toEqual(["research/a.md", "research/b.md"]);
+    expect(out.scannedFragments).toBe(2);
+    expect(out.storedModels).toBe(1);
+    expect(out.embedModel).toBe("embeddinggemma");
+  });
+
+  it("CONTROL — genuine empty: we searched and nothing matched, so NOT degraded", async () => {
+    // THE POINT OF THE WHOLE SLICE. Same zero results as no-stored-vectors
+    // above, and it must NOT carry the same meaning: the fence passed, the
+    // embed leg produced a vector, the ANN scan ran, zero rows came back.
+    const c = searchClient({ storedModels: ["embeddinggemma"], rows: [] });
+    const out = await pgSearchVecDetailed(c, "hello", { embedder: fakeEmbedder("embeddinggemma") });
+    expect(out.degraded).toBe(false);
+    expect(out.degradedReason).toBeUndefined();
+    expect(out.results).toEqual([]);
+    expect(out.scannedFragments).toBe(0);
+    expect(out.storedModels).toBe(1);
+    expect(out.embedModel).toBe("embeddinggemma");
+    // And the ANN scan really ran — that is the difference, not the result.
+    expect(sqlOf(c).some(t => t.includes("<=>"))).toBe(true);
+  });
+
+  it("the two zero-result outcomes are not the same value", async () => {
+    const cannotLook = await pgSearchVecDetailed(searchClient({ storedModels: [] }), "hello", {
+      embedder: fakeEmbedder("embeddinggemma"),
+    });
+    const nothingMatched = await pgSearchVecDetailed(
+      searchClient({ storedModels: ["embeddinggemma"], rows: [] }),
+      "hello",
+      { embedder: fakeEmbedder("embeddinggemma") },
+    );
+    expect(cannotLook.results).toEqual(nothingMatched.results);
+    expect(cannotLook.degraded).not.toBe(nothingMatched.degraded);
+  });
+});
+
+describe("pgSearchVec stays a byte-identical back-compat wrapper", () => {
+  it("degraded input: the bare array equals detailed().results", async () => {
+    const mk = () => searchClient({ storedModels: [] });
+    const opts = { embedder: fakeEmbedder("embeddinggemma") };
+    expect(await pgSearchVec(mk(), "hello", opts))
+      .toEqual((await pgSearchVecDetailed(mk(), "hello", opts)).results);
+  });
+
+  it("healthy input: the bare array equals detailed().results", async () => {
+    const mk = () => searchClient({
+      storedModels: ["embeddinggemma"],
+      rows: [row({ path: "a.md", distance: 0.1 }), row({ path: "b.md", distance: 0.3 })],
+    });
+    const opts = { embedder: fakeEmbedder("embeddinggemma") };
+    const bare = await pgSearchVec(mk(), "hello", opts);
+    expect(bare).toEqual((await pgSearchVecDetailed(mk(), "hello", opts)).results);
+    expect(bare).toHaveLength(2);
   });
 });
