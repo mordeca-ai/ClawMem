@@ -245,6 +245,25 @@ describe("pgSearchHybridDetailed — both arms healthy", () => {
     expect(out.armFailures).toEqual([]);
   });
 
+  it("RUNS THE ARMS IN SEQUENCE: no vec SQL after the first fts SQL", async () => {
+    // THE 25P01 REGRESSION GUARD. `PgQueryable` is one connection and a
+    // connection holds one transaction; the first draft of this module ran both
+    // arms under Promise.allSettled and PostgreSQL rejected the interleaved
+    // transaction blocks with "ROLLBACK TO SAVEPOINT can only be used in
+    // transaction blocks". It failed INTERMITTENTLY, on microtask ordering, so
+    // the guard has to be an explicit ordering assertion rather than a live
+    // green run. Reintroduce concurrency and this goes red deterministically.
+    const c = hybridClient({ vecRows: [], ftsRows: [] });
+    await pgSearchHybridDetailed(c, "q", { collections: "research", embedder });
+    const isVec = (t: string) => t.includes("<=>") || t.includes("SELECT DISTINCT cv.model");
+    const isFts = (t: string) => t.includes("numnode") || t.includes("ts_rank_cd");
+    const firstFts = c.sql.findIndex(isFts);
+    const lastVec = c.sql.reduce((acc, t, i) => (isVec(t) ? i : acc), -1);
+    expect(firstFts).toBeGreaterThan(-1);
+    expect(lastVec).toBeGreaterThan(-1);
+    expect(lastVec).toBeLessThan(firstFts);
+  });
+
   it("forwards ONE scope and ONE budget to BOTH arms", async () => {
     const c = hybridClient({ vecRows: [], ftsRows: [] });
     await pgSearchHybridDetailed(c, "q", {
@@ -344,7 +363,7 @@ describe("pgSearchHybridDetailed — a THROWING arm is demoted, not fatal", () =
     const f = new Error("fts down");
     const p = run({ vecThrows: v, ftsThrows: f });
     await expect(p).rejects.toThrow("vec down");
-    const err = await p.catch(e => e as Error);
+    const err = (await p.catch(e => e)) as Error;
     expect(err.cause).toBe(f);
   });
 });

@@ -150,7 +150,10 @@ export interface PgSearchHybridOptions {
    * candidates and the union is then capped back to `limit`.
    */
   limit?: number;
-  /** Wall-clock budget in ms, applied to each arm independently. */
+  /**
+   * Wall-clock budget in ms, applied to each arm INDEPENDENTLY. The arms run in
+   * sequence, so this is a per-arm bound and the call's worst case is 2x it.
+   */
   timeoutMs?: number;
   /** Server-side bound on each arm's SQL legs, in ms. */
   statementTimeoutMs?: number;
@@ -191,12 +194,32 @@ export function fuseRankedArms(
   return attachRrfScores(fused, lists.flat()).slice(0, limit);
 }
 
+type Settled<T> =
+  | { status: "fulfilled"; value: T }
+  | { status: "rejected"; reason: unknown };
+
+/**
+ * `Promise.allSettled`'s per-element shape, for a call that must run in
+ * SEQUENCE (see pgSearchHybridDetailed). One arm rejecting must not destroy the
+ * other arm's answer, and it must not skip the other arm either.
+ */
+async function settle<T>(fn: () => Promise<T>): Promise<Settled<T>> {
+  try {
+    return { status: "fulfilled", value: await fn() };
+  } catch (reason) {
+    return { status: "rejected", reason };
+  }
+}
+
 /**
  * Hybrid search over the PG vault: run both arms, fuse by rank.
  *
- * The arms run CONCURRENTLY (`allSettled`, so one rejection cannot cancel the
- * other's answer — see PgHybridArmFailure `kind: "threw"`). Both receive the
- * same scope and the same budget.
+ * The arms run SEQUENTIALLY on the handed client, because one connection cannot
+ * hold two transaction blocks at once — see the comment at the call site, which
+ * is the load-bearing constraint of this whole module. A rejecting arm is caught
+ * and demoted rather than allowed to skip or cancel the other (see
+ * PgHybridArmFailure `kind: "threw"`). Both receive the same scope, and each
+ * receives the same budget INDEPENDENTLY.
  *
  * This sits behind the same `(client, query, options)` shape as
  * pgSearchVecDetailed / pgSearchFtsDetailed, so migrating a caller onto the
@@ -217,16 +240,33 @@ export async function pgSearchHybridDetailed(
     ...(opts.statementTimeoutMs === undefined ? {} : { statementTimeoutMs: opts.statementTimeoutMs }),
   };
 
-  const [vecOutcome, ftsOutcome] = await Promise.allSettled([
-    pgSearchVecDetailed(c, query, {
-      ...shared,
-      ...(opts.embedder === undefined ? {} : { embedder: opts.embedder }),
-      ...(opts.overfetch === undefined ? {} : { overfetch: opts.overfetch }),
-    }),
-    pgSearchFtsDetailed(c, query, shared),
-  ]);
+  // SEQUENTIAL, NOT CONCURRENT — AND THAT IS A CORRECTNESS CONSTRAINT, NOT A
+  // STYLE CHOICE. `PgQueryable` is ONE connection, and a PostgreSQL connection
+  // hosts exactly ONE transaction at a time. Both arms wrap each SQL leg in
+  // BEGIN / SET LOCAL / COMMIT (with a SAVEPOINT inside), so running them under
+  // Promise.all/allSettled interleaves two transaction blocks on one backend and
+  // the loser gets SQLSTATE 25P01 ("ROLLBACK TO SAVEPOINT can only be used in
+  // transaction blocks"). MEASURED, not theorised: the first draft of this
+  // module did exactly that, and tests/integration/pg-search-hybrid.test.ts
+  // caught it — intermittently, because whether it fails depends on microtask
+  // interleaving, which is why the unit tier now pins the ordering explicitly.
+  //
+  // Concurrency here needs TWO clients checked out of the pool, which is a
+  // different signature than the arms already expose (see the *InVault wrappers)
+  // and is deliberately out of this slice. The cost of sequencing is that
+  // `timeoutMs` is a PER-ARM budget, so a hybrid call's worst-case wall clock is
+  // the sum of the two arms', not the max. Stated rather than hidden.
+  const vecOutcome = await settle(() => pgSearchVecDetailed(c, query, {
+    ...shared,
+    ...(opts.embedder === undefined ? {} : { embedder: opts.embedder }),
+    ...(opts.overfetch === undefined ? {} : { overfetch: opts.overfetch }),
+  }));
+  const ftsOutcome = await settle(() => pgSearchFtsDetailed(c, query, shared));
 
-  // BOTH REJECTED: outcome 4. Never demote a total failure to an empty answer.
+  // BOTH REJECTED: outcome 4. Never demote a total failure to an empty answer —
+  // a caller cannot tell `results: []` from "the database is unreachable", and
+  // that is the whole reason both arms throw instead of degrading on a
+  // cancelled statement.
   if (vecOutcome.status === "rejected" && ftsOutcome.status === "rejected") {
     const err = vecOutcome.reason;
     if (err instanceof Error && err.cause === undefined) err.cause = ftsOutcome.reason;
