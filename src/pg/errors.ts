@@ -25,6 +25,36 @@ export class PgVecWriteModelMismatchError extends Error {
   }
 }
 
+/**
+ * READ-PATH counterpart of PgVecWriteModelMismatchError (master-harness-2wx75).
+ *
+ * The query was embedded by a model that is not the one behind the stored rows
+ * in scope. Cosine distance between two vector spaces is not a degraded score,
+ * it is an uninterpretable number — so the search REFUSES rather than returning
+ * plausible-looking rows, and refuses LOUDLY rather than returning zero rows,
+ * which a caller cannot tell apart from "nothing matched".
+ */
+export class PgVecReadModelMismatchError extends Error {
+  readonly storedModels: string[];
+  readonly queryModel: string;
+  readonly scope: string;
+  constructor(storedModels: string[], queryModel: string, scope: string) {
+    super(
+      `Refusing vector search over ${scope}: the stored embeddings were produced ` +
+      `by [${storedModels.join(", ")}], but this query was embedded by ` +
+      `"${queryModel}". Different models are different vector spaces, so every ` +
+      `distance between them is meaningless (ADR-0162 §7). Returning zero rows ` +
+      `here would be indistinguishable from "no matches", so this is a refusal. ` +
+      `Either point the embed endpoint back at "${storedModels[0]}", or re-embed ` +
+      `the collection under "${queryModel}".`,
+    );
+    this.name = "PgVecReadModelMismatchError";
+    this.storedModels = storedModels;
+    this.queryModel = queryModel;
+    this.scope = scope;
+  }
+}
+
 /** A single batch carries rows from more than one model — drift by definition. */
 export class PgVecBatchModelMismatchError extends Error {
   constructor(a: string, b: string) {
