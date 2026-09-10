@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.14 — the FTS/lexical arm of the PG read path
+
+pgSearchFtsDetailed / pgSearchFts add the lexical arm of the PG read path, matching the vector arm's conventions: typed degraded channel (empty-tsquery / budget-exhausted), withBoundedTx statement_timeout bound, collection filter in SQL, active+invalidated fenced, total order on (rank DESC, filepath ASC). Ranking is ts_rank_cd with PostgreSQL's default {0.1,0.2,0.4,1.0} weights, whose A:D ratio of 10:1 reproduces the sqlite arm's bm25(documents_fts, 10.0, 1.0) title:body weighting by construction. Query parsing is websearch_to_tsquery, the only constructor that cannot throw on arbitrary user input. Needs no embedding endpoint, so it is the foundation of the yoshiee-DOWN leg. 24 new unit + 14 new live-cluster integration cases; the weights choice is instrument-proven (inverting the array turns the ranking cases red). The body-term case doubles as a regression guard for migration 007 (vn4rz.46), which is what unblocked this arm. No production caller migrated; RRF fusion and the trigram/typo path are still owed.
+
+---
+
 ## v0.36.13 — typed degraded channel for the PG vector read path (GAP 7)
 
 pgSearchVecDetailed returns a typed degraded channel — no-stored-vectors / budget-exhausted-pre-embed / embed-unavailable / budget-exhausted-pre-sql — so a caller can finally tell 'we searched and nothing matched' from 'we could not look'. pgSearchVec becomes a thin back-compat wrapper over it (observable behavior unchanged); pgSearchVecDetailedInVault mirrors the vault convenience wrapper. No production caller migrated: the bead wants the typed channel to exist BEFORE any caller switches. 9 new unit cases + 5 new live-cluster integration cases; the 29 pre-existing unit and 10 pre-existing integration cases pass unmodified.

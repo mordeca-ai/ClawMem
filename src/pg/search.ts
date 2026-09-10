@@ -250,7 +250,7 @@ export function assertQueryModelMatchesStored(
 /** PostgreSQL's SQLSTATE for "cancelled by statement_timeout" (or pg_cancel_backend). */
 const QUERY_CANCELED = "57014";
 
-function isQueryCanceled(e: unknown): boolean {
+export function isQueryCanceled(e: unknown): boolean {
   return typeof e === "object" && e !== null && (e as { code?: unknown }).code === QUERY_CANCELED;
 }
 
@@ -275,12 +275,29 @@ function isQueryCanceled(e: unknown): boolean {
  * it is asserted to be a non-negative integer first. 0 is PostgreSQL's own
  * "no bound".
  */
-async function withBoundedTx<T>(
+export interface BoundedTxOptions {
+  /**
+   * Set `hnsw.iterative_scan = strict_order` for the transaction. TRUE for the
+   * vector arm (it is the sanctioned answer to post-filtered ANN under-fill);
+   * FALSE for the lexical arm, which has no ANN index and for which the GUC
+   * would be pure noise on the connection.
+   */
+  hnswIterativeScan?: boolean;
+  /**
+   * How a SQLSTATE 57014 cancellation becomes a typed error. Defaults to
+   * PgVecSearchTimeoutError; the FTS arm passes its own so a caller reading
+   * `err.name` learns WHICH arm gave up.
+   */
+  onCanceled?: (timeoutMs: number, scope: string, stage: string, cause: unknown) => Error;
+}
+
+export async function withBoundedTx<T>(
   c: PgQueryable,
   timeoutMs: number,
   scope: string,
   stage: string,
   fn: () => Promise<T>,
+  txOpts: BoundedTxOptions = {},
 ): Promise<T> {
   if (!Number.isInteger(timeoutMs) || timeoutMs < 0) {
     throw new Error(
@@ -296,12 +313,14 @@ async function withBoundedTx<T>(
     // "not fatal" true INSIDE a transaction — an unrecognized-parameter error
     // aborts the transaction, and every later statement would fail with
     // "current transaction is aborted" if we merely swallowed it.
-    await c.query("SAVEPOINT clawmem_hnsw_guc");
-    try {
-      await c.query("SET LOCAL hnsw.iterative_scan = strict_order");
-      await c.query("RELEASE SAVEPOINT clawmem_hnsw_guc");
-    } catch {
-      await c.query("ROLLBACK TO SAVEPOINT clawmem_hnsw_guc");
+    if (txOpts.hnswIterativeScan ?? true) {
+      await c.query("SAVEPOINT clawmem_hnsw_guc");
+      try {
+        await c.query("SET LOCAL hnsw.iterative_scan = strict_order");
+        await c.query("RELEASE SAVEPOINT clawmem_hnsw_guc");
+      } catch {
+        await c.query("ROLLBACK TO SAVEPOINT clawmem_hnsw_guc");
+      }
     }
     const out = await fn();
     await c.query("COMMIT");
@@ -310,7 +329,11 @@ async function withBoundedTx<T>(
     // Best-effort: on a dead connection this throws too, and the server has
     // already rolled the transaction (and its SET LOCALs) back for us.
     await c.query("ROLLBACK").catch(() => {});
-    if (isQueryCanceled(e)) throw new PgVecSearchTimeoutError(timeoutMs, scope, stage, e);
+    if (isQueryCanceled(e)) {
+      const make = txOpts.onCanceled
+        ?? ((ms, sc, st, cause) => new PgVecSearchTimeoutError(ms, sc, st, cause));
+      throw make(timeoutMs, scope, stage, e);
+    }
     throw e;
   }
 }
