@@ -261,3 +261,34 @@ export class PgVecSearchTimeoutError extends Error {
     this.stage = stage;
   }
 }
+
+/**
+ * A LEXICAL (FTS) search whose SQL leg was cancelled by its server-side
+ * `statement_timeout` (master-harness-2wx75 slice 4).
+ *
+ * Parallel to PgVecSearchTimeoutError rather than shared with it, for the same
+ * reason the FTS arm's degraded-reason union is its own: the two arms have
+ * different failure surfaces and a caller reading `err.name` should learn WHICH
+ * arm gave up. A cancelled statement is never folded into the degraded channel —
+ * `degraded` describes a call that COMPLETED, and this one did not.
+ */
+export class PgFtsSearchTimeoutError extends Error {
+  readonly timeoutMs: number;
+  readonly scope: string;
+  readonly stage: string;
+  constructor(timeoutMs: number, scope: string, stage: string, cause?: unknown) {
+    super(
+      `Lexical (FTS) search over ${scope} exceeded its ${timeoutMs} ms statement ` +
+      `timeout during the ${stage} query. The SQL leg was cancelled by PostgreSQL, ` +
+      `not by the client, so nothing is still running server-side. This read path ` +
+      `serves a p95 <= 1800 ms hook budget (master-harness-2wx75); if this fires ` +
+      `routinely the fix is the plan or the corpus, not a bigger number — but a ` +
+      `caller that genuinely needs longer can pass statementTimeoutMs.`,
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = "PgFtsSearchTimeoutError";
+    this.timeoutMs = timeoutMs;
+    this.scope = scope;
+    this.stage = stage;
+  }
+}
