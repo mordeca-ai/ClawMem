@@ -22,7 +22,7 @@ import { readdirSync, readFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import type { PoolClient } from "pg";
-import { embedDim } from "./config.ts";
+import { embedDim, pgSchema } from "./config.ts";
 import { withClient } from "./client.ts";
 import type { Vault } from "./vaults.ts";
 
@@ -42,8 +42,44 @@ export interface ApplyResult {
   skipped: string[];
 }
 
+/**
+ * Substitute the migration parameters into one migration file's raw text.
+ *
+ * Exported because the integration suites apply the migration files directly
+ * against a throwaway schema, and a second, hand-maintained copy of this
+ * substitution in each of those suites is exactly how migration 007's
+ * `:CLAWMEM_SCHEMA` reached the server unsubstituted the first time
+ * (master-harness-vn4rz.46). One substitution, one home.
+ *
+ * `schema` defaults to the configured target schema and `dim` to the
+ * configured embedding dimension; callers that apply the files to a schema
+ * they created themselves (before `setPgSchema` is in effect), or with a
+ * fixture dimension, MUST pass those explicitly.
+ */
+export function substituteMigrationParams(
+  raw: string,
+  schema: string = pgSchema() ?? "public",
+  dim: number = embedDim(),
+): string {
+  return raw
+    .replaceAll(":EMBED_DIM", String(dim))
+    .replaceAll(":CLAWMEM_SCHEMA", `"${schema}"`);
+}
+
 /** Read + parameter-substitute every migration file, in version order. */
 export function loadMigrations(dir: string = MIGRATIONS_DIR): MigrationFile[] {
+  // `:CLAWMEM_SCHEMA` is the deployment's OWN schema (master-harness-vn4rz.46).
+  // Migration 005 hardened the FTS trigger functions against CVE-2018-1058 by
+  // pinning `search_path` and hard-qualifying `public.content` in the body —
+  // correct for a deployment that lives in `public`, but it pinned the
+  // FUNCTIONS to the literal name `public`, so a deployment pointed at another
+  // schema (including the integration suite's throwaway one, via setPgSchema)
+  // resolved the body's table in the WRONG schema, found nothing, coalesced to
+  // '' and silently stored a title-only tsvector. Interpolating the target
+  // schema keeps the hardening — search_path is still pinned, just to the
+  // schema the connection actually uses — without pinning the deployment to
+  // one schema NAME.
+  const schema = pgSchema() ?? "public";
   const dim = embedDim();
   return readdirSync(dir)
     .filter(f => f.endsWith(".sql"))
@@ -51,15 +87,17 @@ export function loadMigrations(dir: string = MIGRATIONS_DIR): MigrationFile[] {
     .map(f => {
       const path = join(dir, f);
       const raw = readFileSync(path, "utf-8");
-      // The ONLY substitution. `:EMBED_DIM` comes from the single named constant
-      // in config.ts so the dimension has exactly one authoritative home.
-      const sql = raw.replaceAll(":EMBED_DIM", String(dim));
+      // The only two substitutions, both sourced from the single named
+      // accessors in config.ts so each has exactly one authoritative home:
+      // `:EMBED_DIM` (embedding dimension) and `:CLAWMEM_SCHEMA` (target
+      // schema, quoted as an identifier).
+      const sql = substituteMigrationParams(raw, schema, dim);
       return {
         version: f.replace(/\.sql$/, ""),
         path,
         sql,
-        // Checksum the SUBSTITUTED text: changing EMBED_DIM is a schema change,
-        // and the recorded checksum must notice it.
+        // Checksum the SUBSTITUTED text: changing EMBED_DIM or the target
+        // schema is a schema change, and the recorded checksum must notice it.
         checksum: createHash("sha256").update(sql, "utf-8").digest("hex").slice(0, 16),
         noTransaction: /^--\s*clawmem:no-transaction\s*$/m.test(raw),
       };

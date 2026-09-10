@@ -25,7 +25,7 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import pg from "pg";
 import { readFileSync } from "fs";
 import { join } from "path";
-import { MIGRATIONS_DIR } from "../../src/pg/migrate.ts";
+import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
 import { closePool } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
 import {
@@ -56,7 +56,7 @@ const EXPECTED_CONFORM: Record<string, string> = {
 const EXPECTED_NEW = ["eval-run", "observation", "plan", "retro"] as const;
 
 function migrationSql(file: string): string {
-  return readFileSync(join(MIGRATIONS_DIR, file), "utf-8").replaceAll(":EMBED_DIM", String(DIM));
+  return substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, file), "utf-8"), undefined, DIM);
 }
 
 /**

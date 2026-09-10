@@ -18,7 +18,7 @@ import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync } from "f
 import { tmpdir } from "os";
 import { join } from "path";
 import { randomBytes } from "crypto";
-import { MIGRATIONS_DIR } from "../../src/pg/migrate.ts";
+import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
 import { closePool, withClient } from "../../src/pg/client.ts";
 import { resolvePgConfig, setPgSchema } from "../../src/pg/config.ts";
 import { resetVaultCache } from "../../src/pg/vaults.ts";
@@ -100,8 +100,7 @@ d("PG vault isolation", () => {
         await c.query("CREATE EXTENSION IF NOT EXISTS vector");
         await c.query("CREATE EXTENSION IF NOT EXISTS pg_trgm");
         for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
-          const sql = readFileSync(join(MIGRATIONS_DIR, f), "utf-8")
-            .replaceAll(":EMBED_DIM", String(DIM));
+          const sql = substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), undefined, DIM);
           await c.query(sql);
         }
       } finally {
