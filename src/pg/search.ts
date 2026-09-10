@@ -321,16 +321,90 @@ function scoreFromDistance(distance: number): number {
 }
 
 /**
- * Vector search over the PG vault. Returns `SearchResult[]` — the same shape
- * src/store.ts's searchVec() returns, deduped to the best-scoring fragment per
- * document and totally ordered by (distance, filepath) so ties do not resolve
- * by whatever order the plan happened to emit.
+ * Why a search returned nothing, when it returned nothing for a reason OTHER
+ * than "we looked and nothing matched".
+ *
+ * Each member corresponds 1:1 to one early-exit in pgSearchVecDetailed. There is
+ * deliberately NO member for "empty" — a genuine empty answer is
+ * `degraded: false` with `results: []`, and keeping that OUT of this union is
+ * the whole point (master-harness-2wx75 GAP 7).
  */
-export async function pgSearchVec(
+export type PgVecDegradedReason =
+  | "no-stored-vectors"           // the model fence found nothing embedded in scope
+  | "budget-exhausted-pre-embed"  // timeoutMs already spent before the embed leg
+  | "embed-unavailable"           // the embed endpoint returned no embedding
+  | "budget-exhausted-pre-sql";   // timeoutMs spent after the embed, before the ANN scan
+
+/**
+ * The typed result of a vector search — the degraded channel this path needs so
+ * that "we could not look" stops being the same value as "nothing matched".
+ *
+ * A CALLER MUST HANDLE THREE DISTINCT OUTCOMES, and a caller that cannot tell
+ * them apart is the bug this shape closes:
+ *
+ *  1. DEGRADED-EMPTY — `degraded: true`, `results: []`, `degradedReason` naming
+ *     which of the four non-answers happened. Nothing was searched (or nothing
+ *     could be). Presenting this to a user as "no matches" is a lie; it belongs
+ *     in a "search unavailable / not indexed yet" surface, and
+ *     "no-stored-vectors" in particular is an instruction to run the reindex.
+ *  2. GENUINE-EMPTY — `degraded: false`, `results: []`. The fence passed, the
+ *     embed leg produced a vector, the ANN scan ran, and zero rows matched. This
+ *     is a real, trustworthy answer: "nothing matched."
+ *  3. THROWN — the call rejects. A query-model mismatch throws
+ *     PgVecReadModelMismatchError (a meaningless search is refused, never
+ *     degraded), and a SQL leg that exceeded its SERVER-SIDE bound throws
+ *     PgVecSearchTimeoutError. Those stay throws ON PURPOSE and are NOT folded
+ *     into `degradedReason`: the fields below describe a call that completed,
+ *     and a cancelled statement did not.
+ *
+ * KNOWN WRINKLE, carried forward from slice 2 rather than fixed here:
+ * `isQueryCanceled()` keys on SQLSTATE 57014, which `pg_cancel_backend()` also
+ * emits — so an OPERATOR-initiated cancel is reported as a timeout. Stated, not
+ * addressed; distinguishing the two needs more than the SQLSTATE.
+ */
+export interface PgVecSearchDetailedResult {
+  results: SearchResult[];
+  degraded: boolean;
+  degradedReason?: PgVecDegradedReason;
+  /** Distinct embedding models the fence found in scope (0 ⇔ "no-stored-vectors"). */
+  storedModels: number;
+  /** ANN rows returned BEFORE the per-document dedup thinned them. 0 on every degraded path. */
+  scannedFragments: number;
+  /** The model the embed leg reported, when the embed leg ran and returned one. */
+  embedModel?: string;
+}
+
+function degraded(
+  reason: PgVecDegradedReason,
+  storedModels: number,
+  embedModel?: string,
+): PgVecSearchDetailedResult {
+  return {
+    results: [],
+    degraded: true,
+    degradedReason: reason,
+    storedModels,
+    scannedFragments: 0,
+    ...(embedModel === undefined ? {} : { embedModel }),
+  };
+}
+
+/**
+ * Vector search over the PG vault, WITH the degraded channel.
+ *
+ * The behaviour is identical to pgSearchVec (which is now a thin wrapper over
+ * this); the difference is entirely in what the caller can LEARN about an empty
+ * result. See PgVecSearchDetailedResult for the three outcomes.
+ *
+ * `results` is deduped to the best-scoring fragment per document and totally
+ * ordered by (distance, filepath) so ties do not resolve by whatever order the
+ * plan happened to emit.
+ */
+export async function pgSearchVecDetailed(
   c: PgQueryable,
   query: string,
   opts: PgSearchVecOptions = {},
-): Promise<SearchResult[]> {
+): Promise<PgVecSearchDetailedResult> {
   const limit = opts.limit ?? 20;
   const collections = normalizeCollections(opts.collections);
   const scope = collections ? collections.join(", ") : "(all collections)";
@@ -344,20 +418,20 @@ export async function pgSearchVec(
   // still wait an unbounded time on a lock.
   const storedModels = await withBoundedTx(c, statementTimeoutMs, scope, "model-fence", () =>
     getStoredVecModels(c, collections));
-  if (storedModels.length === 0) return [];
+  if (storedModels.length === 0) return degraded("no-stored-vectors", 0);
 
   const llm = opts.embedder ?? getDefaultLlamaCpp();
   let signal: AbortSignal | undefined;
   if (deadline !== undefined) {
     const remaining = deadline - Date.now();
-    if (remaining <= 0) return [];
+    if (remaining <= 0) return degraded("budget-exhausted-pre-embed", storedModels.length);
     signal = AbortSignal.timeout(remaining);
   }
   // isQuery + formatQueryForEmbedding: BOTH, exactly as store.ts's getEmbedding
   // does. The flag selects the endpoint's query-side params; the formatting is
   // what puts the vector in the same space as the stored fragments.
   const embedded = await llm.embed(formatQueryForEmbedding(query), { isQuery: true, signal });
-  if (!embedded?.embedding) return [];
+  if (!embedded?.embedding) return degraded("embed-unavailable", storedModels.length);
 
   // THE FENCE'S CALL SITE. Covered directly by
   // tests/unit/pg-search-vec.test.ts §"pgSearchVec wires the fence" and by
@@ -366,7 +440,9 @@ export async function pgSearchVec(
   // enough — a fence nobody calls is a fence with a gate next to it.
   assertQueryModelMatchesStored(storedModels, embedded.model, scope);
 
-  if (deadline !== undefined && Date.now() >= deadline) return [];
+  if (deadline !== undefined && Date.now() >= deadline) {
+    return degraded("budget-exhausted-pre-sql", storedModels.length, embedded.model);
+  }
 
   const { text, values } = buildVecSearchQuery(
     toVectorLiteral(embedded.embedding),
@@ -379,7 +455,31 @@ export async function pgSearchVec(
     return rows;
   });
 
-  return dedupeToSearchResults(rows, limit);
+  // GENUINE-EMPTY lives here: zero rows is `degraded: false`. We searched.
+  return {
+    results: dedupeToSearchResults(rows, limit),
+    degraded: false,
+    storedModels: storedModels.length,
+    scannedFragments: rows.length,
+    embedModel: embedded.model,
+  };
+}
+
+/**
+ * Vector search over the PG vault. Returns `SearchResult[]` — the same shape
+ * src/store.ts's searchVec() returns.
+ *
+ * BACK-COMPAT WRAPPER over pgSearchVecDetailed, byte-identical in observable
+ * behaviour. Prefer pgSearchVecDetailed for anything that needs to tell
+ * "nothing matched" from "we could not look"; this signature cannot express the
+ * difference, which is exactly why the detailed one exists.
+ */
+export async function pgSearchVec(
+  c: PgQueryable,
+  query: string,
+  opts: PgSearchVecOptions = {},
+): Promise<SearchResult[]> {
+  return (await pgSearchVecDetailed(c, query, opts)).results;
 }
 
 /**
@@ -432,4 +532,16 @@ export async function pgSearchVecInVault(
   opts: PgSearchVecOptions = {},
 ): Promise<SearchResult[]> {
   return withClient(vault, c => pgSearchVec(c, query, opts));
+}
+
+/**
+ * Convenience: run a DETAILED search on a client checked out of a vault's pool.
+ * Mirrors pgSearchVecInVault; returns the degraded channel with it.
+ */
+export async function pgSearchVecDetailedInVault(
+  vault: Vault,
+  query: string,
+  opts: PgSearchVecOptions = {},
+): Promise<PgVecSearchDetailedResult> {
+  return withClient(vault, c => pgSearchVecDetailed(c, query, opts));
 }

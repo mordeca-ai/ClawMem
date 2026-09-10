@@ -43,7 +43,7 @@ import { join } from "path";
 import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
 import { closePool, toVectorLiteral } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
-import { pgSearchVec, type PgVecEmbedder } from "../../src/pg/search.ts";
+import { pgSearchVec, pgSearchVecDetailed, type PgVecEmbedder } from "../../src/pg/search.ts";
 import { PgVecReadModelMismatchError, PgVecSearchTimeoutError } from "../../src/pg/errors.ts";
 
 const URL_ = process.env.CLAWMEM_PG_URL;
@@ -323,5 +323,91 @@ d("PG vector read path", () => {
       const { rows: ok } = await c.query<{ n: number }>("SELECT 1 AS n");
       expect(ok[0]!.n).toBe(1);
     });
+  });
+  // =========================================================================
+  // THE DEGRADED CHANNEL against the LIVE cluster (GAP 7).
+  //
+  // The unit tier proves the four reasons are produced; here the SAME reasons
+  // are produced by real PostgreSQL state, and the two zero-result outcomes are
+  // separated by real rows rather than by a fake's fixtures.
+  // =========================================================================
+
+  /** The real pgSearchVecDetailed, on a real client, in the throwaway schema. */
+  async function searchDetailed(opts: Parameters<typeof pgSearchVecDetailed>[2] = {}) {
+    return withSchema(c =>
+      pgSearchVecDetailed(c, "anything", { embedder: embedderFor(VAULT_MODEL), ...opts }));
+  }
+
+  it("no-stored-vectors: a collection with documents but nothing embedded yet", async () => {
+    // `drafts` holds one document and zero content_vectors rows — the live
+    // "nothing embedded yet" state the bead names. Same [] a genuine miss would
+    // give the old signature; here it is labelled.
+    const out = await searchDetailed({ collections: "drafts" });
+    expect(out.degraded).toBe(true);
+    expect(out.degradedReason).toBe("no-stored-vectors");
+    expect(out.results).toEqual([]);
+    expect(out.storedModels).toBe(0);
+    expect(out.scannedFragments).toBe(0);
+    expect(out.embedModel).toBeUndefined();
+  });
+
+  it("no-stored-vectors: a collection that does not exist, because the fence is collection-SCOPED", async () => {
+    // WORTH STATING because it is counter-intuitive: getStoredVecModels applies
+    // the SAME collection filter the ANN scan does, so a filter naming a
+    // collection with no rows reports "nothing embedded in scope" and never
+    // reaches the SQL leg. It is NOT a genuine empty result — we did not look.
+    const out = await searchDetailed({ collections: "no-such-collection" });
+    expect(out.degraded).toBe(true);
+    expect(out.degradedReason).toBe("no-stored-vectors");
+    expect(out.results).toEqual([]);
+  });
+
+  it("GENUINE EMPTY, live: the ANN scan really ran and matched zero rows", async () => {
+    // The fence passes (research has embeddinggemma vectors), the embed leg
+    // produces a vector, the bounded transaction runs the real `<=>` scan
+    // against the real index — and it returns no rows. degraded MUST be false:
+    // this is a trustworthy "nothing matched", not a failure to look.
+    //
+    // NOTE ON REACHABILITY (honest, and a finding rather than a fixture trick):
+    // with the fence scoped to the same (collection, active, invalidated)
+    // predicates as the scan, and content_vectors.hash FK'd to content, there
+    // is no live row-state where the scan sees zero rows but the fence saw a
+    // model. A caller-supplied `overfetch: 0` is the reachable way to drive that
+    // branch end-to-end on real PostgreSQL.
+    const out = await searchDetailed({ collections: "research", overfetch: 0 });
+    expect(out.degraded).toBe(false);
+    expect(out.degradedReason).toBeUndefined();
+    expect(out.results).toEqual([]);
+    expect(out.scannedFragments).toBe(0);
+    // The difference from the two cases above is not the result — it is these:
+    expect(out.storedModels).toBe(1);
+    expect(out.embedModel).toBe(VAULT_MODEL);
+  });
+
+  it("embed-unavailable: real vectors present, endpoint returns nothing", async () => {
+    const down: PgVecEmbedder = { async embed() { return null; } };
+    const out = await searchDetailed({ collections: "research", embedder: down });
+    expect(out.degraded).toBe(true);
+    expect(out.degradedReason).toBe("embed-unavailable");
+    expect(out.results).toEqual([]);
+    expect(out.scannedFragments).toBe(0);
+    // The fence DID see the stored model — that is what separates this from
+    // "nothing embedded yet", and the old signature could not say it.
+    expect(out.storedModels).toBe(1);
+    expect(out.embedModel).toBeUndefined();
+  });
+
+  it("CONTROL: the healthy live search is degraded:false and counts pre-dedup fragments", async () => {
+    const out = await searchDetailed({ collections: "research" });
+    expect(out.degraded).toBe(false);
+    expect(out.degradedReason).toBeUndefined();
+    expect(out.results.map(r => r.displayPath)).toEqual([
+      "research/near.md", "research/mid.md", "research/far.md",
+    ]);
+    // three active research fragments; retired.md is fenced out by d.active
+    expect(out.scannedFragments).toBe(3);
+    expect(out.embedModel).toBe(VAULT_MODEL);
+    // And the back-compat signature still returns exactly `.results`.
+    expect(await search({ collections: "research" })).toEqual(out.results);
   });
 });
