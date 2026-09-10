@@ -4,6 +4,23 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.16 — Read path -> PG: search/vsearch/query, per-prompt hook, MCP + openclaw plugin on Postgres; transient dual-read parity window; eval run r46 (recall/MRR vs SQLite gold within tolerance) + hook p95 <= 1800ms
+
+PG read path slice 6 — the RERANK ARM, composed over RRF fusion under ONE decrementing deadline.
+
+New `src/pg/search-reranked.ts` exports `pgSearchRerankedDetailed()`, which CALLS `pgSearchHybridDetailed()` and embeds its result unchanged rather than editing it — so slice 5's asserted invariant (`degraded === false <=> arms === "vec+fts" <=> armFailures.length === 0`) is preserved and re-asserted over the embedded object across all 8 arm combinations.
+
+- **The reranker is injected** (`PgReranker`), exactly as the embedder already is. `src/pg/` takes no runtime dependency on `src/store.ts`, so the `CLAWMEM_RERANK_URL` / `CLAWMEM_RERANK_API_KEY` contract, the GPU→local fallback chain and the d0hz per-backend cache-key namespacing are inherited through injection and never re-read here.
+- **One decrementing deadline, not a third per-arm timeout.** The two PG arms already run sequentially on one client (concurrent bounded transactions earn SQLSTATE 25P01), so the hybrid worst case is vec + fts. A third independent rerank timeout would make it vec + fts + rerank and put the bead's hook p95 ≤ 1800 ms clause out of reach by construction. Instead `deadlineMs` (default 1500) bounds the whole call: the rerank stage receives only `remaining`, and below `PG_RERANK_MIN_BUDGET_MS` (250) it is skipped rather than started. Measured `timings {hybridMs, rerankMs, totalMs}` are returned so the parity run reads the additive budget instead of inferring it.
+- **A rerank problem never throws the search.** Both arms failing still throws (retrieval genuinely could not look); a rerank failure means retrieval already succeeded, so the fused order is served and the reason is stated. `rerank: PgRerankStatus` is an always-present discriminator — `applied` / `skipped-no-reranker` / `skipped-budget` / `skipped-no-text` / `degenerate` / `failed` — and every non-`applied` status asserts a byte-identical fused `filepath` order.
+- **Blended with `blendRerank`, not `blendFusionAndRerank`.** Two correctness differences, not preferences: `blendRerank` maps over the candidates so partial rerank coverage can never drop a document, and it carries the degenerate-score floor plus the `onFallback` hook that this slice wires into the `degenerate` status.
+
+Tests: 22 unit + 10 live-PG integration (32 pass / 0 fail / 181 expect() calls). Full suite 2478 pass / 0 fail / 13 pre-existing skips with the live PG tier executing. Instrument proven red-capable by three independent mutations on distinct assertion classes — propagating a rerank failure (4 fail), swapping the blender (7 fail), handing the reranker the undecremented deadline (3 fail) — each restored.
+
+Not in this slice: caller migration (nothing imports the path yet), the trigram/typo arm, the dual-read parity window, and the r47 run. The rerank blend weight and both budget constants are policy rather than measurement until r47 prices them against a live cross-encoder.
+
+---
+
 ## v0.36.15 — PG hybrid read path: RRF fusion of the vector and lexical arms
 
 The two PostgreSQL read arms now compose. `pgSearchHybridDetailed()` runs the pgvector arm and the FTS arm against one client and fuses their results with Reciprocal Rank Fusion, reusing the same `reciprocalRankFusion` helper the sqlite hybrid path has always used rather than adding a second one. Fusion consumes RANKS, not scores: there is deliberately no cross-backend score normalization and no per-arm blend weight, because a cosine-derived score and a `ts_rank_cd` value are not on a shared scale and no comparability between them has been measured on this corpus -- inventing one would encode a relationship we have no evidence for. Degraded arms are the load-bearing part: every result carries a typed `arms` discriminator ('vec+fts' | 'vec-only' | 'fts-only' | 'none'), so a one-arm answer can never present itself as hybrid, a genuine 'nothing matched' stays distinguishable from 'we could not look', and both arms failing throws instead of returning an empty list. One defect the composition surfaced immediately: the arms must run SEQUENTIALLY, because a PostgreSQL connection holds one transaction at a time and running both arms' BEGIN/SET LOCAL/COMMIT blocks concurrently on one client earns SQLSTATE 25P01 -- so `timeoutMs` is a per-arm budget and a hybrid call's worst case is the sum of the two arms, not the max. Nothing calls the hybrid path yet; caller migration is a separate step.
