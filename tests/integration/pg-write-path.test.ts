@@ -21,7 +21,7 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import pg from "pg";
 import { readFileSync, readdirSync } from "fs";
 import { join } from "path";
-import { MIGRATIONS_DIR } from "../../src/pg/migrate.ts";
+import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
 import { closePool, toVectorLiteral } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
 import {
@@ -66,7 +66,7 @@ d("PG write path", () => {
       await c.query(`CREATE SCHEMA ${schema}`);
       await c.query(`SET search_path TO ${schema}, public`);
       for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
-        const sql = readFileSync(join(MIGRATIONS_DIR, f), "utf-8").replaceAll(":EMBED_DIM", String(DIM));
+        const sql = substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM);
         await c.query(sql);
       }
     } finally {
@@ -181,7 +181,7 @@ d("PG write path", () => {
     await withSchema(async c => {
       await c.query(`SET search_path TO ${schema}, public`);
       for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
-        await c.query(readFileSync(join(MIGRATIONS_DIR, f), "utf-8").replaceAll(":EMBED_DIM", String(DIM)));
+        await c.query(substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM));
       }
     });
     expect(await snapshot()).toBe(before);

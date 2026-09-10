@@ -4,6 +4,42 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.12 — PG FTS trigger functions resolve their tables in the deployment's own schema (migration 007)
+
+FTS trigger functions now resolve their tables in the deployment's own schema.
+
+Migration 005 pinned the three FTS trigger functions to the literal `public` schema —
+both `SET search_path = pg_catalog, public` and a hard-qualified `public.content` in
+each body — as CVE-2018-1058 belt-and-braces. The hardening was right; the pin was not.
+In any non-`public` schema the weight-D body subquery read an unseeded `public.content`,
+found no row, coalesced to `''`, and stored a **title-only tsvector with no error, no
+exception and no zero-row refusal** — the same silent-absence failure class 005's own
+header rails against. The integration suite runs each pass in a throwaway schema, so
+its FTS tier had been measuring title matching and reporting it as full-text matching.
+
+Migration `007_fts_functions_schema_portable.sql` redefines `documents_fts_refresh()`,
+`origin_documents_fts_refresh()` and `content_fts_cascade()` with unqualified table
+references and a `SET search_path` interpolated to the deployment's own schema, via a
+new `:CLAWMEM_SCHEMA` migration parameter. The CVE-2018-1058 hardening is preserved —
+search_path is still pinned, just to the schema the deployment actually uses.
+
+`migrate.ts`'s parameter substitution was extracted as `substituteMigrationParams()`;
+four integration suites that each carried a hand-copied duplicate of the `:EMBED_DIM`
+substitution now call it instead of growing a second hand-copy.
+
+Verified against the live cluster: `tests/integration/pg-write-path.test.ts` 37 pass /
+0 fail (was 36/1), with the `/fox/` and `to_tsquery('english','jumping')` assertions
+unchanged. The instrument was shown able to go RED — removing 007 reproduces the exact
+title-only symptom (`'chronicl':2A 'marmalad':1A`, exit 1) and restoring returns exit 0.
+Public-schema behaviour is unchanged: inside BEGIN/ROLLBACK on the live `public` schema,
+re-firing the trigger on a research row still yields thousands-range positional body
+terms. Sibling PG suites 33 pass / 13 skip / 0 fail; unit + smoke 2094 pass / 0 fail.
+
+Known follow-up: `origin_documents_ensure_partition()` carries the same literal-`public`
+qualification and is not yet exercised in a throwaway schema.
+
+---
+
 ## v0.36.11 — Bounded, self-unwinding PG vector search + integration tier
 
 Hardening for the Postgres vector read path (Campaign B slice 2). Closes four
