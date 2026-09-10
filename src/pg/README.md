@@ -39,6 +39,47 @@ Parity gate (in master-harness):
 tools/clawmem-pg-parity --counts
 ```
 
+## The read path: two arms and one fusion
+
+| Module | Entry point | What it is |
+|---|---|---|
+| `search.ts` | `pgSearchVecDetailed` | The **vector** arm — pgvector ANN, bounded, model-fenced |
+| `search-fts.ts` | `pgSearchFtsDetailed` | The **lexical** arm — `websearch_to_tsquery` + weighted `ts_rank_cd` |
+| `search-hybrid.ts` | `pgSearchHybridDetailed` | **RRF fusion** of the two |
+
+Three rulings are encoded in the fusion, and each has a test that goes red if it is undone:
+
+**Fusion consumes RANKS, not scores.** There is no cross-backend score normalization, no
+blend weight and no scaling between the arms. `1 - cosine_distance` and `ts_rank_cd` are not
+on a shared scale and no comparability between them has been *measured* on this corpus, so
+inventing one would encode a relationship we have no evidence for. RRF needs only each arm's
+ORDER, which is the part we have grounds to trust. The arms are equally weighted and that is
+**not** configurable — a tuning knob with no eval behind it is the same unmeasured claim.
+
+**A fused result NEVER silently presents itself as two-arm.** `PgHybridSearchResult.arms` is
+an always-present discriminator:
+
+| `arms` | `degraded` | Meaning |
+|---|---|---|
+| `"vec+fts"` | `false` | Both arms ran and are trustworthy. The **only** value on which a caller may say "hybrid". Includes the genuine-empty answer (`results: []`, nothing degraded — "nothing matched"). |
+| `"vec-only"` / `"fts-only"` | `true` | One arm degraded or threw; the healthy arm's ranking is returned, in its own order. Not an error, not empty — **not hybrid**. |
+| `"none"` | `true` | Neither arm could look. `results: []`. Rendering this as "no matches" is the lie both arms' degraded channels exist to prevent. |
+
+Both arms rejecting is a **throw**, never an empty answer. `armFailures[]` carries each
+non-contributing arm with its own arm-native reason (`kind: "degraded"`) or the error it
+raised (`kind: "threw"`); the two reason vocabularies are deliberately not merged, because
+`embed-unavailable` and `empty-tsquery` are not the same kind of fact.
+
+**The arms run SEQUENTIALLY, and that is a correctness constraint.** `PgQueryable` is one
+connection and a PostgreSQL connection holds one transaction at a time; both arms wrap each
+SQL leg in `BEGIN` / `SET LOCAL` / `COMMIT`. Running them concurrently on one client
+interleaves two transaction blocks and the loser gets SQLSTATE **25P01** (*"ROLLBACK TO
+SAVEPOINT can only be used in transaction blocks"*) — measured, not theorised. Consequence:
+`timeoutMs` is a **per-arm** budget, so a hybrid call's worst-case wall clock is the *sum* of
+the two arms', not the max. Concurrency would need two pooled clients.
+
+Nothing in `src/` calls the hybrid path yet — caller migration is a separate step.
+
 ## The three things that will bite you
 
 **1. The embedding dimension has exactly ONE home.** `EMBED_DIM` in `config.ts`. pgvector
