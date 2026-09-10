@@ -80,6 +80,69 @@ the two arms', not the max. Concurrency would need two pooled clients.
 
 Nothing in `src/` calls the hybrid path yet — caller migration is a separate step.
 
+### The rerank stage on top: `search-reranked.ts`
+
+| Module | Entry point | What it is |
+|---|---|---|
+| `search-reranked.ts` | `pgSearchRerankedDetailed` | The **cross-encoder rerank** stage — composes the hybrid, re-orders its head |
+
+It **composes** the hybrid rather than editing it: the call returns
+`{ results, hybrid, rerank, timings, … }` with `hybrid` carrying
+`PgHybridSearchResult` *verbatim*, so slice 5's three-way invariant still holds over that
+object (both test tiers re-assert it there). Folding rerank state into `degraded` / `arms`
+would break it — and a rerank problem is not an arm problem: retrieval succeeded either way.
+
+**`rerank` is an always-present discriminator, exactly like `arms`.** For every value other
+than `"applied"`, `results` **is** `hybrid.results` — the same array, byte-identical order.
+A rerank problem degrades to fusion, never to garbage, never to empty, never to a reordering
+nobody chose.
+
+| `rerank` | Meaning |
+|---|---|
+| `"applied"` | Ran, returned usable scores, the blend used them. The only value on which the order differs from the fusion. |
+| `"skipped-no-reranker"` | None injected. A **caller choice**, not a failure. |
+| `"skipped-budget"` | Less than `PG_RERANK_MIN_BUDGET_MS` (250) left of the deadline; we chose not to start. |
+| `"skipped-no-text"` | Nothing to rank — every candidate body empty, or no candidates at all. A degenerate *input*. |
+| `"degenerate"` | Responded, but no score cleared the degenerate floor (an empty response included). Surfaced by `blendRerank`'s `onFallback`. |
+| `"failed"` | Threw, or blew the remaining budget. `rerankError` carries the cause. |
+
+**A rerank problem NEVER throws the search.** Both arms failing still throws (slice 5's
+"we could not look" ≠ "nothing matched"), and the hybrid call here is deliberately *not*
+wrapped in a try/catch — this stage degrades rerank problems, not retrieval problems.
+
+**The budget is ONE deadline that DECREMENTS — not a third per-stage timeout.** `timeoutMs`
+already bounds *each arm*, and the arms run sequentially, so the hybrid's worst case is
+vec + fts. An independent `rerankTimeoutMs` would make it vec + fts + rerank and put the
+`hook p95 ≤ 1800 ms` clause out of reach *by construction*. Instead `deadlineMs` (default
+**1500**, unmeasured, chosen to sit under 1800 with caller headroom) is an **overall**
+wall-clock budget: `t0` once, hybrid, then `remaining = deadlineMs − elapsed` handed to the
+reranker as its `timeoutMs` — and raced against the same instant, so a reranker that honours
+neither `timeoutMs` nor `signal` still cannot overrun. Below the floor we skip. Measured
+`timings: { hybridMs, rerankMs, totalMs }` come back on the result so the parity run **reads**
+the additive budget instead of inferring it.
+
+**The reranker is INJECTED, like the embedder** — `src/pg/` does not import `src/store.ts`.
+The `CLAWMEM_RERANK_URL` / `CLAWMEM_RERANK_API_KEY` contract, the remote-GPU→local fallback
+chain, the batch-of-4 VRAM cap and the d0hz per-backend cache-key namespacing all live in
+`store.ts`'s `rerank()` and are inherited through injection, **never re-read here** (a second
+read of that env inside `src/pg/` is exactly the drift the "reuse the helper, don't restate
+it" ruling exists to prevent). Wire it as
+`(q, docs, o) => store.rerank(q, docs, DEFAULT_RERANK_MODEL, intent, o)`.
+
+**The blend is `blendRerank`, and there is no third blender.** Two correctness reasons, not
+preferences: it maps over **candidates**, so partial rerank coverage can never *drop* a
+document (`blendFusionAndRerank` maps over the rerank output and would); and it has the
+degenerate floor plus the `onFallback` hook that becomes the `"degenerate"` status here.
+`blendFusionAndRerank` also still applies `rrfWeight = 0.75` at rrfRank ≤ 3 — the very defect
+`blendRerank`'s own docstring names (RRF rank-1 mathematically immovable by the reranker).
+
+**Known duplication, stated rather than refactored:** the candidate-cap expression
+`Math.max(limit, 30)` and the 4000-char text truncation now exist both here and in
+`src/clawmem.ts` (~1549 / ~1608, the sqlite reference implementation of this same stage).
+Unifying them means touching the sqlite read path, which is a separate change.
+
+Nothing in `src/` calls the reranked path yet either.
+
 ## The three things that will bite you
 
 **1. The embedding dimension has exactly ONE home.** `EMBED_DIM` in `config.ts`. pgvector
