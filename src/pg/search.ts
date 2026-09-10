@@ -30,6 +30,16 @@
  *     the alias, or that wraps the column, silently becomes a seq scan over
  *     every fragment in the vault.
  *
+ * MEASURED PLANS (2026-09-09, live vault, pgvector 0.8.6, EXPLAIN COSTS OFF):
+ *   - NO collection filter  -> `Index Scan using content_vectors_embedding_hnsw_idx`
+ *     feeding a Memoize'd lookup of documents. The ANN index serves the order-by,
+ *     which is the whole point of the shape above.
+ *   - `--collection research` (141 docs / 8.5k fragments) -> the planner instead
+ *     PRE-filters (`documents_collection_active_idx`) and sorts exactly. That is
+ *     the RIGHT choice at that selectivity — it is exact rather than approximate —
+ *     and it is the planner's to make; do not hint it away. The `<=>` order-by is
+ *     what keeps BOTH plans available.
+ *
  * FILTERING + RECALL. The collection/active predicates sit in the SAME query as
  * the ANN order-by, which makes this a POST-FILTER against the HNSW index: the
  * index walks in distance order and the filter discards. On a narrow collection
