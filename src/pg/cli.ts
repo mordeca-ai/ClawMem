@@ -13,6 +13,7 @@ import { closePool, withClient } from "./client.ts";
 import { resolvePgConfig } from "./config.ts";
 import { isVault, type Vault } from "./vaults.ts";
 import { reindex } from "./reindex.ts";
+import { pgSearchVec } from "./search.ts";
 import { assertSchemaGeometry, getVecModels } from "./write.ts";
 import {
   dropLegacyDocumentRows, dropPartitionsBefore, listPartitions, loadOriginCollection,
@@ -66,6 +67,37 @@ async function main() {
         console.log(`embed dim:  ${dim}`);
         console.log(`vec models: ${models.length ? models.join(", ") : "(none embedded yet)"}`);
         for (const r of rows) console.log(`  ${r.collection.padEnd(28)} ${r.n.padStart(7)}`);
+      });
+      break;
+    }
+    // -------------------------------------------------------------------
+    // READ PATH (master-harness-2wx75). Exercises the vector arm end to end:
+    // embed the query with the SAME formatting the write path used, fence on
+    // model identity, ANN over content_vectors, join documents.
+    // -------------------------------------------------------------------
+    case "search": {
+      const q = flagValue(argv, "--query");
+      if (!q) throw new Error("search requires --query <text>");
+      const cols = flagValue(argv, "--collection");
+      const limitRaw = flagValue(argv, "--limit");
+      const timeoutRaw = flagValue(argv, "--timeout-ms");
+      await withClient(vault, async c => {
+        const results = await pgSearchVec(c, q, {
+          collections: cols ? cols.split(",").map(s => s.trim()) : undefined,
+          limit: limitRaw ? Number(limitRaw) : undefined,
+          timeoutMs: timeoutRaw ? Number(timeoutRaw) : undefined,
+        });
+        console.log(`vault:  ${vault}`);
+        console.log(`target: ${cfg.safeLabel}`);
+        console.log(`query:  ${q}`);
+        console.log(`results: ${results.length}`);
+        for (const r of results) {
+          console.log(
+            `  ${r.score.toFixed(4)}  ${r.displayPath}` +
+            (r.fragmentLabel ? `  [${r.fragmentType ?? "?"}: ${r.fragmentLabel}]` : ""),
+          );
+          console.log(`          ${r.filepath}  docid=${r.docid} pos=${r.chunkPos ?? 0}`);
+        }
       });
       break;
     }
@@ -231,10 +263,10 @@ async function main() {
     }
     default:
       console.error(
-        "usage: bun src/pg/cli.ts <migrate|status|reindex|origin-load|origin-partitions|" +
+        "usage: bun src/pg/cli.ts <migrate|status|reindex|search|origin-load|origin-partitions|" +
         "origin-drop-legacy|origin-retention> [--vault sfw|nsfw] " +
         "[--collection a,b] [--limit N] [--no-embed] [--no-sweep] [--month YYYY-MM] " +
-        "[--before DATE] [--apply]",
+        "[--before DATE] [--apply] [--query TEXT] [--timeout-ms N]",
       );
       process.exit(2);
   }
