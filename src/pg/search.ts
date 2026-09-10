@@ -49,13 +49,22 @@
  * genuinely the nearest, not merely near. See pgvector-readme#… / the
  * filtered-ANN notes in the postgres-ops canon. NOTE: not measured on our corpus
  * yet (master-harness-vn4rz.32 is the probe that would turn this into evidence).
+ *
+ * BOUNDING + GUC LIFETIME (slice 2, GAP 4 + GAP 8). Both GUCs are now `SET
+ * LOCAL` inside an explicit transaction, alongside a `statement_timeout` that
+ * bounds the SQL leg against this path's p95 <= 1800 ms hook budget. `SET` +
+ * `finally`-`RESET` on a POOLED client leaks the setting onto the next checkout
+ * the first time anything skips the finally; a transaction-local setting unwinds
+ * on commit AND on rollback, with no finally to forget. A cancelled statement
+ * surfaces as PgVecSearchTimeoutError — never as a raw driver throw and never as
+ * an empty result, which a caller cannot tell apart from "nothing matched".
  */
 
 import type { SearchResult } from "../store.ts";
 import { formatQueryForEmbedding, getDefaultLlamaCpp } from "../llm.ts";
 import { toVectorLiteral, withClient } from "./client.ts";
 import type { Vault } from "./vaults.ts";
-import { PgVecReadModelMismatchError } from "./errors.ts";
+import { PgVecReadModelMismatchError, PgVecSearchTimeoutError } from "./errors.ts";
 
 /**
  * The narrowest thing this module needs from a `pg` client: a parameterized
@@ -70,6 +79,36 @@ export interface PgQueryable {
   ): Promise<{ rows: R[] }>;
 }
 
+/**
+ * The narrowest thing this module needs from an embedding backend.
+ *
+ * Structurally satisfied by `LlamaCpp` (src/llm.ts), so production passes
+ * nothing and gets `getDefaultLlamaCpp()`. It is an OPTION rather than a hard
+ * import because the integration tier has to drive the REAL pgSearchVec against
+ * the live cluster: a test that cannot control the query vector cannot assert
+ * distance ORDER, and one that depends on a remote GPU endpoint being up is a
+ * test that reports the endpoint's health instead of this module's behaviour.
+ */
+export interface PgVecEmbedder {
+  embed(
+    text: string,
+    options?: { isQuery?: boolean; signal?: AbortSignal },
+  ): Promise<{ embedding: number[]; model: string } | null>;
+}
+
+/**
+ * Default `statement_timeout` for BOTH SQL legs, in ms.
+ *
+ * Derived, not picked: this read path serves a p95 <= 1800 ms hook budget
+ * (master-harness-2wx75), and that budget has to cover the embed round trip to
+ * the remote endpoint plus the SQL leg plus the mapping. 1200 ms leaves ~600 ms
+ * for everything that is not SQL while still being several hundred times the
+ * measured ANN latency on the live vault — so it bounds a pathological scan
+ * without being reachable by a healthy one. A caller with a different budget
+ * passes `statementTimeoutMs`; a caller that genuinely wants no bound passes 0.
+ */
+export const DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS = 1200;
+
 export interface PgSearchVecOptions {
   /** One collection name, a list of them, or nothing = every collection. */
   collections?: string | string[];
@@ -77,6 +116,14 @@ export interface PgSearchVecOptions {
   limit?: number;
   /** Wall-clock budget in ms for the embed leg + the SQL leg. */
   timeoutMs?: number;
+  /**
+   * Server-side bound on EACH SQL leg, in ms. Default
+   * DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS; 0 disables the bound entirely
+   * (PostgreSQL's own meaning for statement_timeout = 0).
+   */
+  statementTimeoutMs?: number;
+  /** Embedding backend. Defaults to getDefaultLlamaCpp(). */
+  embedder?: PgVecEmbedder;
   /**
    * Fragments the ANN pass considers before the JOIN filters and the per-document
    * dedup thin them. Mirrors the sqlite path's `limit * 3` overfetch, widened
@@ -200,6 +247,74 @@ export function assertQueryModelMatchesStored(
   throw new PgVecReadModelMismatchError(storedModels, queryModel, scope);
 }
 
+/** PostgreSQL's SQLSTATE for "cancelled by statement_timeout" (or pg_cancel_backend). */
+const QUERY_CANCELED = "57014";
+
+function isQueryCanceled(e: unknown): boolean {
+  return typeof e === "object" && e !== null && (e as { code?: unknown }).code === QUERY_CANCELED;
+}
+
+/**
+ * Run `fn`'s statements inside ONE transaction whose GUCs are `SET LOCAL`
+ * (master-harness-2wx75 slice 2, GAP 4 + GAP 8).
+ *
+ * WHY A TRANSACTION AND NOT `SET` + `finally`-`RESET`. The previous shape set
+ * `hnsw.iterative_scan` on the session and reset it in a `finally`. On a POOLED
+ * client that is a leak waiting for the first thing that skips the finally — a
+ * process exit, a connection-level error that kills the client mid-flight, a
+ * future early return added between the two — and the leaked GUC then applies
+ * to whatever unrelated caller checks that connection out next. `SET LOCAL`
+ * inside an explicit transaction cannot leak: the settings unwind on COMMIT and
+ * on ROLLBACK alike, including the ROLLBACK the server performs for us when the
+ * connection dies. There is no finally to forget because there is no reset.
+ *
+ * The `statement_timeout` rides the same mechanism, which is the point: the
+ * bound and the recall knob have identical lifetimes.
+ *
+ * `timeoutMs` is INTERPOLATED, not bound — `SET LOCAL` takes no parameters — so
+ * it is asserted to be a non-negative integer first. 0 is PostgreSQL's own
+ * "no bound".
+ */
+async function withBoundedTx<T>(
+  c: PgQueryable,
+  timeoutMs: number,
+  scope: string,
+  stage: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 0) {
+    throw new Error(
+      `statementTimeoutMs must be a non-negative integer (0 = no bound), got ${JSON.stringify(timeoutMs)}`,
+    );
+  }
+  await c.query("BEGIN");
+  try {
+    await c.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
+    // Iterative index scan for the post-filtered case (pgvector >= 0.8). Older
+    // pgvector has no such GUC; post-filter recall degrades, correctness does
+    // not, so it is deliberately not fatal. The SAVEPOINT is what makes
+    // "not fatal" true INSIDE a transaction — an unrecognized-parameter error
+    // aborts the transaction, and every later statement would fail with
+    // "current transaction is aborted" if we merely swallowed it.
+    await c.query("SAVEPOINT clawmem_hnsw_guc");
+    try {
+      await c.query("SET LOCAL hnsw.iterative_scan = strict_order");
+      await c.query("RELEASE SAVEPOINT clawmem_hnsw_guc");
+    } catch {
+      await c.query("ROLLBACK TO SAVEPOINT clawmem_hnsw_guc");
+    }
+    const out = await fn();
+    await c.query("COMMIT");
+    return out;
+  } catch (e) {
+    // Best-effort: on a dead connection this throws too, and the server has
+    // already rolled the transaction (and its SET LOCALs) back for us.
+    await c.query("ROLLBACK").catch(() => {});
+    if (isQueryCanceled(e)) throw new PgVecSearchTimeoutError(timeoutMs, scope, stage, e);
+    throw e;
+  }
+}
+
 /** Cosine distance → the sqlite path's score. Identical formula on purpose. */
 function scoreFromDistance(distance: number): number {
   return 1 - distance;
@@ -221,14 +336,17 @@ export async function pgSearchVec(
   const scope = collections ? collections.join(", ") : "(all collections)";
   const fragmentLimit = opts.overfetch ?? Math.max(limit * 8, 64);
   const deadline = opts.timeoutMs === undefined ? undefined : Date.now() + opts.timeoutMs;
+  const statementTimeoutMs = opts.statementTimeoutMs ?? DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS;
 
   // The fence FIRST: a cheap DISTINCT beats paying for an embed we are about to
   // refuse. It also means a mismatched endpoint reports the mismatch rather than
-  // an embed timeout.
-  const storedModels = await getStoredVecModels(c, collections);
+  // an embed timeout. It is bounded too — a DISTINCT is cheap work but it can
+  // still wait an unbounded time on a lock.
+  const storedModels = await withBoundedTx(c, statementTimeoutMs, scope, "model-fence", () =>
+    getStoredVecModels(c, collections));
   if (storedModels.length === 0) return [];
 
-  const llm = getDefaultLlamaCpp();
+  const llm = opts.embedder ?? getDefaultLlamaCpp();
   let signal: AbortSignal | undefined;
   if (deadline !== undefined) {
     const remaining = deadline - Date.now();
@@ -241,6 +359,11 @@ export async function pgSearchVec(
   const embedded = await llm.embed(formatQueryForEmbedding(query), { isQuery: true, signal });
   if (!embedded?.embedding) return [];
 
+  // THE FENCE'S CALL SITE. Covered directly by
+  // tests/unit/pg-search-vec.test.ts §"pgSearchVec wires the fence" and by
+  // tests/integration/pg-search-vec.test.ts against a live cluster: delete this
+  // line and BOTH go red. The pure function having its own unit cases is not
+  // enough — a fence nobody calls is a fence with a gate next to it.
   assertQueryModelMatchesStored(storedModels, embedded.model, scope);
 
   if (deadline !== undefined && Date.now() >= deadline) return [];
@@ -251,18 +374,10 @@ export async function pgSearchVec(
     fragmentLimit,
   );
 
-  // Iterative index scan for the post-filtered case (pgvector >= 0.8). Session
-  // GUCs leak across a POOLED checkout, so the reset is in a finally.
-  let rows: PgVecRow[];
-  await c.query("SET hnsw.iterative_scan = strict_order").catch(() => {
-    // Older pgvector has no such GUC. Post-filter recall degrades; correctness
-    // does not. Deliberately not fatal.
+  const rows = await withBoundedTx(c, statementTimeoutMs, scope, "ann-scan", async () => {
+    const { rows } = await c.query<PgVecRow>(text, values);
+    return rows;
   });
-  try {
-    ({ rows } = await c.query<PgVecRow>(text, values));
-  } finally {
-    await c.query("RESET hnsw.iterative_scan").catch(() => {});
-  }
 
   return dedupeToSearchResults(rows, limit);
 }

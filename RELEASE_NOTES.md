@@ -4,6 +4,35 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.11 — Bounded, self-unwinding PG vector search + integration tier
+
+Hardening for the Postgres vector read path (Campaign B slice 2). Closes four
+gaps slice 1 reported against itself.
+
+The SQL leg is now bounded and self-unwinding: `withBoundedTx` runs each search
+inside an explicit transaction with `SET LOCAL statement_timeout` (default
+1200 ms, caller-overridable via `PgSearchVecOptions.statementTimeoutMs`; 0 means
+PostgreSQL's no-bound) and `SET LOCAL hnsw.iterative_scan`, replacing a session
+`SET` with a `RESET` in a `finally` that could leak a GUC onto the next checkout
+of a pooled connection. A timeout now surfaces as a typed
+`PgVecSearchTimeoutError` carrying the bound and the scope, rather than a raw
+driver throw or a silently truncated result.
+
+The model-identity fence is now covered where it is WIRED, not only where it is
+defined — removing the call site inside `pgSearchVec` turns both test tiers red.
+And `search.ts` gains a real behavioural integration tier
+(`tests/integration/pg-search-vec.test.ts`, 10 cases against the live cluster in
+a throwaway schema): an inactive document is genuinely excluded — with a control
+case proving it would otherwise rank first — the collection filter genuinely
+narrows, the limit is honoured, ordering follows actual vector distance, an
+unembedded collection returns empty, the fence names both models, the induced
+timeout fires, and no session GUC survives the call.
+
+Read-path only. No caller is migrated; `pgSearchVec` remains reachable solely
+through the `pg search` CLI verb.
+
+---
+
 ## v0.36.10 — Postgres vector read path
 
 Postgres vector read path (Campaign B slice 1). Adds `src/pg/search.ts` — the
