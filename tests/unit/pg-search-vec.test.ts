@@ -19,15 +19,18 @@
 
 import { describe, it, expect } from "bun:test";
 import {
+  DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS,
   assertQueryModelMatchesStored,
   buildVecSearchQuery,
   dedupeToSearchResults,
   getStoredVecModels,
   normalizeCollections,
+  pgSearchVec,
   type PgQueryable,
+  type PgVecEmbedder,
   type PgVecRow,
 } from "../../src/pg/search.ts";
-import { PgVecReadModelMismatchError } from "../../src/pg/errors.ts";
+import { PgVecReadModelMismatchError, PgVecSearchTimeoutError } from "../../src/pg/errors.ts";
 
 /** A `pg` client stand-in that records what it was asked and replays fixtures. */
 function fakeClient(rowsFor: (sql: string, values: unknown[]) => unknown[]): PgQueryable & {
@@ -219,5 +222,169 @@ describe("inactive documents are excluded", () => {
     const served = fixture.filter(r => (q.text.includes("d.active = true") ? r.active : true));
     const out = dedupeToSearchResults(served as PgVecRow[], 10);
     expect(out.map(r => r.displayPath)).toEqual(["research/live.md"]);
+  });
+});
+
+// ===========================================================================
+// pgSearchVec — the WIRING (master-harness-2wx75 slice 2, GAP 1 + GAP 4/8)
+//
+// Everything above tests pure functions. That left the orchestration itself —
+// which of those functions pgSearchVec actually CALLS, and in what transaction
+// shape — proven by reading. A refactor that dropped the fence call, or that
+// dropped the statement_timeout, would leave every case above green. These
+// cases fail on exactly that, and the embedder is an injected fake so no GPU
+// endpoint is involved.
+// ===========================================================================
+
+/** An embedder that answers with a fixed vector + model, and records its calls. */
+function fakeEmbedder(model: string, embedding = [0.1, 0.2]): PgVecEmbedder & {
+  calls: { text: string; isQuery?: boolean }[];
+} {
+  const calls: { text: string; isQuery?: boolean }[] = [];
+  return {
+    calls,
+    async embed(text, options) {
+      calls.push({ text, isQuery: options?.isQuery });
+      return { embedding, model };
+    },
+  };
+}
+
+/**
+ * A recording fake that answers the whole pgSearchVec conversation: the
+ * transaction verbs, the DISTINCT model fence, and the ANN scan.
+ */
+function searchClient(opts: { storedModels: string[]; rows?: PgVecRow[] }) {
+  const calls: { text: string; values: unknown[] }[] = [];
+  const client: PgQueryable & { calls: typeof calls } = {
+    calls,
+    async query(text: string, values: unknown[] = []) {
+      calls.push({ text, values });
+      if (text.includes("SELECT DISTINCT cv.model")) {
+        return { rows: opts.storedModels.map(m => ({ model: m })) as never[] };
+      }
+      if (text.includes("<=>")) return { rows: (opts.rows ?? []) as never[] };
+      return { rows: [] as never[] };
+    },
+  };
+  return client;
+}
+
+const sqlOf = (c: { calls: { text: string }[] }) => c.calls.map(x => x.text.trim());
+
+describe("pgSearchVec wires the fence — the call site, not just the function", () => {
+  it("REFUSES a search whose query model differs from the stored model", async () => {
+    // THE GAP-1 CASE. assertQueryModelMatchesStored has its own unit cases, but
+    // they all pass if pgSearchVec never calls it. Delete the call site in
+    // src/pg/search.ts and this case goes red (verified by doing exactly that).
+    const c = searchClient({ storedModels: ["embeddinggemma"] });
+    let caught: unknown;
+    try {
+      await pgSearchVec(c, "hello", { embedder: fakeEmbedder("nomic-embed-text") });
+    } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(PgVecReadModelMismatchError);
+    expect((caught as Error).message).toContain("embeddinggemma");
+    expect((caught as Error).message).toContain("nomic-embed-text");
+    // And it must REFUSE, not degrade: the ANN scan never ran.
+    expect(sqlOf(c).some(t => t.includes("<=>"))).toBe(false);
+  });
+
+  it("REFUSES a heterogeneous stored set through the same call site", async () => {
+    const c = searchClient({ storedModels: ["embeddinggemma", "other-model"] });
+    await expect(pgSearchVec(c, "hello", { embedder: fakeEmbedder("embeddinggemma") }))
+      .rejects.toBeInstanceOf(PgVecReadModelMismatchError);
+  });
+
+  it("runs the ANN scan when the models agree, embedding the QUERY-side format", async () => {
+    const c = searchClient({ storedModels: ["embeddinggemma"], rows: [row({ path: "hit.md" })] });
+    const emb = fakeEmbedder("embeddinggemma");
+    const out = await pgSearchVec(c, "hello", { embedder: emb });
+    expect(out.map(r => r.displayPath)).toEqual(["research/hit.md"]);
+    expect(emb.calls).toEqual([{ text: "task: search result | query: hello", isQuery: true }]);
+  });
+
+  it("returns empty without embedding anything when nothing is stored in scope", async () => {
+    const c = searchClient({ storedModels: [] });
+    const emb = fakeEmbedder("embeddinggemma");
+    expect(await pgSearchVec(c, "hello", { embedder: emb })).toEqual([]);
+    expect(emb.calls).toHaveLength(0);
+  });
+});
+
+describe("pgSearchVec bounds both SQL legs with transaction-local GUCs", () => {
+  it("wraps each leg in BEGIN/COMMIT with SET LOCAL — never a session SET + RESET", async () => {
+    const c = searchClient({ storedModels: ["embeddinggemma"], rows: [row()] });
+    await pgSearchVec(c, "hello", { embedder: fakeEmbedder("embeddinggemma") });
+    const sql = sqlOf(c);
+    // GAP 8: a session-level SET with a finally-RESET leaks onto the next
+    // checkout of a POOLED connection. Neither verb may appear at all.
+    expect(sql.some(t => /^SET (?!LOCAL)/.test(t))).toBe(false);
+    expect(sql.some(t => t.startsWith("RESET"))).toBe(false);
+    expect(sql.filter(t => t === "BEGIN")).toHaveLength(2);
+    expect(sql.filter(t => t === "COMMIT")).toHaveLength(2);
+    // GAP 4: the bound is present on BOTH legs, at the documented default.
+    expect(sql.filter(t => t === `SET LOCAL statement_timeout = ${DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS}`))
+      .toHaveLength(2);
+    expect(sql.filter(t => t === "SET LOCAL hnsw.iterative_scan = strict_order")).toHaveLength(2);
+    // The default itself must stay inside the p95 <= 1800 ms hook budget.
+    expect(DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS).toBeLessThan(1800);
+  });
+
+  it("honours an explicit statementTimeoutMs, and 0 means PostgreSQL's no-bound", async () => {
+    const c = searchClient({ storedModels: ["embeddinggemma"], rows: [] });
+    await pgSearchVec(c, "hello", { embedder: fakeEmbedder("embeddinggemma"), statementTimeoutMs: 250 });
+    expect(sqlOf(c).filter(t => t === "SET LOCAL statement_timeout = 250")).toHaveLength(2);
+
+    const c0 = searchClient({ storedModels: ["embeddinggemma"], rows: [] });
+    await pgSearchVec(c0, "hello", { embedder: fakeEmbedder("embeddinggemma"), statementTimeoutMs: 0 });
+    expect(sqlOf(c0).filter(t => t === "SET LOCAL statement_timeout = 0")).toHaveLength(2);
+  });
+
+  it("refuses a non-integer / negative timeout instead of interpolating it into SQL", async () => {
+    const c = searchClient({ storedModels: ["embeddinggemma"] });
+    await expect(pgSearchVec(c, "hello", {
+      embedder: fakeEmbedder("embeddinggemma"), statementTimeoutMs: -1,
+    })).rejects.toThrow(/non-negative integer/);
+    // Nothing was smuggled into a SET LOCAL.
+    expect(sqlOf(c).some(t => t.includes("statement_timeout"))).toBe(false);
+  });
+
+  it("survives a pgvector too old to know hnsw.iterative_scan (savepoint, not fatal)", async () => {
+    const calls: string[] = [];
+    const c: PgQueryable = {
+      async query(text: string, values: unknown[] = []) {
+        calls.push(text.trim());
+        if (text.includes("hnsw.iterative_scan")) {
+          const e = Object.assign(new Error('unrecognized configuration parameter'), { code: "42704" });
+          throw e;
+        }
+        if (text.includes("SELECT DISTINCT cv.model")) return { rows: [{ model: "embeddinggemma" }] as never[] };
+        if (text.includes("<=>")) return { rows: [row({ path: "old.md" })] as never[] };
+        return { rows: [] as never[] };
+      },
+    };
+    const out = await pgSearchVec(c, "hello", { embedder: fakeEmbedder("embeddinggemma") });
+    expect(out.map(r => r.displayPath)).toEqual(["research/old.md"]);
+    expect(calls.filter(t => t === "ROLLBACK TO SAVEPOINT clawmem_hnsw_guc")).toHaveLength(2);
+    expect(calls.filter(t => t === "COMMIT")).toHaveLength(2);
+  });
+
+  it("surfaces a cancelled statement as PgVecSearchTimeoutError, not a raw driver throw", async () => {
+    const c: PgQueryable = {
+      async query(text: string) {
+        if (text.includes("<=>")) {
+          throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+        }
+        if (text.includes("SELECT DISTINCT cv.model")) return { rows: [{ model: "embeddinggemma" }] as never[] };
+        return { rows: [] as never[] };
+      },
+    };
+    let caught: unknown;
+    try {
+      await pgSearchVec(c, "hello", { embedder: fakeEmbedder("embeddinggemma"), statementTimeoutMs: 5 });
+    } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(PgVecSearchTimeoutError);
+    expect((caught as PgVecSearchTimeoutError).stage).toBe("ann-scan");
+    expect((caught as PgVecSearchTimeoutError).timeoutMs).toBe(5);
   });
 });

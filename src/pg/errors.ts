@@ -224,3 +224,40 @@ export class VaultDatabaseCollisionError extends Error {
     this.name = "VaultDatabaseCollisionError";
   }
 }
+
+/**
+ * The SQL leg of a vector search exceeded its `statement_timeout`
+ * (master-harness-2wx75 slice 2, GAP 4).
+ *
+ * `pgSearchVec` bounds BOTH of its SQL round trips with a transaction-local
+ * `statement_timeout`, because an ANN scan is not a bounded amount of work:
+ * a pathological plan, a lock wait, or an under-filled iterative scan can all
+ * outlive the caller's deadline. The hook budget this read path serves is
+ * p95 <= 1800 ms end to end, so an unbounded SQL leg is not a slow search —
+ * it is a blown budget with no signal.
+ *
+ * It is a TYPED refusal rather than a raw driver throw (`57014
+ * query_canceled`) so a caller can tell "we ran out of time" apart from a
+ * genuine failure, and apart from the far more dangerous alternative: a silent
+ * empty result, which is indistinguishable from "nothing matched".
+ */
+export class PgVecSearchTimeoutError extends Error {
+  readonly timeoutMs: number;
+  readonly scope: string;
+  readonly stage: string;
+  constructor(timeoutMs: number, scope: string, stage: string, cause?: unknown) {
+    super(
+      `Vector search over ${scope} exceeded its ${timeoutMs} ms statement timeout ` +
+      `during the ${stage} query. The SQL leg was cancelled by PostgreSQL, not by ` +
+      `the client, so nothing is still running server-side. This read path serves a ` +
+      `p95 <= 1800 ms hook budget (master-harness-2wx75); if this fires routinely, ` +
+      `the fix is the plan or the corpus, not a bigger number — but a caller that ` +
+      `genuinely needs longer can pass statementTimeoutMs.`,
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = "PgVecSearchTimeoutError";
+    this.timeoutMs = timeoutMs;
+    this.scope = scope;
+    this.stage = stage;
+  }
+}
