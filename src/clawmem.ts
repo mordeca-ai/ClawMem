@@ -64,6 +64,7 @@ import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, HALF_LIVES, type EnrichedResult } from "./memory.ts";
 import { enrichResults, reciprocalRankFusion, toRanked, blendFusionAndRerank, hasStrongFtsSignal, ftsBypassEnabled, type RankedResult } from "./search-utils.ts";
 import { splitDocument } from "./splitter.ts";
+import { buildEmbedFrontmatter } from "./embed-input.ts";
 import { getProfile, updateProfile, isProfileStale, type ProfileUpdateOutcome } from "./profile.ts";
 import { regenerateAllDirectoryContexts } from "./directory-context.ts";
 import {
@@ -521,6 +522,15 @@ export type DocEmbedTask = {
   fragments: ReturnType<typeof splitDocument>;
 };
 
+export async function finalizeCanaryWithoutPreflight(
+  wroteVectors: boolean,
+  setTaint: (reason: string) => Promise<void>,
+): Promise<{ exitCode: 1; warning: string }> {
+  const warning = "WARNING: this run had NO validated preflight geometry (canary unavailable). The vault state is UNVERIFIED — run 'clawmem embed --force' against a validated server to clear.";
+  if (wroteVectors) await setTaint(`no preflight validation at ${new Date().toISOString()}`);
+  return { exitCode: 1, warning };
+}
+
 /**
  * Build the fragment set for one document at embed time (master-harness-z7o4y).
  *
@@ -554,11 +564,9 @@ export function buildDocEmbedTask(
   docDescription: string | null | undefined,
   collection: string
 ): DocEmbedTask {
-  const title = docTitle || basename(path).replace(/\.(md|txt)$/i, "");
-  const frontmatter: Record<string, any> = { title };
-  if (docDescription) frontmatter.description = docDescription;
+  const frontmatter = buildEmbedFrontmatter(docTitle, path, docDescription);
   const fragments = splitDocument(body, frontmatter);
-  return { hash, path, title, collection, fragments };
+  return { hash, path, title: frontmatter.title, collection, fragments };
 }
 
 /** Minimal shape of an embed-batch-capable LLM client, for injection in tests. */
@@ -952,16 +960,19 @@ export async function cmdEmbed(args: string[]) {
 
     // Shared end-of-run finalization (T9-H1 + T10-M1): EVERY exit path that reaches a
     // completed run — including the no-work early return — verifies the end state.
-    // Absent preflight vectors (canary unavailable, run proceeded) → persistent
-    // unverified taint + nonzero; baseline persist/recalibration happens ONLY after a
-    // successful same-dimension end probe. "Not verified" is never success (T8-M2).
-    const finalizeCanary = async (failedFragmentsCount: number) => {
-      const setTaint = (reason: string) =>
-        markSafeGlobal("setVaultFlag(taint)", () => s.setVaultFlag("embed_geometry_taint", reason, leaseGuard));
+    // Absent preflight vectors (canary unavailable, run proceeded) → nonzero, plus
+    // persistent unverified taint only when this run wrote vectors. A no-work run cannot
+    // mix geometries. Baseline persistence/recalibration happens ONLY after a successful
+    // same-dimension end probe. "Not verified" is never success (T8-M2).
+    const finalizeCanary = async (failedFragmentsCount: number, wroteVectors: boolean) => {
+      const setTaint = async (reason: string) => {
+        if (!wroteVectors) return;
+        await markSafeGlobal("setVaultFlag(taint)", () => s.setVaultFlag("embed_geometry_taint", reason, leaseGuard));
+      };
       if (!canaryState) {
-        console.error(`${c.red}WARNING: this run had NO validated preflight geometry (canary unavailable). The vault state is UNVERIFIED — run 'clawmem embed --force' against a validated server to clear.${c.reset}`);
-        await setTaint(`no preflight validation at ${new Date().toISOString()}`);
-        process.exitCode = 1;
+        const final = await finalizeCanaryWithoutPreflight(wroteVectors, setTaint);
+        console.error(`${c.red}${final.warning}${c.reset}`);
+        process.exitCode = final.exitCode;
         return;
       }
       let endDrift: number | null = null;
@@ -1084,7 +1095,7 @@ export async function cmdEmbed(args: string[]) {
       // it must not skip end verification, silently exit zero on an unvalidated
       // endpoint, or persist/recalibrate a baseline without a verified end.
       console.log(`${c.green}All documents already embedded${c.reset}`);
-      await finalizeCanary(0);
+      await finalizeCanary(0, false);
       return;
     }
 
@@ -1249,7 +1260,7 @@ export async function cmdEmbed(args: string[]) {
     console.log(`${c.green}Embedded ${embedded} documents (${totalFragments} fragments, ${failedFragments} failed) in ${totalSec}s${c.reset}`);
 
     // End-of-run verification — shared finalization (T9-H1 + T10-M1); see finalizeCanary.
-    await finalizeCanary(failedFragments);
+    await finalizeCanary(failedFragments, totalFragments > 0);
 
     // Partial-embed contract (master-harness-zkjyh): fragments that never embedded leave
     // the vault incomplete (their documents are marked 'failed' for retry above), so the
@@ -3098,13 +3109,15 @@ async function cmdDoctor() {
     } else if (summary.validated < summary.nMin || summary.validatedSeq0 < summary.seq0Target) {
       const seq0Part = summary.validatedSeq0 < summary.seq0Target ? `; seq-0 quota UNMET (${summary.validatedSeq0}/${summary.seq0Target} validated — primary fragments are the surprisal/graph/health anchors)` : "";
       console.log(`${c.red}✗${c.reset} Sampled vectors: DEGRADED — validation could not complete (${summary.validated}/${summary.target} validated, min ${summary.nMin}${seq0Part}; ${summary.unreconstructable} unreconstructable, ${summary.inconclusiveLegacy} legacy-inconclusive; ${summary.attempts} attempts over ${summary.eligible} eligible)`);
-      // Do NOT prescribe a re-embed here. A complete `clawmem embed --force` over all 153,274
-      // fragments (rc=0, 0 failed, every vector rewritten) was run 2026-09-01 under
-      // master-harness-vn4rz.29 and this finding did not move: 4/16 validated + 20 unreconstructable
-      // before, 3/16 + 21 after — sampling noise over 24 attempts. The unreconstructable rows are a
-      // splitter/metadata RECONSTRUCTION drift inside the sampler (src/canary.ts), not stale vectors,
-      // so a rebuild is known-useless work (master-harness-1nvlz).
-      console.log(`   ${c.dim}The sampler could not reconstruct these rows' exact embed input. A full 'clawmem embed --force' does NOT clear this — it was tried (master-harness-vn4rz.29, all 153,274 fragments rewritten) and the counts did not move. Investigate splitter/metadata reconstruction drift in src/canary.ts against the canonical document; legacy-tier rows lack the provenance to reconstruct at all.${c.reset}`);
+      const topReasons = Object.entries(summary.unreconstructableByReason)
+        .filter(([, count]) => count > 0)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4);
+      console.log(`   ${c.dim}Unreconstructable reasons: ${topReasons.length > 0 ? topReasons.map(([reason, count]) => `${reason}=${count}`).join(", ") : "none"}.${c.reset}`);
+      if (topReasons.length > 0) {
+        const [topReason, topCount] = topReasons[0]!;
+        console.log(`   ${c.dim}Top measured reason: ${topReason} (${topCount}). Investigate that reconstruction stage against the canonical document metadata and persisted fragment contract.${c.reset}`);
+      }
       issues++;
       process.exitCode = 1;
     } else {
