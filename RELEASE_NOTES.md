@@ -4,6 +4,16 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.17 — Sampled-vector validation reconstructs through the embed path's own frontmatter
+
+The sampled-vector validator reconstructed a row's embed input by re-parsing `content.doc` with `parseDocument()`, but `content.doc` is stored frontmatter-**stripped**, so that parse was a structural no-op. The embed path instead synthesizes `{title, description}` from the durable `documents` row. The two therefore split differently, the reconstructed fragment count came up one short, and nearly every row was condemned "unreconstructable" — measured 589/600 on the live vault, which is why a full `embed --force` never moved the counts.
+
+Both paths now call one shared `buildEmbedFrontmatter` (`src/embed-input.ts`) so they cannot drift apart again; live `doctor` went from `4/16 DEGRADED` to `16/16 validated`. The `unreconstructable` counter is now segmented by reason (eight distinct causes instead of one opaque total) and `doctor` prints the measured top reason, replacing guidance that blamed a legacy tier which does not exist in this vault (0 of 164,310 rows lack an `embed_input_fp`).
+
+Separately, `embed_geometry_taint` is no longer stamped by a run that wrote zero vectors: `finalizeCanary` now takes an explicit `wroteVectors` flag, so a no-work run against an unreachable embed endpoint still warns loudly and exits nonzero, but no longer marks the vault as possibly mixing two geometries.
+
+---
+
 ## v0.36.16 — Read path -> PG: search/vsearch/query, per-prompt hook, MCP + openclaw plugin on Postgres; transient dual-read parity window; eval run r46 (recall/MRR vs SQLite gold within tolerance) + hook p95 <= 1800ms
 
 PG read path slice 6 — the RERANK ARM, composed over RRF fusion under ONE decrementing deadline.
