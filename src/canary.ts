@@ -21,9 +21,8 @@
  * (the profile key embeds the version).
  */
 import { formatDocForEmbedding, formatQueryForEmbedding } from "./llm.ts";
-import { basename } from "path";
 import { createHash } from "crypto";
-import { parseDocument } from "./indexer.ts";
+import { buildEmbedFrontmatter } from "./embed-input.ts";
 import { splitDocument } from "./splitter.ts";
 import { canonicalDocId, type Store } from "./store.ts";
 
@@ -222,7 +221,7 @@ export function persistCanaryBaselineIfFirst(
 
 // Sampled persisted-vs-fresh vector validation (doctor section 11). Reconstructs each
 // sampled fragment from its CANONICAL document via the production pipeline
-// (parseDocument → splitDocument → seq/label alignment → formatDocForEmbedding), then:
+// (durable metadata → splitDocument → seq/label alignment → formatDocForEmbedding), then:
 //   - fingerprinted rows: fp match → FULL validation (cos ≥ 0.98; below = DEFINITIVE
 //     corruption/drift); fp mismatch → DEFINITIVE stale-input. The first definitive
 //     failure returns IMMEDIATELY (T8-H2) — doctor is nonzero either way, and continuing
@@ -240,6 +239,29 @@ export function persistCanaryBaselineIfFirst(
 
 export const SAMPLE_REPLACEMENT_BUDGET = 8;
 
+export type UnreconstructableReason =
+  | "canonical_unresolved"
+  | "body_missing"
+  | "frag_count_mismatch"
+  | "frag_missing_at_seq"
+  | "label_mismatch"
+  | "reconstruct_exception"
+  | "stored_vector_missing"
+  | "fresh_embed_failed";
+
+function emptyUnreconstructableReasons(): Record<UnreconstructableReason, number> {
+  return {
+    canonical_unresolved: 0,
+    body_missing: 0,
+    frag_count_mismatch: 0,
+    frag_missing_at_seq: 0,
+    label_mismatch: 0,
+    reconstruct_exception: 0,
+    stored_vector_missing: 0,
+    fresh_embed_failed: 0,
+  };
+}
+
 export async function runSampledVectorValidation(
   s: Store,
   embed: (text: string) => Promise<{ embedding: number[] | Float32Array; model?: string } | null>
@@ -247,6 +269,7 @@ export async function runSampledVectorValidation(
   eligible: number; target: number; nMin: number; validated: number;
   validatedSeq0: number; seq0Target: number;
   legacyTier: number; unreconstructable: number; inconclusiveLegacy: number; attempts: number;
+  unreconstructableByReason: Record<UnreconstructableReason, number>;
   definitiveFailures: string[];
 }> {
   type MetaRow = { hash: string; seq: number; fragment_label: string | null; embed_input_fp: string | null; canonical_id: string | null };
@@ -268,7 +291,12 @@ export async function runSampledVectorValidation(
   const result = {
     eligible, target, nMin, validated: 0, validatedSeq0: 0, seq0Target,
     legacyTier: 0, unreconstructable: 0, inconclusiveLegacy: 0, attempts: 0,
+    unreconstructableByReason: emptyUnreconstructableReasons(),
     definitiveFailures: [] as string[],
+  };
+  const markUnreconstructable = (reason: UnreconstructableReason) => {
+    result.unreconstructable++;
+    result.unreconstructableByReason[reason]++;
   };
   if (eligible === 0) return result;
 
@@ -290,7 +318,7 @@ export async function runSampledVectorValidation(
   // stored canonical identity may name a since-deactivated alias while an active twin
   // keeps the row eligible; condemning it as unreconstructable would be false. The
   // active-document EXISTS guard above still gates ELIGIBILITY.
-  const aliasStmt = s.db.prepare(`SELECT collection, path, title, active FROM documents WHERE hash = ? ORDER BY active DESC, collection, path`);
+  const aliasStmt = s.db.prepare(`SELECT collection, path, title, description, active FROM documents WHERE hash = ? ORDER BY active DESC, collection, path`);
   const fragCountStmt = s.db.prepare(`SELECT count(*) as c FROM content_vectors WHERE hash = ?`);
   const vecStmt = s.db.prepare(`SELECT embedding FROM vectors_vec WHERE hash_seq = ?`);
 
@@ -302,7 +330,7 @@ export async function runSampledVectorValidation(
     // Canonical resolution (T8-H3 / T9-M1): the document whose canonicalDocId matches the
     // stored id — searched across ALL aliases (active first). Null-canonical legacy rows
     // fall back to a single ACTIVE alias; ambiguity → unreconstructable, never condemned.
-    const aliases = aliasStmt.all(row.hash) as { collection: string; path: string; title: string; active: number }[];
+    const aliases = aliasStmt.all(row.hash) as { collection: string; path: string; title: string; description: string | null; active: number }[];
     let canonical = row.canonical_id
       ? aliases.find(a => canonicalDocId(a.collection, a.path) === row.canonical_id)
       : undefined;
@@ -310,28 +338,26 @@ export async function runSampledVectorValidation(
       const activeAliases = aliases.filter(a => a.active === 1);
       if (activeAliases.length === 1) canonical = activeAliases[0];
     }
-    if (!canonical) { result.unreconstructable++; continue; }
+    if (!canonical) { markUnreconstructable("canonical_unresolved"); continue; }
 
     // Reconstruct through the production pipeline (lazy body hydration).
     let fragText: string;
     try {
       const bodyRow = bodyStmt.get(row.hash) as { doc: string } | undefined;
-      if (!bodyRow) { result.unreconstructable++; continue; }
-      let frontmatter: Record<string, any> | undefined;
-      try { frontmatter = parseDocument(bodyRow.doc, canonical.path).meta as any; } catch { /* no frontmatter */ }
+      if (!bodyRow) { markUnreconstructable("body_missing"); continue; }
+      const frontmatter = buildEmbedFrontmatter(canonical.title, canonical.path, canonical.description);
       const frags = splitDocument(bodyRow.doc, frontmatter);
       // Per-hash fragment-count contract (T8-M4): splitter output must match what was persisted.
       const persistedCount = (fragCountStmt.get(row.hash) as { c: number }).c;
-      if (frags.length !== persistedCount) { result.unreconstructable++; continue; }
+      if (frags.length !== persistedCount) { markUnreconstructable("frag_count_mismatch"); continue; }
       const frag = frags[row.seq];
-      if (!frag) { result.unreconstructable++; continue; }
-      if ((frag.label ?? null) !== (row.fragment_label ?? null)) { result.unreconstructable++; continue; }
-      const docTitle = canonical.title || basename(canonical.path).replace(/\.(md|txt)$/i, "");
-      fragText = formatDocForEmbedding(frag.content, frag.label || docTitle);
-    } catch { result.unreconstructable++; continue; }
+      if (!frag) { markUnreconstructable("frag_missing_at_seq"); continue; }
+      if ((frag.label ?? null) !== (row.fragment_label ?? null)) { markUnreconstructable("label_mismatch"); continue; }
+      fragText = formatDocForEmbedding(frag.content, frag.label || frontmatter.title);
+    } catch { markUnreconstructable("reconstruct_exception"); continue; }
 
     const stored = vecStmt.get(`${row.hash}_${row.seq}`) as { embedding: Uint8Array } | undefined;
-    if (!stored?.embedding) { result.unreconstructable++; continue; }
+    if (!stored?.embedding) { markUnreconstructable("stored_vector_missing"); continue; }
     const storedBuf = new Uint8Array(stored.embedding);
     const storedVec = new Float32Array(storedBuf.buffer, storedBuf.byteOffset, storedBuf.byteLength / 4);
 
@@ -342,7 +368,7 @@ export async function runSampledVectorValidation(
         return result; // definitive → nonzero regardless of coverage; stop spending embeds (T8-H2)
       }
       const fresh = await embed(fragText).catch(() => null);
-      if (!fresh || fresh.embedding.length !== storedVec.length) { result.unreconstructable++; continue; }
+      if (!fresh || fresh.embedding.length !== storedVec.length) { markUnreconstructable("fresh_embed_failed"); continue; }
       const sim = cosineSim(storedVec, fresh.embedding instanceof Float32Array ? fresh.embedding : new Float32Array(fresh.embedding));
       if (sim < 0.98) {
         result.definitiveFailures.push(`corruption/drift: ${canonical.collection}/${canonical.path}#${row.seq} — fingerprint matches but cos(stored, fresh) = ${sim.toFixed(4)} < 0.98`);
@@ -352,7 +378,7 @@ export async function runSampledVectorValidation(
       if (row.seq === 0) result.validatedSeq0++;
     } else {
       const fresh = await embed(fragText).catch(() => null);
-      if (!fresh || fresh.embedding.length !== storedVec.length) { result.unreconstructable++; continue; }
+      if (!fresh || fresh.embedding.length !== storedVec.length) { markUnreconstructable("fresh_embed_failed"); continue; }
       const sim = cosineSim(storedVec, fresh.embedding instanceof Float32Array ? fresh.embedding : new Float32Array(fresh.embedding));
       if (sim < 0.98) { result.inconclusiveLegacy++; continue; }
       result.legacyTier++;

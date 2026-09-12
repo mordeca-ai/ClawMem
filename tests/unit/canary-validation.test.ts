@@ -28,6 +28,10 @@ import { acquireWorkerLease } from "../../src/worker-lease.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { formatDocForEmbedding } from "../../src/llm.ts";
 import { createHash } from "crypto";
+import { buildDocEmbedTask, finalizeCanaryWithoutPreflight } from "../../src/clawmem.ts";
+import { buildEmbedFrontmatter } from "../../src/embed-input.ts";
+import { parseDocument } from "../../src/indexer.ts";
+import { splitDocument } from "../../src/splitter.ts";
 
 // ---------------------------------------------------------------------------
 // Canary battery
@@ -215,6 +219,71 @@ function seedEmbedded(store: Store, col: string, path: string, body: string, opt
 const validationEmbed = async (t: string) => ({ embedding: textEmbed(t), model: "fake" });
 
 describe("sampled vector validation (doctor section 11)", () => {
+  it("reconstructs buildDocEmbedTask fragments with identical count, labels, and embed-input fingerprints", async () => {
+    const store = createStore(":memory:");
+    const path = "docs/parity.md";
+    const collection = "docs";
+    const title = "Canary Reconstruction Parity";
+    const description = "Durable metadata must produce the same embedding fragments in both paths.";
+    const raw = `---\ntitle: ${title}\ndescription: ${description}\n---\n# Canary\n\n${"body text ".repeat(30)}`;
+    const { body } = parseDocument(raw, path);
+    const hash = hashContent(body + collection + path);
+    const task = buildDocEmbedTask(hash, body, path, title, description, collection);
+    const reconstructed = splitDocument(body, buildEmbedFrontmatter(title, path, description));
+
+    const embedFingerprint = (content: string, label: string) =>
+      createHash("sha256").update(formatDocForEmbedding(content, label), "utf8").digest("hex");
+    expect(reconstructed.length).toBe(task.fragments.length);
+    expect(reconstructed.map(fragment => fragment.label)).toEqual(task.fragments.map(fragment => fragment.label));
+    expect(reconstructed.map(fragment => embedFingerprint(fragment.content, fragment.label || title)))
+      .toEqual(task.fragments.map(fragment => embedFingerprint(fragment.content, fragment.label || task.title)));
+
+    const now = new Date().toISOString();
+    store.insertContent(hash, body, now);
+    store.insertDocument(collection, path, title, hash, now, now, description);
+    store.ensureVecTable(4);
+    for (let seq = 0; seq < task.fragments.length; seq++) {
+      const fragment = task.fragments[seq]!;
+      const text = formatDocForEmbedding(fragment.content, fragment.label || task.title);
+      store.insertEmbedding(
+        hash, seq, fragment.startLine, textEmbed(text), "fake", now, fragment.type,
+        fragment.label ?? undefined, canonicalDocId(collection, path), undefined,
+        createHash("sha256").update(text, "utf8").digest("hex"),
+      );
+    }
+    store.markEmbedSynced(hash);
+
+    const result = await runSampledVectorValidation(store, validationEmbed);
+    expect(result.validated).toBe(result.target);
+    expect(result.unreconstructable).toBe(0);
+    expect(result.definitiveFailures).toEqual([]);
+  });
+
+  it("pins the stripped-frontmatter bug by producing a different fragment count", () => {
+    const path = "docs/frontmatter-drift.md";
+    const title = "Frontmatter Drift Fixture";
+    const description = "This description is durable but absent from the stripped content body.";
+    const raw = `---\ntitle: ${title}\ndescription: ${description}\n---\n# Drift\n\n${"long fixture body ".repeat(20)}`;
+    const { body } = parseDocument(raw, path);
+    const production = buildDocEmbedTask("fixture-hash", body, path, title, description, "docs");
+    const reparsed = parseDocument(body, path);
+    const buggyReconstruction = splitDocument(body, reparsed.meta as Record<string, unknown>);
+
+    expect(buggyReconstruction.length).not.toBe(production.fragments.length);
+  });
+
+  it("segments a known label mismatch instead of reporting only a bare total", async () => {
+    const store = createStore(":memory:");
+    const hash = seedEmbedded(store, "user", "label.md", "label mismatch document");
+    store.db.prepare(`UPDATE content_vectors SET fragment_label = 'wrong-label' WHERE hash = ? AND seq = 0`).run(hash);
+
+    const result = await runSampledVectorValidation(store, validationEmbed);
+    expect(result.unreconstructable).toBe(1);
+    expect(result.unreconstructableByReason.label_mismatch).toBe(1);
+    expect(Object.values(result.unreconstructableByReason).reduce((sum, count) => sum + count, 0))
+      .toBe(result.unreconstructable);
+  });
+
   it("validates a healthy fingerprinted vault (small population scales, green)", async () => {
     const store = createStore(":memory:");
     for (let i = 0; i < 3; i++) seedEmbedded(store, "user", `d${i}.md`, `healthy document number ${i}`);
@@ -329,7 +398,7 @@ describe("retryOnBusyAsync (design (f).2)", () => {
 });
 
 describe("no-work run end verification (T10-M1)", () => {
-  it("a fully-embedded vault with an unavailable preflight exits NONZERO and persists taint", async () => {
+  it("a fully-embedded vault with an unavailable preflight exits NONZERO without setting taint", async () => {
     const dbPath = `/tmp/clawmem-nowork-taint-${process.pid}.sqlite`;
     const { unlinkSync } = await import("node:fs");
     try { unlinkSync(dbPath); } catch { /* absent */ }
@@ -341,7 +410,8 @@ describe("no-work run end verification (T10-M1)", () => {
     store.close();
 
     // Run the REAL CLI with an unreachable embed endpoint and local fallback disabled:
-    // canary unavailable → non-force warn → no work → shared finalization must taint + exit 1.
+    // canary unavailable → non-force warn → no work → loud/nonzero, but no vectors
+    // were written so mixed-geometry taint would be unsound.
     const proc = Bun.spawnSync(["bun", "src/clawmem.ts", "embed"], {
       cwd: `${import.meta.dir}/../..`,
       env: {
@@ -360,10 +430,21 @@ describe("no-work run end verification (T10-M1)", () => {
     expect(proc.exitCode).not.toBe(0);
 
     const check = createStore(dbPath);
-    expect(check.getVaultFlag("embed_geometry_taint")).toContain("no preflight validation");
+    expect(check.getVaultFlag("embed_geometry_taint")).toBeNull();
     check.close();
     try { unlinkSync(dbPath); } catch { /* gone */ }
   }, 30_000);
+
+  it("a run that writes vectors without a validated preflight exits NONZERO and sets taint", async () => {
+    const store = createStore(":memory:");
+    const final = await finalizeCanaryWithoutPreflight(
+      true,
+      async reason => store.setVaultFlag("embed_geometry_taint", reason),
+    );
+
+    expect(final.exitCode).not.toBe(0);
+    expect(store.getVaultFlag("embed_geometry_taint")).toContain("no preflight validation");
+  });
 });
 
 describe("lease-fenced embed-state markers (design (f).5)", () => {
