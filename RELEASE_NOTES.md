@@ -4,6 +4,17 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.19 — PG FTS tokenizer parity: prefix tsquery + separator-normalized index (r47 LEG2 triage)
+
+PG lexical arm reaches tokenizer parity with the sqlite FTS5 reference (master-harness-2wx75, r47 LEG2 triage).
+
+- Query side: src/pg/fts-query.ts mirrors buildFTS5Query — unicode token boundaries, the curated FTS5 stopword relaxation, uppercase OR groups, and one server-stemmed PREFIX node per token (`to_tsquery('english', $n || ':*')`, bind values only). Replaces websearch_to_tsquery, which ANDed exact lexemes and turned hyphenated words into phrase nodes (r47 X10 matched zero documents).
+- Index side: migration 008 normalizes punctuation runs to spaces before to_tsvector in documents_fts_refresh and origin_documents_fts_refresh, so slash-joined text ("embedding/inference") is indexed as separate words like unicode61 does (r47 MH5). Includes an idempotent backfill of both tables' fts columns.
+- Behavior change: quoted-phrase and websearch operator syntax are no longer interpreted by the PG lexical arm, matching the sqlite arm.
+- Known noise: a token that is an english-dictionary stopword but not in the curated list emits a server NOTICE ("query contains only stop words ... ignored"); results are unaffected.
+
+---
+
 ## v0.36.18 — PG retrieve CLI verb (clawmem-pg-retrieve/v1) — r47 parity instrument
 
 master-harness-2wx75 SLICE 7 (clawmem half): new `bun src/pg/cli.ts retrieve` verb emitting clawmem-pg-retrieve/v1 JSON for search, vsearch and query modes; first live execution of the store.rerank wiring. Contract documented in README-retrieve.md. Instrument for the r47 PG-vs-sqlite parity eval driven from master-harness (eval-retrieval --engine clawmem-pg). Full bun test 2519 pass / 13 skip / 0 fail at build time.
