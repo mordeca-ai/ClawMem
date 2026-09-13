@@ -5,7 +5,7 @@
  * src/pg/search-fts.ts; the DB is replaced by a RECORDING FAKE that captures
  * the SQL text and the bind values, which is what makes the query CONTRACT
  * (the `@@` match against the bare `d.fts` column that `documents_fts_idx` can
- * serve, the weighted `ts_rank_cd`, the `websearch_to_tsquery` constructor, the
+ * serve, the weighted `ts_rank_cd`, the parameterized prefix constructor, the
  * active/invalidated fence, the in-SQL collection filter, the total order)
  * assertable at all — a live plan proves it for one corpus on one day; these
  * assertions hold for every caller.
@@ -22,13 +22,18 @@
 import { describe, it, expect } from "bun:test";
 import {
   DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS,
-  FTS_QUERY_PLACEHOLDER,
   buildFtsSearchQuery,
   pgSearchFts,
   pgSearchFtsDetailed,
   toSearchResults,
   type PgFtsRow,
 } from "../../src/pg/search-fts.ts";
+import {
+  PG_FTS_STOPWORDS,
+  buildPgFtsQuery,
+  tokenizeForPgFts,
+} from "../../src/pg/fts-query.ts";
+import { buildFTS5Query } from "../../src/store.ts";
 import type { PgQueryable } from "../../src/pg/search.ts";
 
 /** A `pg` client stand-in that records what it was asked and replays fixtures. */
@@ -73,35 +78,93 @@ function row(over: Partial<PgFtsRow> = {}): PgFtsRow {
   };
 }
 
+describe("buildPgFtsQuery — sqlite FTS5 parity", () => {
+  it("X10 builds server-stemmed prefix nodes for qualit/bi/encod without a phrase operator", () => {
+    const query = buildPgFtsQuery(
+      "Why does a cross-encoder reranker provide qualitatively different signal than a bi-encoder vector search?",
+    )!;
+    expect(query.values).toContain("qualitatively");
+    expect(query.values).toContain("bi");
+    expect(query.values.filter(value => value === "encoder")).toHaveLength(2);
+    expect(query.text.match(/to_tsquery\('english', \$\d+::text \|\| ':\*'\)/g)?.length)
+      .toBe(query.values.length);
+    expect(query.text).not.toContain("<->");
+    expect(query.text).not.toContain("cross-encoder");
+  });
+
+  it("treats uppercase OR between groups as OR and lowercase or as a term", () => {
+    const upper = buildPgFtsQuery("cocoa OR frosting")!;
+    expect(upper.values).toEqual(["cocoa", "frosting"]);
+    expect(upper.text).toContain(" || ");
+
+    const lower = buildPgFtsQuery("or")!;
+    expect(lower.values).toEqual(["or"]);
+    expect(lower.text).not.toContain(") || to_tsquery(");
+  });
+
+  it("drops the copied curated stopwords exactly where buildFTS5Query drops them", () => {
+    for (const stopword of PG_FTS_STOPWORDS) {
+      expect(buildFTS5Query(`${stopword} sentinel`)).toBe('"sentinel"*');
+      expect(buildPgFtsQuery(`${stopword} sentinel`)!.values).toEqual(["sentinel"]);
+    }
+  });
+
+  it("falls back to all terms when a group contains only curated stopwords", () => {
+    const query = buildPgFtsQuery("the and of")!;
+    expect(query.values).toEqual(["the", "and", "of"]);
+    expect(query.text).toContain(" && ");
+  });
+
+  it("tokenizes lowercase Unicode words on every non-letter/non-number separator", () => {
+    expect(tokenizeForPgFts("ÉTÉ_embedding/inference-東京.42"))
+      .toEqual(["été", "embedding", "inference", "東京", "42"]);
+  });
+
+  it("keeps adversarial user text in bind values and never interpolates it into SQL", () => {
+    const inputs = [
+      `quality'quoted`, "quality & vector", "quality | vector", "quality ! vector",
+      "quality:vector", "quality(vector)", "quality\\vector", "品質 vector",
+    ];
+    for (const input of inputs) {
+      const query = buildPgFtsQuery(input)!;
+      expect(query.values.length).toBeGreaterThan(0);
+      expect(query.text).not.toContain(input);
+      expect(query.text).toMatch(/^\(?to_tsquery\('english', \$1::text \|\| ':\*'\)/);
+    }
+    for (const input of ["", "   ", `' & | ! : ( ) \\`]) {
+      expect(buildPgFtsQuery(input)).toBeNull();
+    }
+  });
+});
+
 describe("buildFtsSearchQuery — the SQL contract", () => {
   it("matches with `@@` against the BARE d.fts column (the only GIN-servable shape)", () => {
-    const q = buildFtsSearchQuery(null, 20);
+    const q = buildFtsSearchQuery("fox", null, 20)!;
     // Not `to_tsvector(...) @@ ...`: computing the vector at query time throws
     // away documents_fts_idx AND loses the setweight() weights the trigger
     // stored, so the rank weights below would have nothing to act on.
-    expect(q.text).toMatch(/d\.fts @@ websearch_to_tsquery\('english', \$1\)/);
+    expect(q.text).toMatch(/d\.fts @@ to_tsquery\('english', \$1::text \|\| ':\*'\)/);
     expect(q.text).not.toContain("to_tsvector(");
   });
 
-  it("parses the query with websearch_to_tsquery, the constructor that cannot throw", () => {
-    const q = buildFtsSearchQuery(null, 20);
-    expect(q.text).toContain("websearch_to_tsquery('english', $1)");
-    // `to_tsquery` raises a syntax error on unbalanced user input; `plainto_`
-    // cannot express a phrase or a negation. Neither may appear.
-    expect(q.text).not.toMatch(/[^_]to_tsquery\(/);
-    expect(q.text).not.toContain("plainto_tsquery");
+  it("uses the same parameterized prefix expression for match and rank", () => {
+    const q = buildFtsSearchQuery("quality", null, 20)!;
+    const node = "to_tsquery('english', $1::text || ':*')";
+    expect(q.text.split(node)).toHaveLength(3);
+    expect(q.values).toEqual(["quality", 20]);
+    expect(q.text).not.toContain("websearch_to_tsquery");
   });
 
   it("names the text-search configuration explicitly at the query end", () => {
     // migrations/001 §2: the trigger writes with to_tsvector('english', ...).
     // A bare two-arg query form would depend on the session's
     // default_text_search_config and could stem differently — silently.
-    const q = buildFtsSearchQuery(null, 20);
+    const q = buildFtsSearchQuery("fox", null, 20)!;
     expect(q.text.match(/'english'/g)?.length).toBe(2); // rank + match
   });
 
   it("ranks with ts_rank_cd and PostgreSQL's DEFAULT weights, giving 10:1 title:body", () => {
-    const q = buildFtsSearchQuery(null, 20);
+    const q = buildFtsSearchQuery("fox", null, 20)!;
     // {D, C, B, A} = {0.1, 0.2, 0.4, 1.0}. A:D = 10:1, the SAME title:body
     // ratio as the sqlite arm's bm25(documents_fts, 10.0, 1.0). Cover density
     // (`_cd`) rather than plain ts_rank: it accounts for term proximity.
@@ -110,29 +173,29 @@ describe("buildFtsSearchQuery — the SQL contract", () => {
   });
 
   it("fences to active, non-invalidated documents", () => {
-    const q = buildFtsSearchQuery(null, 20);
+    const q = buildFtsSearchQuery("fox", null, 20)!;
     expect(q.text).toContain("d.active = true");
     expect(q.text).toContain("d.invalidated_at IS NULL");
   });
 
   it("joins content for the body, as the sqlite arm does", () => {
-    expect(buildFtsSearchQuery(null, 20).text)
+    expect(buildFtsSearchQuery("fox", null, 20)!.text)
       .toContain("JOIN content ON content.hash = d.hash");
   });
 
   it("orders TOTALLY — rank first, then the (collection, path) unique key", () => {
     // Rank alone leaves ties to whatever order the plan emitted, and with a
     // weighted tsvector over short documents ties are common.
-    expect(buildFtsSearchQuery(null, 20).text)
+    expect(buildFtsSearchQuery("fox", null, 20)!.text)
       .toMatch(/ORDER BY rank DESC, d\.collection ASC, d\.path ASC/);
   });
 
   it("omits the collection filter when none is requested, binding only query + limit", () => {
-    const q = buildFtsSearchQuery(null, 20);
+    const q = buildFtsSearchQuery("fox", null, 20)!;
     // `d.collection` is in the SELECT list and the ORDER BY either way; what
     // must be absent is the FILTER.
     expect(q.text).not.toContain("ANY(");
-    expect(q.values).toEqual([FTS_QUERY_PLACEHOLDER, 20]);
+    expect(q.values).toEqual(["fox", 20]);
     expect(q.text).toContain("LIMIT $2");
   });
 
@@ -140,17 +203,17 @@ describe("buildFtsSearchQuery — the SQL contract", () => {
     // In SQL and not as a post-filter: a post-filter over a fixed overfetch can
     // be STARVED by higher-ranked ineligible documents. Same reasoning the
     // sqlite arm's own comment gives.
-    const q = buildFtsSearchQuery(["research", "decisions"], 5);
+    const q = buildFtsSearchQuery("fox", ["research", "decisions"], 5)!;
     expect(q.text).toContain("d.collection = ANY($2::text[])");
-    expect(q.values).toEqual([FTS_QUERY_PLACEHOLDER, ["research", "decisions"], 5]);
+    expect(q.values).toEqual(["fox", ["research", "decisions"], 5]);
     expect(q.text).toContain("LIMIT $3");
     // Nothing user-supplied is ever interpolated into SQL text.
     expect(q.text).not.toContain("research");
   });
 
   it("binds the limit as a parameter, not literal text", () => {
-    expect(buildFtsSearchQuery(null, 7).values.at(-1)).toBe(7);
-    expect(buildFtsSearchQuery(null, 7).text).not.toContain("LIMIT 7");
+    expect(buildFtsSearchQuery("fox", null, 7)!.values.at(-1)).toBe(7);
+    expect(buildFtsSearchQuery("fox", null, 7)!.text).not.toContain("LIMIT 7");
   });
 });
 
@@ -159,8 +222,7 @@ describe("pgSearchFtsDetailed — the query text reaches $1", () => {
     const c = ftsClient({ rows: [row()] });
     await pgSearchFtsDetailed(c, "unbalanced & ( input", { collections: "research" });
     const scan = c.calls.find(k => k.text.includes("ts_rank_cd"))!;
-    expect(scan.values).toEqual(["unbalanced & ( input", ["research"], 20]);
-    expect(scan.values).not.toContain(FTS_QUERY_PLACEHOLDER);
+    expect(scan.values).toEqual(["unbalanced", "input", ["research"], 20]);
     expect(scan.text).not.toContain("unbalanced");
   });
 
@@ -192,6 +254,15 @@ describe("pgSearchFtsDetailed — the query text reaches $1", () => {
 });
 
 describe("pgSearchFtsDetailed — the degraded channel", () => {
+  it("DEGRADED empty-tsquery: punctuation-only input normalizes to no tokens", async () => {
+    const c = ftsClient({ rows: [row()] });
+    const out = await pgSearchFtsDetailed(c, `' & | ! : ( ) \\`, {});
+    expect(out).toEqual({
+      results: [], degraded: true, degradedReason: "empty-tsquery", scannedRows: 0,
+    });
+    expect(c.calls).toEqual([]);
+  });
+
   it("DEGRADED empty-tsquery: the query normalized to zero lexemes", async () => {
     // All stopwords. The scan would match nothing, but reporting that as "no
     // matches" is a lie — nothing was searched for.
