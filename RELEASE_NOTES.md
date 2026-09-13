@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.18 — PG retrieve CLI verb (clawmem-pg-retrieve/v1) — r47 parity instrument
+
+master-harness-2wx75 SLICE 7 (clawmem half): new `bun src/pg/cli.ts retrieve` verb emitting clawmem-pg-retrieve/v1 JSON for search, vsearch and query modes; first live execution of the store.rerank wiring. Contract documented in README-retrieve.md. Instrument for the r47 PG-vs-sqlite parity eval driven from master-harness (eval-retrieval --engine clawmem-pg). Full bun test 2519 pass / 13 skip / 0 fail at build time.
+
+---
+
 ## v0.36.17 — Sampled-vector validation reconstructs through the embed path's own frontmatter
 
 The sampled-vector validator reconstructed a row's embed input by re-parsing `content.doc` with `parseDocument()`, but `content.doc` is stored frontmatter-**stripped**, so that parse was a structural no-op. The embed path instead synthesizes `{title, description}` from the durable `documents` row. The two therefore split differently, the reconstructed fragment count came up one short, and nearly every row was condemned "unreconstructable" — measured 589/600 on the live vault, which is why a full `embed --force` never moved the counts.
