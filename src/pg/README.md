@@ -141,7 +141,14 @@ degenerate floor plus the `onFallback` hook that becomes the `"degenerate"` stat
 `src/clawmem.ts` (~1549 / ~1608, the sqlite reference implementation of this same stage).
 Unifying them means touching the sqlite read path, which is a separate change.
 
-Nothing in `src/` calls the reranked path yet either.
+Inside `src/`, only the `retrieve` verb calls these functions.
+
+### The CLI over all of it: `retrieve.ts`
+
+`bun src/pg/cli.ts retrieve --mode <search|vsearch|query> --query <text>` prints exactly
+one JSON object (`clawmem-pg-retrieve/v1`). It is the first place the reranker injection
+actually runs. The contract, exit codes and wiring are in
+[`README-retrieve.md`](README-retrieve.md).
 
 ## The three things that will bite you
 
