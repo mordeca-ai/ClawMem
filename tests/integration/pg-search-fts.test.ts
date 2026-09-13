@@ -64,10 +64,10 @@ type Fixture = {
  *  - weight-title.md   : "marmalade" in the TITLE (weight A), body unrelated.
  *  - weight-body.md    : "marmalade" ONLY in the body (weight D). The pair is
  *                        the WEIGHT PROOF: title must out-rank body 10:1.
- *  - phrase-adjacent.md: "brown fox" adjacent.
- *  - phrase-split.md   : "brown" and "fox" present but NOT adjacent. The pair
- *                        proves websearch_to_tsquery really parses a quoted
- *                        phrase rather than being bypassed.
+ *  - prefix-quality.md : "quality" proves a query's longer grammatical form
+ *                        is server-stemmed and prefix-matched.
+ *  - slash-token.md    : proves migration 008 splits punctuation at index time.
+ *  - cross-encoder.md  : proves hyphens split into ordinary AND terms.
  *  - elsewhere.md      : the same "marmalade" term in ANOTHER collection, so a
  *                        collection filter that failed to narrow is visible.
  *  - retired.md        : "zebrafish", inactive.  } the fences' victims — both
@@ -80,10 +80,12 @@ const FIXTURES: Fixture[] = [
     body: "Nothing in this body mentions the fruit preserve at all." },
   { path: "weight-body.md", collection: "research", title: "Unremarkable notes",
     body: "He spread marmalade on the toast and said nothing further." },
-  { path: "phrase-adjacent.md", collection: "research", title: "Adjacent",
-    body: "The quick brown fox jumps over the lazy dog." },
-  { path: "phrase-split.md", collection: "research", title: "Split",
-    body: "The fox was brown, elderly, and disinclined to jump." },
+  { path: "prefix-quality.md", collection: "research", title: "Prefix",
+    body: "The quality signal separates the two retrieval approaches." },
+  { path: "slash-token.md", collection: "research", title: "Slash",
+    body: "The embedding/inference boundary is searchable." },
+  { path: "cross-encoder.md", collection: "research", title: "Encoder",
+    body: "A cross encoder provides a different ranking signal." },
   { path: "elsewhere.md", collection: "decisions", title: "Marmalade elsewhere",
     body: "Another collection entirely, also about marmalade." },
   { path: "retired.md", collection: "research", title: "Retired zebrafish",
@@ -263,31 +265,32 @@ d("PG lexical (FTS) read path", () => {
   });
 
   // =========================================================================
-  // websearch_to_tsquery is really PARSING
+  // sqlite-compatible query and index tokenization
   // =========================================================================
 
-  it("treats a QUOTED phrase differently from the same words unquoted", async () => {
-    // phrase-adjacent.md: "quick brown fox".  phrase-split.md: "fox was brown".
-    // Unquoted, websearch_to_tsquery ANDs the lexemes -> both match. Quoted, it
-    // builds `brown <-> fox` -> only the adjacent one. If the constructor were
-    // bypassed (a hand-rolled sanitizer stripping the quotes, say) these two
-    // searches would return the same set.
-    const unquoted = (await search("brown fox", { collections: "research" }))
-      .map(r => r.displayPath).sort();
-    expect(unquoted).toEqual(["research/phrase-adjacent.md", "research/phrase-split.md"]);
-
-    const quoted = (await search('"brown fox"', { collections: "research" }))
-      .map(r => r.displayPath);
-    expect(quoted).toEqual(["research/phrase-adjacent.md"]);
-    expect(quoted).not.toEqual(unquoted);
+  it("matches a shorter server-stemmed prefix against a longer query form", async () => {
+    const out = await search("qualitatively", { collections: "research" });
+    expect(out.map(r => r.displayPath)).toEqual(["research/prefix-quality.md"]);
   });
 
-  it("does not THROW on syntactically hostile input — the reason for websearch_to_tsquery", async () => {
-    // `to_tsquery` raises a syntax error on this; websearch_to_tsquery does not.
-    // A search box is exactly where such input arrives.
-    const out = await searchDetailed("marmalade & ( ! ) \\ ''' <->", { collections: "research" });
-    expect(out.degraded).toBe(false);
-    expect(out.results.map(r => r.displayPath)).toContain("research/weight-title.md");
+  it("indexes slash-joined text as separate unicode61-compatible tokens", async () => {
+    const out = await search("inference", { collections: "research" });
+    expect(out.map(r => r.displayPath)).toEqual(["research/slash-token.md"]);
+  });
+
+  it("treats a hyphen as an ordinary token boundary, not a phrase operator", async () => {
+    const out = await search("cross-encoder", { collections: "research" });
+    expect(out.map(r => r.displayPath)).toEqual(["research/cross-encoder.md"]);
+  });
+
+  it("does not throw on adversarial query syntax", async () => {
+    for (const query of [
+      "marmalade & ( ! ) \\ ''' <->", 'marmalade:() | ! "quoted"', "品質 \\ marmalade",
+    ]) {
+      const out = await searchDetailed(query, { collections: "research" });
+      expect(out.degraded).toBe(false);
+      expect(Array.isArray(out.results)).toBe(true);
+    }
   });
 
   // =========================================================================

@@ -33,13 +33,11 @@
  *     density (`ts_rank_cd`) rather than plain `ts_rank`: it accounts for term
  *     proximity, which is what a lexical arm over prose bodies wants.
  *
- *  3. THE QUERY CONSTRUCTOR IS `websearch_to_tsquery`. It is the only tsquery
- *     constructor that CANNOT throw on arbitrary user input — `to_tsquery`
- *     raises a syntax error on an unbalanced `&`/`(`, and a search box is
- *     exactly where unbalanced input arrives. It also parses quoted phrases,
- *     `or`, and leading `-` negation, making it the closest analogue to
- *     sqlite's sanitizing buildFTS5Query(). We deliberately hand-roll NO
- *     sanitizer: a sanitizer is a parser we would have to keep correct.
+ *  3. THE QUERY CONSTRUCTOR mirrors sqlite's buildFTS5Query(): Unicode-aware
+ *     token boundaries, curated stopword relaxation, uppercase OR groups, and
+ *     one server-stemmed prefix tsquery node per token. This avoids phrase
+ *     nodes for hyphenated input and restores the prefix semantics of FTS5's
+ *     `"term"*`; all user text remains in bind values.
  *
  *  4. THE COLLECTION FILTER IS IN SQL. `d.collection = ANY($n::text[])` sits in
  *     the same WHERE as the match, so `limit` is satisfied with eligible rows by
@@ -64,6 +62,7 @@ import type { SearchResult } from "../store.ts";
 import { withClient } from "./client.ts";
 import type { Vault } from "./vaults.ts";
 import { PgFtsSearchTimeoutError } from "./errors.ts";
+import { buildPgFtsQuery, type PgFtsQueryFragment } from "./fts-query.ts";
 import {
   DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS,
   normalizeCollections,
@@ -72,16 +71,6 @@ import {
 } from "./search.ts";
 
 export { DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS };
-
-/**
- * The text-search configuration, named EXPLICITLY at the query end.
- *
- * migrations/001 §2 mandates naming it at BOTH ends: the trigger writes with
- * `to_tsvector('english', ...)`, so a query built with the bare two-arg form
- * would depend on the session's `default_text_search_config` and could silently
- * stem differently — a failure with no error, only worse recall.
- */
-const FTS_CONFIG = "english";
 
 /**
  * PostgreSQL's DEFAULT ts_rank weight array, {D, C, B, A}.
@@ -173,38 +162,8 @@ function degraded(reason: PgFtsDegradedReason): PgFtsSearchDetailedResult {
  * active/invalidated fence, the in-SQL collection filter, the total order) is
  * assertable in the unit tier rather than only observable in a live plan.
  *
- * `$1` is the RAW user query string; `websearch_to_tsquery` does the parsing
- * server-side. Nothing is interpolated into the text except this module's own
- * constants (the config name and the weight array).
- *
- * TOTAL ORDER: `ORDER BY rank DESC, filepath ASC`. Rank alone leaves ties to
- * whatever order the plan emitted — and with a weighted tsvector over short
- * fixtures ties are COMMON, not exotic. The vector arm made exactly this
- * choice; matching it means a hybrid caller sees one tie-break rule.
- */
-/**
- * Sentinel occupying `$1` in buildFtsSearchQuery()'s `values`.
- *
- * The builder is PURE — it never sees the user's query text — but the SQL it
- * emits references that text twice (the match predicate and the rank
- * expression), so `$1` must exist and every other placeholder must be numbered
- * around it. Rather than have the builder take a string it does not use, it
- * returns this marker in slot 0 and the caller substitutes the real query.
- * Exported so the unit tier asserts the substitution contract instead of
- * hard-coding a magic string.
- */
-export const FTS_QUERY_PLACEHOLDER = "\u0000fts-query\u0000";
-
-/**
- * Build the ranked FTS query. Pure — no client, no I/O — so the SQL contract
- * (the `@@` match against the bare column, the weighted `ts_rank_cd`, the
- * active/invalidated fence, the in-SQL collection filter, the total order) is
- * assertable in the unit tier rather than only observable in a live plan.
- *
- * `$1` is the RAW user query string (see FTS_QUERY_PLACEHOLDER);
- * `websearch_to_tsquery` does the parsing server-side. Nothing is interpolated
- * into the text except this module's own constants — the config name and the
- * weight array, neither of which any caller can influence.
+ * The parameterized prefix-node expression comes from buildPgFtsQuery and is
+ * reused byte-for-byte for ranking and matching. No user text is interpolated.
  *
  * TOTAL ORDER: `ORDER BY rank DESC, d.collection ASC, d.path ASC`. Rank alone
  * leaves ties to whatever order the plan emitted — and with a weighted tsvector
@@ -214,10 +173,13 @@ export const FTS_QUERY_PLACEHOLDER = "\u0000fts-query\u0000";
  * exactly this choice; matching it means a hybrid caller sees one tie-break rule.
  */
 export function buildFtsSearchQuery(
+  query: string,
   collections: string[] | null,
   limit: number,
-): { text: string; values: unknown[] } {
-  const values: unknown[] = [FTS_QUERY_PLACEHOLDER];
+): { text: string; values: unknown[]; tsquery: PgFtsQueryFragment } | null {
+  const tsquery = buildPgFtsQuery(query);
+  if (tsquery === null) return null;
+  const values: unknown[] = [...tsquery.values];
   let filter = "";
   if (collections !== null) {
     values.push(collections);
@@ -233,16 +195,16 @@ export function buildFtsSearchQuery(
       d.title,
       d.modified_at,
       content.doc AS body,
-      ts_rank_cd('${RANK_WEIGHTS}', d.fts, websearch_to_tsquery('${FTS_CONFIG}', $1)) AS rank
+      ts_rank_cd('${RANK_WEIGHTS}', d.fts, ${tsquery.text}) AS rank
     FROM documents d
     JOIN content ON content.hash = d.hash
-    WHERE d.fts @@ websearch_to_tsquery('${FTS_CONFIG}', $1)
+    WHERE d.fts @@ ${tsquery.text}
       AND d.active = true
       AND d.invalidated_at IS NULL${filter}
     ORDER BY rank DESC, d.collection ASC, d.path ASC
     LIMIT ${limitParam}
   `;
-  return { text, values };
+  return { text, values, tsquery };
 }
 
 /**
@@ -251,11 +213,8 @@ export function buildFtsSearchQuery(
  * DECIDED IN SQL, on purpose, and as a cheap PRE-CHECK inside the same bounded
  * transaction as the scan:
  *
- *  - IN SQL rather than in TypeScript, because "is this a stopword" is a
- *     property of the `english` text-search configuration living in the
- *     database, not of any list we could keep in this file. A JS stopword list
- *     would be a second source of truth that drifts from the dictionary the
- *     trigger used to build the tsvector.
+ *  - IN SQL because PostgreSQL's english dictionary has its own stopwords in
+ *     addition to the curated sqlite-parity relaxation in fts-query.ts.
  *  - AS A PRE-CHECK rather than a column on the main query, because the main
  *     query returns ZERO ROWS in exactly the case we need to report — there is
  *     no row on which to carry the flag. Folding it in would need a LATERAL or
@@ -267,10 +226,10 @@ export function buildFtsSearchQuery(
  *
  * It touches no table, so its cost is a parse plus a dictionary lookup.
  */
-async function isEmptyTsquery(c: PgQueryable, query: string): Promise<boolean> {
+async function isEmptyTsquery(c: PgQueryable, query: PgFtsQueryFragment): Promise<boolean> {
   const { rows } = await c.query<{ n: number | string }>(
-    `SELECT numnode(websearch_to_tsquery('${FTS_CONFIG}', $1)) AS n`,
-    [query],
+    `SELECT numnode(${query.text}) AS n`,
+    query.values,
   );
   const n = rows[0]?.n;
   return (typeof n === "string" ? Number(n) : (n ?? 0)) === 0;
@@ -301,10 +260,9 @@ export async function pgSearchFtsDetailed(
   if (opts.timeoutMs !== undefined && opts.timeoutMs <= 0) return degraded("budget-exhausted");
   const deadline = opts.timeoutMs === undefined ? undefined : Date.now() + opts.timeoutMs;
 
-  const { text, values } = buildFtsSearchQuery(collections, limit);
-  // Substitute the real query text for the builder's $1 marker. Positional, so
-  // it cannot silently land in the wrong slot: slot 0 IS $1 by construction.
-  const bound = values.map(v => (v === FTS_QUERY_PLACEHOLDER ? query : v));
+  const built = buildFtsSearchQuery(query, collections, limit);
+  if (built === null) return degraded("empty-tsquery");
+  const { text, values, tsquery } = built;
 
   const outcome = await withBoundedTx(
     c,
@@ -312,9 +270,9 @@ export async function pgSearchFtsDetailed(
     scope,
     "fts-scan",
     async (): Promise<PgFtsSearchDetailedResult> => {
-      if (await isEmptyTsquery(c, query)) return degraded("empty-tsquery");
+      if (await isEmptyTsquery(c, tsquery)) return degraded("empty-tsquery");
       if (deadline !== undefined && Date.now() >= deadline) return degraded("budget-exhausted");
-      const { rows } = await c.query<PgFtsRow>(text, bound);
+      const { rows } = await c.query<PgFtsRow>(text, values);
       // GENUINE-EMPTY lives here: zero rows is `degraded: false`. We looked.
       return { results: toSearchResults(rows, limit), degraded: false, scannedRows: rows.length };
     },
