@@ -109,6 +109,53 @@ export interface PgVecEmbedder {
  */
 export const DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS = 1200;
 
+/**
+ * Default `hnsw.ef_search` for the ANN scan (master-harness-2wx75 slice 8).
+ *
+ * THE BUG THIS FIXES — FILTERED-HNSW STARVATION. On the live SFW vault 67% of
+ * content_vectors rows belong to hashes with NO active document (superseded /
+ * invalidated content keeps its vectors). pgvector 0.8.6's HNSW scan with the
+ * default `hnsw.ef_search = 40` hands the executor its 40 nearest FRAGMENTS, and
+ * only THEN does the `d.active = true AND d.invalidated_at IS NULL` join filter
+ * run — so two thirds of an already-small candidate list is discarded and the
+ * scan comes back starved. Measured for 6 query embeddings asking for
+ * fragmentLimit = 240: 0 / 1 / 1 / 13 / 15 / 21 rows.
+ *
+ * With `hnsw.iterative_scan = strict_order` AND `hnsw.ef_search = 100` set
+ * locally in the same transaction, every one of those queries returned the full
+ * 240 rows (76-129 distinct documents) in 77-270 ms. `strict_order` keeps the
+ * `<=>` order exact (so the rows we LIMIT are the nearest, not merely near); the
+ * wider ef_search makes each index pass large enough that the post-filter does
+ * not empty it.
+ *
+ * `hnsw.max_scan_tuples` is deliberately left at its default (20000): the
+ * measured full-fill case needs ~3x the fragment limit in visited tuples, well
+ * inside that ceiling, and raising it only widens the worst-case latency of a
+ * query that genuinely has few matches.
+ */
+export const DEFAULT_PG_SEARCH_HNSW_EF_SEARCH = 100;
+/** pgvector's own accepted range for `hnsw.ef_search`. */
+export const PG_SEARCH_HNSW_EF_SEARCH_MIN = 1;
+export const PG_SEARCH_HNSW_EF_SEARCH_MAX = 1000;
+
+/**
+ * Refuse anything that is not an integer in pgvector's range. Like
+ * statement_timeout, the value is INTERPOLATED into `SET LOCAL` (which takes no
+ * bind parameters), so nothing unvalidated may reach the SQL text.
+ */
+export function assertValidHnswEfSearch(n: unknown): asserts n is number {
+  if (
+    typeof n !== "number"
+    || !Number.isInteger(n)
+    || n < PG_SEARCH_HNSW_EF_SEARCH_MIN
+    || n > PG_SEARCH_HNSW_EF_SEARCH_MAX
+  ) {
+    throw new Error(
+      `hnswEfSearch must be an integer in ${PG_SEARCH_HNSW_EF_SEARCH_MIN}..${PG_SEARCH_HNSW_EF_SEARCH_MAX}, got ${JSON.stringify(n)}`,
+    );
+  }
+}
+
 export interface PgSearchVecOptions {
   /** One collection name, a list of them, or nothing = every collection. */
   collections?: string | string[];
@@ -122,6 +169,13 @@ export interface PgSearchVecOptions {
    * (PostgreSQL's own meaning for statement_timeout = 0).
    */
   statementTimeoutMs?: number;
+  /**
+   * `hnsw.ef_search` for the ANN-scan transaction only. Default
+   * DEFAULT_PG_SEARCH_HNSW_EF_SEARCH (100); integer in 1..1000. Transaction-local
+   * (`SET LOCAL`), so a pooled connection never inherits it. See the default's
+   * doc comment for the filtered-HNSW starvation this exists to prevent.
+   */
+  hnswEfSearch?: number;
   /** Embedding backend. Defaults to getDefaultLlamaCpp(). */
   embedder?: PgVecEmbedder;
   /**
@@ -284,6 +338,13 @@ export interface BoundedTxOptions {
    */
   hnswIterativeScan?: boolean;
   /**
+   * When set, `SET LOCAL hnsw.ef_search = <n>` for the transaction, after the
+   * iterative-scan GUC and before `fn`. Validated (integer, 1..1000) because it
+   * is interpolated. Unset = the server default (40). Only the vector arm's
+   * ann-scan leg passes it; the model fence and the FTS arm run no ANN scan.
+   */
+  hnswEfSearch?: number;
+  /**
    * How a SQLSTATE 57014 cancellation becomes a typed error. Defaults to
    * PgVecSearchTimeoutError; the FTS arm passes its own so a caller reading
    * `err.name` learns WHICH arm gave up.
@@ -304,6 +365,7 @@ export async function withBoundedTx<T>(
       `statementTimeoutMs must be a non-negative integer (0 = no bound), got ${JSON.stringify(timeoutMs)}`,
     );
   }
+  if (txOpts.hnswEfSearch !== undefined) assertValidHnswEfSearch(txOpts.hnswEfSearch);
   await c.query("BEGIN");
   try {
     await c.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
@@ -320,6 +382,19 @@ export async function withBoundedTx<T>(
         await c.query("RELEASE SAVEPOINT clawmem_hnsw_guc");
       } catch {
         await c.query("ROLLBACK TO SAVEPOINT clawmem_hnsw_guc");
+      }
+    }
+    // Candidate-list width for the same scan (filtered-HNSW starvation, see
+    // DEFAULT_PG_SEARCH_HNSW_EF_SEARCH). Its own savepoint, so a server that
+    // rejects the iterative-scan GUC still gets the wider ef_search, and vice
+    // versa.
+    if (txOpts.hnswEfSearch !== undefined) {
+      await c.query("SAVEPOINT clawmem_hnsw_ef");
+      try {
+        await c.query(`SET LOCAL hnsw.ef_search = ${txOpts.hnswEfSearch}`);
+        await c.query("RELEASE SAVEPOINT clawmem_hnsw_ef");
+      } catch {
+        await c.query("ROLLBACK TO SAVEPOINT clawmem_hnsw_ef");
       }
     }
     const out = await fn();
@@ -434,6 +509,9 @@ export async function pgSearchVecDetailed(
   const fragmentLimit = opts.overfetch ?? Math.max(limit * 8, 64);
   const deadline = opts.timeoutMs === undefined ? undefined : Date.now() + opts.timeoutMs;
   const statementTimeoutMs = opts.statementTimeoutMs ?? DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS;
+  const hnswEfSearch = opts.hnswEfSearch ?? DEFAULT_PG_SEARCH_HNSW_EF_SEARCH;
+  // Refuse a bad value BEFORE any SQL or embed round trip is spent.
+  assertValidHnswEfSearch(hnswEfSearch);
 
   // The fence FIRST: a cheap DISTINCT beats paying for an embed we are about to
   // refuse. It also means a mismatched endpoint reports the mismatch rather than
@@ -476,7 +554,7 @@ export async function pgSearchVecDetailed(
   const rows = await withBoundedTx(c, statementTimeoutMs, scope, "ann-scan", async () => {
     const { rows } = await c.query<PgVecRow>(text, values);
     return rows;
-  });
+  }, { hnswEfSearch });
 
   // GENUINE-EMPTY lives here: zero rows is `degraded: false`. We searched.
   return {

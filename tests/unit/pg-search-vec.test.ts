@@ -19,6 +19,7 @@
 
 import { describe, it, expect } from "bun:test";
 import {
+  DEFAULT_PG_SEARCH_HNSW_EF_SEARCH,
   DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS,
   assertQueryModelMatchesStored,
   buildVecSearchQuery,
@@ -387,6 +388,95 @@ describe("pgSearchVec bounds both SQL legs with transaction-local GUCs", () => {
     expect(caught).toBeInstanceOf(PgVecSearchTimeoutError);
     expect((caught as PgVecSearchTimeoutError).stage).toBe("ann-scan");
     expect((caught as PgVecSearchTimeoutError).timeoutMs).toBe(5);
+  });
+});
+
+// ===========================================================================
+// FILTERED-HNSW STARVATION (master-harness-2wx75 slice 8).
+//
+// The live vault's ANN scan returned 0-21 of 240 requested fragments because
+// the default hnsw.ef_search = 40 candidate list was mostly inactive-document
+// vectors discarded by the post-filter. The fix is a transaction-local
+// ef_search on the ann-scan leg. These cases pin WHERE it is issued (inside the
+// ann-scan transaction, before the `<=>` query, never on the fence leg), WHAT
+// value, and that a bad value is refused before any SQL is sent.
+// ===========================================================================
+
+/** The statements of the transaction that contains the ANN (`<=>`) query. */
+function annTx(sql: string[]): string[] {
+  const ann = sql.findIndex(t => t.includes("<=>"));
+  expect(ann).toBeGreaterThan(-1);
+  const begin = sql.lastIndexOf("BEGIN", ann);
+  const commit = sql.indexOf("COMMIT", ann);
+  expect(begin).toBeGreaterThan(-1);
+  expect(commit).toBeGreaterThan(ann);
+  return sql.slice(begin, commit + 1);
+}
+
+describe("pgSearchVec widens hnsw.ef_search on the ann-scan transaction only", () => {
+  it("issues SET LOCAL hnsw.ef_search = 100 by default, inside the ANN transaction, before the query", async () => {
+    expect(DEFAULT_PG_SEARCH_HNSW_EF_SEARCH).toBe(100);
+    const c = searchClient({ storedModels: ["embeddinggemma"], rows: [row()] });
+    await pgSearchVec(c, "hello", { embedder: fakeEmbedder("embeddinggemma") });
+    const sql = sqlOf(c);
+    const tx = annTx(sql);
+    const ef = tx.indexOf("SET LOCAL hnsw.ef_search = 100");
+    const iter = tx.indexOf("SET LOCAL hnsw.iterative_scan = strict_order");
+    const ann = tx.findIndex(t => t.includes("<=>"));
+    expect(ef).toBeGreaterThan(0);            // after BEGIN
+    expect(iter).toBeGreaterThan(0);          // same transaction carries strict_order
+    expect(ef).toBeLessThan(ann);             // before the ANN query
+    expect(tx.slice(0, ann).some(t => t === "COMMIT" || t === "ROLLBACK")).toBe(false);
+    // Exactly once overall: the model-fence leg runs no ANN scan and must not get it.
+    expect(sql.filter(t => t.startsWith("SET LOCAL hnsw.ef_search"))).toHaveLength(1);
+    // Transaction-local only — never a session SET that would pollute the pool.
+    expect(sql.some(t => /^SET (?!LOCAL)/.test(t))).toBe(false);
+  });
+
+  it("honours an overridden hnswEfSearch, including both ends of the valid range", async () => {
+    for (const n of [250, 1, 1000]) {
+      const c = searchClient({ storedModels: ["embeddinggemma"], rows: [row()] });
+      await pgSearchVec(c, "hello", { embedder: fakeEmbedder("embeddinggemma"), hnswEfSearch: n });
+      const tx = annTx(sqlOf(c));
+      const ef = tx.indexOf(`SET LOCAL hnsw.ef_search = ${n}`);
+      expect(ef).toBeGreaterThan(0);
+      expect(ef).toBeLessThan(tx.findIndex(t => t.includes("<=>")));
+      expect(sqlOf(c).filter(t => t.startsWith("SET LOCAL hnsw.ef_search"))).toHaveLength(1);
+    }
+  });
+
+  it("refuses an invalid hnswEfSearch before sending ANY SQL or embedding anything", async () => {
+    for (const bad of [0, -5, 1001, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "100"]) {
+      const c = searchClient({ storedModels: ["embeddinggemma"], rows: [row()] });
+      const emb = fakeEmbedder("embeddinggemma");
+      await expect(pgSearchVec(c, "hello", {
+        embedder: emb, hnswEfSearch: bad as number,
+      })).rejects.toThrow(/hnswEfSearch must be an integer in 1\.\.1000/);
+      expect(c.calls).toHaveLength(0);
+      expect(emb.calls).toHaveLength(0);
+    }
+  });
+
+  it("keeps the wider ef_search when the server rejects the iterative-scan GUC (separate savepoints)", async () => {
+    const calls: string[] = [];
+    const c: PgQueryable = {
+      async query(text: string) {
+        calls.push(text.trim());
+        if (text.includes("hnsw.iterative_scan")) {
+          throw Object.assign(new Error("unrecognized configuration parameter"), { code: "42704" });
+        }
+        if (text.includes("SELECT DISTINCT cv.model")) return { rows: [{ model: "embeddinggemma" }] as never[] };
+        if (text.includes("<=>")) return { rows: [row()] as never[] };
+        return { rows: [] as never[] };
+      },
+    };
+    await pgSearchVec(c, "hello", { embedder: fakeEmbedder("embeddinggemma") });
+    const tx = annTx(calls);
+    const rolledBack = tx.indexOf("ROLLBACK TO SAVEPOINT clawmem_hnsw_guc");
+    const ef = tx.indexOf("SET LOCAL hnsw.ef_search = 100");
+    expect(rolledBack).toBeGreaterThan(0);
+    expect(ef).toBeGreaterThan(rolledBack);   // issued AFTER the rollback, so it survives it
+    expect(tx).toContain("RELEASE SAVEPOINT clawmem_hnsw_ef");
   });
 });
 
