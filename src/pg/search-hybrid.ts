@@ -120,6 +120,12 @@ export interface PgHybridSearchResult {
    * compare a value here against a `pgSearchVec` or `pgSearchFts` score.
    */
   results: SearchResult[];
+  /**
+   * The fused retrieval pool before the caller-visible `limit` is applied.
+   * Equal to `results` unless `candidateLimit` exceeds `limit`; reranking uses
+   * this wider pool while every hybrid fallback still returns `results`.
+   */
+  candidates: SearchResult[];
   /** Which arms contributed. Always present; never claims more than ran. */
   arms: PgHybridArms;
   /** true iff at least one arm failed to contribute. */
@@ -150,6 +156,12 @@ export interface PgSearchHybridOptions {
    * candidates and the union is then capped back to `limit`.
    */
   limit?: number;
+  /**
+   * Documents retained after fusion for a downstream stage. Defaults to
+   * `limit` and is clamped to at least `limit`. Both arms are asked for this
+   * many so a caller can rerank a wider pool without widening final output.
+   */
+  candidateLimit?: number;
   /**
    * Wall-clock budget in ms, applied to each arm INDEPENDENTLY. The arms run in
    * sequence, so this is a per-arm bound and the call's worst case is 2x it.
@@ -232,10 +244,11 @@ export async function pgSearchHybridDetailed(
   opts: PgSearchHybridOptions = {},
 ): Promise<PgHybridSearchResult> {
   const limit = opts.limit ?? 20;
+  const candidateLimit = Math.max(limit, opts.candidateLimit ?? limit);
   const rrfK = opts.rrfK ?? DEFAULT_PG_HYBRID_RRF_K;
   const shared = {
     ...(opts.collections === undefined ? {} : { collections: opts.collections }),
-    limit,
+    limit: candidateLimit,
     ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
     ...(opts.statementTimeoutMs === undefined ? {} : { statementTimeoutMs: opts.statementTimeoutMs }),
   };
@@ -304,8 +317,10 @@ export async function pgSearchHybridDetailed(
         ? "fts-only"
         : "none";
 
+  const candidates = fuseRankedArms(lists, candidateLimit, rrfK);
   return {
-    results: fuseRankedArms(lists, limit, rrfK),
+    results: candidates.slice(0, limit),
+    candidates,
     arms,
     degraded: armFailures.length > 0,
     armFailures,

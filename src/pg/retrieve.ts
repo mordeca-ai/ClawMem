@@ -37,10 +37,16 @@
  */
 
 import type { SearchResult } from "../store.ts";
+import { applyCompositeScoring, type EnrichedResult } from "../memory.ts";
 import type { PgQueryable, PgVecEmbedder } from "./search.ts";
 import { pgSearchVecDetailed } from "./search.ts";
 import { pgSearchFtsDetailed } from "./search-fts.ts";
-import { pgSearchRerankedDetailed, type PgReranker, type PgRerankStatus } from "./search-reranked.ts";
+import {
+  pgSearchRerankedDetailed,
+  PG_RERANK_CAP_FLOOR,
+  type PgReranker,
+  type PgRerankStatus,
+} from "./search-reranked.ts";
 import type { PgHybridArmFailure } from "./search-hybrid.ts";
 import type { Vault } from "./vaults.ts";
 
@@ -172,8 +178,73 @@ export interface RetrieveDeps {
   searchFts: typeof pgSearchFtsDetailed;
   searchVec: typeof pgSearchVecDetailed;
   searchReranked: typeof pgSearchRerankedDetailed;
+  /** PG metadata enrichment + the same composite ranking used by sqlite CLI. */
+  rankResults?(c: PgQueryable, results: SearchResult[], query: string, limit: number): Promise<SearchResult[]>;
   /** Release anything the deps opened (pools, the rerank cache store, the LLM). */
   dispose(): Promise<void>;
+}
+
+type PgRankMetadataRow = {
+  collection: string;
+  path: string;
+  content_type: string;
+  authored_at: Date | string | null;
+  access_count: number | string;
+  confidence: number | string;
+  quality_score: number | string;
+  pinned: boolean;
+  last_accessed_at: Date | string | null;
+  duplicate_count: number | string;
+  revision_count: number | string;
+  invalidated_at: Date | string | null;
+};
+
+const isoOrNull = (v: Date | string | null): string | null =>
+  v === null ? null : v instanceof Date ? v.toISOString() : v;
+
+/**
+ * Apply the sqlite CLI's post-retrieval contract to PG rows: enrich from the
+ * authoritative documents table, composite-rank, then apply the visible cap.
+ * One batched lookup avoids an N+1 query and does not touch either vault.
+ */
+export async function pgCompositeRank(
+  c: PgQueryable,
+  results: SearchResult[],
+  query: string,
+  limit: number,
+): Promise<SearchResult[]> {
+  if (results.length === 0) return [];
+  const keys = results.map(r => r.displayPath);
+  const { rows } = await c.query<PgRankMetadataRow>(`
+    SELECT collection, path, content_type, authored_at, access_count,
+           confidence, quality_score, pinned, last_accessed_at,
+           duplicate_count, revision_count, invalidated_at
+    FROM documents
+    WHERE active = true
+      AND invalidated_at IS NULL
+      AND (collection || '/' || path) = ANY($1::text[])
+  `, [keys]);
+  const metadata = new Map(rows.map(row => [`${row.collection}/${row.path}`, row]));
+  const enriched: EnrichedResult[] = results.map(r => {
+    const m = metadata.get(r.displayPath);
+    return {
+      ...r,
+      contentType: m?.content_type ?? "unknown",
+      authoredAt: m ? isoOrNull(m.authored_at) : null,
+      accessCount: Number(m?.access_count ?? 0),
+      confidence: Number(m?.confidence ?? 0.5),
+      qualityScore: Number(m?.quality_score ?? 0.5),
+      pinned: m?.pinned ?? false,
+      lastAccessedAt: m ? isoOrNull(m.last_accessed_at) : null,
+      duplicateCount: Number(m?.duplicate_count ?? 1),
+      revisionCount: Number(m?.revision_count ?? 1),
+      observationType: null,
+      invalidatedAt: m ? isoOrNull(m.invalidated_at) : null,
+    };
+  });
+  return applyCompositeScoring(enriched, query)
+    .slice(0, limit)
+    .map(r => ({ ...r, score: r.compositeScore }));
 }
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
@@ -244,25 +315,37 @@ export async function runRetrieve(
     const collections = args.collections;
     switch (args.mode) {
       case "search": {
-        const r = await deps.withClient(args.vault, c => deps.searchFts(c, args.query, {
-          limit: args.limit,
-          ...(collections === undefined ? {} : { collections }),
-          ...(args.deadlineMs === undefined ? {} : { timeoutMs: args.deadlineMs }),
-        }));
-        out.results = toWire(r.results);
+        const { r, ranked } = await deps.withClient(args.vault, async c => {
+          const r = await deps.searchFts(c, args.query, {
+            limit: args.limit * 2,
+            ...(collections === undefined ? {} : { collections }),
+            ...(args.deadlineMs === undefined ? {} : { timeoutMs: args.deadlineMs }),
+          });
+          const ranked = deps.rankResults
+            ? await deps.rankResults(c, r.results, args.query, args.limit)
+            : r.results.slice(0, args.limit);
+          return { r, ranked };
+        });
+        out.results = toWire(ranked);
         out.degraded = r.degraded;
         out.degradedReason = r.degradedReason ?? null;
         break;
       }
       case "vsearch": {
         const embedder = timedEmbedder(deps.embedder(), embed);
-        const r = await deps.withClient(args.vault, c => deps.searchVec(c, args.query, {
-          limit: args.limit,
-          embedder,
-          ...(collections === undefined ? {} : { collections }),
-          ...(args.deadlineMs === undefined ? {} : { timeoutMs: args.deadlineMs }),
-        }));
-        out.results = toWire(r.results);
+        const { r, ranked } = await deps.withClient(args.vault, async c => {
+          const r = await deps.searchVec(c, args.query, {
+            limit: args.limit * 2,
+            embedder,
+            ...(collections === undefined ? {} : { collections }),
+            ...(args.deadlineMs === undefined ? {} : { timeoutMs: args.deadlineMs }),
+          });
+          const ranked = deps.rankResults
+            ? await deps.rankResults(c, r.results, args.query, args.limit)
+            : r.results.slice(0, args.limit);
+          return { r, ranked };
+        });
+        out.results = toWire(ranked);
         out.degraded = r.degraded;
         out.degradedReason = r.degradedReason ?? null;
         break;
@@ -272,14 +355,20 @@ export async function runRetrieve(
         // Built BEFORE the connection is checked out, so reranker construction
         // cost never counts against a PG statement or the rerank deadline.
         const reranker = args.noRerank ? undefined : await deps.reranker();
-        const r = await deps.withClient(args.vault, c => deps.searchReranked(c, args.query, {
-          limit: args.limit,
-          embedder,
-          ...(collections === undefined ? {} : { collections }),
-          ...(args.deadlineMs === undefined ? {} : { deadlineMs: args.deadlineMs }),
-          ...(reranker === undefined ? {} : { reranker }),
-        }));
-        out.results = toWire(r.results);
+        const { r, ranked } = await deps.withClient(args.vault, async c => {
+          const r = await deps.searchReranked(c, args.query, {
+            limit: Math.max(args.limit, PG_RERANK_CAP_FLOOR),
+            embedder,
+            ...(collections === undefined ? {} : { collections }),
+            ...(args.deadlineMs === undefined ? {} : { deadlineMs: args.deadlineMs }),
+            ...(reranker === undefined ? {} : { reranker }),
+          });
+          const ranked = deps.rankResults
+            ? await deps.rankResults(c, r.results, args.query, args.limit)
+            : r.results.slice(0, args.limit);
+          return { r, ranked };
+        });
+        out.results = toWire(ranked);
         out.degraded = r.hybrid.degraded;
         out.degradedReason = r.hybrid.armFailures.length > 0
           ? r.hybrid.armFailures.map(describeArmFailure).join("; ")
@@ -337,6 +426,7 @@ export function productionRetrieveDeps(): RetrieveDeps {
     searchFts: pgSearchFtsDetailed,
     searchVec: pgSearchVecDetailed,
     searchReranked: pgSearchRerankedDetailed,
+    rankResults: pgCompositeRank,
     async dispose() {
       const { closePool } = await import("./client.ts");
       await closePool().catch(() => {});

@@ -245,6 +245,16 @@ describe("pgSearchHybridDetailed — both arms healthy", () => {
     expect(out.armFailures).toEqual([]);
   });
 
+  it("separates a wider candidate pool from the caller-visible limit", async () => {
+    const out = await run({
+      vecRows: [vecRow("v1.md", 0.1), vecRow("v2.md", 0.2)],
+      ftsRows: [ftsRow("f1.md", 0.9)],
+    }, { limit: 2, candidateLimit: 3 });
+    expect(out.candidates).toHaveLength(3);
+    expect(out.results).toHaveLength(2);
+    expect(out.results).toEqual(out.candidates.slice(0, 2));
+  });
+
   it("RUNS THE ARMS IN SEQUENCE: no vec SQL after the first fts SQL", async () => {
     // THE 25P01 REGRESSION GUARD. `PgQueryable` is one connection and a
     // connection holds one transaction; the first draft of this module ran both
