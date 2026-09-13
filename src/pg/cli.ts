@@ -14,6 +14,7 @@ import { resolvePgConfig } from "./config.ts";
 import { isVault, type Vault } from "./vaults.ts";
 import { reindex } from "./reindex.ts";
 import { pgSearchVec } from "./search.ts";
+import { retrieveCli } from "./retrieve.ts";
 import { assertSchemaGeometry, getVecModels } from "./write.ts";
 import {
   dropLegacyDocumentRows, dropPartitionsBefore, listPartitions, loadOriginCollection,
@@ -43,6 +44,13 @@ function vaultFlag(argv: string[]): Vault {
 
 async function main() {
   const [cmd, ...argv] = process.argv.slice(2);
+  // `retrieve` (master-harness-2wx75 slice 7) is dispatched BEFORE the shared
+  // vault/config resolution below: its contract is ONE JSON object on stdout
+  // even when config resolution fails, so it owns its own flag parsing and
+  // error mapping (src/pg/retrieve.ts). It also spells the sfw vault "public".
+  if (cmd === "retrieve") {
+    process.exit(await retrieveCli(argv));
+  }
   const vault = vaultFlag(argv);
   const cfg = resolvePgConfig(vault);
 
@@ -263,7 +271,7 @@ async function main() {
     }
     default:
       console.error(
-        "usage: bun src/pg/cli.ts <migrate|status|reindex|search|origin-load|origin-partitions|" +
+        "usage: bun src/pg/cli.ts <migrate|status|reindex|search|retrieve|origin-load|origin-partitions|" +
         "origin-drop-legacy|origin-retention> [--vault sfw|nsfw] " +
         "[--collection a,b] [--limit N] [--no-embed] [--no-sweep] [--month YYYY-MM] " +
         "[--before DATE] [--apply] [--query TEXT] [--timeout-ms N]",
