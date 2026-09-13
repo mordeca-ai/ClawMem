@@ -411,3 +411,133 @@ d("PG vector read path", () => {
     expect(await search({ collections: "research" })).toEqual(out.results);
   });
 });
+
+// ===========================================================================
+// FILTERED-HNSW STARVATION, live (master-harness-2wx75 slice 8).
+//
+// The live vault's ANN scan came back with 0-21 of 240 requested fragments:
+// 67% of content_vectors belong to inactive documents, and with the default
+// hnsw.ef_search = 40 the index hands over its 40 nearest fragments BEFORE the
+// `d.active = true` join filter throws most of them away.
+//
+// This reproduces that shape at small scale in its OWN throwaway schema (so the
+// exact-list expectations of the suite above are untouched): 60 INACTIVE
+// fragments all nearer the query than the one ACTIVE target. With ef_search 40
+// and no iterative scan, the index never reaches the target and the search
+// comes back empty (the CONTROL below proves it). With the fix it is returned.
+//
+// FORCING THE INDEX. At fixture scale the planner would rather fetch the few
+// documents and SORT them exactly — measured: with only `enable_seqscan = off`
+// the plan is `Index Scan using documents_effective_time_idx` -> Sort, which is
+// immune to this bug and made the case pass for the wrong reason. The test's own
+// client therefore sets `enable_seqscan = off` AND `enable_sort = off` for the
+// session (the live vault gets the HNSW plan on its own at 100k+ fragments),
+// RESETs both in a finally, and the CONTROL asserts via EXPLAIN that the HNSW
+// index really serves the scan — so a plan change fails loudly instead of
+// silently greening the fix case.
+// ===========================================================================
+
+const STARVE_INACTIVE = 60; // > default ef_search (40)
+const STARVE_TARGET = "target.md";
+
+/** Near-duplicate of the query: angle `deg` in (x, y) plus a tiny unique tilt so no two vectors tie. */
+function nearQuery(i: number): number[] {
+  const v = atAngle(1 + i * 0.05);
+  v[2 + (i % (DIM - 2))] = 0.001 * (1 + (i % 7));
+  return v;
+}
+
+d("PG vector read path — filtered-HNSW starvation", () => {
+  let pool: pg.Pool;
+  let schema: string;
+
+  beforeAll(async () => {
+    pool = new pg.Pool({ connectionString: URL_ });
+    schema = `clawmem_rtest_starve_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    const c = await pool.connect();
+    try {
+      await c.query(`CREATE SCHEMA ${schema}`);
+      await c.query(`SET search_path TO ${schema}, public`);
+      for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
+        await c.query(substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM));
+      }
+      const seed = async (i: number, path: string, active: boolean, vec: number[]) => {
+        const hash = `${i}`.padStart(64, "f");
+        await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, `body of ${path}`]);
+        await c.query(
+          `INSERT INTO documents (collection, path, title, hash, active) VALUES ('starve', $1, $1, $2, $3)`,
+          [path, hash, active],
+        );
+        await c.query(
+          `INSERT INTO content_vectors (hash, seq, pos, model, embedding) VALUES ($1, 0, 0, $2, $3::vector)`,
+          [hash, VAULT_MODEL, toVectorLiteral(vec)],
+        );
+      };
+      for (let i = 0; i < STARVE_INACTIVE; i++) await seed(i, `retired-${i}.md`, false, nearQuery(i));
+      // The one ACTIVE document: 30 degrees off the query, farther than every inactive row.
+      await seed(STARVE_INACTIVE, STARVE_TARGET, true, atAngle(30));
+      await c.query(`ANALYZE content_vectors`);
+      await c.query(`ANALYZE documents`);
+    } finally {
+      c.release();
+    }
+  });
+
+  afterAll(async () => {
+    if (schema) await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await pool.end();
+  });
+
+  /** A client in the starvation schema with seq scans + explicit sorts disabled for the session; always reset. */
+  async function withIndexForced<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
+    const c = await pool.connect();
+    try {
+      await c.query(`SET search_path TO ${schema}, public`);
+      await c.query("SET enable_seqscan = off");
+      await c.query("SET enable_sort = off");
+      return await fn(c);
+    } finally {
+      await c.query("RESET enable_seqscan").catch(() => {});
+      await c.query("RESET enable_sort").catch(() => {});
+      c.release();
+    }
+  }
+
+  it("CONTROL: the fixture really starves at ef_search 40 without iterative scan, on the HNSW index", async () => {
+    // Same active-fenced ANN shape the search runs, under pgvector's defaults.
+    const { buildVecSearchQuery } = await import("../../src/pg/search.ts");
+    const { text, values } = buildVecSearchQuery(toVectorLiteral(QUERY_VEC), null, 240);
+    await withIndexForced(async c => {
+      await c.query("BEGIN");
+      try {
+        await c.query("SET LOCAL hnsw.iterative_scan = off");
+        await c.query("SET LOCAL hnsw.ef_search = 40");
+        const plan = await c.query<{ "QUERY PLAN": string }>(`EXPLAIN (COSTS OFF) ${text}`, values);
+        expect(plan.rows.map(r => r["QUERY PLAN"]).join("\n")).toContain("content_vectors_embedding_hnsw_idx");
+        const { rows } = await c.query<{ path: string }>(text, values);
+        // The target exists and is active, yet the starved scan cannot see it.
+        expect(rows.map(r => r.path)).not.toContain(STARVE_TARGET);
+      } finally {
+        await c.query("ROLLBACK");
+      }
+    });
+  });
+
+  it("RETURNS the active document that more than 40 inactive vectors outrank", async () => {
+    const out = await withIndexForced(c =>
+      pgSearchVecDetailed(c, "anything", { embedder: embedderFor(VAULT_MODEL) }));
+    expect(out.degraded).toBe(false);
+    expect(out.results.map(r => r.displayPath)).toEqual([`starve/${STARVE_TARGET}`]);
+    expect(out.scannedFragments).toBe(1);
+  });
+
+  it("leaves neither hnsw GUC behind on the pooled connection", async () => {
+    await withIndexForced(async c => {
+      await pgSearchVec(c, "anything", { embedder: embedderFor(VAULT_MODEL), hnswEfSearch: 250 });
+      const { rows } = await c.query<{ ef: string; it: string }>(
+        "SELECT current_setting('hnsw.ef_search') AS ef, current_setting('hnsw.iterative_scan') AS it");
+      expect(rows[0]!.ef).toBe("40");
+      expect(rows[0]!.it).toBe("off");
+    });
+  });
+});
