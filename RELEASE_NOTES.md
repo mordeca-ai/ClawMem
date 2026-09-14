@@ -4,6 +4,18 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.21 — master-harness-2wx75 slice 10: bound PG hybrid arms by the overall deadline
+
+PG read path (master-harness-2wx75 slice 10): bound the hybrid arms by the overall deadline.
+
+- pgSearchHybridDetailed gains `deadlineAt` (absolute performance.now() instant). Arms still run vec then fts on one client, but each arm's timeoutMs and per-leg statement_timeout are clamped to the REMAINING overall budget, recomputed before each arm and each SQL/embed leg. A budget below PG_SEARCH_MIN_LEG_BUDGET_MS (25ms) degrades the arm as budget-exhausted without issuing SQL; statement_timeout = 0 (unbounded) is never emitted from a clamp.
+- pgSearchRerankedDetailed passes its single-t0 deadline (default 1500ms) down, so the r51 overrun mechanism (slow-but-completing arms each bounded only by their own 1200ms statement_timeout, deadline checked only before rerank; engine outliers to 5.7s) is closed by construction. No deadline option => byte-identical behaviour.
+- New degraded reasons: budget-exhausted-pre-fence, budget-exhausted-in-embed.
+- Parity (master-harness r52, N=3, 21:12-21:30 CDT): LEG1 discriminating 0.5769; LEG2 search +0.0526/+0.1227, vsearch +0.0000/+0.0311, query +0.0000/+0.0137 (recall@10/MRR@10) identical on all three runs; query p95 868 / 875 / 820 ms vs 1800 at host loadavg 10.7 / 9.3 / 7.4 at leg start; rerank applied 26/26, 0 measured errors. A first canonical attempt at loadavg ~36 (Plex transcode + foreign rg sweep) was an INFRA refusal from 3 standalone-vsearch 1200ms statement timeouts, a path this slice does not change.
+- Tests: unit 2229/0 (+10); PG integration 266 pass / 13 skip / 0 fail (+3 live pg_sleep deadline cases).
+
+---
+
 ## v0.36.20 — Read path -> PG: search/vsearch/query, per-prompt hook, MCP + openclaw plugin on Postgres; transient dual-read parity window; eval run r46 (recall/MRR vs SQLite gold within tolerance) + hook p95 <= 1800ms
 
 PG read path (master-harness-2wx75): cheap model fence + ANN-scan ef_search safeguard + parity restore.
