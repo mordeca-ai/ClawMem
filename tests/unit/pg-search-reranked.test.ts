@@ -280,7 +280,12 @@ describe("pgSearchRerankedDetailed — the status matrix", () => {
     );
     expect(out.rerank).toBe("skipped-budget");
     expect(rr.calls).toHaveLength(0);
-    expect(out.candidateCount).toBe(3);        // there WERE candidates
+    // Slice 10: the deadline reaches INSIDE the hybrid. The vec arm ate it, so
+    // the fts arm is degraded budget-exhausted without running — only the two
+    // vec rows are candidates (before slice 10 the fts arm ran anyway: 3).
+    expect(out.candidateCount).toBe(2);        // there WERE candidates
+    expect(out.hybrid.arms).toBe("vec-only");
+    expect(out.hybrid.armFailures).toEqual([{ arm: "fts", kind: "degraded", reason: "budget-exhausted" }]);
     expect(out.rerankReason).toContain(`${PG_RERANK_MIN_BUDGET_MS}ms floor`);
     // …and the call did not run long past its budget waiting to discover that.
     expect(out.timings.totalMs).toBeLessThanOrEqual(100 + SLACK);
