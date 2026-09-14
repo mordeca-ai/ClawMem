@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.22 — clawmem PG reindex never GCs superseded content_vectors: 67% of vectors (116k/174k) belong to non-active hashes, starving filtered HNSW and inflating the 719MB index
+
+PG content GC: deletes content (cascading content_vectors) whose hash is referenced by neither documents nor origin_documents; sfw vault only; LIMIT-batched with a per-pass cap and a 15-min grace window; runs at the end of reindex() (opt-out --no-gc) and as the gc verb (--dry-run). Retention: any documents row (incl. active=false) or origin_documents row protects its content. Live first pass removed 699 content / 9,616 vectors; the space reclaim needs VACUUM/REINDEX (follow-up).
+
+---
+
 ## Unreleased — master-harness-vn4rz.49: PG content GC for superseded content_vectors (SFW vault)
 
 PG write path (master-harness-vn4rz.49): the reindex never deleted `content` rows of superseded hashes, so their `content_vectors` stayed in the table and the HNSW index indefinitely.
