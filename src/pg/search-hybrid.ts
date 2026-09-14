@@ -316,32 +316,41 @@ export async function pgSearchHybridDetailed(
   };
 
   const vecBudget = armBudget();
-  const vecOutcome: Settled<PgVecSearchDetailedResult> = vecBudget === null
-    ? {
-      status: "fulfilled",
-      value: {
-        results: [],
-        degraded: true,
-        degradedReason: "budget-exhausted-pre-fence",
-        storedModels: 0,
-        scannedFragments: 0,
-      },
-    }
-    : await settle(() => pgSearchVecDetailed(c, query, {
-      ...shared,
-      ...vecBudget,
-      ...(deadlineAt === undefined ? {} : { deadlineAt }),
-      ...(opts.embedder === undefined ? {} : { embedder: opts.embedder }),
-      ...(opts.overfetch === undefined ? {} : { overfetch: opts.overfetch }),
-    }));
+  const vecOutcome: Settled<PgVecSearchDetailedResult> =
+    vecBudget === null
+      ? {
+          status: "fulfilled",
+          value: {
+            results: [],
+            degraded: true,
+            degradedReason: "budget-exhausted-pre-fence",
+            storedModels: 0,
+            scannedFragments: 0,
+          },
+        }
+      : await settle(() =>
+          pgSearchVecDetailed(c, query, {
+            ...shared,
+            ...vecBudget,
+            ...(deadlineAt === undefined ? {} : { deadlineAt }),
+            ...(opts.embedder === undefined ? {} : { embedder: opts.embedder }),
+            ...(opts.overfetch === undefined ? {} : { overfetch: opts.overfetch }),
+          }),
+        );
   // Recomputed AFTER the vec arm returned: the fts arm gets what is LEFT.
   const ftsBudget = armBudget();
-  const ftsOutcome: Settled<PgFtsSearchDetailedResult> = ftsBudget === null
-    ? {
-      status: "fulfilled",
-      value: { results: [], degraded: true, degradedReason: "budget-exhausted", scannedRows: 0 },
-    }
-    : await settle(() => pgSearchFtsDetailed(c, query, { ...shared, ...ftsBudget }));
+  const ftsOutcome: Settled<PgFtsSearchDetailedResult> =
+    ftsBudget === null
+      ? {
+          status: "fulfilled",
+          value: {
+            results: [],
+            degraded: true,
+            degradedReason: "budget-exhausted",
+            scannedRows: 0,
+          },
+        }
+      : await settle(() => pgSearchFtsDetailed(c, query, { ...shared, ...ftsBudget }));
 
   // BOTH REJECTED: outcome 4. Never demote a total failure to an empty answer —
   // a caller cannot tell `results: []` from "the database is unreachable", and

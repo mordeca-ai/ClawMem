@@ -300,34 +300,52 @@ d("PG reranked read path", () => {
   }
 
   const stmtBounds = (seen: string[]) =>
-    seen.flatMap(t => { const m = /^SET LOCAL statement_timeout = (\d+)$/.exec(t); return m ? [Number(m[1])] : []; });
+    seen.flatMap((t) => {
+      const m = /^SET LOCAL statement_timeout = (\d+)$/.exec(t);
+      return m ? [Number(m[1])] : [];
+    });
 
   it("LIVE A4: a vec leg that would sleep 5 s is cancelled at the REMAINING budget; the call lands inside deadline + epsilon, degraded not thrown", async () => {
     const seen: string[] = [];
     const deadlineMs = 600;
-    const out = await withSchema(c => pgSearchRerankedDetailed(slowAnnClient(c, 5, seen), "zebrafish", {
-      collections: "research", embedder, reranker: reversing().reranker, deadlineMs,
-    }));
+    const out = await withSchema((c) =>
+      pgSearchRerankedDetailed(slowAnnClient(c, 5, seen), "zebrafish", {
+        collections: "research",
+        embedder,
+        reranker: reversing().reranker,
+        deadlineMs,
+      }),
+    );
     expect(out.timings.totalMs).toBeLessThanOrEqual(deadlineMs + EPSILON_MS);
     expect(out.hybrid.degraded).toBe(true);
     expect(out.hybrid.arms).toBe("none");
     // The vec ANN leg was cancelled by its CLAMPED server-side bound…
     expect(out.hybrid.armFailures[0]).toMatchObject({ arm: "vec", kind: "threw" });
-    expect((out.hybrid.armFailures[0] as { error: Error }).error.name).toBe("PgVecSearchTimeoutError");
+    expect((out.hybrid.armFailures[0] as { error: Error }).error.name).toBe(
+      "PgVecSearchTimeoutError",
+    );
     // …so nothing was left for fts: degraded on budget, and it issued no SQL.
-    expect(out.hybrid.armFailures[1]).toEqual({ arm: "fts", kind: "degraded", reason: "budget-exhausted" });
-    expect(seen.some(t => t.includes("numnode") || t.includes("ts_rank_cd"))).toBe(false);
+    expect(out.hybrid.armFailures[1]).toEqual({
+      arm: "fts",
+      kind: "degraded",
+      reason: "budget-exhausted",
+    });
+    expect(seen.some((t) => t.includes("numnode") || t.includes("ts_rank_cd"))).toBe(false);
     const bounds = stmtBounds(seen);
-    expect(bounds.every(n => n > 0 && n <= deadlineMs)).toBe(true);
+    expect(bounds.every((n) => n > 0 && n <= deadlineMs)).toBe(true);
     expect(bounds).not.toContain(0);
   });
 
   it("LIVE A4: a slow-but-COMPLETING vec leg leaves the fts arm only what remains", async () => {
     const seen: string[] = [];
     const deadlineMs = 1000;
-    const out = await withSchema(c => pgSearchRerankedDetailed(slowAnnClient(c, 0.3, seen), "zebrafish", {
-      collections: "research", embedder, deadlineMs,
-    }));
+    const out = await withSchema((c) =>
+      pgSearchRerankedDetailed(slowAnnClient(c, 0.3, seen), "zebrafish", {
+        collections: "research",
+        embedder,
+        deadlineMs,
+      }),
+    );
     expect(out.hybrid.arms).toBe("vec+fts");
     expect(out.timings.totalMs).toBeLessThanOrEqual(deadlineMs + EPSILON_MS);
     const lastVec = seen.reduce((acc, t, i) => (t.includes("<=>") ? i : acc), -1);
@@ -341,12 +359,16 @@ d("PG reranked read path", () => {
   it("LIVE A4: the hybrid itself honours deadlineAt against a 5 s vec leg (no throw)", async () => {
     const seen: string[] = [];
     const t0 = performance.now();
-    const out = await withSchema(c => pgSearchHybridDetailed(slowAnnClient(c, 5, seen), "zebrafish", {
-      collections: "research", embedder, deadlineAt: performance.now() + 400,
-    }));
+    const out = await withSchema((c) =>
+      pgSearchHybridDetailed(slowAnnClient(c, 5, seen), "zebrafish", {
+        collections: "research",
+        embedder,
+        deadlineAt: performance.now() + 400,
+      }),
+    );
     expect(performance.now() - t0).toBeLessThanOrEqual(400 + EPSILON_MS);
     expect(out.degraded).toBe(true);
-    expect(out.armFailures.map(f => f.arm)).toEqual(["vec", "fts"]);
+    expect(out.armFailures.map((f) => f.arm)).toEqual(["vec", "fts"]);
   });
 
   // =========================================================================

@@ -482,12 +482,12 @@ function scoreFromDistance(distance: number): number {
  * the whole point (master-harness-2wx75 GAP 7).
  */
 export type PgVecDegradedReason =
-  | "no-stored-vectors"           // the model fence found nothing embedded in scope
-  | "budget-exhausted-pre-fence"  // deadlineAt left < PG_SEARCH_MIN_LEG_BUDGET_MS before ANY SQL (slice 10)
-  | "budget-exhausted-pre-embed"  // timeoutMs already spent before the embed leg
-  | "budget-exhausted-in-embed"   // deadlineAt reached while the embed leg was still running (slice 10)
-  | "embed-unavailable"           // the embed endpoint returned no embedding
-  | "budget-exhausted-pre-sql";   // timeoutMs spent after the embed, before the ANN scan
+  | "no-stored-vectors" // the model fence found nothing embedded in scope
+  | "budget-exhausted-pre-fence" // deadlineAt left < PG_SEARCH_MIN_LEG_BUDGET_MS before ANY SQL (slice 10)
+  | "budget-exhausted-pre-embed" // timeoutMs already spent before the embed leg
+  | "budget-exhausted-in-embed" // deadlineAt reached while the embed leg was still running (slice 10)
+  | "embed-unavailable" // the embed endpoint returned no embedding
+  | "budget-exhausted-pre-sql"; // timeoutMs spent after the embed, before the ANN scan
 
 /**
  * The typed result of a vector search — the degraded channel this path needs so
@@ -650,10 +650,17 @@ export async function pgSearchVecDetailed(
     return degraded("budget-exhausted-pre-sql", storedModels.length, embedded.model);
   }
 
-  const rows = await withBoundedTx(c, annTimeoutMs, scope, "ann-scan", async () => {
-    const { rows } = await c.query<PgVecRow>(text, values);
-    return rows;
-  }, { hnswEfSearch });
+  const rows = await withBoundedTx(
+    c,
+    annTimeoutMs,
+    scope,
+    "ann-scan",
+    async () => {
+      const { rows } = await c.query<PgVecRow>(text, values);
+      return rows;
+    },
+    { hnswEfSearch },
+  );
 
   // GENUINE-EMPTY lives here: zero rows is `degraded: false`. We searched.
   return {
@@ -675,7 +682,7 @@ const BUDGET_SPENT: unique symbol = Symbol("pg-search-budget-spent");
 async function raceBudget<T>(p: Promise<T>, budgetMs: number): Promise<T | typeof BUDGET_SPENT> {
   p.catch(() => {});
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const expiry = new Promise<typeof BUDGET_SPENT>(resolve => {
+  const expiry = new Promise<typeof BUDGET_SPENT>((resolve) => {
     timer = setTimeout(() => resolve(BUDGET_SPENT), budgetMs);
   });
   try {
