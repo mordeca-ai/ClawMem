@@ -46,8 +46,10 @@ import { getDefaultLlamaCpp, formatDocForEmbedding } from "../llm.ts";
 import { splitDocument } from "../splitter.ts";
 import { canonicalDocId } from "../store.ts";
 import { embedDim } from "./config.ts";
+import { vaultIsConfigured } from "./config.ts";
 import {
-  deactivateAbsentDocuments, insertEmbeddingsBatch, upsertDocument, type EmbeddingWrite,
+  deactivateAbsentDocuments, gcOrphanedContent, insertEmbeddingsBatch, upsertDocument,
+  type ContentGcResult, type EmbeddingWrite,
 } from "./write.ts";
 
 /** Mirrors indexer.ts's brace expansion — Bun.Glob has no brace support. */
@@ -73,6 +75,13 @@ export interface ReindexOptions {
    * `true` is a request, never a bypass.
    */
   sweep?: boolean;
+  /**
+   * Run the sfw-vault content GC after the pass (master-harness-vn4rz.49).
+   * DEFAULT TRUE. See gcOrphanedContent in write.ts for the retention rule.
+   */
+  gc?: boolean;
+  /** Receives the GC result, or a skip reason when the GC did not run. */
+  onContentGc?: (r: ContentGcResult | { skipped: string }) => void;
   onProgress?: (msg: string) => void;
 }
 
@@ -509,6 +518,18 @@ export async function reindex(opts: ReindexOptions = {}): Promise<ReindexStats[]
   for (const c of listCollections()) {
     if (wanted.size > 0 && !wanted.has(c.name)) continue;
     out.push(await reindexCollection(c.name, c.path, c.pattern, opts));
+  }
+  // CONTENT GC (master-harness-vn4rz.49): its own transactions, AFTER the whole
+  // pass, so no document upsert of this run is still pending. Orphan-hood is
+  // purely referential (no documents / origin_documents row), so a --limit or
+  // collection-scoped run cannot manufacture false orphans the way a truncated
+  // walk manufactures false absences. SFW vault only, by construction.
+  if (opts.gc === false) {
+    opts.onContentGc?.({ skipped: "disabled by --no-gc" });
+  } else if (!vaultIsConfigured("sfw")) {
+    opts.onContentGc?.({ skipped: "sfw vault not configured" });
+  } else {
+    opts.onContentGc?.(await gcOrphanedContent({ vault: "sfw" }));
   }
   return out;
 }

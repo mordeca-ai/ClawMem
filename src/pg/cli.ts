@@ -15,7 +15,9 @@ import { isVault, type Vault } from "./vaults.ts";
 import { reindex } from "./reindex.ts";
 import { pgSearchVec } from "./search.ts";
 import { retrieveCli } from "./retrieve.ts";
-import { assertSchemaGeometry, getVecModels } from "./write.ts";
+import {
+  assertSchemaGeometry, CONTENT_GC_DEFAULTS, gcOrphanedContent, getVecModels, type ContentGcResult,
+} from "./write.ts";
 import {
   dropLegacyDocumentRows, dropPartitionsBefore, listPartitions, loadOriginCollection,
 } from "./origin.ts";
@@ -24,6 +26,19 @@ import { listCollections } from "../collections.ts";
 function flagValue(argv: string[], name: string): string | undefined {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
+}
+
+function printContentGc(r: ContentGcResult | { skipped: string }): void {
+  if ("skipped" in r) {
+    console.log(`content gc SKIPPED: ${r.skipped}`);
+    return;
+  }
+  console.log(
+    `content gc (${r.vault}${r.dryRun ? ", DRY RUN" : ""}): eligible ${r.eligibleContent} content / ` +
+    `${r.eligibleVectors} vectors, within grace ${r.withinGraceContent}, deleted ` +
+    `${r.contentDeleted} content / ${r.vectorsDeleted} vectors in ${r.batches} batch(es)` +
+    (r.capped ? ", CAPPED (run again to continue)" : ""),
+  );
 }
 
 /**
@@ -50,6 +65,26 @@ async function main() {
   // error mapping (src/pg/retrieve.ts). It also spells the sfw vault "public".
   if (cmd === "retrieve") {
     process.exit(await retrieveCli(argv));
+  }
+  // `gc` (master-harness-vn4rz.49) is SFW-only by construction: the nsfw vault
+  // is refused here, before any config is resolved or a pool opened, and again
+  // inside gcOrphanedContent.
+  if (cmd === "gc") {
+    const v = vaultFlag(argv);
+    const num = (name: string) => {
+      const raw = flagValue(argv, name);
+      return raw === undefined ? undefined : Number(raw);
+    };
+    const r = await gcOrphanedContent({
+      vault: v,
+      dryRun: argv.includes("--dry-run"),
+      batchSize: num("--batch-size"),
+      maxBatches: num("--max-batches"),
+      graceSeconds: num("--grace-seconds"),
+    });
+    printContentGc(r);
+    await closePool();
+    return;
   }
   const vault = vaultFlag(argv);
   const cfg = resolvePgConfig(vault);
@@ -110,6 +145,7 @@ async function main() {
       break;
     }
     case "reindex": {
+      const gcLines: (ContentGcResult | { skipped: string })[] = [];
       const cols = flagValue(argv, "--collection");
       const limitRaw = flagValue(argv, "--limit");
       const stats = await reindex({
@@ -120,6 +156,8 @@ async function main() {
         // --no-sweep is the opt-out, never the other way around.
         sweep: !argv.includes("--no-sweep"),
         embedBatchSize: argv.includes("--batch-size") ? Number(flagValue(argv, "--batch-size")) : undefined,
+        gc: !argv.includes("--no-gc"),
+        onContentGc: r => gcLines.push(r),
         onProgress: m => console.log(m),
       });
       for (const s of stats) {
@@ -190,6 +228,7 @@ async function main() {
           );
         }
       }
+      for (const g of gcLines) printContentGc(g);
       break;
     }
     // ---------------------------------------------------------------------
@@ -272,9 +311,11 @@ async function main() {
     default:
       console.error(
         "usage: bun src/pg/cli.ts <migrate|status|reindex|search|retrieve|origin-load|origin-partitions|" +
-        "origin-drop-legacy|origin-retention> [--vault sfw|nsfw] " +
+        "origin-drop-legacy|origin-retention|gc> [--vault sfw|nsfw] " +
         "[--collection a,b] [--limit N] [--no-embed] [--no-sweep] [--month YYYY-MM] " +
-        "[--before DATE] [--apply] [--query TEXT] [--timeout-ms N]",
+        "[--before DATE] [--apply] [--query TEXT] [--timeout-ms N] [--no-gc] " +
+        `[gc: --dry-run --batch-size N (${CONTENT_GC_DEFAULTS.batchSize}) ` +
+        `--max-batches N (${CONTENT_GC_DEFAULTS.maxBatches}) --grace-seconds N (${CONTENT_GC_DEFAULTS.graceSeconds})]`,
       );
       process.exit(2);
   }

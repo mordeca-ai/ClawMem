@@ -292,3 +292,24 @@ export class PgFtsSearchTimeoutError extends Error {
     this.stage = stage;
   }
 }
+
+/**
+ * The content GC refused a non-sfw vault (master-harness-vn4rz.49).
+ *
+ * Thrown BEFORE any configuration is resolved or any pool is opened, so a
+ * refusal here proves the nsfw database was never connected to, let alone
+ * mutated. The nsfw vault's garbage collection needs separate operator
+ * authorization; widening this is a reviewed code change, not a flag.
+ */
+export class ContentGcVaultRefusedError extends Error {
+  readonly vault: string;
+  constructor(vault: string) {
+    super(
+      `Refusing content GC on the "${vault}" vault: the GC is SFW-only by construction ` +
+      `(master-harness-vn4rz.49). The nsfw vault (clawmem_nsfw) is never connected to ` +
+      `by this path without separate operator authorization. Nothing was read or deleted.`,
+    );
+    this.name = "ContentGcVaultRefusedError";
+    this.vault = vault;
+  }
+}
