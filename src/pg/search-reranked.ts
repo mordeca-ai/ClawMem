@@ -45,12 +45,21 @@
  *    returned so a parity run can READ the additive budget instead of
  *    inferring it.
  *
- *    RELATIONSHIP TO `timeoutMs`: `timeoutMs` bounds EACH ARM inside the
- *    hybrid; `deadlineMs` bounds THE WHOLE CALL including both arms and the
- *    rerank. They are not redundant and neither derives the other — a caller
- *    that sets `timeoutMs` larger than `deadlineMs` has simply guaranteed the
- *    rerank stage will be skipped for budget, which is a visible status rather
- *    than a hidden overrun. `deadlineMs` defaults to
+ *    THE DEADLINE REACHES INSIDE THE HYBRID (slice 10). Checking it only after
+ *    the hybrid returned was not enough: measured at r51 parity rep2 (host
+ *    loadavg ~12.6), slow-but-completing arms each ran under their OWN 1200 ms
+ *    statement_timeout and the call overran to 5.7 s of engine time before the
+ *    first deadline check. So the same t0-derived instant is handed down as
+ *    the hybrid's `deadlineAt`: the vec arm (and each of its legs) is bounded
+ *    by what remains, the remainder is recomputed after it returns, and the
+ *    fts arm is bounded by THAT — or degraded as budget-exhausted without
+ *    issuing SQL when too little is left.
+ *
+ *    RELATIONSHIP TO `timeoutMs`: `timeoutMs` still bounds EACH ARM inside the
+ *    hybrid, but as `min(timeoutMs, remaining)`; `deadlineMs` bounds THE WHOLE
+ *    CALL including both arms and the rerank. A caller that sets `timeoutMs`
+ *    larger than `deadlineMs` no longer overruns — the deadline wins, and the
+ *    rerank stage is skipped for budget as a visible status. `deadlineMs` defaults to
  *    DEFAULT_PG_RERANK_DEADLINE_MS (1500), chosen to sit under the 1800 ms
  *    hook p95 clause with headroom for the caller's own work; it is NOT a
  *    measured value and vn4rz's parity run is what will price it.
@@ -186,7 +195,7 @@ export interface PgRerankTimings {
  *
  * There is deliberately NO `rerankTimeoutMs`. See ruling 4.
  */
-export interface PgSearchRerankedOptions extends PgSearchHybridOptions {
+export interface PgSearchRerankedOptions extends Omit<PgSearchHybridOptions, "deadlineAt"> {
   /** The injected reranker. Omitted ⇒ `"skipped-no-reranker"` (a caller choice). */
   reranker?: PgReranker;
   /**
@@ -299,6 +308,9 @@ export async function pgSearchRerankedDetailed(
     ...(opts.embedder === undefined ? {} : { embedder: opts.embedder as PgVecEmbedder }),
     ...(opts.overfetch === undefined ? {} : { overfetch: opts.overfetch }),
     ...(opts.rrfK === undefined ? {} : { rrfK: opts.rrfK }),
+    // The SAME t0-derived instant, handed down so each arm is bounded by what
+    // remains of the overall deadline rather than by its own full timeout.
+    deadlineAt: t0 + deadlineMs,
   };
 
   // The hybrid is NOT wrapped in a try/catch. Both arms failing must still

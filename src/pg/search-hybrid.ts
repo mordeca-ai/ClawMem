@@ -41,6 +41,8 @@
 import type { SearchResult } from "../store.ts";
 import { reciprocalRankFusion, toRanked, attachRrfScores } from "../search-utils.ts";
 import {
+  clampLegStatementTimeout,
+  DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS,
   pgSearchVecDetailed,
   type PgQueryable,
   type PgVecEmbedder,
@@ -164,11 +166,29 @@ export interface PgSearchHybridOptions {
   candidateLimit?: number;
   /**
    * Wall-clock budget in ms, applied to each arm INDEPENDENTLY. The arms run in
-   * sequence, so this is a per-arm bound and the call's worst case is 2x it.
+   * sequence, so WITHOUT `deadlineAt` this is a per-arm bound and the call's
+   * worst case is 2x it. WITH `deadlineAt`, each arm gets
+   * `min(timeoutMs, remaining)` instead.
    */
   timeoutMs?: number;
-  /** Server-side bound on each arm's SQL legs, in ms. */
+  /**
+   * Server-side bound on each arm's SQL legs, in ms. Default
+   * DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS. WITH `deadlineAt`, every leg gets
+   * `min(this, remaining)` (see clampLegStatementTimeout).
+   */
   statementTimeoutMs?: number;
+  /**
+   * OVERALL deadline for the whole hybrid call, as an ABSOLUTE instant on the
+   * `performance.now()` clock (monotonic; the same clock
+   * pgSearchRerankedDetailed takes its single t0 from). Slice 10.
+   *
+   * When set, the remaining budget is recomputed before EACH arm — and, inside
+   * the vec arm, before each of its legs — and every timeout that arm is handed
+   * is clamped to it. An arm left with less than PG_SEARCH_MIN_LEG_BUDGET_MS is
+   * DEGRADED as budget-exhausted (`kind: "degraded"`) without issuing any SQL;
+   * it is not a throw. Omitted ⇒ behaviour identical to before slice 10.
+   */
+  deadlineAt?: number;
   /** Embedding backend for the vec arm. Defaults to the vec arm's default. */
   embedder?: PgVecEmbedder;
   /** Fragment overfetch for the vec arm's ANN pass. */
@@ -230,8 +250,9 @@ async function settle<T>(fn: () => Promise<T>): Promise<Settled<T>> {
  * hold two transaction blocks at once — see the comment at the call site, which
  * is the load-bearing constraint of this whole module. A rejecting arm is caught
  * and demoted rather than allowed to skip or cancel the other (see
- * PgHybridArmFailure `kind: "threw"`). Both receive the same scope, and each
- * receives the same budget INDEPENDENTLY.
+ * PgHybridArmFailure `kind: "threw"`). Both receive the same scope. Without
+ * `deadlineAt` each receives the same budget INDEPENDENTLY; with it, each is
+ * bounded by what REMAINS of the one overall deadline when it starts (slice 10).
  *
  * This sits behind the same `(client, query, options)` shape as
  * pgSearchVecDetailed / pgSearchFtsDetailed, so migrating a caller onto the
@@ -267,14 +288,69 @@ export async function pgSearchHybridDetailed(
   // Concurrency here needs TWO clients checked out of the pool, which is a
   // different signature than the arms already expose (see the *InVault wrappers)
   // and is deliberately out of this slice. The cost of sequencing is that
-  // `timeoutMs` is a PER-ARM budget, so a hybrid call's worst-case wall clock is
-  // the sum of the two arms', not the max. Stated rather than hidden.
-  const vecOutcome = await settle(() => pgSearchVecDetailed(c, query, {
-    ...shared,
-    ...(opts.embedder === undefined ? {} : { embedder: opts.embedder }),
-    ...(opts.overfetch === undefined ? {} : { overfetch: opts.overfetch }),
-  }));
-  const ftsOutcome = await settle(() => pgSearchFtsDetailed(c, query, shared));
+  // WITHOUT `deadlineAt`, `timeoutMs` / `statementTimeoutMs` are PER-ARM budgets,
+  // so a hybrid call's worst-case wall clock is the sum of the two arms', not the
+  // max — measured at 5.7 s of engine time under host load (r51 rep2).
+  //
+  // WITH `deadlineAt` (slice 10) the sum is bounded by the deadline instead: the
+  // remaining budget is recomputed immediately before EACH arm, each arm's
+  // timeouts are clamped to it, and an arm left with less than
+  // PG_SEARCH_MIN_LEG_BUDGET_MS is degraded as budget-exhausted WITHOUT any SQL
+  // (never handed `statement_timeout = 0`, which PostgreSQL reads as unbounded).
+  // The vec arm also receives `deadlineAt` so its later legs (embed, ANN scan)
+  // are clamped to what is left after its earlier ones. The worst case becomes
+  // deadline + one leg's cancellation latency + the non-SQL tail.
+  const deadlineAt = opts.deadlineAt;
+  const armBudget = (): { timeoutMs?: number; statementTimeoutMs?: number } | null => {
+    if (deadlineAt === undefined) return shared;
+    const remaining = Math.floor(deadlineAt - performance.now());
+    const statementTimeoutMs = clampLegStatementTimeout(
+      opts.statementTimeoutMs ?? DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS,
+      remaining,
+    );
+    if (statementTimeoutMs === null) return null;
+    return {
+      timeoutMs: opts.timeoutMs === undefined ? remaining : Math.min(opts.timeoutMs, remaining),
+      statementTimeoutMs,
+    };
+  };
+
+  const vecBudget = armBudget();
+  const vecOutcome: Settled<PgVecSearchDetailedResult> =
+    vecBudget === null
+      ? {
+          status: "fulfilled",
+          value: {
+            results: [],
+            degraded: true,
+            degradedReason: "budget-exhausted-pre-fence",
+            storedModels: 0,
+            scannedFragments: 0,
+          },
+        }
+      : await settle(() =>
+          pgSearchVecDetailed(c, query, {
+            ...shared,
+            ...vecBudget,
+            ...(deadlineAt === undefined ? {} : { deadlineAt }),
+            ...(opts.embedder === undefined ? {} : { embedder: opts.embedder }),
+            ...(opts.overfetch === undefined ? {} : { overfetch: opts.overfetch }),
+          }),
+        );
+  // Recomputed AFTER the vec arm returned: the fts arm gets what is LEFT.
+  const ftsBudget = armBudget();
+  const ftsOutcome: Settled<PgFtsSearchDetailedResult> =
+    ftsBudget === null
+      ? {
+          status: "fulfilled",
+          value: {
+            results: [],
+            degraded: true,
+            degradedReason: "budget-exhausted",
+            scannedRows: 0,
+          },
+        }
+      : await settle(() => pgSearchFtsDetailed(c, query, { ...shared, ...ftsBudget }));
 
   // BOTH REJECTED: outcome 4. Never demote a total failure to an empty answer —
   // a caller cannot tell `results: []` from "the database is unreachable", and

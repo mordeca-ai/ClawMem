@@ -33,7 +33,12 @@ import {
   DEFAULT_PG_HYBRID_RRF_K,
   type PgHybridArms,
 } from "../../src/pg/search-hybrid.ts";
-import type { PgQueryable, PgVecEmbedder, PgVecRow } from "../../src/pg/search.ts";
+import {
+  PG_SEARCH_MIN_LEG_BUDGET_MS,
+  type PgQueryable,
+  type PgVecEmbedder,
+  type PgVecRow,
+} from "../../src/pg/search.ts";
 import type { PgFtsRow } from "../../src/pg/search-fts.ts";
 import type { SearchResult } from "../../src/store.ts";
 
@@ -398,6 +403,213 @@ describe("pgSearchHybridDetailed — the three-way invariant", () => {
         expect(out.armFailures.length === 0).toBe(arms === "vec+fts");
       }
     });
+});
+
+// ===========================================================================
+// THE OVERALL DEADLINE — each arm bounded by what REMAINS (slice 10)
+// ===========================================================================
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const STMT = /^SET LOCAL statement_timeout = (\d+)$/;
+
+/**
+ * A fake client that burns wall clock on the vec ANN scan and RECORDS every
+ * statement in order, so the statement_timeout each leg was handed is readable.
+ */
+function slowVecClient(vecDelayMs: number, plan: ArmPlan = {}): PgQueryable & { sql: string[] } {
+  const inner = hybridClient(plan);
+  const sql: string[] = [];
+  return {
+    sql,
+    async query(text: string, values?: unknown[]) {
+      sql.push(text);
+      if (text.includes("<=>")) await sleep(vecDelayMs);
+      return inner.query(text, values);
+    },
+  };
+}
+
+const isVecSql = (t: string) =>
+  t.includes("<=>") || t.includes("SELECT DISTINCT model FROM content_vectors");
+const isFtsSql = (t: string) => t.includes("numnode") || t.includes("ts_rank_cd");
+
+/** statement_timeout values set AFTER the last vec statement, i.e. by the FTS arm. */
+function ftsStatementTimeouts(sql: string[]): number[] {
+  const lastVec = sql.reduce((acc, t, i) => (isVecSql(t) ? i : acc), -1);
+  return sql.slice(lastVec + 1).flatMap((t) => {
+    const m = STMT.exec(t);
+    return m ? [Number(m[1])] : [];
+  });
+}
+
+describe("pgSearchHybridDetailed — overall deadline (deadlineAt)", () => {
+  it("A1: the FTS arm's statement_timeout is CLAMPED to the budget left after the vec arm", async () => {
+    const c = slowVecClient(300, { vecRows: [vecRow("v.md", 0.1)], ftsRows: [ftsRow("f.md", 9)] });
+    const t0 = performance.now();
+    const out = await pgSearchHybridDetailed(c, "zebrafish", {
+      collections: "research",
+      embedder,
+      deadlineAt: t0 + 1000,
+    });
+    const fts = ftsStatementTimeouts(c.sql);
+    expect(fts).toHaveLength(1);
+    // Not the 1200 ms default: at most what was left (1000 - the 300 ms vec arm).
+    expect(fts[0]!).toBeLessThanOrEqual(1000 - 300);
+    expect(fts[0]!).toBeGreaterThan(0);
+    expect(out.arms).toBe("vec+fts");
+  });
+
+  it("the vec ANN leg's statement_timeout is clamped to what remains after the embed leg", async () => {
+    const slowEmbed: PgVecEmbedder = {
+      async embed() {
+        await sleep(300);
+        return { embedding: [0.1, 0.2], model: MODEL };
+      },
+    };
+    const c = slowVecClient(0, { vecRows: [vecRow("v.md", 0.1)], ftsRows: [] });
+    await pgSearchHybridDetailed(c, "zebrafish", {
+      collections: "research",
+      embedder: slowEmbed,
+      deadlineAt: performance.now() + 1000,
+    });
+    const annIdx = c.sql.findIndex((t) => t.includes("<=>"));
+    const annStmt = c.sql
+      .slice(0, annIdx)
+      .reverse()
+      .map((t) => STMT.exec(t))
+      .find((m) => m);
+    expect(Number(annStmt![1])).toBeLessThanOrEqual(1000 - 300);
+    // …and the fence, which ran first, was clamped to the full remaining budget.
+    const fenceStmt = STMT.exec(c.sql.find((t) => STMT.test(t))!);
+    expect(Number(fenceStmt![1])).toBeLessThanOrEqual(1000);
+  });
+
+  it("a configured statementTimeoutMs SMALLER than the remaining budget is kept", async () => {
+    const c = slowVecClient(0, { vecRows: [], ftsRows: [] });
+    await pgSearchHybridDetailed(c, "q", {
+      collections: "research",
+      embedder,
+      statementTimeoutMs: 250,
+      deadlineAt: performance.now() + 5000,
+    });
+    const stmts = c.sql.flatMap((t) => {
+      const m = STMT.exec(t);
+      return m ? [Number(m[1])] : [];
+    });
+    expect(stmts.length).toBeGreaterThanOrEqual(3);
+    expect(stmts.every((n) => n === 250)).toBe(true);
+  });
+
+  it("a configured statementTimeoutMs of 0 (no bound) is STILL bounded by the deadline", async () => {
+    const c = slowVecClient(0, { vecRows: [], ftsRows: [] });
+    await pgSearchHybridDetailed(c, "q", {
+      collections: "research",
+      embedder,
+      statementTimeoutMs: 0,
+      deadlineAt: performance.now() + 900,
+    });
+    const stmts = c.sql.flatMap((t) => {
+      const m = STMT.exec(t);
+      return m ? [Number(m[1])] : [];
+    });
+    expect(stmts.length).toBeGreaterThanOrEqual(3);
+    expect(stmts.every((n) => n > 0 && n <= 900)).toBe(true);
+  });
+
+  it("A2: budget exhausted after vec ⇒ FTS degraded budget-exhausted, NO FTS SQL, vec-only, no throw", async () => {
+    const c = slowVecClient(150, {
+      vecRows: [vecRow("near.md", 0.1), vecRow("far.md", 0.9)],
+      ftsRows: [ftsRow("f.md", 9)],
+    });
+    const out = await pgSearchHybridDetailed(c, "zebrafish", {
+      collections: "research",
+      embedder,
+      deadlineAt: performance.now() + 100,
+    });
+    expect(out.arms).toBe("vec-only");
+    expect(out.degraded).toBe(true);
+    expect(out.armFailures).toEqual([{ arm: "fts", kind: "degraded", reason: "budget-exhausted" }]);
+    expect(out.fts).toEqual({
+      results: [],
+      degraded: true,
+      degradedReason: "budget-exhausted",
+      scannedRows: 0,
+    });
+    expect(pathsOf(out.results)).toEqual(["research/near.md", "research/far.md"]);
+    // NO FTS SQL at all — not even its BEGIN / SET LOCAL.
+    expect(c.sql.some(isFtsSql)).toBe(false);
+    expect(ftsStatementTimeouts(c.sql)).toEqual([]);
+    const lastVec = c.sql.reduce((acc, t, i) => (isVecSql(t) ? i : acc), -1);
+    expect(c.sql.slice(lastVec + 1)).toEqual(["COMMIT"]);
+    // …and a bound of 0 (PostgreSQL's "NO bound") was never issued anywhere.
+    expect(c.sql).not.toContain("SET LOCAL statement_timeout = 0");
+  });
+
+  it("deadline ALREADY spent ⇒ both arms degraded on budget, arms none, NO SQL at all, no throw", async () => {
+    const c = slowVecClient(0, { vecRows: [vecRow("v.md", 0.1)], ftsRows: [ftsRow("f.md", 9)] });
+    const out = await pgSearchHybridDetailed(c, "zebrafish", {
+      collections: "research",
+      embedder,
+      deadlineAt: performance.now() - 1,
+    });
+    expect(out.arms).toBe("none");
+    expect(out.degraded).toBe(true);
+    expect(out.results).toEqual([]);
+    expect(out.armFailures).toEqual([
+      { arm: "vec", kind: "degraded", reason: "budget-exhausted-pre-fence" },
+      { arm: "fts", kind: "degraded", reason: "budget-exhausted" },
+    ]);
+    expect(c.sql).toEqual([]);
+  });
+
+  it("a remaining budget BELOW the leg floor degrades rather than issuing a sub-floor bound", async () => {
+    const c = slowVecClient(0, { vecRows: [], ftsRows: [] });
+    const out = await pgSearchHybridDetailed(c, "q", {
+      collections: "research",
+      embedder,
+      deadlineAt: performance.now() + PG_SEARCH_MIN_LEG_BUDGET_MS / 2,
+    });
+    expect(out.arms).toBe("none");
+    expect(c.sql).toEqual([]);
+  });
+
+  it("an embedder that IGNORES its signal is still bounded: the call returns near the deadline", async () => {
+    const hanging: PgVecEmbedder = { embed: () => new Promise(() => {}) };
+    const c = slowVecClient(0, { ftsRows: [ftsRow("f.md", 9)] });
+    const t0 = performance.now();
+    const out = await pgSearchHybridDetailed(c, "zebrafish", {
+      collections: "research",
+      embedder: hanging,
+      deadlineAt: t0 + 200,
+    });
+    expect(performance.now() - t0).toBeLessThan(200 + 150);
+    expect(out.armFailures[0]).toEqual({
+      arm: "vec",
+      kind: "degraded",
+      reason: "budget-exhausted-in-embed",
+    });
+    expect(out.arms).toBe("none");
+    expect(c.sql.some((t) => t.includes("<=>"))).toBe(false);
+  });
+
+  it("both arms REJECTING under a deadline still throws (real errors are not budget)", async () => {
+    const p = pgSearchHybridDetailed(
+      hybridClient({ vecThrows: new Error("vec down"), ftsThrows: new Error("fts down") }),
+      "q",
+      { collections: "research", embedder, deadlineAt: performance.now() + 5000 },
+    );
+    await expect(p).rejects.toThrow("vec down");
+  });
+
+  it("A3: NO deadline ⇒ the full default statement_timeout reaches every leg, as before", async () => {
+    const c = slowVecClient(50, { vecRows: [], ftsRows: [] });
+    await pgSearchHybridDetailed(c, "q", { collections: "research", embedder });
+    const stmts = c.sql.flatMap((t) => {
+      const m = STMT.exec(t);
+      return m ? [Number(m[1])] : [];
+    });
+    expect(stmts).toEqual([1200, 1200, 1200]);
+  });
 });
 
 describe("pgSearchHybrid — the bare wrapper", () => {

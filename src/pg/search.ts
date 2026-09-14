@@ -110,6 +110,35 @@ export interface PgVecEmbedder {
 export const DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS = 1200;
 
 /**
+ * The smallest remaining OVERALL budget (`deadlineAt`, master-harness-2wx75
+ * slice 10) for which a SQL leg is still started, in ms.
+ *
+ * Below it the leg is DEGRADED as budget-exhausted without issuing any SQL.
+ * Two reasons, one of them a correctness one: (1) `statement_timeout = 0` is
+ * PostgreSQL's "NO bound", so a remaining budget that rounds down to 0 must
+ * never reach `SET LOCAL` — it would turn "no time left" into "unbounded"; and
+ * (2) BEGIN + SET LOCAL + COMMIT are round trips of their own, so a leg handed
+ * a few ms is a leg that cancels itself after paying for the transaction. 25 ms
+ * is a policy floor, not a measurement.
+ */
+export const PG_SEARCH_MIN_LEG_BUDGET_MS = 25;
+
+/**
+ * The `statement_timeout` a SQL leg gets under an overall deadline, or `null`
+ * when the remaining budget is below PG_SEARCH_MIN_LEG_BUDGET_MS (⇒ the caller
+ * degrades instead of issuing SQL).
+ *
+ * `configuredMs` is the caller's statementTimeoutMs (or the default). A
+ * configured 0 ("no bound") is still bounded by the deadline — a deadline IS a
+ * bound. The result is always a positive integer, never 0.
+ */
+export function clampLegStatementTimeout(configuredMs: number, remainingMs: number): number | null {
+  const remaining = Math.floor(remainingMs);
+  if (!Number.isFinite(remaining) || remaining < PG_SEARCH_MIN_LEG_BUDGET_MS) return null;
+  return configuredMs === 0 ? remaining : Math.min(configuredMs, remaining);
+}
+
+/**
  * Default `hnsw.ef_search` for the ANN scan (master-harness-2wx75 slice 8).
  *
  * THE BUG THIS FIXES — FILTERED-HNSW STARVATION. On the live SFW vault 67% of
@@ -169,6 +198,17 @@ export interface PgSearchVecOptions {
    * (PostgreSQL's own meaning for statement_timeout = 0).
    */
   statementTimeoutMs?: number;
+  /**
+   * OVERALL deadline as an absolute `performance.now()` instant (slice 10; the
+   * hybrid passes its own down). When set, the remaining budget is recomputed
+   * before EACH leg: the model fence and the ANN scan each get
+   * `clampLegStatementTimeout(statementTimeoutMs, remaining)`, the embed leg's
+   * signal fires at the deadline AND the embed is raced against it (an
+   * embedder that ignores its signal is still bounded), and a leg with less
+   * than PG_SEARCH_MIN_LEG_BUDGET_MS left degrades without issuing SQL.
+   * Omitted ⇒ behaviour identical to before slice 10.
+   */
+  deadlineAt?: number;
   /**
    * `hnsw.ef_search` for the ANN-scan transaction only. Default
    * DEFAULT_PG_SEARCH_HNSW_EF_SEARCH (100); integer in 1..1000. Transaction-local
@@ -442,10 +482,12 @@ function scoreFromDistance(distance: number): number {
  * the whole point (master-harness-2wx75 GAP 7).
  */
 export type PgVecDegradedReason =
-  | "no-stored-vectors"           // the model fence found nothing embedded in scope
-  | "budget-exhausted-pre-embed"  // timeoutMs already spent before the embed leg
-  | "embed-unavailable"           // the embed endpoint returned no embedding
-  | "budget-exhausted-pre-sql";   // timeoutMs spent after the embed, before the ANN scan
+  | "no-stored-vectors" // the model fence found nothing embedded in scope
+  | "budget-exhausted-pre-fence" // deadlineAt left < PG_SEARCH_MIN_LEG_BUDGET_MS before ANY SQL (slice 10)
+  | "budget-exhausted-pre-embed" // timeoutMs already spent before the embed leg
+  | "budget-exhausted-in-embed" // deadlineAt reached while the embed leg was still running (slice 10)
+  | "embed-unavailable" // the embed endpoint returned no embedding
+  | "budget-exhausted-pre-sql"; // timeoutMs spent after the embed, before the ANN scan
 
 /**
  * The typed result of a vector search — the degraded channel this path needs so
@@ -478,7 +520,10 @@ export interface PgVecSearchDetailedResult {
   results: SearchResult[];
   degraded: boolean;
   degradedReason?: PgVecDegradedReason;
-  /** Distinct embedding models the fence found in scope (0 ⇔ "no-stored-vectors"). */
+  /**
+   * Distinct embedding models the fence found in scope. 0 on "no-stored-vectors"
+   * and on "budget-exhausted-pre-fence" (the fence never ran).
+   */
   storedModels: number;
   /** ANN rows returned BEFORE the per-document dedup thinned them. 0 on every degraded path. */
   scannedFragments: number;
@@ -527,11 +572,24 @@ export async function pgSearchVecDetailed(
   // Refuse a bad value BEFORE any SQL or embed round trip is spent.
   assertValidHnswEfSearch(hnswEfSearch);
 
+  // OVERALL DEADLINE (slice 10). Without `deadlineAt` every leg gets the full
+  // statementTimeoutMs, exactly as before. With it, each leg's bound is
+  // recomputed from what REMAINS at the moment that leg starts — so the ANN
+  // scan after a slow embed is not handed the full value — and `null` means
+  // "too little left": degrade, issue no SQL.
+  const deadlineAt = opts.deadlineAt;
+  const legStatementTimeout = (): number | null =>
+    deadlineAt === undefined
+      ? statementTimeoutMs
+      : clampLegStatementTimeout(statementTimeoutMs, deadlineAt - performance.now());
+
   // The fence FIRST: a cheap DISTINCT beats paying for an embed we are about to
   // refuse. It also means a mismatched endpoint reports the mismatch rather than
   // an embed timeout. It is bounded too — a DISTINCT is cheap work but it can
   // still wait an unbounded time on a lock.
-  const storedModels = await withBoundedTx(c, statementTimeoutMs, scope, "model-fence", () =>
+  const fenceTimeoutMs = legStatementTimeout();
+  if (fenceTimeoutMs === null) return degraded("budget-exhausted-pre-fence", 0);
+  const storedModels = await withBoundedTx(c, fenceTimeoutMs, scope, "model-fence", () =>
     getStoredVecModels(c, collections));
   if (storedModels.length === 0) return degraded("no-stored-vectors", 0);
 
@@ -542,10 +600,30 @@ export async function pgSearchVecDetailed(
     if (remaining <= 0) return degraded("budget-exhausted-pre-embed", storedModels.length);
     signal = AbortSignal.timeout(remaining);
   }
+  let embedBudgetMs: number | undefined;
+  if (deadlineAt !== undefined) {
+    const remaining = Math.floor(deadlineAt - performance.now());
+    if (remaining < PG_SEARCH_MIN_LEG_BUDGET_MS) {
+      return degraded("budget-exhausted-pre-embed", storedModels.length);
+    }
+    embedBudgetMs = remaining;
+    const overall = AbortSignal.timeout(remaining);
+    signal = signal === undefined ? overall : AbortSignal.any([signal, overall]);
+  }
   // isQuery + formatQueryForEmbedding: BOTH, exactly as store.ts's getEmbedding
   // does. The flag selects the endpoint's query-side params; the formatting is
   // what puts the vector in the same space as the stored fragments.
-  const embedded = await llm.embed(formatQueryForEmbedding(query), { isQuery: true, signal });
+  const embedCall = llm.embed(formatQueryForEmbedding(query), { isQuery: true, signal });
+  let embedded: Awaited<typeof embedCall>;
+  if (embedBudgetMs === undefined) {
+    embedded = await embedCall;
+  } else {
+    // RACED, not merely signalled: an embedder that ignores its AbortSignal
+    // would otherwise hold the whole call past the deadline.
+    const raced = await raceBudget(embedCall, embedBudgetMs);
+    if (raced === BUDGET_SPENT) return degraded("budget-exhausted-in-embed", storedModels.length);
+    embedded = raced;
+  }
   if (!embedded?.embedding) return degraded("embed-unavailable", storedModels.length);
 
   // THE FENCE'S CALL SITE. Covered directly by
@@ -565,10 +643,24 @@ export async function pgSearchVecDetailed(
     fragmentLimit,
   );
 
-  const rows = await withBoundedTx(c, statementTimeoutMs, scope, "ann-scan", async () => {
-    const { rows } = await c.query<PgVecRow>(text, values);
-    return rows;
-  }, { hnswEfSearch });
+  // Recomputed HERE, after the fence and the embed spent their share: under a
+  // deadline the ANN scan is bounded by what is left, not the full value.
+  const annTimeoutMs = legStatementTimeout();
+  if (annTimeoutMs === null) {
+    return degraded("budget-exhausted-pre-sql", storedModels.length, embedded.model);
+  }
+
+  const rows = await withBoundedTx(
+    c,
+    annTimeoutMs,
+    scope,
+    "ann-scan",
+    async () => {
+      const { rows } = await c.query<PgVecRow>(text, values);
+      return rows;
+    },
+    { hnswEfSearch },
+  );
 
   // GENUINE-EMPTY lives here: zero rows is `degraded: false`. We searched.
   return {
@@ -578,6 +670,26 @@ export async function pgSearchVecDetailed(
     scannedFragments: rows.length,
     embedModel: embedded.model,
   };
+}
+
+const BUDGET_SPENT: unique symbol = Symbol("pg-search-budget-spent");
+
+/**
+ * Race `p` against a `budgetMs` timer. Resolves to BUDGET_SPENT if the timer
+ * wins. The timer is always cleared, and a LATE rejection of the losing `p` is
+ * observed (never an unhandled rejection) — the call has already moved on.
+ */
+async function raceBudget<T>(p: Promise<T>, budgetMs: number): Promise<T | typeof BUDGET_SPENT> {
+  p.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<typeof BUDGET_SPENT>((resolve) => {
+    timer = setTimeout(() => resolve(BUDGET_SPENT), budgetMs);
+  });
+  try {
+    return await Promise.race([p, expiry]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /**

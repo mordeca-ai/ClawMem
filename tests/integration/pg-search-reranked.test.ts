@@ -38,7 +38,7 @@ import { join } from "path";
 import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
 import { closePool, toVectorLiteral } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
-import { type PgVecEmbedder } from "../../src/pg/search.ts";
+import { type PgQueryable, type PgVecEmbedder } from "../../src/pg/search.ts";
 import { pgSearchHybridDetailed, type PgHybridArms } from "../../src/pg/search-hybrid.ts";
 import {
   pgSearchReranked,
@@ -274,6 +274,101 @@ d("PG reranked read path", () => {
     // measurably smaller than the deadline — this is the additive budget the
     // parity run needs to READ.
     expect(out.timings.hybridMs).toBeGreaterThan(0);
+  });
+
+  // =========================================================================
+  // THE OVERALL DEADLINE REACHES INSIDE THE HYBRID, LIVE (slice 10)
+  // =========================================================================
+
+  /** Stated epsilon over the deadline: cancellation latency + the non-SQL tail. */
+  const EPSILON_MS = 150;
+
+  /**
+   * A real client whose vec ANN leg is artificially slow: `pg_sleep` runs INSIDE
+   * the arm's bounded transaction, immediately before the `<=>` scan, so the
+   * server-side statement_timeout the arm set is what bounds it. Every
+   * statement is recorded so the handed bounds are readable.
+   */
+  function slowAnnClient(c: pg.PoolClient, sleepS: number, seen: string[]): PgQueryable {
+    return {
+      async query<R extends Record<string, unknown>>(text: string, values?: unknown[]) {
+        seen.push(text);
+        if (text.includes("<=>")) await c.query(`SELECT pg_sleep(${sleepS})`);
+        return (await c.query(text, values)) as unknown as { rows: R[] };
+      },
+    };
+  }
+
+  const stmtBounds = (seen: string[]) =>
+    seen.flatMap((t) => {
+      const m = /^SET LOCAL statement_timeout = (\d+)$/.exec(t);
+      return m ? [Number(m[1])] : [];
+    });
+
+  it("LIVE A4: a vec leg that would sleep 5 s is cancelled at the REMAINING budget; the call lands inside deadline + epsilon, degraded not thrown", async () => {
+    const seen: string[] = [];
+    const deadlineMs = 600;
+    const out = await withSchema((c) =>
+      pgSearchRerankedDetailed(slowAnnClient(c, 5, seen), "zebrafish", {
+        collections: "research",
+        embedder,
+        reranker: reversing().reranker,
+        deadlineMs,
+      }),
+    );
+    expect(out.timings.totalMs).toBeLessThanOrEqual(deadlineMs + EPSILON_MS);
+    expect(out.hybrid.degraded).toBe(true);
+    expect(out.hybrid.arms).toBe("none");
+    // The vec ANN leg was cancelled by its CLAMPED server-side bound…
+    expect(out.hybrid.armFailures[0]).toMatchObject({ arm: "vec", kind: "threw" });
+    expect((out.hybrid.armFailures[0] as { error: Error }).error.name).toBe(
+      "PgVecSearchTimeoutError",
+    );
+    // …so nothing was left for fts: degraded on budget, and it issued no SQL.
+    expect(out.hybrid.armFailures[1]).toEqual({
+      arm: "fts",
+      kind: "degraded",
+      reason: "budget-exhausted",
+    });
+    expect(seen.some((t) => t.includes("numnode") || t.includes("ts_rank_cd"))).toBe(false);
+    const bounds = stmtBounds(seen);
+    expect(bounds.every((n) => n > 0 && n <= deadlineMs)).toBe(true);
+    expect(bounds).not.toContain(0);
+  });
+
+  it("LIVE A4: a slow-but-COMPLETING vec leg leaves the fts arm only what remains", async () => {
+    const seen: string[] = [];
+    const deadlineMs = 1000;
+    const out = await withSchema((c) =>
+      pgSearchRerankedDetailed(slowAnnClient(c, 0.3, seen), "zebrafish", {
+        collections: "research",
+        embedder,
+        deadlineMs,
+      }),
+    );
+    expect(out.hybrid.arms).toBe("vec+fts");
+    expect(out.timings.totalMs).toBeLessThanOrEqual(deadlineMs + EPSILON_MS);
+    const lastVec = seen.reduce((acc, t, i) => (t.includes("<=>") ? i : acc), -1);
+    const ftsBounds = stmtBounds(seen.slice(lastVec + 1));
+    expect(ftsBounds).toHaveLength(1);
+    // Not the 1200 ms default: at most the deadline minus the 300 ms sleep.
+    expect(ftsBounds[0]!).toBeLessThanOrEqual(deadlineMs - 300);
+    expect(ftsBounds[0]!).toBeGreaterThan(0);
+  });
+
+  it("LIVE A4: the hybrid itself honours deadlineAt against a 5 s vec leg (no throw)", async () => {
+    const seen: string[] = [];
+    const t0 = performance.now();
+    const out = await withSchema((c) =>
+      pgSearchHybridDetailed(slowAnnClient(c, 5, seen), "zebrafish", {
+        collections: "research",
+        embedder,
+        deadlineAt: performance.now() + 400,
+      }),
+    );
+    expect(performance.now() - t0).toBeLessThanOrEqual(400 + EPSILON_MS);
+    expect(out.degraded).toBe(true);
+    expect(out.armFailures.map((f) => f.arm)).toEqual(["vec", "fts"]);
   });
 
   // =========================================================================
