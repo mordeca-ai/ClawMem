@@ -43,7 +43,12 @@ import { join } from "path";
 import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
 import { closePool, toVectorLiteral } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
-import { pgSearchVec, pgSearchVecDetailed, type PgVecEmbedder } from "../../src/pg/search.ts";
+import {
+  getStoredVecModels,
+  pgSearchVec,
+  pgSearchVecDetailed,
+  type PgVecEmbedder,
+} from "../../src/pg/search.ts";
 import { PgVecReadModelMismatchError, PgVecSearchTimeoutError } from "../../src/pg/errors.ts";
 
 const URL_ = process.env.CLAWMEM_PG_URL;
@@ -539,5 +544,95 @@ d("PG vector read path — filtered-HNSW starvation", () => {
       expect(rows[0]!.ef).toBe("40");
       expect(rows[0]!.it).toBe("off");
     });
+  });
+});
+
+// ===========================================================================
+// The cheap model fence (2wx75 slice 9) keeps the EXACT semantics of the old
+// DISTINCT-over-join: a model is reported only when at least one ACTIVE,
+// NON-INVALIDATED, IN-SCOPE vector carries it. The distinct-model outer scan is
+// unfiltered, so every model below IS in content_vectors — only the EXISTS
+// probe can keep the foreign ones out.
+// ===========================================================================
+
+const FENCE_FOREIGN_INACTIVE = "foreign-inactive-model";
+const FENCE_FOREIGN_INVALIDATED = "foreign-invalidated-model";
+const FENCE_OUT_OF_SCOPE = "out-of-scope-model";
+
+d("PG vector read path — cheap model fence semantics", () => {
+  let pool: pg.Pool;
+  let schema: string;
+
+  beforeAll(async () => {
+    pool = new pg.Pool({ connectionString: URL_ });
+    schema = `clawmem_rtest_fence_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    const c = await pool.connect();
+    try {
+      await c.query(`CREATE SCHEMA ${schema}`);
+      await c.query(`SET search_path TO ${schema}, public`);
+      for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
+        await c.query(substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM));
+      }
+      const seed = async (
+        i: number, collection: string, model: string, active: boolean, invalidated: boolean,
+      ) => {
+        const hash = `${i}`.padStart(64, "c");
+        await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, `fence body ${i}`]);
+        await c.query(
+          `INSERT INTO documents (collection, path, title, hash, active, invalidated_at)
+           VALUES ($1, $2, $2, $3, $4, $5)`,
+          [collection, `fence-${i}.md`, hash, active, invalidated ? new Date() : null],
+        );
+        await c.query(
+          `INSERT INTO content_vectors (hash, seq, pos, model, embedding) VALUES ($1, 0, 0, $2, $3::vector)`,
+          [hash, model, toVectorLiteral(atAngle(i * 10))],
+        );
+      };
+      await seed(1, "scope", VAULT_MODEL, true, false);
+      await seed(2, "scope", FENCE_FOREIGN_INACTIVE, false, false);
+      await seed(3, "scope", FENCE_FOREIGN_INVALIDATED, true, true);
+      await seed(4, "elsewhere", FENCE_OUT_OF_SCOPE, true, false);
+      await c.query(`ANALYZE content_vectors`);
+      await c.query(`ANALYZE documents`);
+    } finally {
+      c.release();
+    }
+  });
+
+  afterAll(async () => {
+    if (schema) await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await pool.end();
+  });
+
+  async function withFenceSchema<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
+    const c = await pool.connect();
+    try {
+      await c.query(`SET search_path TO ${schema}, public`);
+      return await fn(c);
+    } finally {
+      c.release();
+    }
+  }
+
+  it("CONTROL: every foreign model really is stored in content_vectors", async () => {
+    const { rows } = await withFenceSchema(c =>
+      c.query<{ model: string }>(`SELECT DISTINCT model FROM content_vectors ORDER BY 1`));
+    expect(rows.map(r => r.model)).toEqual(
+      [VAULT_MODEL, FENCE_FOREIGN_INACTIVE, FENCE_FOREIGN_INVALIDATED, FENCE_OUT_OF_SCOPE].sort());
+  });
+
+  it("reports ONLY the in-scope live model — not inactive, invalidated, or out-of-scope models", async () => {
+    const models = await withFenceSchema(c => getStoredVecModels(c, ["scope"]));
+    expect(models).toEqual([VAULT_MODEL]);
+  });
+
+  it("unscoped: still excludes inactive + invalidated, and DOES include the other collection's live model", async () => {
+    const models = await withFenceSchema(c => getStoredVecModels(c, null));
+    expect(models).toEqual([VAULT_MODEL, FENCE_OUT_OF_SCOPE].sort());
+  });
+
+  it("scoped to a collection whose only vectors belong to it reports that model alone", async () => {
+    const models = await withFenceSchema(c => getStoredVecModels(c, ["elsewhere"]));
+    expect(models).toEqual([FENCE_OUT_OF_SCOPE]);
   });
 });

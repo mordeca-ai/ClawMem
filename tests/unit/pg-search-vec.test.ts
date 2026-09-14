@@ -109,10 +109,34 @@ describe("getStoredVecModels — scoped to the rows the search will read", () =>
     const c = fakeClient(() => [{ model: "embeddinggemma" }]);
     expect(await getStoredVecModels(c, ["research"])).toEqual(["embeddinggemma"]);
     const call = c.calls[0]!;
-    expect(call.text).toContain("SELECT DISTINCT cv.model");
+    expect(call.text).toContain("SELECT DISTINCT model FROM content_vectors");
     expect(call.text).toContain("d.active = true");
     expect(call.text).toContain("d.collection = ANY($1::text[])");
     expect(call.values).toEqual([["research"]]);
+  });
+
+  it("puts the scope filter INSIDE the EXISTS semi-join, never on the outer distinct-model scan", async () => {
+    // The cheap fence (2wx75 slice 9): the outer `SELECT DISTINCT model FROM
+    // content_vectors` walks content_vectors_model_idx and is UNFILTERED by
+    // design; every scope predicate must sit in the EXISTS probe. A filter on
+    // the outer scan would be wrong (content_vectors has no active/collection),
+    // and a filter missing from the EXISTS would report models that live only on
+    // inactive / invalidated / out-of-scope documents.
+    const c = fakeClient(() => [{ model: "embeddinggemma" }]);
+    await getStoredVecModels(c, ["research"]);
+    const text = c.calls[0]!.text;
+    const existsAt = text.indexOf("EXISTS (");
+    expect(existsAt).toBeGreaterThan(-1);
+    const outer = text.slice(0, existsAt);
+    const inner = text.slice(existsAt);
+    expect(outer).toContain("SELECT DISTINCT model FROM content_vectors");
+    for (const pred of ["d.active = true", "d.invalidated_at IS NULL", "d.collection = ANY($1::text[])"]) {
+      expect(outer).not.toContain(pred);
+      expect(inner).toContain(pred);
+    }
+    expect(inner).toContain("cv.model = m.model");
+    expect(inner).toContain("JOIN documents d ON d.hash = cv.hash");
+    expect(c.calls[0]!.values).toEqual([["research"]]);
   });
 
   it("drops the filter when no collection is requested", async () => {
@@ -262,7 +286,7 @@ function searchClient(opts: { storedModels: string[]; rows?: PgVecRow[] }) {
     calls,
     async query(text: string, values: unknown[] = []) {
       calls.push({ text, values });
-      if (text.includes("SELECT DISTINCT cv.model")) {
+      if (text.includes("SELECT DISTINCT model FROM content_vectors")) {
         return { rows: opts.storedModels.map(m => ({ model: m })) as never[] };
       }
       if (text.includes("<=>")) return { rows: (opts.rows ?? []) as never[] };
@@ -360,7 +384,7 @@ describe("pgSearchVec bounds both SQL legs with transaction-local GUCs", () => {
           const e = Object.assign(new Error('unrecognized configuration parameter'), { code: "42704" });
           throw e;
         }
-        if (text.includes("SELECT DISTINCT cv.model")) return { rows: [{ model: "embeddinggemma" }] as never[] };
+        if (text.includes("SELECT DISTINCT model FROM content_vectors")) return { rows: [{ model: "embeddinggemma" }] as never[] };
         if (text.includes("<=>")) return { rows: [row({ path: "old.md" })] as never[] };
         return { rows: [] as never[] };
       },
@@ -377,7 +401,7 @@ describe("pgSearchVec bounds both SQL legs with transaction-local GUCs", () => {
         if (text.includes("<=>")) {
           throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
         }
-        if (text.includes("SELECT DISTINCT cv.model")) return { rows: [{ model: "embeddinggemma" }] as never[] };
+        if (text.includes("SELECT DISTINCT model FROM content_vectors")) return { rows: [{ model: "embeddinggemma" }] as never[] };
         return { rows: [] as never[] };
       },
     };
@@ -465,7 +489,7 @@ describe("pgSearchVec widens hnsw.ef_search on the ann-scan transaction only", (
         if (text.includes("hnsw.iterative_scan")) {
           throw Object.assign(new Error("unrecognized configuration parameter"), { code: "42704" });
         }
-        if (text.includes("SELECT DISTINCT cv.model")) return { rows: [{ model: "embeddinggemma" }] as never[] };
+        if (text.includes("SELECT DISTINCT model FROM content_vectors")) return { rows: [{ model: "embeddinggemma" }] as never[] };
         if (text.includes("<=>")) return { rows: [row()] as never[] };
         return { rows: [] as never[] };
       },

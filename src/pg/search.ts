@@ -272,11 +272,25 @@ export async function getStoredVecModels(
     values.push(collections);
     filter = ` AND d.collection = ANY($1::text[])`;
   }
+  // Cheap fence (2wx75 slice 9). The old shape — DISTINCT over the full
+  // content_vectors x documents join — visited every in-scope vector to find
+  // one model: 34,106 shared buffers / 638ms FULLY WARM on the live vault
+  // (174k vectors, 1 model), half the 1200ms statement_timeout on every call.
+  // This shape enumerates the few distinct models via content_vectors_model_idx
+  // and probes each with an EXISTS semi-join that stops at the first live row:
+  // 3,325 buffers / 29.5ms unfiltered, 49ms with a 2-collection filter, same
+  // model set for 34/34 live collections. Semantics unchanged: the set of
+  // models behind at least one active, non-invalidated, in-scope vector. Every
+  // scope predicate MUST stay inside the EXISTS — the outer scan is unfiltered.
   const { rows } = await c.query<{ model: string }>(
-    `SELECT DISTINCT cv.model AS model
-     FROM content_vectors cv
-     JOIN documents d ON d.hash = cv.hash
-     WHERE d.active = true AND d.invalidated_at IS NULL${filter}
+    `SELECT m.model AS model
+     FROM (SELECT DISTINCT model FROM content_vectors) m
+     WHERE EXISTS (
+       SELECT 1 FROM content_vectors cv
+       JOIN documents d ON d.hash = cv.hash
+       WHERE cv.model = m.model
+         AND d.active = true AND d.invalidated_at IS NULL${filter}
+     )
      ORDER BY 1`,
     values,
   );

@@ -191,7 +191,7 @@ function hybridClient(plan: ArmPlan = {}): PgQueryable & { sql: string[] } {
     sql,
     async query(text: string) {
       sql.push(text);
-      if (text.includes("SELECT DISTINCT cv.model")) {
+      if (text.includes("SELECT DISTINCT model FROM content_vectors")) {
         return { rows: (plan.vecModels ?? [MODEL]).map(model => ({ model })) as never[] };
       }
       if (text.includes("<=>")) {
@@ -265,7 +265,7 @@ describe("pgSearchHybridDetailed — both arms healthy", () => {
     // green run. Reintroduce concurrency and this goes red deterministically.
     const c = hybridClient({ vecRows: [], ftsRows: [] });
     await pgSearchHybridDetailed(c, "q", { collections: "research", embedder });
-    const isVec = (t: string) => t.includes("<=>") || t.includes("SELECT DISTINCT cv.model");
+    const isVec = (t: string) => t.includes("<=>") || t.includes("SELECT DISTINCT model FROM content_vectors");
     const isFts = (t: string) => t.includes("numnode") || t.includes("ts_rank_cd");
     const firstFts = c.sql.findIndex(isFts);
     const lastVec = c.sql.reduce((acc, t, i) => (isVec(t) ? i : acc), -1);

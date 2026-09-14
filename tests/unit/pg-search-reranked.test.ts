@@ -93,7 +93,7 @@ function ftsRow(path: string, rank: number, body = `body of ${path}`): PgFtsRow 
 function hybridClient(plan: ArmPlan = {}): PgQueryable {
   return {
     async query(text: string) {
-      if (text.includes("SELECT DISTINCT cv.model")) {
+      if (text.includes("SELECT DISTINCT model FROM content_vectors")) {
         return { rows: (plan.vecModels ?? [MODEL]).map(model => ({ model })) as never[] };
       }
       if (text.includes("<=>")) {
