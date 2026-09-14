@@ -27,6 +27,7 @@ import {
   EXIT_OK,
   EXIT_THREW,
   RETRIEVE_SCHEMA,
+  pgCompositeRank,
   retrieveCli,
   type RetrieveDeps,
   type RetrieveOutput,
@@ -113,6 +114,7 @@ d("pg retrieve against the live cluster", () => {
       searchFts: pgSearchFtsDetailed,
       searchVec: pgSearchVecDetailed,
       searchReranked: pgSearchRerankedDetailed,
+      rankResults: pgCompositeRank,
       // The pool is shared across cases; afterAll closes it.
       async dispose() {},
       ...over,

@@ -22,6 +22,7 @@ import {
   RETRIEVE_DEFAULT_LIMIT,
   RETRIEVE_SCHEMA,
   parseRetrieveArgs,
+  pgCompositeRank,
   retrieveCli,
   runRetrieve,
   type RetrieveArgs,
@@ -59,7 +60,7 @@ function sr(collection: string, path: string, score: number): SearchResult {
 const ROWS = [sr("research", "a.md", 0.9), sr("research", "sub/b.md", 0.5)];
 
 function hybrid(over: Partial<PgHybridSearchResult> = {}): PgHybridSearchResult {
-  return { results: ROWS, arms: "vec+fts", degraded: false, armFailures: [], rrfK: 60, ...over };
+  return { results: ROWS, candidates: ROWS, arms: "vec+fts", degraded: false, armFailures: [], rrfK: 60, ...over };
 }
 
 function reranked(status: PgRerankStatus, over: Partial<PgRerankedSearchResult> = {}): PgRerankedSearchResult {
@@ -182,7 +183,7 @@ describe("runRetrieve dispatch", () => {
     const { output, exitCode } = await runRetrieve(
       baseArgs({ mode: "search", limit: 3, collections: ["research"], deadlineMs: 700 }), deps);
     expect(exitCode).toBe(EXIT_OK);
-    expect(calls.fts).toEqual([{ limit: 3, collections: ["research"], timeoutMs: 700 }]);
+    expect(calls.fts).toEqual([{ limit: 6, collections: ["research"], timeoutMs: 700 }]);
     expect(calls.vec).toHaveLength(0);
     expect(calls.reranked).toHaveLength(0);
     expect(calls.rerankerBuilt).toBe(0);
@@ -195,6 +196,7 @@ describe("runRetrieve dispatch", () => {
     const { deps, calls } = fakeDeps();
     const { output } = await runRetrieve(baseArgs({ mode: "vsearch" }), deps);
     expect(calls.vec).toHaveLength(1);
+    expect((calls.vec[0] as { limit?: number }).limit).toBe(20);
     expect(calls.fts).toHaveLength(0);
     expect(calls.reranked).toHaveLength(0);
     expect(output.rerankStatus).toBeNull();
@@ -207,6 +209,7 @@ describe("runRetrieve dispatch", () => {
     expect(calls.reranked).toHaveLength(1);
     const o = calls.reranked[0] as { reranker?: unknown; deadlineMs?: number; timeoutMs?: number };
     expect(typeof o.reranker).toBe("function");
+    expect((o as { limit?: number }).limit).toBe(30);
     expect(o.deadlineMs).toBe(4000);
     expect(o.timeoutMs).toBeUndefined();
     expect(calls.rerankerBuilt).toBe(1);
@@ -222,6 +225,31 @@ describe("runRetrieve dispatch", () => {
     expect(calls.rerankerBuilt).toBe(0);
     expect((calls.reranked[0] as { reranker?: unknown }).reranker).toBeUndefined();
     expect(output.rerankStatus).toBe("skipped-no-reranker");
+  });
+});
+
+describe("pgCompositeRank", () => {
+  it("batch-enriches the raw pool, composite-ranks it, then applies the visible limit", async () => {
+    const calls: { text: string; values?: readonly unknown[] }[] = [];
+    const c: PgQueryable = {
+      async query(text: string, values?: readonly unknown[]) {
+        calls.push({ text, values });
+        return { rows: ROWS.map(r => ({
+          collection: r.collectionName, path: r.displayPath.slice(r.collectionName.length + 1),
+          content_type: "note", authored_at: null, access_count: 0,
+          confidence: 0.5, quality_score: 0.5, pinned: false,
+          last_accessed_at: null, duplicate_count: 1, revision_count: 1,
+          invalidated_at: null,
+        })) as never[] };
+      },
+    };
+    const raw = ROWS.map(r => ({ ...r, modifiedAt: "2026-09-01T00:00:00.000Z" }));
+    const out = await pgCompositeRank(c, raw, "ordinary retrieval question", 1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.text).toContain("ANY($1::text[])");
+    expect(calls[0]!.values).toEqual([raw.map(r => r.displayPath)]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.score).not.toBe(raw[0]!.score);
   });
 });
 

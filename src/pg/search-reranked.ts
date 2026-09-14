@@ -288,10 +288,12 @@ export async function pgSearchRerankedDetailed(
   const deadlineMs = opts.deadlineMs ?? DEFAULT_PG_RERANK_DEADLINE_MS;
   const limit = opts.limit ?? 20;
   const rerankCap = opts.rerankCap ?? Math.max(limit, PG_RERANK_CAP_FLOOR);
+  const candidateLimit = Math.max(limit, rerankCap);
 
   const hybridOpts: PgSearchHybridOptions = {
     ...(opts.collections === undefined ? {} : { collections: opts.collections }),
     limit,
+    candidateLimit,
     ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
     ...(opts.statementTimeoutMs === undefined ? {} : { statementTimeoutMs: opts.statementTimeoutMs }),
     ...(opts.embedder === undefined ? {} : { embedder: opts.embedder as PgVecEmbedder }),
@@ -327,7 +329,7 @@ export async function pgSearchRerankedDetailed(
   // and needing no budget at all) > budget. Only the last one is about time.
   if (!opts.reranker) return degradeToFusion("skipped-no-reranker");
 
-  const candidates = hybrid.results.slice(0, rerankCap);
+  const candidates = hybrid.candidates.slice(0, rerankCap);
   const documents = candidates.map(r => ({
     file: r.filepath,
     // `body` is optional on SearchResult and the vec arm can return a row with

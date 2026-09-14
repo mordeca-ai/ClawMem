@@ -93,7 +93,7 @@ function ftsRow(path: string, rank: number, body = `body of ${path}`): PgFtsRow 
 function hybridClient(plan: ArmPlan = {}): PgQueryable {
   return {
     async query(text: string) {
-      if (text.includes("SELECT DISTINCT cv.model")) {
+      if (text.includes("SELECT DISTINCT model FROM content_vectors")) {
         return { rows: (plan.vecModels ?? [MODEL]).map(model => ({ model })) as never[] };
       }
       if (text.includes("<=>")) {
@@ -217,10 +217,17 @@ describe("pgSearchRerankedDetailed — applied", () => {
   it("caps at `limit` while still reranking a WIDER pool", async () => {
     const rr = reversing();
     const out = await run(THREE, { reranker: rr.reranker, limit: 2 });
-    // limit 2 ⇒ the hybrid returns 2, so the pool is 2. rerankCap floors at 30
-    // and never truncates below the fused list.
+    // `limit` is the caller-visible result count, not the retrieval depth.
+    // The default rerankCap floors at 30, so all three available candidates
+    // must reach the reranker even though only two are returned.
     expect(out.results).toHaveLength(2);
-    expect(out.candidateCount).toBe(2);
+    expect(out.candidateCount).toBe(3);
+    expect(rr.calls[0]!.documents).toHaveLength(3);
+    expect(out.hybrid.results).toHaveLength(2);
+    // The fused pool is 30 by default, and each retrieval arm is allowed the
+    // sqlite-equivalent 2x pre-fusion depth. The fake returns only three rows,
+    // but the detailed arm result records the forwarded limit through SQL.
+    expect(out.hybrid.candidates).toHaveLength(3);
   });
 
   it("a rerankCap SMALLER than the fused list reranks the head and keeps the tail", async () => {

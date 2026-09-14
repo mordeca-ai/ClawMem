@@ -4,6 +4,17 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.20 — Read path -> PG: search/vsearch/query, per-prompt hook, MCP + openclaw plugin on Postgres; transient dual-read parity window; eval run r46 (recall/MRR vs SQLite gold within tolerance) + hook p95 <= 1800ms
+
+PG read path (master-harness-2wx75): cheap model fence + ANN-scan ef_search safeguard + parity restore.
+
+- getStoredVecModels: distinct-model scan (content_vectors_model_idx) + EXISTS scope semi-join replaces DISTINCT over the full vectors x documents join. Live vault: 34,106 buffers / 638ms warm -> 3,329 buffers / 32.9ms; identical model set on 34/34 collections. Removes ~600ms fixed cost from every vector search under the 1200ms statement_timeout.
+- ann-scan tx: SET LOCAL hnsw.ef_search = 100 alongside iterative_scan=strict_order (defence-in-depth; regression-tested).
+- Parity (master-harness r51, N=3): LEG2 search/vsearch/query deltas within -0.05 on all three runs; query p95 1540 / 3309 (host loadavg ~12.6) / 918 ms. Latency acceptance still open under load: the hybrid arms are bounded per-arm (statement_timeout), not by the overall deadline.
+- Tests: unit 2219/0; PG integration 263 pass / 13 skip / 0 fail.
+
+---
+
 ## v0.36.19 — PG FTS tokenizer parity: prefix tsquery + separator-normalized index (r47 LEG2 triage)
 
 PG lexical arm reaches tokenizer parity with the sqlite FTS5 reference (master-harness-2wx75, r47 LEG2 triage).

@@ -191,7 +191,7 @@ function hybridClient(plan: ArmPlan = {}): PgQueryable & { sql: string[] } {
     sql,
     async query(text: string) {
       sql.push(text);
-      if (text.includes("SELECT DISTINCT cv.model")) {
+      if (text.includes("SELECT DISTINCT model FROM content_vectors")) {
         return { rows: (plan.vecModels ?? [MODEL]).map(model => ({ model })) as never[] };
       }
       if (text.includes("<=>")) {
@@ -245,6 +245,16 @@ describe("pgSearchHybridDetailed — both arms healthy", () => {
     expect(out.armFailures).toEqual([]);
   });
 
+  it("separates a wider candidate pool from the caller-visible limit", async () => {
+    const out = await run({
+      vecRows: [vecRow("v1.md", 0.1), vecRow("v2.md", 0.2)],
+      ftsRows: [ftsRow("f1.md", 0.9)],
+    }, { limit: 2, candidateLimit: 3 });
+    expect(out.candidates).toHaveLength(3);
+    expect(out.results).toHaveLength(2);
+    expect(out.results).toEqual(out.candidates.slice(0, 2));
+  });
+
   it("RUNS THE ARMS IN SEQUENCE: no vec SQL after the first fts SQL", async () => {
     // THE 25P01 REGRESSION GUARD. `PgQueryable` is one connection and a
     // connection holds one transaction; the first draft of this module ran both
@@ -255,7 +265,7 @@ describe("pgSearchHybridDetailed — both arms healthy", () => {
     // green run. Reintroduce concurrency and this goes red deterministically.
     const c = hybridClient({ vecRows: [], ftsRows: [] });
     await pgSearchHybridDetailed(c, "q", { collections: "research", embedder });
-    const isVec = (t: string) => t.includes("<=>") || t.includes("SELECT DISTINCT cv.model");
+    const isVec = (t: string) => t.includes("<=>") || t.includes("SELECT DISTINCT model FROM content_vectors");
     const isFts = (t: string) => t.includes("numnode") || t.includes("ts_rank_cd");
     const firstFts = c.sql.findIndex(isFts);
     const lastVec = c.sql.reduce((acc, t, i) => (isVec(t) ? i : acc), -1);
