@@ -4,6 +4,20 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## Unreleased — master-harness-vn4rz.49: PG content GC for superseded content_vectors (SFW vault)
+
+PG write path (master-harness-vn4rz.49): the reindex never deleted `content` rows of superseded hashes, so their `content_vectors` stayed in the table and the HNSW index indefinitely.
+
+- New `gcOrphanedContent` (src/pg/write.ts): deletes `content` rows whose hash is referenced by NO `documents` row and NO `origin_documents` row; `content_vectors` go with them via ON DELETE CASCADE. It runs in LIMIT-batched transactions (default 500 rows per batch, 200 batches per pass) and reports `capped` when the cap stops a pass before convergence.
+- **Retention rule:** ANY `documents` row protects its content and vectors, including `active=false` (a soft-retired file that returns reactivates with its vectors). `origin_documents` rows protect theirs too. This matches the sqlite `cleanupOrphanedContent` parity reference, which is deliberately not active-scoped.
+- Race guards: candidates are locked `FOR UPDATE SKIP LOCKED`; the DELETE re-checks both references under a fresh snapshot; content younger than a 15-minute `created_at` grace window is skipped.
+- SFW vault only: `clawmem_nsfw` is refused before any config is resolved or any pool is opened (`ContentGcVaultRefusedError`).
+- Hooked at the end of `reindex()` (opt out with `--no-gc`), plus a new `bun src/pg/cli.ts gc [--dry-run] [--batch-size N] [--max-batches N] [--grace-seconds N]` verb.
+- DELETE does not shrink the heap or the HNSW index; reclaiming that space needs VACUUM / REINDEX CONCURRENTLY as a separate operation.
+- Tests: tests/unit/pg-gc.test.ts (nsfw refusal, 3), tests/integration/pg-content-gc.test.ts (superseded removal, active=false + origin retention, idempotence, batch cap, grace window, in-flight writer; 7).
+
+---
+
 ## v0.36.21 — master-harness-2wx75 slice 10: bound PG hybrid arms by the overall deadline
 
 PG read path (master-harness-2wx75 slice 10): bound the hybrid arms by the overall deadline.

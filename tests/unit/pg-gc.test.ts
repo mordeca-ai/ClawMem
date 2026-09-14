@@ -13,13 +13,16 @@ import { gcOrphanedContent } from "../../src/pg/write.ts";
 import { ContentGcVaultRefusedError } from "../../src/pg/errors.ts";
 
 const NSFW_ENV_KEYS = [
-  "CLAWMEM_PG_NSFW_URL", "CLAWMEM_PG_NSFW_HOST", "CLAWMEM_PG_NSFW_DATABASE",
-  "CLAWMEM_PG_NSFW_USER", "CLAWMEM_PG_NSFW_PASSWORD",
+  "CLAWMEM_PG_NSFW_URL",
+  "CLAWMEM_PG_NSFW_HOST",
+  "CLAWMEM_PG_NSFW_DATABASE",
+  "CLAWMEM_PG_NSFW_USER",
+  "CLAWMEM_PG_NSFW_PASSWORD",
 ];
 
 describe("content GC vault fence", () => {
   it("REFUSES the nsfw vault before resolving config or opening a pool", async () => {
-    const saved = Object.fromEntries(NSFW_ENV_KEYS.map(k => [k, process.env[k]]));
+    const saved = Object.fromEntries(NSFW_ENV_KEYS.map((k) => [k, process.env[k]]));
     for (const k of NSFW_ENV_KEYS) delete process.env[k];
     try {
       let err: unknown;
@@ -36,8 +39,9 @@ describe("content GC vault fence", () => {
   });
 
   it("REFUSES the nsfw vault in dry-run mode too (a count is still a connection)", async () => {
-    await expect(gcOrphanedContent({ vault: "nsfw", dryRun: true }))
-      .rejects.toBeInstanceOf(ContentGcVaultRefusedError);
+    await expect(gcOrphanedContent({ vault: "nsfw", dryRun: true })).rejects.toBeInstanceOf(
+      ContentGcVaultRefusedError,
+    );
   });
 
   it("the CLI `gc --vault nsfw` exits non-zero with the refusal", () => {

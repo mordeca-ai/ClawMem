@@ -19,7 +19,10 @@ import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.
 import { closePool, toVectorLiteral } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
 import {
-  deactivateAbsentDocuments, gcOrphanedContent, insertEmbeddingsBatch, upsertDocument,
+  deactivateAbsentDocuments,
+  gcOrphanedContent,
+  insertEmbeddingsBatch,
+  upsertDocument,
 } from "../../src/pg/write.ts";
 
 const URL_ = process.env.CLAWMEM_PG_URL;
@@ -39,8 +42,12 @@ d("PG content GC", () => {
     try {
       await c.query(`CREATE SCHEMA ${schema}`);
       await c.query(`SET search_path TO ${schema}, public`);
-      for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
-        await c.query(substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM));
+      for (const f of readdirSync(MIGRATIONS_DIR)
+        .filter((f) => f.endsWith(".sql"))
+        .sort()) {
+        await c.query(
+          substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM),
+        );
       }
     } finally {
       c.release();
@@ -69,7 +76,12 @@ d("PG content GC", () => {
     await upsertDocument({ collection: COLLECTION, path, title: path, hash, body: `# ${hash}` });
     await insertEmbeddingsBatch(
       Array.from({ length: fragments }, (_, seq) => ({
-        collection: COLLECTION, path, hash, seq, pos: seq, model: MODEL,
+        collection: COLLECTION,
+        path,
+        hash,
+        seq,
+        pos: seq,
+        model: MODEL,
         embedding: new Array(DIM).fill(0.01 * (seq + 1)),
       })),
     );
@@ -87,7 +99,10 @@ d("PG content GC", () => {
   }
 
   async function vectorsFor(hash: string): Promise<number> {
-    const r = await q<{ n: number }>(`SELECT count(*)::int n FROM content_vectors WHERE hash = $1`, [hash]);
+    const r = await q<{ n: number }>(
+      `SELECT count(*)::int n FROM content_vectors WHERE hash = $1`,
+      [hash],
+    );
     return r[0]!.n;
   }
   async function contentExists(hash: string): Promise<boolean> {
@@ -123,7 +138,8 @@ d("PG content GC", () => {
     await writeDoc("other.md", "h_other");
     await deactivateAbsentDocuments(COLLECTION, ["doc.md", "other.md"], "gc test");
     const inactive = await q<{ active: boolean }>(
-      `SELECT active FROM documents WHERE collection = $1 AND path = 'keep.md'`, [COLLECTION],
+      `SELECT active FROM documents WHERE collection = $1 AND path = 'keep.md'`,
+      [COLLECTION],
     );
     expect(inactive[0]!.active).toBe(false);
 
@@ -207,7 +223,9 @@ d("PG content GC", () => {
     } finally {
       writer.release();
     }
-    const doc = await q(`SELECT 1 FROM documents WHERE collection = $1 AND path = 'inflight.md'`, [COLLECTION]);
+    const doc = await q(`SELECT 1 FROM documents WHERE collection = $1 AND path = 'inflight.md'`, [
+      COLLECTION,
+    ]);
     expect(doc.length).toBe(1);
     expect(await vectorsFor("h_inflight")).toBe(2);
   });
