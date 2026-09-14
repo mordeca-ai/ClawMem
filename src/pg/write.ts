@@ -31,6 +31,7 @@ import { withTransaction, toVectorLiteral } from "./client.ts";
 import { embedDim, resolvePgConfig } from "./config.ts";
 import { resolveVault, type Vault } from "./vaults.ts";
 import {
+  ContentGcVaultRefusedError,
   PgSchemaGeometryError,
   PgVecBatchModelMismatchError,
   PgVecBatchVaultMismatchError,
@@ -639,4 +640,170 @@ export async function insertMemoryEvolution(m: MemoryEvolutionWrite): Promise<nu
     );
     return Number(rows[0]!.id);
   });
+}
+
+// ===========================================================================
+// Content GC (master-harness-vn4rz.49)
+// ===========================================================================
+
+/**
+ * RETENTION RULE (master-harness-vn4rz.49) — read this before changing anything
+ * below.
+ *
+ * A `content` row (and, through ON DELETE CASCADE, every `content_vectors` row
+ * for its hash) is garbage ONLY when its hash is referenced by NO `documents`
+ * row AND NO `origin_documents` row. Consequences, all deliberate:
+ *
+ *  - ANY documents row protects its content, INCLUDING active=false. The
+ *    absent-from-walk sweep (vn4rz.41) soft-retires rows so a returning file
+ *    reactivates with its vectors intact; GC honouring `active` would make that
+ *    reactivation silently vectorless. This is also the sqlite parity rule
+ *    (store.ts cleanupOrphanedContent: `hash NOT IN documents`, deliberately
+ *    NOT active-scoped — active-scoping there cascade-destroyed archived docs).
+ *  - origin_documents rows protect their content too: the origin tier shares
+ *    the content table and cascades from it.
+ *  - What IS collected: hashes superseded by a content change (upsertDocument
+ *    re-points documents.hash and never deletes the old content row), which is
+ *    how the live vault accumulated unreferenced vectors.
+ *
+ * SFW VAULT ONLY. A non-sfw vault is refused before any config is resolved or
+ * any pool is opened (ContentGcVaultRefusedError).
+ *
+ * RACE GUARD. upsertDocument inserts content and documents in ONE transaction,
+ * so a committed content row is never "not yet referenced" by its own writer.
+ * The remaining windows are closed three ways:
+ *   1. candidates are locked `FOR UPDATE OF c SKIP LOCKED` — a writer whose FK
+ *      check already holds KEY SHARE on a content row (an in-flight documents /
+ *      origin_documents / content_vectors insert) makes that row skipped, not
+ *      waited on and not deleted;
+ *   2. the DELETE re-checks both NOT EXISTS predicates under a fresh READ
+ *      COMMITTED snapshot taken AFTER the row locks are held, so a reference
+ *      committed between the candidate scan and the delete is seen and kept
+ *      (a delete without the re-check would CASCADE-destroy that new document);
+ *   3. a created_at grace window (default 15 min) keeps young content rows out
+ *      of the candidate set, covering reindex's upsert -> embed gap where a
+ *      concurrent writer could supersede a hash whose vectors are still pending.
+ *
+ * BOUNDED. Each batch is its own transaction of at most `batchSize` content
+ * rows; a pass stops at `maxBatches` and reports `capped: true` so the next
+ * pass continues. DELETE does not shrink the heap or the HNSW index — that
+ * needs VACUUM / REINDEX CONCURRENTLY, which is out of scope here.
+ */
+export const CONTENT_GC_DEFAULTS = {
+  batchSize: 500,
+  maxBatches: 200,
+  graceSeconds: 900,
+} as const;
+
+export interface ContentGcOptions {
+  /** Must be "sfw". Anything else is refused before a connection exists. */
+  vault?: Vault;
+  batchSize?: number;
+  maxBatches?: number;
+  graceSeconds?: number;
+  /** Count what WOULD be collected; delete nothing. */
+  dryRun?: boolean;
+}
+
+export interface ContentGcResult {
+  vault: Vault;
+  dryRun: boolean;
+  /** Eligible at the start of the pass (after the grace window). */
+  eligibleContent: number;
+  eligibleVectors: number;
+  /** Unreferenced but younger than the grace window, so kept this pass. */
+  withinGraceContent: number;
+  contentDeleted: number;
+  vectorsDeleted: number;
+  batches: number;
+  /** True when maxBatches stopped the pass before convergence. */
+  capped: boolean;
+}
+
+const ORPHAN_PREDICATE = `
+  NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = c.hash)
+  AND NOT EXISTS (SELECT 1 FROM origin_documents o WHERE o.hash = c.hash)`;
+
+function positiveInt(name: string, v: number, allowZero = false): number {
+  if (!Number.isInteger(v) || v < 0 || (!allowZero && v === 0)) {
+    throw new Error(`content GC: ${name} must be a ${allowZero ? "non-negative" : "positive"} integer, got ${v}`);
+  }
+  return v;
+}
+
+export async function gcOrphanedContent(opts: ContentGcOptions = {}): Promise<ContentGcResult> {
+  const vault = opts.vault ?? "sfw";
+  // Refuse FIRST — before resolvePgConfig, before a pool exists.
+  if (vault !== "sfw") throw new ContentGcVaultRefusedError(vault);
+  const batchSize = positiveInt("batchSize", opts.batchSize ?? CONTENT_GC_DEFAULTS.batchSize);
+  const maxBatches = positiveInt("maxBatches", opts.maxBatches ?? CONTENT_GC_DEFAULTS.maxBatches);
+  const graceSeconds = positiveInt(
+    "graceSeconds", opts.graceSeconds ?? CONTENT_GC_DEFAULTS.graceSeconds, true,
+  );
+  const dryRun = opts.dryRun === true;
+
+  const counts = await withTransaction(vault, async c => {
+    await assertVaultDatabase(c, vault);
+    const { rows } = await c.query<{ eligible: number; vectors: number; young: number }>(
+      `SELECT
+         count(*) FILTER (WHERE c.created_at <  now() - make_interval(secs => $1))::int AS eligible,
+         count(*) FILTER (WHERE c.created_at >= now() - make_interval(secs => $1))::int AS young,
+         COALESCE(sum((SELECT count(*) FROM content_vectors v WHERE v.hash = c.hash))
+           FILTER (WHERE c.created_at < now() - make_interval(secs => $1)), 0)::int AS vectors
+       FROM content c
+      WHERE ${ORPHAN_PREDICATE}`,
+      [graceSeconds],
+    );
+    return rows[0]!;
+  });
+
+  const result: ContentGcResult = {
+    vault, dryRun,
+    eligibleContent: counts.eligible,
+    eligibleVectors: counts.vectors,
+    withinGraceContent: counts.young,
+    contentDeleted: 0, vectorsDeleted: 0, batches: 0, capped: false,
+  };
+  if (dryRun) return result;
+
+  let converged = false;
+  while (result.batches < maxBatches) {
+    const batch = await withTransaction(vault, async c => {
+      await assertVaultDatabase(c, vault);
+      const locked = await c.query<{ hash: string }>(
+        `SELECT c.hash FROM content c
+          WHERE c.created_at < now() - make_interval(secs => $1)
+            AND ${ORPHAN_PREDICATE}
+          ORDER BY c.hash
+          LIMIT $2
+          FOR UPDATE OF c SKIP LOCKED`,
+        [graceSeconds, batchSize],
+      );
+      if (locked.rows.length === 0) return { selected: 0, content: 0, vectors: 0 };
+      const { rows } = await c.query<{ content_deleted: number; vectors_deleted: number }>(
+        `WITH del AS (
+           DELETE FROM content c
+            WHERE c.hash = ANY($1::text[])
+              AND ${ORPHAN_PREDICATE}
+           RETURNING c.hash
+         )
+         SELECT (SELECT count(*) FROM del)::int AS content_deleted,
+                (SELECT count(*) FROM content_vectors v
+                  WHERE v.hash IN (SELECT hash FROM del))::int AS vectors_deleted`,
+        [locked.rows.map(r => r.hash)],
+      );
+      return {
+        selected: locked.rows.length,
+        content: rows[0]!.content_deleted,
+        vectors: rows[0]!.vectors_deleted,
+      };
+    });
+    if (batch.selected === 0) { converged = true; break; }
+    result.batches++;
+    result.contentDeleted += batch.content;
+    result.vectorsDeleted += batch.vectors;
+    if (batch.selected < batchSize) { converged = true; break; }
+  }
+  result.capped = !converged;
+  return result;
 }
