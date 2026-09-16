@@ -6,22 +6,31 @@
  * retry; each names the operator action that clears it.
  */
 
+import { LOCAL_EMBED_ARM_LABEL } from "../llm.ts";
+
 /** The vault already holds vectors under a different model (ADR-0162 §7). */
 export class PgVecWriteModelMismatchError extends Error {
   readonly storedModels: string[];
   readonly writeModel: string;
+  readonly endpoint: string;
   constructor(storedModels: string[], writeModel: string, endpoint: string) {
+    // The local fallback arm is not fixed by re-pointing the endpoint (master-harness-vn4rz.44).
+    const local = endpoint === LOCAL_EMBED_ARM_LABEL;
     super(
       `Refusing vector write: this database already holds embeddings from ` +
       `[${storedModels.join(", ")}], but ${endpoint} produced "${writeModel}". ` +
       `A different model is a different vector space — mixing them makes cosine ` +
-      `distance meaningless (ADR-0162 §7, master-harness-p2ib3). Either point the ` +
-      `embed endpoint back at "${storedModels[0]}", or clear the vectors and ` +
-      `re-embed the whole database under the new model.`,
+      `distance meaningless (ADR-0162 §7, master-harness-p2ib3). Either ` +
+      (local
+        ? `restore the remote embed endpoint (the local arm is the cooldown/unreachable ` +
+          `fallback) or set the local embed model to "${storedModels[0]}"`
+        : `point the embed endpoint back at "${storedModels[0]}"`) +
+      `, or clear the vectors and re-embed the whole database under the new model.`,
     );
     this.name = "PgVecWriteModelMismatchError";
     this.storedModels = storedModels;
     this.writeModel = writeModel;
+    this.endpoint = endpoint;
   }
 }
 

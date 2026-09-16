@@ -30,6 +30,7 @@ import type { PoolClient } from "pg";
 import { withTransaction, toVectorLiteral } from "./client.ts";
 import { embedDim, resolvePgConfig } from "./config.ts";
 import { resolveVault, type Vault } from "./vaults.ts";
+import { UNREPORTED_EMBED_ARM_LABEL } from "../llm.ts";
 import {
   ContentGcVaultRefusedError,
   PgSchemaGeometryError,
@@ -43,8 +44,10 @@ import {
 /** Arbitrary but stable key for the write-geometry advisory lock. */
 const GEOMETRY_LOCK_KEY = 0x1a2b3c4d;
 
-function embedEndpointLabel(): string {
-  return process.env.CLAWMEM_EMBED_URL || "the local in-process embedder";
+/** Producing arm's identity (master-harness-vn4rz.44) — reported by the writer, never inferred
+ *  from CLAWMEM_EMBED_URL, which can be set while the local fallback arm produced the vector. */
+function embedEndpointLabel(endpoint: string | undefined): string {
+  return endpoint || UNREPORTED_EMBED_ARM_LABEL;
 }
 
 // ===========================================================================
@@ -132,12 +135,13 @@ export async function getVecModels(c: PoolClient): Promise<string[]> {
 export async function assertWriteEmbedModelConsistent(
   c: PoolClient,
   writeModel: string,
+  endpoint?: string,
 ): Promise<void> {
   if (!writeModel) return;
   const stored = await getVecModels(c);
   if (stored.length === 0) return;
   if (!(stored.length === 1 && stored[0] === writeModel)) {
-    throw new PgVecWriteModelMismatchError(stored, writeModel, embedEndpointLabel());
+    throw new PgVecWriteModelMismatchError(stored, writeModel, embedEndpointLabel(endpoint));
   }
 }
 
@@ -162,6 +166,8 @@ export interface EmbeddingWrite {
   fragmentLabel?: string | null;
   canonicalId?: string | null;
   embedInputFp?: string | null;
+  /** Producing embed arm (EmbeddingResult.endpoint) — named by the write fence on refusal. */
+  endpoint?: string;
 }
 
 function assertDimension(w: EmbeddingWrite, expected: number): void {
@@ -225,7 +231,7 @@ export async function insertEmbeddingsBatch(writes: EmbeddingWrite[]): Promise<v
     }
 
     for (const w of writes) assertDimension(w, dim);
-    for (const w of writes) await assertWriteEmbedModelConsistent(c, w.model);
+    for (const w of writes) await assertWriteEmbedModelConsistent(c, w.model, w.endpoint);
 
     for (const w of writes) {
       await c.query(

@@ -240,7 +240,7 @@ export async function loadOriginCollection(
         writes.push({
           collection: opts.collection, path: frag.relPath,
           hash: frag.hash, seq: frag.seq, pos: frag.pos,
-          embedding: r.embedding, model: r.model,
+          embedding: r.embedding, model: r.model, endpoint: r.endpoint,
           fragmentType: frag.fragmentType, fragmentLabel: frag.fragmentLabel,
           canonicalId: frag.canonicalId, embedInputFp: hashContent(frag.text),
         });

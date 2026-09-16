@@ -24,6 +24,8 @@ import {
   sanitizeExpandedQueries,
   expansionFallback,
   isFallbackExpansion,
+  LOCAL_EMBED_ARM_LABEL,
+  UNREPORTED_EMBED_ARM_LABEL,
   type RerankDocument,
 } from "./llm.ts";
 import { normalizeIsoTimestamp } from "./normalize.ts";
@@ -1511,7 +1513,14 @@ export class VecReadModelMismatchError extends FatalVectorError {
  */
 export class VecWriteModelMismatchError extends FatalVectorError {
   constructor(public readonly storedModels: string[], public readonly writeModel: string, public readonly endpoint: string) {
-    super(`Refusing to write vectors: embedding-model mismatch on the WRITE path. The vault's vectors were embedded with ${storedModels.map(m => `"${m}"`).join(", ")} (expected) but endpoint ${endpoint} produced "${writeModel}" (actual). Writing a second model into one vector space (even at the same dimension) makes cosine similarity meaningless and poisons the vault. Nothing was written. Point CLAWMEM_EMBED_URL at the vault's model, or run 'clawmem embed --force' to clear and rebuild the whole vault with the current model.`);
+    // The remedy depends on the arm (master-harness-vn4rz.44): pointing CLAWMEM_EMBED_URL elsewhere
+    // does nothing for a vector the local fallback arm produced.
+    const remedy = endpoint === LOCAL_EMBED_ARM_LABEL
+      ? "The local arm is the fallback used when CLAWMEM_EMBED_URL is unset or the remote endpoint is on cooldown/unreachable — restore the remote embed endpoint (or set the local embed model to the vault's model) and re-run"
+      : endpoint === UNREPORTED_EMBED_ARM_LABEL
+        ? "The writer did not report which embed arm produced the vector — make that embedder produce the vault's model"
+        : "Point CLAWMEM_EMBED_URL at the vault's model";
+    super(`Refusing to write vectors: embedding-model mismatch on the WRITE path. The vault's vectors were embedded with ${storedModels.map(m => `"${m}"`).join(", ")} (expected) but ${endpoint === LOCAL_EMBED_ARM_LABEL || endpoint === UNREPORTED_EMBED_ARM_LABEL ? endpoint : `endpoint ${endpoint}`} produced "${writeModel}" (actual). Writing a second model into one vector space (even at the same dimension) makes cosine similarity meaningless and poisons the vault. Nothing was written. ${remedy}, or run 'clawmem embed --force' to clear and rebuild the whole vault with the current model.`);
     this.name = "VecWriteModelMismatchError";
   }
 }
@@ -1800,7 +1809,7 @@ export type Store = {
   getHashesNeedingFragments: () => { hash: string; body: string; path: string; title: string; collection: string; description: string | null }[];
   clearAllEmbeddings: (leaseGuard?: LeaseGuard) => void;
   getVectorConsistency: () => { cvCount: number; vvCount: number; cvMissingVv: number; vvOrphan: number; pending: number };
-  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard, embedInputFp?: string) => void;
+  insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard, embedInputFp?: string, endpoint?: string) => void;
   insertEmbeddingsBatch: (writes: EmbeddingWrite[], leaseGuard?: LeaseGuard) => void;
   cleanStaleEmbeddings: (leaseGuard?: LeaseGuard) => number;
   saveCanaryBaseline: (profileKey: string, probes: { probeId: string; embedding: Float32Array }[], pairMargins: Record<string, number>, leaseGuard?: LeaseGuard) => void;
@@ -2000,7 +2009,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     getHashesNeedingFragments: () => getHashesNeedingFragments(db),
     clearAllEmbeddings: (leaseGuard?: LeaseGuard) => clearAllEmbeddings(db, leaseGuard),
     getVectorConsistency: () => getVectorConsistency(db),
-    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard, embedInputFp?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, fragmentType, fragmentLabel, canonicalId, leaseGuard, embedInputFp),
+    insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard, embedInputFp?: string, endpoint?: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt, fragmentType, fragmentLabel, canonicalId, leaseGuard, embedInputFp, endpoint),
     insertEmbeddingsBatch: (writes: EmbeddingWrite[], leaseGuard?: LeaseGuard) => insertEmbeddingsBatch(db, writes, leaseGuard),
     cleanStaleEmbeddings: (leaseGuard?: LeaseGuard) => cleanStaleEmbeddings(db, leaseGuard),
     saveCanaryBaseline: (profileKey: string, probes: { probeId: string; embedding: Float32Array }[], pairMargins: Record<string, number>, leaseGuard?: LeaseGuard) => {
@@ -4883,11 +4892,12 @@ export function getVectorConsistency(db: Database): {
 // the cache and is re-checked rather than riding a stale entry.
 const verifiedWriteEmbedModels = new WeakMap<Database, { dataVersion: number; model: string }>();
 
-/** The embedding endpoint identity for operator-facing errors — the URL when remote, else the
- *  in-process embedder. Read at throw time so the message names the server that actually produced
- *  the foreign vectors. */
-function embedEndpointLabel(): string {
-  return process.env.CLAWMEM_EMBED_URL || "the local in-process embedder";
+/** The producing arm's identity for operator-facing errors (master-harness-vn4rz.44). The writer
+ *  reports it (EmbeddingResult.endpoint); CLAWMEM_EMBED_URL is deliberately NOT consulted — it can
+ *  be set while the local cooldown-fallback arm produced the vector, which is how the old env-based
+ *  label blamed an innocent remote server. An unreporting writer is named as such, not guessed. */
+function embedEndpointLabel(endpoint: string | undefined): string {
+  return endpoint || UNREPORTED_EMBED_ARM_LABEL;
 }
 
 /**
@@ -4911,7 +4921,7 @@ function embedEndpointLabel(): string {
  * FRESH vault, because an endpoint that reports no model is undiscriminable and there is
  * nothing there to poison — the vault's identity simply becomes "" until re-embedded.
  */
-function assertWriteEmbedModelConsistent(db: Database, writeModel: string): void {
+function assertWriteEmbedModelConsistent(db: Database, writeModel: string, endpoint?: string): void {
   const dataVersion = (db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version;
   const cached = verifiedWriteEmbedModels.get(db);
   if (cached && cached.dataVersion === dataVersion && cached.model === writeModel) return;
@@ -4922,7 +4932,7 @@ function assertWriteEmbedModelConsistent(db: Database, writeModel: string): void
   if (storedModels.length === 0) return;
 
   if (!(storedModels.length === 1 && storedModels[0] === writeModel)) {
-    throw new VecWriteModelMismatchError(storedModels, writeModel, embedEndpointLabel());
+    throw new VecWriteModelMismatchError(storedModels, writeModel, embedEndpointLabel(endpoint));
   }
 
   verifiedWriteEmbedModels.set(db, { dataVersion, model: writeModel });
@@ -4944,7 +4954,8 @@ export function insertEmbedding(
   fragmentLabel?: string,
   canonicalId?: string,
   leaseGuard?: LeaseGuard,
-  embedInputFp?: string
+  embedInputFp?: string,
+  endpoint?: string
 ): void {
   const hashSeq = `${hash}_${seq}`;
   // Atomic vec0 + metadata write: the DELETE (vec0's "upsert" — no INSERT OR
@@ -4966,7 +4977,7 @@ export function insertEmbedding(
     // transaction as the write, so the check and the INSERT are atomic — a concurrent writer
     // cannot commit a foreign model between the read of content_vectors and these INSERTs.
     // Throwing here rolls the transaction back: nothing is written.
-    assertWriteEmbedModelConsistent(db, model);
+    assertWriteEmbedModelConsistent(db, model, endpoint);
     db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run(hashSeq);
     db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(hashSeq, embedding);
     db.prepare(
@@ -4987,6 +4998,8 @@ export type EmbeddingWrite = {
   canonicalId?: string;
   /** SHA-256 over the UTF-8 bytes of the exact formatted embed input (v0.21 (d).4 / T5-L1). */
   embedInputFp?: string;
+  /** Producing embed arm (EmbeddingResult.endpoint) — named by the write fence on refusal. */
+  endpoint?: string;
 };
 
 /**
@@ -5020,7 +5033,7 @@ export function insertEmbeddingsBatch(db: Database, writes: EmbeddingWrite[], le
     // comparison below. Two models inside ONE batch is drift by definition.
     const batchModels = [...new Set(writes.map(w => w.model).filter(m => !!m))].sort();
     if (batchModels.length > 1) throw new VecModelMismatchError(batchModels[0]!, batchModels[1]!);
-    for (const w of writes) assertWriteEmbedModelConsistent(db, w.model);
+    for (const w of writes) assertWriteEmbedModelConsistent(db, w.model, w.endpoint);
     for (const w of writes) {
       const hashSeq = `${w.hash}_${w.seq}`;
       deleteVec.run(hashSeq);
