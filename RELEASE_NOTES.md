@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.23 — origin_documents_ensure_partition() is still pinned to literal public — same schema-portability defect class as vn4rz.46, and no throwaway-schema test exercises it
+
+Make origin_documents_ensure_partition follow the configured PostgreSQL schema while retaining pg_catalog-first search_path hardening. Add a transaction-safe live integration regression proving both child and parent partitions remain in the throwaway schema.
+
+---
+
 ## v0.36.22 — clawmem PG reindex never GCs superseded content_vectors: 67% of vectors (116k/174k) belong to non-active hashes, starving filtered HNSW and inflating the 719MB index
 
 PG content GC: deletes content (cascading content_vectors) whose hash is referenced by neither documents nor origin_documents; sfw vault only; LIMIT-batched with a per-pass cap and a 15-min grace window; runs at the end of reindex() (opt-out --no-gc) and as the gc verb (--dry-run). Retention: any documents row (incl. active=false) or origin_documents row protects its content. Live first pass removed 699 content / 9,616 vectors; the space reclaim needs VACUUM/REINDEX (follow-up).

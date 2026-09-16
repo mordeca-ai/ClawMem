@@ -22,7 +22,7 @@ import pg from "pg";
 import { readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
-import { closePool, toVectorLiteral } from "../../src/pg/client.ts";
+import { closePool, toVectorLiteral, withClient } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
 import {
   deactivateAbsentDocuments,
@@ -95,6 +95,42 @@ d("PG write path", () => {
       c.release();
     }
   }
+
+  it("creates origin-document partitions in the configured schema", async () => {
+    // Roll back the DDL so this sharp test is safe even against the pre-fix
+    // function, which creates the partition under public instead.
+    await withClient("sfw", async c => {
+      await c.query("BEGIN");
+      try {
+        const month = "2099-01-01";
+        const partition = "origin_documents_2099_01";
+        await c.query("SELECT origin_documents_ensure_partition($1::date)", [month]);
+
+        const { rows } = await c.query<{
+          child_schema: string;
+          parent_schema: string;
+        }>(
+          `SELECT child_ns.nspname AS child_schema,
+                  parent_ns.nspname AS parent_schema
+             FROM pg_catalog.pg_inherits AS inheritance
+             JOIN pg_catalog.pg_class AS child
+               ON child.oid = inheritance.inhrelid
+             JOIN pg_catalog.pg_namespace AS child_ns
+               ON child_ns.oid = child.relnamespace
+             JOIN pg_catalog.pg_class AS parent
+               ON parent.oid = inheritance.inhparent
+             JOIN pg_catalog.pg_namespace AS parent_ns
+               ON parent_ns.oid = parent.relnamespace
+            WHERE child.relname = $1`,
+          [partition],
+        );
+
+        expect(rows).toEqual([{ child_schema: schema, parent_schema: schema }]);
+      } finally {
+        await c.query("ROLLBACK");
+      }
+    });
+  });
 
   /**
    * THE FUNCTION UNDER TEST — the real exported one (vn4rz.7 pass C, Task 3.1).
