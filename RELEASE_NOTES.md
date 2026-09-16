@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.24 — Write fence names the producing embed arm, not ambient CLAWMEM_EMBED_URL
+
+Vector write-fence refusals now name the embed arm that actually produced the vector. `EmbeddingResult` carries an optional `endpoint` (the remote URL fetched, or "the local in-process embedder"), threaded through sqlite `insertEmbedding`/batch writes and PG `EmbeddingWrite` into `VecWriteModelMismatchError` / `PgVecWriteModelMismatchError`. A set-but-unused `CLAWMEM_EMBED_URL` no longer gets blamed for a local-fallback poisoning; writers that report no arm are labelled "an unreported embed arm" instead of guessed from env. Remedy text is arm-specific. 7 new unit tests (master-harness-vn4rz.44).
+
+---
+
 ## v0.36.23 — origin_documents_ensure_partition() is still pinned to literal public — same schema-portability defect class as vn4rz.46, and no throwaway-schema test exercises it
 
 Make origin_documents_ensure_partition follow the configured PostgreSQL schema while retaining pg_catalog-first search_path hardening. Add a transaction-safe live integration regression proving both child and parent partitions remain in the throwaway schema.
