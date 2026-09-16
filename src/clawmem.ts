@@ -714,6 +714,7 @@ export async function runBatchedEmbed(
         writes.push({
           hash: doc.hash, seq: item.seq, pos: frag.startLine,
           embedding: new Float32Array(result.embedding), model: result.model, embeddedAt,
+          endpoint: result.endpoint, // producing arm, named by the write fence (vn4rz.44)
           fragmentType: frag.type, fragmentLabel: frag.label ?? undefined,
           canonicalId: canonicalDocId(doc.collection, doc.path),
           // Embed-input fingerprint ((d).4 / T5-L1): SHA-256 over the UTF-8 bytes of the
@@ -1213,7 +1214,7 @@ export async function cmdEmbed(args: string[]) {
                 s.insertEmbedding(
                   hash, seq, frag.startLine, new Float32Array(result.embedding),
                   result.model, new Date().toISOString(), frag.type, frag.label ?? undefined, canId,
-                  leaseGuard, embedInputFp
+                  leaseGuard, embedInputFp, result.endpoint
                 );
               }, "insertEmbedding", () => leaseLost);
               totalFragments++;

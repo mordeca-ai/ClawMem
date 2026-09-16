@@ -70,7 +70,17 @@ export type TokenLogProb = {
 export type EmbeddingResult = {
   embedding: number[];
   model: string;
+  /** Which arm PRODUCED this vector (master-harness-vn4rz.44): the remote base URL actually
+   *  fetched, or LOCAL_EMBED_ARM_LABEL for the in-process fallback. Carried into vector writes so
+   *  the write fence names the real culprit — CLAWMEM_EMBED_URL can be set while the local arm
+   *  (cooldown fallback) produced the vector. Optional: absent = unreported, never guessed. */
+  endpoint?: string;
 };
+
+/** Operator-facing identity of the in-process node-llama-cpp embed arm. */
+export const LOCAL_EMBED_ARM_LABEL = "the local in-process embedder";
+/** Used when a vector write did not report its producing arm — honest, not inferred from env. */
+export const UNREPORTED_EMBED_ARM_LABEL = "an unreported embed arm";
 
 /**
  * Generation result with optional logprobs
@@ -1039,6 +1049,7 @@ export class LlamaCpp implements LLM {
       return {
         embedding: Array.from(embedding.vector),
         model: this.embedModelId,
+        endpoint: LOCAL_EMBED_ARM_LABEL,
       };
     } catch (error) {
       console.error("[embed] Local embedding error:", error);
@@ -1055,7 +1066,7 @@ export class LlamaCpp implements LLM {
         try {
           const safeText = this.truncateForLocalEmbed(text);
           const embedding = await context.getEmbeddingFor(safeText);
-          results.push({ embedding: Array.from(embedding.vector), model: this.embedModelId });
+          results.push({ embedding: Array.from(embedding.vector), model: this.embedModelId, endpoint: LOCAL_EMBED_ARM_LABEL });
         } catch (err) {
           console.error("[embed] Local batch embedding error:", err);
           results.push(null);
@@ -1419,6 +1430,7 @@ export class LlamaCpp implements LLM {
           embedding: data.data[0]!.embedding,
           // NEVER fall back to the URL — an endpoint is not a model identity.
           model: canonicalEmbedModelId(data.model || this.remoteEmbedModel),
+          endpoint: this.remoteEmbedUrl ?? undefined,
         };
       } catch (error) {
         // An abort/timeout is an intentional caller-driven cancellation (the
@@ -1477,7 +1489,7 @@ export class LlamaCpp implements LLM {
         const modelName = canonicalEmbedModelId(data.model || this.remoteEmbedModel);
         const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
         for (const item of data.data) {
-          results[item.index] = { embedding: item.embedding, model: modelName };
+          results[item.index] = { embedding: item.embedding, model: modelName, endpoint: this.remoteEmbedUrl ?? undefined };
         }
         return results;
       } catch (error) {

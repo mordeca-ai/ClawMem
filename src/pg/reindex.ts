@@ -363,7 +363,7 @@ export async function reindexCollection(
         // whole reason EmbeddingWrite.collection could be made REQUIRED.
         collection: name, path: frag.relPath,
         hash: frag.hash, seq: frag.seq, pos: frag.pos,
-        embedding: r.embedding, model: r.model,
+        embedding: r.embedding, model: r.model, endpoint: r.endpoint,
         fragmentType: frag.fragmentType,
         fragmentLabel: frag.fragmentLabel,
         canonicalId: frag.canonicalId,

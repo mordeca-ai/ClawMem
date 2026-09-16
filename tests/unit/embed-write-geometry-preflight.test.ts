@@ -74,11 +74,12 @@ describe("write-path geometry preflight — RED (refusal)", () => {
   });
 
   it("names the endpoint plus the expected and actual model in the error", () => {
-    process.env.CLAWMEM_EMBED_URL = FOREIGN_ENDPOINT;
+    // The endpoint is the one the WRITE reports as its producing arm (master-harness-vn4rz.44),
+    // not CLAWMEM_EMBED_URL — see embed-write-arm-label.test.ts.
     const { store, hashes } = vaultWithGeometry();
     let caught: unknown;
     try {
-      store.insertEmbedding(hashes[1]!, 0, 1, vec(4, 0.5), FOREIGN_MODEL, new Date().toISOString(), "full", undefined, "c/b.md");
+      store.insertEmbedding(hashes[1]!, 0, 1, vec(4, 0.5), FOREIGN_MODEL, new Date().toISOString(), "full", undefined, "c/b.md", undefined, undefined, FOREIGN_ENDPOINT);
     } catch (e) { caught = e; }
 
     expect(caught).toBeInstanceOf(VecWriteModelMismatchError);
