@@ -12,7 +12,7 @@
 
 import type { Server } from "bun";
 import type { Store, SearchResult, TimelineResult } from "./store.ts";
-import { enrichResults } from "./search-utils.ts";
+import { enrichResults, fuseAndRerank, toRanked, RERANK_DEGENERATE_FLOOR } from "./search-utils.ts";
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { listCollections } from "./collections.ts";
@@ -124,6 +124,68 @@ function handleStats(_req: Request, _url: URL, store: Store): Response {
   });
 }
 
+// --- Hybrid retrieval (BM25 + vector → RRF → rerank) ---
+
+// Rate-limited stderr signal when a REST hybrid request falls back to fused order, so a dead or
+// degenerate reranker is visible in the server log as well as in the `reranked` response field.
+let restRerankFallbackCount = 0;
+let lastRestRerankFallbackWarnAt = 0;
+function onRestRerankFallback(reason: string): void {
+  restRerankFallbackCount++;
+  const now = Date.now();
+  if (now - lastRestRerankFallbackWarnAt > 60_000) {
+    lastRestRerankFallbackWarnAt = now;
+    console.error(`[clawmem serve] hybrid rerank unavailable → fused order (${reason}); ${restRerankFallbackCount} occurrence(s) this process. Run 'clawmem doctor' to check the reranker.`);
+  }
+}
+
+type HybridOutcome = { results: SearchResult[]; reranked: boolean; rerankFallback?: string };
+
+/**
+ * REST hybrid mode (master-harness-h06j): the same fusion+rerank pipeline as CLI `clawmem query`
+ * (minus LLM query expansion) — BM25 + vector legs RRF-fused, top candidates reranked through the
+ * store reranker and blended. Replaces the ADR-0059-rejected un-reranked max-score merge. Rerank
+ * failure or degenerate scores fall back to fused order and are reported, never a 500.
+ */
+async function hybridSearch(store: Store, query: string, limit: number, collections?: string[]): Promise<HybridOutcome> {
+  const rerankCap = Math.max(limit, 30);
+  const pool = rerankCap * 2;
+  const fts = store.searchFTS(query, pool, undefined, collections);
+  let vec: SearchResult[] = [];
+  try {
+    vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, pool, undefined, collections);
+  } catch (e) { rethrowIfFatalVectorError(e); /* vector unavailable → BM25-only fusion */ }
+
+  const outcome = await fuseAndRerank(
+    query,
+    [
+      { results: fts.map(toRanked), weight: 2 },
+      { results: vec.map(toRanked), weight: 2 },
+    ],
+    (q, docs) => store.rerank(q, docs, DEFAULT_RERANK_MODEL),
+    { rerankCap, degenerateFloor: RERANK_DEGENERATE_FLOOR }
+  );
+  if (!outcome.reranked && outcome.fallbackReason !== "no-candidates") {
+    onRestRerankFallback(outcome.fallbackReason ?? "unknown");
+  }
+
+  const byPath = new Map<string, SearchResult>();
+  for (const r of [...fts, ...vec]) if (!byPath.has(r.filepath)) byPath.set(r.filepath, r);
+  const results = outcome.blended.flatMap(b => {
+    const r = byPath.get(b.file);
+    return r ? [{ ...r, score: b.score }] : [];
+  });
+  return outcome.reranked
+    ? { results, reranked: true }
+    : { results, reranked: false, rerankFallback: outcome.fallbackReason };
+}
+
+/** Response fields for the hybrid path only; other modes' response shape is unchanged. */
+function rerankFields(h: HybridOutcome | undefined): { reranked?: boolean; rerankFallback?: string } {
+  if (!h) return {};
+  return h.reranked ? { reranked: true } : { reranked: false, rerankFallback: h.rerankFallback };
+}
+
 // --- Unified Search ---
 
 async function handleSearch(req: Request, _url: URL, store: Store): Promise<Response> {
@@ -145,6 +207,7 @@ async function handleSearch(req: Request, _url: URL, store: Store): Promise<Resp
   const collections = body.collection ? body.collection.split(",").map(c => c.trim()) : undefined;
 
   let results: SearchResult[];
+  let hybrid: HybridOutcome | undefined;
 
   if (mode === "keyword" || (mode === "auto" && query.split(/\s+/).length <= 3)) {
     results = store.searchFTS(query, limit * 2, undefined, collections);
@@ -156,21 +219,9 @@ async function handleSearch(req: Request, _url: URL, store: Store): Promise<Resp
       results = store.searchFTS(query, limit * 2, undefined, collections);
     }
   } else {
-    // hybrid — BM25 + vector
-    const ftsResults = store.searchFTS(query, limit * 2, undefined, collections);
-    let vecResults: SearchResult[] = [];
-    try {
-      vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch (e) { rethrowIfFatalVectorError(e); /* vector unavailable */ }
-    // Simple merge — dedupe by filepath, take max score
-    const merged = new Map<string, SearchResult>();
-    for (const r of [...ftsResults, ...vecResults]) {
-      const existing = merged.get(r.filepath);
-      if (!existing || r.score > existing.score) {
-        merged.set(r.filepath, r);
-      }
-    }
-    results = Array.from(merged.values());
+    // hybrid — BM25 + vector, RRF-fused and reranked (master-harness-h06j)
+    hybrid = await hybridSearch(store, query, limit, collections);
+    results = hybrid.results;
   }
 
   // Enrich with SAME metadata + composite scoring
@@ -183,6 +234,7 @@ async function handleSearch(req: Request, _url: URL, store: Store): Promise<Resp
     return jsonResponse({
       query,
       mode,
+      ...rerankFields(hybrid),
       count: final.length,
       results: final.map(r => ({
         docid: r.docid,
@@ -198,6 +250,7 @@ async function handleSearch(req: Request, _url: URL, store: Store): Promise<Resp
   return jsonResponse({
     query,
     mode,
+    ...rerankFields(hybrid),
     count: final.length,
     results: final.map(r => ({
       docid: r.docid,
@@ -634,6 +687,7 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
   const collections = body.collection ? body.collection.split(",").map(c => c.trim()) : undefined;
 
   let results: SearchResult[];
+  let hybrid: HybridOutcome | undefined;
 
   if (mode === "timeline") {
     // Delegate to session log
@@ -670,18 +724,9 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
       results = store.searchFTS(query, limit * 2, undefined, collections);
     }
   } else {
-    // hybrid
-    const fts = store.searchFTS(query, limit * 2, undefined, collections);
-    let vec: SearchResult[] = [];
-    try {
-      vec = await store.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, collections);
-    } catch (e) { rethrowIfFatalVectorError(e); /* vector unavailable */ }
-    const merged = new Map<string, SearchResult>();
-    for (const r of [...fts, ...vec]) {
-      const existing = merged.get(r.filepath);
-      if (!existing || r.score > existing.score) merged.set(r.filepath, r);
-    }
-    results = Array.from(merged.values());
+    // hybrid — BM25 + vector, RRF-fused and reranked (master-harness-h06j)
+    hybrid = await hybridSearch(store, query, limit, collections);
+    results = hybrid.results;
   }
 
   const enriched = enrichResults(store, results, query);
@@ -691,7 +736,7 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
 
   if (compact) {
     return jsonResponse({
-      query, mode, count: final.length,
+      query, mode, ...rerankFields(hybrid), count: final.length,
       results: final.map(r => ({
         docid: r.docid, path: r.displayPath, title: r.title,
         score: Math.round(r.compositeScore * 1000) / 1000,
@@ -702,7 +747,7 @@ async function handleRetrieve(req: Request, _url: URL, store: Store): Promise<Re
   }
 
   return jsonResponse({
-    query, mode, count: final.length,
+    query, mode, ...rerankFields(hybrid), count: final.length,
     results: final.map(r => ({
       docid: r.docid, path: r.displayPath, title: r.title,
       score: Math.round(r.compositeScore * 1000) / 1000,

@@ -62,7 +62,7 @@ import type { Store as StoreType } from "./store.ts";
 import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, HALF_LIVES, type EnrichedResult } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, blendFusionAndRerank, hasStrongFtsSignal, ftsBypassEnabled, type RankedResult } from "./search-utils.ts";
+import { enrichResults, toRanked, fuseAndRerank, hasStrongFtsSignal, ftsBypassEnabled, type RankedResult } from "./search-utils.ts";
 import { splitDocument } from "./splitter.ts";
 import { buildEmbedFrontmatter } from "./embed-input.ts";
 import { getProfile, updateProfile, isProfileStale, type ProfileUpdateOutcome } from "./profile.ts";
@@ -1603,28 +1603,15 @@ async function cmdQuery(args: string[]) {
     }
   }
 
-  // Step 4: RRF fusion
-  const rrfResults = reciprocalRankFusion(
-    allRanked.map(a => a.results),
-    allRanked.map(a => a.weight),
-    60
+  // Steps 4-7: RRF fusion → top RERANK_CAP candidates (73tb.23) → rerank → position-aware
+  // blend on the normalized RRF fusion score (master-harness-z7o4y). Shared with the REST
+  // hybrid modes (master-harness-h06j); a reranker failure falls back to fusion order.
+  const { blended } = await fuseAndRerank(
+    query,
+    allRanked,
+    (q, docs) => s.rerank(q, docs, DEFAULT_RERANK_MODEL),
+    { rerankCap: RERANK_CAP }
   );
-
-  // Step 5: Take top candidates for reranking (73tb.23: scale with the requested budget)
-  const candidates = rrfResults.slice(0, RERANK_CAP);
-
-  // Step 6: Rerank
-  let reranked: { file: string; score: number }[] = [];
-  try {
-    const docs = candidates.map(r => ({ file: r.file, text: r.body.slice(0, 4000) }));
-    reranked = await s.rerank(query, docs, DEFAULT_RERANK_MODEL);
-  } catch {
-    reranked = candidates.map(r => ({ file: r.file, score: r.score }));
-  }
-
-  // Step 7: Position-aware blending — uses the candidate's actual (normalized)
-  // RRF fusion score, not a rank-index proxy (master-harness-z7o4y fusion fix).
-  const blended = blendFusionAndRerank(candidates, reranked);
 
   // Step 8: Map back to full results and apply composite scoring. Build the map from
   // ALL legs (incl. typed expansions) so expansion-only candidates aren't dropped.
