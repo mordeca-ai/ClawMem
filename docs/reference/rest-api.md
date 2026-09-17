@@ -44,6 +44,8 @@ Set `CLAWMEM_API_TOKEN` to require `Authorization: Bearer <token>` on all reques
 
 Modes: `auto`, `keyword`, `semantic`, `hybrid`.
 
+`hybrid` (and `auto` for queries longer than three words) runs the same fusion+rerank pipeline as CLI `clawmem query`, minus LLM query expansion: BM25 and vector legs are RRF-fused, the top `max(limit, 30)` candidates are reranked through the configured reranker, and the two signals are blended (since v0.36.25; before that it was an un-reranked max-score merge).
+
 **POST /retrieve**
 
 ```json
@@ -62,7 +64,7 @@ Auto-routing classifies the query (shared signal set with the MCP classifier sin
 - Timeline queries → session history
 - Short keyword queries → BM25
 - Conceptual queries → vector
-- Everything else → hybrid
+- Everything else → hybrid (BM25 + vector, RRF-fused and reranked, same as `/search` `mode=hybrid`)
 
 The REST surface filters nothing internally: `/retrieve` returns `_clawmem` system documents in every mode, including graph-discovered ones on the causal route. Entity co-occurrence expansion does not run on REST (its only home is the MCP `intent_search` tool). A REST-wide visibility option may arrive in a later release.
 
@@ -181,6 +183,7 @@ All responses are JSON. Search/retrieve responses include:
 {
   "query": "authentication",
   "mode": "hybrid",
+  "reranked": true,
   "count": 3,
   "results": [
     {
@@ -194,6 +197,8 @@ All responses are JSON. Search/retrieve responses include:
   ]
 }
 ```
+
+`reranked` appears only on hybrid responses. It is `true` when the reranker scored the candidates. It is `false` when the reranker threw or returned only degenerate (near-zero) scores; the results are then in fused order, and `rerankFallback` gives the reason (`error: ...` or `degenerate`). A reranker failure never turns into a 500.
 
 When `compact=false`, results include `modifiedAt`, `confidence`, and full `body` instead of `snippet`.
 
