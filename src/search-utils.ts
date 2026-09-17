@@ -307,3 +307,84 @@ export function blendFusionAndRerank(
   blended.sort((a, b) => b.score - a.score);
   return blended;
 }
+
+// =============================================================================
+// Fusion + rerank pipeline (shared by CLI `query` and the REST hybrid modes)
+// =============================================================================
+
+/** Scores a candidate pool; the store's `rerank(query, docs, model)` bound to a model. */
+export type RerankFn = (
+  query: string,
+  docs: { file: string; text: string }[]
+) => Promise<{ file: string; score: number }[]>;
+
+export interface FuseAndRerankOptions {
+  /** Max fused candidates sent to the reranker (CLI: max(limit, 30)). */
+  rerankCap: number;
+  /** RRF k constant (default 60). */
+  k?: number;
+  /** Per-doc text sent to the reranker is truncated to this many chars (default 4000). */
+  maxDocChars?: number;
+  /**
+   * When set, a reranker whose every score is <= this floor is treated as unusable and the
+   * pipeline falls back to fused order (reported as `reranked: false`, reason `degenerate`).
+   * Unset preserves the CLI's historical behavior (degenerate scores are still blended).
+   */
+  degenerateFloor?: number;
+}
+
+export interface FuseAndRerankResult {
+  /** Fused candidates (RRF order, capped at `rerankCap`). */
+  candidates: RankedResult[];
+  /** Final order: fusion blended with rerank scores, or fusion order when not reranked. */
+  blended: { file: string; score: number }[];
+  /** True only when the reranker returned usable scores for the candidate pool. */
+  reranked: boolean;
+  /** Why rerank did not apply (`error: ...`, `degenerate`, `no-candidates`). */
+  fallbackReason?: string;
+}
+
+/**
+ * RRF-fuse ranked lists, rerank the top `rerankCap` candidates, and blend (blendFusionAndRerank).
+ * A reranker failure NEVER throws: it falls back to the fused order and says so via
+ * `reranked: false` + `fallbackReason` (master-harness-h06j — the REST hybrid cliff was silent).
+ */
+export async function fuseAndRerank(
+  query: string,
+  lists: { results: RankedResult[]; weight: number }[],
+  rerankFn: RerankFn,
+  opts: FuseAndRerankOptions
+): Promise<FuseAndRerankResult> {
+  const fused = reciprocalRankFusion(
+    lists.map(l => l.results),
+    lists.map(l => l.weight),
+    opts.k ?? 60
+  );
+  const candidates = fused.slice(0, opts.rerankCap);
+  const fusionOrder = () => blendFusionAndRerank(
+    candidates,
+    candidates.map(r => ({ file: r.file, score: r.score }))
+  );
+
+  if (candidates.length === 0) {
+    return { candidates, blended: [], reranked: false, fallbackReason: "no-candidates" };
+  }
+
+  let scores: { file: string; score: number }[];
+  try {
+    const maxChars = opts.maxDocChars ?? 4000;
+    scores = await rerankFn(query, candidates.map(r => ({ file: r.file, text: r.body.slice(0, maxChars) })));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { candidates, blended: fusionOrder(), reranked: false, fallbackReason: `error: ${msg}` };
+  }
+
+  if (opts.degenerateFloor !== undefined) {
+    const max = scores.reduce((m, r) => Math.max(m, Number.isFinite(r.score) ? r.score : 0), 0);
+    if (scores.length === 0 || max <= opts.degenerateFloor) {
+      return { candidates, blended: fusionOrder(), reranked: false, fallbackReason: "degenerate" };
+    }
+  }
+
+  return { candidates, blended: blendFusionAndRerank(candidates, scores), reranked: true };
+}
