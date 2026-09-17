@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.25 — REST hybrid search/retrieve now rerank (parity with CLI `clawmem query`)
+
+`clawmem serve` `POST /search` `mode=hybrid` and `POST /retrieve`'s hybrid path (explicit or auto-classified) returned an un-reranked BM25+vector max-score merge (the ADR-0059-rejected shape) while CLI `clawmem query` was hybrid+rerank. Both REST paths now RRF-fuse the BM25 and vector legs, rerank the top `max(limit, 30)` candidates through the store reranker, and blend with `blendFusionAndRerank`. The fusion+rerank step is one shared helper, `fuseAndRerank` (src/search-utils.ts); CLI `query` now calls it too, with unchanged behavior. A reranker that throws, or that returns only degenerate scores (all <= `RERANK_DEGENERATE_FLOOR`), falls back to fused order and never returns a 500. Hybrid responses carry `reranked: true|false`, plus `rerankFallback` (the reason) when false, and a rate-limited stderr line is logged, so the fallback is no longer silent. keyword, semantic and auto-short-query responses are unchanged and never call the reranker. 12 new unit tests (master-harness-h06j).
+
+---
+
 ## v0.36.24 — Write fence names the producing embed arm, not ambient CLAWMEM_EMBED_URL
 
 Vector write-fence refusals now name the embed arm that actually produced the vector. `EmbeddingResult` carries an optional `endpoint` (the remote URL fetched, or "the local in-process embedder"), threaded through sqlite `insertEmbedding`/batch writes and PG `EmbeddingWrite` into `VecWriteModelMismatchError` / `PgVecWriteModelMismatchError`. A set-but-unused `CLAWMEM_EMBED_URL` no longer gets blamed for a local-fallback poisoning; writers that report no arm are labelled "an unreported embed arm" instead of guessed from env. Remedy text is arm-specific. 7 new unit tests (master-harness-vn4rz.44).
