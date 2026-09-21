@@ -239,6 +239,95 @@ export function persistCanaryBaselineIfFirst(
 
 export const SAMPLE_REPLACEMENT_BUDGET = 8;
 
+/** Cosine floor for a fingerprint-matched stored-vs-fresh pair (doctor section 11). */
+export const SAMPLED_VECTOR_COS_FLOOR = 0.98;
+
+export type StoredVectorVerdict =
+  | { kind: "validated"; sim: number; sent: string }
+  | { kind: "legacy-validated"; sim: number; sent: string }
+  | { kind: "legacy-inconclusive"; sim: number; sent: string; detail: string }
+  | { kind: "stale-input"; sim?: number; sent?: string; detail: string }
+  | { kind: "stale-policy"; sim: number; sent: string; detail: string }
+  | { kind: "arm-mismatch"; sim: number; sent: string; detail: string }
+  | { kind: "corruption/drift"; sim: number; sent: string; detail: string };
+
+/**
+ * The embed-free half of the verdict: a v1 digest covers the PRE-truncation text, so a
+ * mismatch there is a content change whatever the arm does — decidable without spending
+ * an embed. Returns null when an embed is needed to decide.
+ */
+export function classifyStoredVectorPreEmbed(
+  storedFp: string | null | undefined,
+  fragText: string
+): { kind: "stale-input"; detail: string } | null {
+  const fp = parseEmbedInputFp(storedFp);
+  if (fp?.version === 1 && fp.hex !== sha256Hex(fragText)) {
+    return { kind: "stale-input", detail: "embed input changed since embed (fingerprint mismatch); re-embed required" };
+  }
+  return null;
+}
+
+/**
+ * Classify one stored vector against a fresh embed of its reconstructed input
+ * (master-harness-5n0ew). Shared by doctor's sampled validator and
+ * scripts/embed-fingerprint-audit.ts, so both apply ONE policy.
+ *
+ * The text compared is what the embedder reports it SENT (`fresh.input`), read back from
+ * the same embedder rather than re-derived here — there is no second truncation policy to
+ * drift. A fingerprint that cannot attest what the stored vector was produced from (a v1
+ * digest of an input the arm truncates; a vector from a different arm) is STALE, never
+ * corruption: a cosine across two inputs or two arms is not a verdict on the vector.
+ */
+export function classifyStoredVector(
+  storedFp: string | null | undefined,
+  fragText: string,
+  storedVec: Float32Array,
+  fresh: { embedding: number[] | Float32Array; endpoint?: string; input?: string }
+): StoredVectorVerdict {
+  const sent = sentEmbedInput(fragText, fresh);
+  const sim = cosineSim(storedVec, fresh.embedding instanceof Float32Array ? fresh.embedding : new Float32Array(fresh.embedding));
+  const fp = parseEmbedInputFp(storedFp);
+  if (!fp) {
+    // Legacy structural tier: low cos is INCONCLUSIVE (title provenance unavailable).
+    return sim < SAMPLED_VECTOR_COS_FLOOR
+      ? { kind: "legacy-inconclusive", sim, sent, detail: `no fingerprint; cos(stored, fresh) = ${sim.toFixed(4)}` }
+      : { kind: "legacy-validated", sim, sent };
+  }
+  if (fp.version === 1) {
+    const pre = classifyStoredVectorPreEmbed(storedFp, fragText);
+    if (pre) return { ...pre, sim, sent };
+    if (sent !== fragText) {
+      return {
+        kind: "stale-policy", sim, sent,
+        detail: `v1 fingerprint attests the ${fragText.length}-char pre-truncation input, but the embedder sends ${sent.length} chars; what was embedded is unattestable — re-embed`,
+      };
+    }
+  } else {
+    if (fp.hex !== sha256Hex(sent)) {
+      return {
+        kind: "stale-input", sim, sent,
+        detail: "the text embedded differs from what the embedder sends today (content or truncation policy changed); re-embed required",
+      };
+    }
+    const freshArm = embedArmOf(fresh);
+    if (fp.arm !== freshArm) {
+      // Same bytes, different arm: the in-process and remote arms are not one geometry
+      // (0.968–0.9995 on identical long inputs, measured), so cosine is no verdict.
+      return {
+        kind: "arm-mismatch", sim, sent,
+        detail: `embedded by the ${fp.arm} arm, validator embeds on the ${freshArm} arm; cross-arm cosine is not a corruption signal — re-embed on the serving arm`,
+      };
+    }
+  }
+  if (sim < SAMPLED_VECTOR_COS_FLOOR) {
+    const armNote = fp.version === 1
+      ? " (v1 fingerprint: producing arm unattested — an in-process-fallback vector of a >512-token input from before v0.36.26 looks exactly like this)"
+      : ` (${fp.arm} arm)`;
+    return { kind: "corruption/drift", sim, sent, detail: `fingerprint matches but cos(stored, fresh) = ${sim.toFixed(4)} < ${SAMPLED_VECTOR_COS_FLOOR}${armNote}` };
+  }
+  return { kind: "validated", sim, sent };
+}
+
 export type UnreconstructableReason =
   | "canonical_unresolved"
   | "body_missing"
@@ -367,60 +456,37 @@ export async function runSampledVectorValidation(
     const storedBuf = new Uint8Array(stored.embedding);
     const storedVec = new Float32Array(storedBuf.buffer, storedBuf.byteOffset, storedBuf.byteLength / 4);
 
-    const storedFp = parseEmbedInputFp(row.embed_input_fp);
-    if (storedFp) {
-      const where = `${canonical.collection}/${canonical.path}#${row.seq}`;
-      // v1 digests the PRE-truncation text, so a mismatch there is a content change no
-      // matter what the arm does — decidable without spending an embed.
-      if (storedFp.version === 1 && storedFp.hex !== sha256Hex(fragText)) {
-        result.definitiveFailures.push(`stale-input: ${where} — embed input changed since embed (fingerprint mismatch); re-embed required`);
-        return result; // definitive → nonzero regardless of coverage; stop spending embeds (T8-H2)
-      }
-      const fresh = await embed(fragText).catch(() => null);
-      if (!fresh || fresh.embedding.length !== storedVec.length) { markUnreconstructable("fresh_embed_failed"); continue; }
-      // What the embedder ACTUALLY sent for this fragment today — read back from the same
-      // embedder, never re-derived here (master-harness-5n0ew: one truncation policy).
-      const sent = sentEmbedInput(fragText, fresh);
-      const freshArm = embedArmOf(fresh);
-      if (storedFp.version === 1) {
-        if (sent !== fragText) {
-          // The v1 digest matches the untruncated text, but the model never sees that text:
-          // what the stored vector was produced from is unattestable. Stale, not corrupt.
-          result.stalePolicy++;
-          result.stalePolicyRows.push(`stale-policy: ${where} — v1 fingerprint attests the ${fragText.length}-char pre-truncation input, but the embedder sends ${sent.length} chars; what was embedded is unattestable — re-embed`);
-          continue;
-        }
-      } else {
-        if (storedFp.hex !== sha256Hex(sent)) {
-          result.definitiveFailures.push(`stale-input: ${where} — the text embedded differs from what the embedder sends today (content or truncation policy changed); re-embed required`);
-          return result;
-        }
-        if (storedFp.arm !== freshArm) {
-          // Same bytes, different arm: the in-process and remote arms are not one geometry
-          // (0.968–0.9995 on identical long inputs), so a cosine across arms is no verdict.
-          result.stalePolicy++;
-          result.stalePolicyRows.push(`arm-mismatch: ${where} — embedded by the ${storedFp.arm} arm, validator embeds on the ${freshArm} arm; cross-arm cosine is not a corruption signal — re-embed on the serving arm`);
-          continue;
-        }
-      }
-      const sim = cosineSim(storedVec, fresh.embedding instanceof Float32Array ? fresh.embedding : new Float32Array(fresh.embedding));
-      if (sim < 0.98) {
-        const armNote = storedFp.version === 1
-          ? " (v1 fingerprint: producing arm unattested — an in-process-fallback vector of a >512-token input from before v0.36.26 looks exactly like this)"
-          : ` (${storedFp.arm} arm)`;
-        result.definitiveFailures.push(`corruption/drift: ${where} — fingerprint matches but cos(stored, fresh) = ${sim.toFixed(4)} < 0.98${armNote}`);
+    const where = `${canonical.collection}/${canonical.path}#${row.seq}`;
+    const pre = classifyStoredVectorPreEmbed(row.embed_input_fp, fragText);
+    if (pre) {
+      result.definitiveFailures.push(`${pre.kind}: ${where} — ${pre.detail}`);
+      return result; // definitive → nonzero regardless of coverage; stop spending embeds (T8-H2)
+    }
+    const fresh = await embed(fragText).catch(() => null);
+    if (!fresh || fresh.embedding.length !== storedVec.length) { markUnreconstructable("fresh_embed_failed"); continue; }
+    const v = classifyStoredVector(row.embed_input_fp, fragText, storedVec, fresh);
+    switch (v.kind) {
+      case "stale-input":
+      case "corruption/drift":
+        result.definitiveFailures.push(`${v.kind}: ${where} — ${v.detail}`);
         return result;
-      }
-      result.validated++;
-      if (row.seq === 0) result.validatedSeq0++;
-    } else {
-      const fresh = await embed(fragText).catch(() => null);
-      if (!fresh || fresh.embedding.length !== storedVec.length) { markUnreconstructable("fresh_embed_failed"); continue; }
-      const sim = cosineSim(storedVec, fresh.embedding instanceof Float32Array ? fresh.embedding : new Float32Array(fresh.embedding));
-      if (sim < 0.98) { result.inconclusiveLegacy++; continue; }
-      result.legacyTier++;
-      result.validated++;
-      if (row.seq === 0) result.validatedSeq0++;
+      case "stale-policy":
+      case "arm-mismatch":
+        result.stalePolicy++;
+        result.stalePolicyRows.push(`${v.kind}: ${where} — ${v.detail}`);
+        continue;
+      case "legacy-inconclusive":
+        result.inconclusiveLegacy++;
+        continue;
+      case "legacy-validated":
+        result.legacyTier++;
+        result.validated++;
+        if (row.seq === 0) result.validatedSeq0++;
+        continue;
+      case "validated":
+        result.validated++;
+        if (row.seq === 0) result.validatedSeq0++;
+        continue;
     }
   }
   return result;
