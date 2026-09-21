@@ -4,6 +4,22 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.26 — In-process embeds of >512-token inputs were wrong; fingerprints now attest the text and arm actually embedded
+
+`clawmem doctor` failed with "fingerprint matches but cos(stored, fresh) = 0.7420 < 0.98" on long seq-0 fragments (master-harness-5n0ew). Two defects, measured on the live vault:
+
+- **The in-process embed arm evaluated long inputs in 512-token slices.** `createEmbeddingContext()` used node-llama-cpp's default batch size (512) against a 2048-token context. EmbeddingGemma attends bidirectionally, so any input over 512 tokens was embedded as slices that never attended to each other. The context now sets `batchSize = contextSize` (`localEmbedContextOptions`), the same rule as llama-server's `-ub == -b`. On the live failing document the stored vectors were reproduced at cos 1.0000 by the old context. Against the ollama arm they scored 0.32 to 0.74 on every fragment over 512 tokens, and 0.999 or better under 512. With the fix, agreement is 0.968 to 0.9995. Vectors reach this arm whenever the remote endpoint is unreachable and `CLAWMEM_NO_LOCAL_MODELS` is not `true`. Example: a cron job without the shell env, where the wrapper defaults `CLAWMEM_EMBED_URL` to `localhost:8088`.
+- **The embed-input fingerprint could not see truncation or the arm.** v1 fingerprints were sha256 of the text before truncation. Doctor therefore could not tell a different input from a corrupt vector. `EmbeddingResult.input` now carries the exact text each arm sent. New writes store `v2:<remote|local|unreported>:<sha256(sent text)>` from all four write sites: sqlite batch, sqlite per-fragment, PG reindex and PG origin. Doctor reads the sent text back from the same embedder and does not re-derive it, so embed time and validate time share one truncation policy.
+- **Doctor classification** (`classifyStoredVector`, shared with the new audit script):
+  - A v1 row whose input the embedder now truncates is `stale-policy`.
+  - A v2 row embedded by a different arm is `arm-mismatch`.
+  - Both are reported as needing a re-embed. They are not corruption, and they do not count as validated. Definitive `stale-input` and `corruption/drift` are unchanged, and the 0.98 floor is unchanged.
+- **Targeted re-embed:** `clawmem embed --requeue-hashes <file>` puts the listed content hashes back on the worklist under the embed lease (no `--force`, and old vectors are kept until they are replaced). `scripts/embed-fingerprint-audit.ts` is a read-only audit. It shows cos segmented oversized-vs-normal and above/below 512 tokens, and writes a requeue file (`--sample`, `--windows`, `--min-chars`, `--hashes`, `--no-embed`).
+
+10 new unit tests (`tests/unit/embed-fingerprint-roundtrip.test.ts`), including a batch-path round trip on an oversized fragment and a negative control for a truncation-policy mismatch.
+
+---
+
 ## v0.36.25 — REST hybrid search/retrieve now rerank (parity with CLI `clawmem query`)
 
 `clawmem serve` `POST /search` `mode=hybrid` and `POST /retrieve`'s hybrid path (explicit or auto-classified) returned an un-reranked BM25+vector max-score merge (the ADR-0059-rejected shape) while CLI `clawmem query` was hybrid+rerank. Both REST paths now RRF-fuse the BM25 and vector legs, rerank the top `max(limit, 30)` candidates through the store reranker, and blend with `blendFusionAndRerank`. The fusion+rerank step is one shared helper, `fuseAndRerank` (src/search-utils.ts); CLI `query` now calls it too, with unchanged behavior. A reranker that throws, or that returns only degenerate scores (all <= `RERANK_DEGENERATE_FLOOR`), falls back to fused order and never returns a 500. Hybrid responses carry `reranked: true|false`, plus `rerankFallback` (the reason) when false, and a rate-limited stderr line is logged, so the fallback is no longer silent. keyword, semantic and auto-short-query responses are unchanged and never call the reranker. 12 new unit tests (master-harness-h06j).
