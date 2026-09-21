@@ -21,7 +21,7 @@
  * (the profile key embeds the version).
  */
 import { formatDocForEmbedding, formatQueryForEmbedding } from "./llm.ts";
-import { createHash } from "crypto";
+import { embedArmOf, parseEmbedInputFp, sentEmbedInput, sha256Hex } from "./embed-fingerprint.ts";
 import { buildEmbedFrontmatter } from "./embed-input.ts";
 import { splitDocument } from "./splitter.ts";
 import { canonicalDocId, type Store } from "./store.ts";
@@ -264,13 +264,17 @@ function emptyUnreconstructableReasons(): Record<UnreconstructableReason, number
 
 export async function runSampledVectorValidation(
   s: Store,
-  embed: (text: string) => Promise<{ embedding: number[] | Float32Array; model?: string } | null>
+  embed: (text: string) => Promise<{ embedding: number[] | Float32Array; model?: string; endpoint?: string; input?: string } | null>
 ): Promise<{
   eligible: number; target: number; nMin: number; validated: number;
   validatedSeq0: number; seq0Target: number;
   legacyTier: number; unreconstructable: number; inconclusiveLegacy: number; attempts: number;
   unreconstructableByReason: Record<UnreconstructableReason, number>;
   definitiveFailures: string[];
+  /** Rows whose fingerprint cannot attest what the stored vector was produced from
+   *  (master-harness-5n0ew): NOT corruption, NOT validated — they need a re-embed. */
+  stalePolicy: number;
+  stalePolicyRows: string[];
 }> {
   type MetaRow = { hash: string; seq: number; fragment_label: string | null; embed_input_fp: string | null; canonical_id: string | null };
   // Metadata-only eligibility — one row per (hash,seq), NO document join (alias docs must
@@ -293,6 +297,8 @@ export async function runSampledVectorValidation(
     legacyTier: 0, unreconstructable: 0, inconclusiveLegacy: 0, attempts: 0,
     unreconstructableByReason: emptyUnreconstructableReasons(),
     definitiveFailures: [] as string[],
+    stalePolicy: 0,
+    stalePolicyRows: [] as string[],
   };
   const markUnreconstructable = (reason: UnreconstructableReason) => {
     result.unreconstructable++;
@@ -361,17 +367,48 @@ export async function runSampledVectorValidation(
     const storedBuf = new Uint8Array(stored.embedding);
     const storedVec = new Float32Array(storedBuf.buffer, storedBuf.byteOffset, storedBuf.byteLength / 4);
 
-    if (row.embed_input_fp) {
-      const fp = createHash("sha256").update(fragText, "utf8").digest("hex");
-      if (fp !== row.embed_input_fp) {
-        result.definitiveFailures.push(`stale-input: ${canonical.collection}/${canonical.path}#${row.seq} — embed input changed since embed (fingerprint mismatch); re-embed required`);
+    const storedFp = parseEmbedInputFp(row.embed_input_fp);
+    if (storedFp) {
+      const where = `${canonical.collection}/${canonical.path}#${row.seq}`;
+      // v1 digests the PRE-truncation text, so a mismatch there is a content change no
+      // matter what the arm does — decidable without spending an embed.
+      if (storedFp.version === 1 && storedFp.hex !== sha256Hex(fragText)) {
+        result.definitiveFailures.push(`stale-input: ${where} — embed input changed since embed (fingerprint mismatch); re-embed required`);
         return result; // definitive → nonzero regardless of coverage; stop spending embeds (T8-H2)
       }
       const fresh = await embed(fragText).catch(() => null);
       if (!fresh || fresh.embedding.length !== storedVec.length) { markUnreconstructable("fresh_embed_failed"); continue; }
+      // What the embedder ACTUALLY sent for this fragment today — read back from the same
+      // embedder, never re-derived here (master-harness-5n0ew: one truncation policy).
+      const sent = sentEmbedInput(fragText, fresh);
+      const freshArm = embedArmOf(fresh);
+      if (storedFp.version === 1) {
+        if (sent !== fragText) {
+          // The v1 digest matches the untruncated text, but the model never sees that text:
+          // what the stored vector was produced from is unattestable. Stale, not corrupt.
+          result.stalePolicy++;
+          result.stalePolicyRows.push(`stale-policy: ${where} — v1 fingerprint attests the ${fragText.length}-char pre-truncation input, but the embedder sends ${sent.length} chars; what was embedded is unattestable — re-embed`);
+          continue;
+        }
+      } else {
+        if (storedFp.hex !== sha256Hex(sent)) {
+          result.definitiveFailures.push(`stale-input: ${where} — the text embedded differs from what the embedder sends today (content or truncation policy changed); re-embed required`);
+          return result;
+        }
+        if (storedFp.arm !== freshArm) {
+          // Same bytes, different arm: the in-process and remote arms are not one geometry
+          // (0.968–0.9995 on identical long inputs), so a cosine across arms is no verdict.
+          result.stalePolicy++;
+          result.stalePolicyRows.push(`arm-mismatch: ${where} — embedded by the ${storedFp.arm} arm, validator embeds on the ${freshArm} arm; cross-arm cosine is not a corruption signal — re-embed on the serving arm`);
+          continue;
+        }
+      }
       const sim = cosineSim(storedVec, fresh.embedding instanceof Float32Array ? fresh.embedding : new Float32Array(fresh.embedding));
       if (sim < 0.98) {
-        result.definitiveFailures.push(`corruption/drift: ${canonical.collection}/${canonical.path}#${row.seq} — fingerprint matches but cos(stored, fresh) = ${sim.toFixed(4)} < 0.98`);
+        const armNote = storedFp.version === 1
+          ? " (v1 fingerprint: producing arm unattested — an in-process-fallback vector of a >512-token input from before v0.36.26 looks exactly like this)"
+          : ` (${storedFp.arm} arm)`;
+        result.definitiveFailures.push(`corruption/drift: ${where} — fingerprint matches but cos(stored, fresh) = ${sim.toFixed(4)} < 0.98${armNote}`);
         return result;
       }
       result.validated++;

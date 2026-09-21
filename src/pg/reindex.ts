@@ -51,6 +51,7 @@ import {
   deactivateAbsentDocuments, gcOrphanedContent, insertEmbeddingsBatch, upsertDocument,
   type ContentGcResult, type EmbeddingWrite,
 } from "./write.ts";
+import { embedInputFingerprint } from "../embed-fingerprint.ts";
 
 /** Mirrors indexer.ts's brace expansion — Bun.Glob has no brace support. */
 function expandBraces(pattern: string): string[] {
@@ -367,9 +368,10 @@ export async function reindexCollection(
         fragmentType: frag.fragmentType,
         fragmentLabel: frag.fragmentLabel,
         canonicalId: frag.canonicalId,
-        // SHA-256 over the UTF-8 bytes of the exact formatted embed input,
-        // matching src/clawmem.ts's contract byte for byte.
-        embedInputFp: hashContent(frag.text),
+        // v2 embed-input fingerprint over the text the arm ACTUALLY sent
+        // (post-truncation) + the arm — src/clawmem.ts's contract, one helper
+        // (master-harness-5n0ew).
+        embedInputFp: embedInputFingerprint(frag.text, r),
       });
     }
     if (writes.length > 0) {

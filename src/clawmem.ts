@@ -6,7 +6,7 @@
 import { parseArgs } from "util";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { resolve as pathResolve, basename, relative as pathRelative } from "path";
-import { createHash } from "crypto";
+import { embedInputFingerprint } from "./embed-fingerprint.ts";
 import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
 import { retryOnBusyAsync, isSqliteBusyError } from "./busy-retry.ts";
 import {
@@ -717,9 +717,10 @@ export async function runBatchedEmbed(
           endpoint: result.endpoint, // producing arm, named by the write fence (vn4rz.44)
           fragmentType: frag.type, fragmentLabel: frag.label ?? undefined,
           canonicalId: canonicalDocId(doc.collection, doc.path),
-          // Embed-input fingerprint ((d).4 / T5-L1): SHA-256 over the UTF-8 bytes of the
-          // exact formatted embed input, written in the same atomic batch transaction.
-          embedInputFp: createHash("sha256").update(item.text, "utf8").digest("hex"),
+          // Embed-input fingerprint ((d).4 / T5-L1, v2 since master-harness-5n0ew): SHA-256
+          // over the text the arm ACTUALLY sent (post-truncation, result.input) + the arm,
+          // written in the same atomic batch transaction.
+          embedInputFp: embedInputFingerprint(item.text, result),
         });
         stats.ok++;
         totalFragments++;
@@ -852,6 +853,23 @@ const retryOnBusy = <T,>(fn: () => T, label: string, isLeaseLost: () => boolean)
       console.error(`${c.yellow}    ${l}: database busy — retrying in ${delayMs / 1000}s (${attempt}/3)${c.reset}`),
   });
 
+/**
+ * Parse a --requeue-hashes file: one 64-hex content hash per line, blank lines and
+ * '#' comments ignored. Anything else is rejected outright — a typo must not silently
+ * requeue nothing (or the wrong thing).
+ */
+export function parseRequeueHashesFile(text: string): string[] {
+  const out = new Set<string>();
+  for (const [i, raw] of text.split(/\r?\n/).entries()) {
+    const line = raw.replace(/#.*$/, "").trim();
+    if (!line) continue;
+    if (!/^[0-9a-f]{64}$/.test(line)) throw new Error(`line ${i + 1}: not a 64-hex content hash: ${JSON.stringify(line.slice(0, 80))}`);
+    out.add(line);
+  }
+  if (out.size === 0) throw new Error("no hashes listed");
+  return [...out];
+}
+
 export async function cmdEmbed(args: string[]) {
   const { values } = parseArgs({
     args,
@@ -867,9 +885,30 @@ export async function cmdEmbed(args: string[]) {
       // unembedded is now a FAILURE by default, because a caller cannot otherwise tell
       // a partial embed from a complete one. --lenient restores the historic exit-0.
       lenient: { type: "boolean", default: false },
+      // Targeted re-embed (master-harness-5n0ew): a file of content hashes (one per line,
+      // '#' comments allowed) whose documents are put back on the worklist under the
+      // embed lease, then embedded by this same run. The non-destructive alternative to
+      // --force for rows doctor reports as stale-policy / corruption.
+      "requeue-hashes": { type: "string" },
     },
     allowPositionals: false,
   });
+
+  let requeueHashes: string[] = [];
+  if (values["requeue-hashes"]) {
+    if (values.force) {
+      console.error(`${c.red}--requeue-hashes is a targeted re-embed; it cannot be combined with --force (which rebuilds everything).${c.reset}`);
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      requeueHashes = parseRequeueHashesFile(readFileSync(values["requeue-hashes"], "utf8"));
+    } catch (err) {
+      console.error(`${c.red}--requeue-hashes: ${(err as Error).message}${c.reset}`);
+      process.exitCode = 1;
+      return;
+    }
+  }
 
   const s = getStore();
   // Embed runs race live hook/watcher writers. Set the operational busy timeout on the
@@ -1089,6 +1128,11 @@ export async function cmdEmbed(args: string[]) {
       }
     }
 
+    if (requeueHashes.length > 0) {
+      const requeued = await retryOnBusy(() => s.requeueEmbeds(requeueHashes, leaseGuard), "requeueEmbeds", () => leaseLost);
+      console.log(`Requeued ${requeued} active document row(s) for ${requeueHashes.length} listed hash(es) (targeted re-embed)`);
+    }
+
     // Use fragment-based pipeline: split documents into semantic fragments and embed each
     const hashes = s.getHashesNeedingFragments();
     if (hashes.length === 0) {
@@ -1204,9 +1248,9 @@ export async function cmdEmbed(args: string[]) {
             const fragMs = Date.now() - fragStart;
             if (result) {
               bindAndValidate(result);
-              // Embed-input fingerprint ((d).4 / T5-L1): SHA-256 over the UTF-8 bytes of
-              // the exact formatted embed input, written in the same atomic transaction.
-              const embedInputFp = createHash("sha256").update(text, "utf8").digest("hex");
+              // Embed-input fingerprint ((d).4 / T5-L1, v2 since master-harness-5n0ew): over
+              // the text the arm ACTUALLY sent (post-truncation) + the arm, same transaction.
+              const embedInputFp = embedInputFingerprint(text, result);
               // SQLITE_BUSY-only async retry ((f).2/6): busy exhaustion throws to the
               // per-fragment catch (fragment failure); FatalVectorError passes through.
               await retryOnBusy(() => {
@@ -3086,12 +3130,21 @@ async function cmdDoctor() {
     const s = getStore();
     const llm = getDefaultLlamaCpp();
     const summary = await runSampledVectorValidation(s, (t: string) => llm.embed(t));
+    // Stale-policy rows (master-harness-5n0ew) are reported on every branch: they are
+    // neither validated nor corrupt — their fingerprint cannot attest what the stored
+    // vector was produced from (v1 digest of a truncated input, or a different embed arm).
+    const reportStalePolicy = () => {
+      if (summary.stalePolicy === 0) return;
+      console.log(`${c.yellow}!${c.reset} Sampled vectors: ${summary.stalePolicy} stale-policy row(s) skipped — fingerprint cannot attest the embedded input/arm (needs re-embed, not corruption)`);
+      for (const f of summary.stalePolicyRows.slice(0, 4)) console.log(`   ${c.dim}${f}${c.reset}`);
+    };
+    reportStalePolicy();
     if (summary.eligible === 0) {
       console.log(`${c.yellow}!${c.reset} Sampled vectors: no eligible rows (no synced embedded documents)`);
     } else if (summary.definitiveFailures.length > 0) {
       console.log(`${c.red}✗${c.reset} Sampled vectors: DEFINITIVE failure after ${summary.attempts} attempt(s) (${summary.validated}/${summary.target} validated before stopping, ${summary.eligible} eligible)`);
       for (const f of summary.definitiveFailures.slice(0, 4)) console.log(`   ${c.dim}${f}${c.reset}`);
-      console.log(`   ${c.dim}Stale-input rows need a re-embed; corruption/drift at matching fingerprints means the stored vector no longer matches its exact input.${c.reset}`);
+      console.log(`   ${c.dim}Stale-input rows need a re-embed; corruption/drift at matching fingerprints means the stored vector no longer matches its exact input. A v1-fingerprint row cannot name its producing arm — see docs/troubleshooting.md "Sampled vectors: corruption/drift on long fragments".${c.reset}`);
       issues++;
       process.exitCode = 1;
     } else if (summary.validated < summary.nMin || summary.validatedSeq0 < summary.seq0Target) {

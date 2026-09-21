@@ -75,12 +75,40 @@ export type EmbeddingResult = {
    *  the write fence names the real culprit — CLAWMEM_EMBED_URL can be set while the local arm
    *  (cooldown fallback) produced the vector. Optional: absent = unreported, never guessed. */
   endpoint?: string;
+  /** The EXACT text the producing arm handed to the model — after that arm's own
+   *  truncation (master-harness-5n0ew). The embed-input fingerprint is computed from this,
+   *  never from the pre-truncation request, so it attests what the vector represents.
+   *  Optional: absent = the arm sent the request unchanged. */
+  input?: string;
 };
 
 /** Operator-facing identity of the in-process node-llama-cpp embed arm. */
 export const LOCAL_EMBED_ARM_LABEL = "the local in-process embedder";
 /** Used when a vector write did not report its producing arm — honest, not inferred from env. */
 export const UNREPORTED_EMBED_ARM_LABEL = "an unreported embed arm";
+
+/** Fallback when a GGUF does not report its training context. */
+const LOCAL_EMBED_DEFAULT_CONTEXT = 2048;
+
+/**
+ * Options for the in-process embedding context (master-harness-5n0ew).
+ *
+ * batchSize MUST equal contextSize. Embedding models attend BIDIRECTIONALLY and pool over
+ * the whole sequence, so the entire input has to be evaluated in ONE batch — the same
+ * reason llama-server needs `-ub == -b` for embeddings. node-llama-cpp's default batch
+ * size is 512, so an unconfigured context silently evaluated any >512-token input in
+ * 512-token slices and returned a vector for which the slices never attended to each
+ * other. Measured on the live vault: stored in-process vectors reproduced at cos 1.0000
+ * by the default context, and diverged from the same model served whole by ollama at
+ * cos 0.32–0.74 on every fragment over 512 tokens (0.999+ under 512). Setting
+ * batchSize = contextSize restored agreement to 0.968–0.9995.
+ */
+export function localEmbedContextOptions(trainContextSize: number | undefined): { contextSize: number; batchSize: number } {
+  const contextSize = trainContextSize && trainContextSize > 0
+    ? Math.min(trainContextSize, LOCAL_EMBED_DEFAULT_CONTEXT * 4)
+    : LOCAL_EMBED_DEFAULT_CONTEXT;
+  return { contextSize, batchSize: contextSize };
+}
 
 /**
  * Generation result with optional logprobs
@@ -861,7 +889,7 @@ export class LlamaCpp implements LLM {
       return this.embedContext;
     }
     const model = await this.ensureEmbedModel();
-    this.embedContext = await model.createEmbeddingContext();
+    this.embedContext = await model.createEmbeddingContext(localEmbedContextOptions(model.trainContextSize));
     this.touchActivity();
     return this.embedContext;
   }
@@ -1050,6 +1078,7 @@ export class LlamaCpp implements LLM {
         embedding: Array.from(embedding.vector),
         model: this.embedModelId,
         endpoint: LOCAL_EMBED_ARM_LABEL,
+        input: safeText,
       };
     } catch (error) {
       console.error("[embed] Local embedding error:", error);
@@ -1066,7 +1095,7 @@ export class LlamaCpp implements LLM {
         try {
           const safeText = this.truncateForLocalEmbed(text);
           const embedding = await context.getEmbeddingFor(safeText);
-          results.push({ embedding: Array.from(embedding.vector), model: this.embedModelId, endpoint: LOCAL_EMBED_ARM_LABEL });
+          results.push({ embedding: Array.from(embedding.vector), model: this.embedModelId, endpoint: LOCAL_EMBED_ARM_LABEL, input: safeText });
         } catch (err) {
           console.error("[embed] Local batch embedding error:", err);
           results.push(null);
@@ -1431,6 +1460,7 @@ export class LlamaCpp implements LLM {
           // NEVER fall back to the URL — an endpoint is not a model identity.
           model: canonicalEmbedModelId(data.model || this.remoteEmbedModel),
           endpoint: this.remoteEmbedUrl ?? undefined,
+          input,
         };
       } catch (error) {
         // An abort/timeout is an intentional caller-driven cancellation (the
@@ -1489,7 +1519,7 @@ export class LlamaCpp implements LLM {
         const modelName = canonicalEmbedModelId(data.model || this.remoteEmbedModel);
         const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
         for (const item of data.data) {
-          results[item.index] = { embedding: item.embedding, model: modelName, endpoint: this.remoteEmbedUrl ?? undefined };
+          results[item.index] = { embedding: item.embedding, model: modelName, endpoint: this.remoteEmbedUrl ?? undefined, input: truncated[item.index] };
         }
         return results;
       } catch (error) {
