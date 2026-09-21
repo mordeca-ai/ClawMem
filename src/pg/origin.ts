@@ -42,6 +42,7 @@ import { canonicalDocId } from "../store.ts";
 import { withClient, withTransaction } from "./client.ts";
 import { insertEmbeddingsBatch, type EmbeddingWrite } from "./write.ts";
 import type { Vault } from "./vaults.ts";
+import { embedInputFingerprint } from "../embed-fingerprint.ts";
 
 /** How `authored_at` was obtained. Mirrors the CHECK in migration 004. */
 export type AuthoredAtSource = "frontmatter-ts" | "frontmatter-authored-at" | "none";
@@ -242,7 +243,7 @@ export async function loadOriginCollection(
           hash: frag.hash, seq: frag.seq, pos: frag.pos,
           embedding: r.embedding, model: r.model, endpoint: r.endpoint,
           fragmentType: frag.fragmentType, fragmentLabel: frag.fragmentLabel,
-          canonicalId: frag.canonicalId, embedInputFp: hashContent(frag.text),
+          canonicalId: frag.canonicalId, embedInputFp: embedInputFingerprint(frag.text, r),
         });
       }
       if (writes.length) {

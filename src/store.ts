@@ -1843,6 +1843,8 @@ export type Store = {
   // Embed state tracking
   markEmbedStart: (hash: string, leaseGuard?: LeaseGuard) => void;
   markEmbedSynced: (hash: string, leaseGuard?: LeaseGuard) => void;
+  /** Targeted re-embed (master-harness-5n0ew): put these hashes' active docs back on the worklist. */
+  requeueEmbeds: (hashes: string[], leaseGuard?: LeaseGuard) => number;
   markEmbedFailed: (hash: string, error: string, leaseGuard?: LeaseGuard) => void;
   getEmbedStats: () => { pending: number; synced: number; failed: number };
 
@@ -2100,6 +2102,24 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
         assertLeaseHeld(db, leaseGuard);
         db.prepare(`UPDATE documents SET embed_state = 'synced', embed_attempts = 0, embed_error = NULL WHERE hash = ? AND active = 1`).run(hash);
       }).immediate();
+    },
+    requeueEmbeds: (hashes: string[], leaseGuard?: LeaseGuard) => {
+      // Lease-fenced like every other embed-state write: 'pending' + a fresh retry budget,
+      // so getHashesNeedingFragments selects the doc and the per-(hash,seq) upsert replaces
+      // its vectors. Vectors are NOT deleted here — a failed re-embed leaves the old ones.
+      let changed = 0;
+      db.transaction(() => {
+        assertLeaseHeld(db, leaseGuard);
+        // Counted by SELECT, not .changes: documents carries triggers, and bun:sqlite's
+        // change count includes their writes (measured 6 for one requeued row).
+        const count = db.prepare(`SELECT count(*) AS n FROM documents WHERE hash = ? AND active = 1`);
+        const stmt = db.prepare(`UPDATE documents SET embed_state = 'pending', embed_attempts = 0, embed_error = NULL WHERE hash = ? AND active = 1`);
+        for (const h of hashes) {
+          changed += (count.get(h) as { n: number }).n;
+          stmt.run(h);
+        }
+      }).immediate();
+      return changed;
     },
     markEmbedFailed: (hash: string, error: string, leaseGuard?: LeaseGuard) => {
       db.transaction(() => {
