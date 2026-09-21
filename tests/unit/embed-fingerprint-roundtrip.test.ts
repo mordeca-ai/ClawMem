@@ -17,7 +17,7 @@ import { describe, it, expect, beforeEach, afterEach, afterAll } from "bun:test"
 
 import { LlamaCpp, resetEmbedContextCache, localEmbedContextOptions, formatDocForEmbedding, LOCAL_EMBED_ARM_LABEL } from "../../src/llm.ts";
 import { runBatchedEmbed, buildDocEmbedTask, parseRequeueHashesFile } from "../../src/clawmem.ts";
-import { runSampledVectorValidation, cosineSim } from "../../src/canary.ts";
+import { runSampledVectorValidation, cosineSim, classifyStoredVector } from "../../src/canary.ts";
 import { createStore, type Store } from "../../src/store.ts";
 import { acquireWorkerLease } from "../../src/worker-lease.ts";
 import { hashContent } from "../../src/indexer.ts";
@@ -240,6 +240,36 @@ describe("in-process embed context (master-harness-5n0ew)", () => {
     }
     expect(localEmbedContextOptions(2048)).toEqual({ contextSize: 2048, batchSize: 2048 });
     expect(localEmbedContextOptions(undefined).contextSize).toBe(2048);
+  });
+
+  it("ensureEmbedContext actually passes those options to createEmbeddingContext (wiring, skeptic F1)", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    let received: unknown = "never-called";
+    (llm as any).ensureEmbedModel = async () => ({
+      trainContextSize: 2048,
+      createEmbeddingContext: async (opts?: unknown) => {
+        received = opts;
+        return { dispose: async () => {} };
+      },
+    });
+    await (llm as any).ensureEmbedContext();
+    expect(received).toEqual({ contextSize: 2048, batchSize: 2048 });
+  });
+});
+
+describe("classifyStoredVector cross-arm (skeptic F2)", () => {
+  it("a v2:local row validated on the remote arm with a DIFFERENT sent prefix is arm-mismatch, not stale-input", () => {
+    const text = "word ".repeat(1200);
+    const fp = embedInputFingerprint(text, { endpoint: LOCAL_EMBED_ARM_LABEL, input: text.slice(0, 4096) });
+    const v = new Float32Array([1, 0, 0]);
+    const r = classifyStoredVector(fp, text, v, { embedding: [1, 0, 0], endpoint: "http://x:11434", input: text.slice(0, 3000) });
+    expect(r.kind).toBe("arm-mismatch");
+  });
+  it("same arm, different sent text is still stale-input", () => {
+    const text = "word ".repeat(1200);
+    const fp = embedInputFingerprint(text, { endpoint: "http://x:11434", input: text.slice(0, 4096) });
+    const r = classifyStoredVector(fp, text, new Float32Array([1, 0, 0]), { embedding: [1, 0, 0], endpoint: "http://x:11434", input: text.slice(0, 3000) });
+    expect(r.kind).toBe("stale-input");
   });
 });
 

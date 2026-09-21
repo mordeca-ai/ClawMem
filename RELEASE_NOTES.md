@@ -15,6 +15,7 @@ For upgrade instructions (migration steps, opt-in features, verification command
   - A v2 row embedded by a different arm is `arm-mismatch`.
   - Both are reported as needing a re-embed. They are not corruption, and they do not count as validated. Definitive `stale-input` and `corruption/drift` are unchanged, and the 0.98 floor is unchanged.
 - **Targeted re-embed:** `clawmem embed --requeue-hashes <file>` puts the listed content hashes back on the worklist under the embed lease (no `--force`, and old vectors are kept until they are replaced). `scripts/embed-fingerprint-audit.ts` is a read-only audit. It shows cos segmented oversized-vs-normal and above/below 512 tokens, and writes a requeue file (`--sample`, `--windows`, `--min-chars`, `--hashes`, `--no-embed`).
+- **Cross-arm rows are checked for arm before text.** The arms truncate by different budgets, so a `v2:local` row validated on the remote arm could differ in sent bytes with nothing changed and was misfiled as a definitive `stale-input`. It is now `arm-mismatch` (non-definitive). A wiring test also pins that `ensureEmbedContext` passes `batchSize = contextSize` to node-llama-cpp; reverting the fix now fails it.
 
 10 new unit tests (`tests/unit/embed-fingerprint-roundtrip.test.ts`), including a batch-path round trip on an oversized fragment and a negative control for a truncation-policy mismatch.
 

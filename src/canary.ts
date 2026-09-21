@@ -303,19 +303,23 @@ export function classifyStoredVector(
       };
     }
   } else {
-    if (fp.hex !== sha256Hex(sent)) {
-      return {
-        kind: "stale-input", sim, sent,
-        detail: "the text embedded differs from what the embedder sends today (content or truncation policy changed); re-embed required",
-      };
-    }
+    // Arm BEFORE text: the arms truncate by different budgets (in-process by char cap,
+    // remote by char cap then token ceiling), so a cross-arm row can differ in sent bytes
+    // without anything having changed. Checking the text first misfiled such rows as a
+    // DEFINITIVE stale-input (skeptic finding F2).
     const freshArm = embedArmOf(fresh);
     if (fp.arm !== freshArm) {
-      // Same bytes, different arm: the in-process and remote arms are not one geometry
+      // Different arm: the in-process and remote arms are not one geometry
       // (0.968–0.9995 on identical long inputs, measured), so cosine is no verdict.
       return {
         kind: "arm-mismatch", sim, sent,
         detail: `embedded by the ${fp.arm} arm, validator embeds on the ${freshArm} arm; cross-arm cosine is not a corruption signal — re-embed on the serving arm`,
+      };
+    }
+    if (fp.hex !== sha256Hex(sent)) {
+      return {
+        kind: "stale-input", sim, sent,
+        detail: "the text embedded differs from what the embedder sends today (content or truncation policy changed); re-embed required",
       };
     }
   }
