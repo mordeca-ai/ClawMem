@@ -4,6 +4,22 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.27 — `doctor --clear-taint`: clear the embed-geometry taint on evidence, without a full rebuild
+
+`embed_geometry_taint` is set when an embed run could not verify its geometry (no preflight, an unverified end, or mid-run drift). Until now only a verified full `clawmem embed --force` cleared it: about three hours of GPU on the live vault, with recall degraded for the duration. That was the only way out even after the affected rows had been re-embedded with `embed --requeue-hashes` (master-harness-vn4rz.59).
+
+- **New:** `clawmem doctor --clear-taint [--sample N]` (default N = 200). It clears the flag only when every gate passes:
+  - it takes the embed single-writer lease (`embedding`, same TTL and heartbeat as `clawmem embed`), and refuses if another writer holds it;
+  - the geometry canary battery passes against the configured embedder, including drift against the stored baseline. An unavailable endpoint, a failing battery, or a missing baseline (drift cannot be checked) refuses;
+  - the doctor sampled-vector validator reaches N validated rows with no definitive failure (`corruption/drift`, `stale-input`) and meets the seq-0 quota. `stale-policy` / `arm-mismatch` rows are skipped and do not count toward N, as in doctor. A vault with fewer than N eligible rows refuses; pass a smaller `--sample` deliberately if that is intended.
+- Any failed gate exits 1, names the gate (`lease`, `canary`, `sampler`, `taint-changed`), and leaves the taint in place.
+- On success the clear is lease-fenced and an audit record is written first to the vault flag `embed_geometry_taint_cleared`: prior reason, time, method, sample target, validated counts, and the canary profile key and margins. `clawmem doctor` prints the last clear as an info line. The taint message now names both clear paths.
+- `runSampledVectorValidation` takes an optional `{ target, replacementBudget }`. Doctor's defaults (16 and 8) are unchanged. The clear uses N and `max(8, ceil(N / 4))`, so skipped stale-policy rows do not exhaust the attempt budget at N = 200.
+
+8 new unit tests (`tests/unit/taint-clear.test.ts`): no-taint no-op, cleared with audit, and refusals for a corruption row, an unreachable target, an unavailable canary, a failing canary, a missing baseline, and a held lease.
+
+---
+
 ## v0.36.26 — In-process embeds of >512-token inputs were wrong; fingerprints now attest the text and arm actually embedded
 
 `clawmem doctor` failed with "fingerprint matches but cos(stored, fresh) = 0.7420 < 0.98" on long seq-0 fragments (master-harness-5n0ew). Two defects, measured on the live vault:

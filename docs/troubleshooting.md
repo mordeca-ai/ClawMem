@@ -125,6 +125,11 @@ builders operate on — so archiving documents legitimately lowers the total.
 - Find the affected rows (read-only): `CLAWMEM_NO_LOCAL_MODELS=true bun scripts/embed-fingerprint-audit.ts --sample 240 --out audit.jsonl --requeue-out requeue.txt`. Add `--windows runs.json` to select rows embedded inside known fallback runs, and `--no-embed` to list them without spending embeds.
 - Fix: run `CLAWMEM_NO_LOCAL_MODELS=true clawmem embed --requeue-hashes requeue.txt` with the real `CLAWMEM_EMBED_URL` exported, then check with `bun scripts/embed-fingerprint-audit.ts --hashes requeue.txt`. Also make every scheduled embed run export the real endpoint plus `CLAWMEM_NO_LOCAL_MODELS=true`, so a down endpoint fails instead of falling back to a different geometry.
 
+**Doctor reports "Geometry taint: a prior embed run was tainted/unverified"**
+- Cause: an embed run wrote vectors it could not verify: no preflight canary, an unreachable endpoint at the end-of-run check, or mid-run drift. The vault may mix two geometries, so doctor stays red until the flag is cleared.
+- Full clear: `clawmem embed --force` against a stable server. It rebuilds every vector and clears the flag on a verified end.
+- Targeted clear (v0.36.27+): when the tainted run's rows are known, re-embed them (`clawmem embed --requeue-hashes requeue.txt`, see the previous entry), then run `clawmem doctor --clear-taint` (optionally `--sample N`, default 200). It holds the embed lease, requires the geometry canary to pass including drift against the stored baseline, and requires N sampled vectors to validate with no corruption/drift or stale-input row. Any failed gate exits 1, names the gate, and leaves the taint set. A held lease means an embed is running; wait for it to finish. On success the audit record is kept in the vault flag `embed_geometry_taint_cleared`, and doctor prints it as an info line.
+
 **kg_query returns empty for every entity**
 - `entity_triples` is populated by the decision-extractor Stop hook from observer-emitted `<triples>` blocks. Zero rows typically means either (a) the Stop hook has never fired in this vault, or (b) the observer LLM is not emitting `<triples>` blocks.
 - Check triple population: `sqlite3 ~/.cache/clawmem/index.sqlite "SELECT COUNT(*) FROM entity_triples"`.
