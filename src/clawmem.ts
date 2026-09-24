@@ -9,6 +9,7 @@ import { resolve as pathResolve, basename, relative as pathRelative } from "path
 import { embedInputFingerprint } from "./embed-fingerprint.ts";
 import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
 import { retryOnBusyAsync, isSqliteBusyError } from "./busy-retry.ts";
+import { clearGeometryTaint, describeLastTaintClear, DEFAULT_CLEAR_TAINT_SAMPLE, TAINT_CLEARED_FLAG } from "./taint-clear.ts";
 import {
   createStore,
   prewarmVectors,
@@ -2885,7 +2886,50 @@ async function cmdBackup(args: string[]) {
 // Doctor (Health Check)
 // =============================================================================
 
-async function cmdDoctor() {
+/**
+ * `clawmem doctor --clear-taint [--sample N]` (master-harness-vn4rz.59): clear
+ * embed_geometry_taint only on evidence — embed lease held, canary pass incl. drift vs
+ * baseline, sampled vectors reach N with no definitive failure. See src/taint-clear.ts.
+ */
+async function cmdDoctorClearTaint(sampleArg: string | undefined) {
+  const sample = sampleArg === undefined ? DEFAULT_CLEAR_TAINT_SAMPLE : Number(sampleArg);
+  if (!Number.isInteger(sample) || sample < 1) {
+    console.error(`${c.red}--sample must be a positive integer (got ${JSON.stringify(sampleArg)})${c.reset}`);
+    process.exitCode = 1;
+    return;
+  }
+  const s = getStore();
+  s.db.exec(`PRAGMA busy_timeout = 10000`);
+  const llm = getDefaultLlamaCpp();
+  const outcome = await clearGeometryTaint(s, (t: string) => llm.embed(t), { sample });
+  if (outcome.status === "refused") {
+    console.error(`${c.red}✗ ${outcome.message}${c.reset}`);
+    for (const d of outcome.details) console.error(`   ${c.dim}${d}${c.reset}`);
+  } else {
+    console.log(`${c.green}✓${c.reset} ${outcome.message}`);
+    if (outcome.status === "cleared") console.log(`   ${c.dim}Audit record written to vault flag ${TAINT_CLEARED_FLAG}.${c.reset}`);
+  }
+  process.exitCode = outcome.exitCode;
+}
+
+async function cmdDoctor(args: string[] = []) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      "clear-taint": { type: "boolean", default: false },
+      sample: { type: "string" },
+    },
+    allowPositionals: false,
+  });
+  if (values["clear-taint"]) {
+    await cmdDoctorClearTaint(values.sample);
+    return;
+  }
+  if (values.sample !== undefined) {
+    console.error(`${c.red}--sample is only valid with --clear-taint${c.reset}`);
+    process.exitCode = 1;
+    return;
+  }
   console.log(`${c.bold}ClawMem Doctor${c.reset}\n`);
   let issues = 0;
 
@@ -3085,10 +3129,12 @@ async function cmdDoctor() {
       && ((s.db.prepare(`SELECT count(*) as cnt FROM vectors_vec`).get() as { cnt: number })?.cnt ?? 0) > 0;
     const taint = s.getVaultFlag("embed_geometry_taint");
     if (taint) {
-      console.log(`${c.red}✗${c.reset} Geometry taint: a prior embed run was tainted/unverified (${taint}) — the vault may mix two geometries. Run 'clawmem embed --force' against a stable server to clear.`);
+      console.log(`${c.red}✗${c.reset} Geometry taint: a prior embed run was tainted/unverified (${taint}) — the vault may mix two geometries. Clear it with 'clawmem embed --force' against a stable server (full rebuild), or, after re-embedding the affected rows (embed --requeue-hashes), with 'clawmem doctor --clear-taint' (lease + canary + sampled-vector evidence gated).`);
       issues++;
       process.exitCode = 1;
     }
+    const lastClear = describeLastTaintClear(s.getVaultFlag(TAINT_CLEARED_FLAG));
+    if (lastClear) console.log(`${c.dim}i Geometry taint: ${lastClear}${c.reset}`);
     try {
       const llm = getDefaultLlamaCpp();
       const outcome = await runCanaryBattery(t => llm.embed(t), key => s.getCanaryBaseline(key));
@@ -3680,7 +3726,7 @@ async function main() {
         await cmdReindex(subArgs);
         break;
       case "doctor":
-        await cmdDoctor();
+        await cmdDoctor(subArgs);
         break;
       case "backup":
         await cmdBackup(subArgs);
@@ -4676,6 +4722,8 @@ ${c.bold}Integration:${c.reset}
   clawmem serve [--port 7438] [--host 127.0.0.1]  Start HTTP REST API server
   clawmem update-context               Regenerate all directory CLAUDE.md files
   clawmem doctor                       Full health check
+  clawmem doctor --clear-taint [--sample N]
+                                       Clear embed geometry taint on evidence (lease + canary + N sampled vectors, default 200)
   clawmem backup [--dest <dir>] [--keep <n>]  Snapshot the index (VACUUM INTO), prune to <n> (default 7)
   clawmem rerank-health [--json]       Probe reranker discrimination (exit 1 if degenerate)
   clawmem migrate causal-witnesses --preflight [--out <manifest.json>]

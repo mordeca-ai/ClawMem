@@ -357,7 +357,13 @@ function emptyUnreconstructableReasons(): Record<UnreconstructableReason, number
 
 export async function runSampledVectorValidation(
   s: Store,
-  embed: (text: string) => Promise<{ embedding: number[] | Float32Array; model?: string; endpoint?: string; input?: string } | null>
+  embed: (text: string) => Promise<{ embedding: number[] | Float32Array; model?: string; endpoint?: string; input?: string } | null>,
+  opts?: {
+    /** Validated-row target (default 16, doctor). Capped at the eligible population. */
+    target?: number;
+    /** Extra attempts beyond `target` (default SAMPLE_REPLACEMENT_BUDGET). */
+    replacementBudget?: number;
+  }
 ): Promise<{
   eligible: number; target: number; nMin: number; validated: number;
   validatedSeq0: number; seq0Target: number;
@@ -381,7 +387,7 @@ export async function runSampledVectorValidation(
     )
   `).all() as MetaRow[];
   const eligible = eligibleRows.length;
-  const target = Math.min(16, eligible);
+  const target = Math.min(opts?.target ?? 16, eligible);
   const nMin = Math.min(8, eligible);
   const seq0Pool = eligibleRows.filter(r => r.seq === 0);
   const seq0Target = Math.min(4, seq0Pool.length);
@@ -411,7 +417,7 @@ export async function runSampledVectorValidation(
     return null;
   };
 
-  const maxAttempts = target + SAMPLE_REPLACEMENT_BUDGET;
+  const maxAttempts = target + (opts?.replacementBudget ?? SAMPLE_REPLACEMENT_BUDGET);
   const bodyStmt = s.db.prepare(`SELECT doc FROM content WHERE hash = ?`);
   // Canonical RESOLUTION consults ALL aliases including inactive ones (T9-M1) — the
   // stored canonical identity may name a since-deactivated alias while an active twin
