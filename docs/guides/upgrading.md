@@ -59,6 +59,16 @@ docker compose up -d reranker                      # /v1/rerank on :8090
 
 ---
 
+## v0.36.28: geometry canary probe v2 (long-input probe)
+
+**No migration, no re-embed.** The canary gained a long-input probe (`m_long`) and its probe version moved to 2, so the stored baseline key changes from `v1:<model>:<dim>` to `v2:<model>:<dim>`.
+
+- The v2 baseline seeds itself on the next verified `clawmem embed` run (first-healthy calibration; an incremental timer run is enough). No `--recalibrate-canary` step.
+- Until it exists, the canary checks absolute floors only, and `clawmem doctor --clear-taint` refuses at the canary gate. If a taint clear is pending, run `clawmem embed` first.
+- If `clawmem embed` or doctor now fails with `m_long = ... < floor`, the embedder is not evaluating inputs over 512 tokens as one sequence (for the in-process arm: a node-llama-cpp context whose `batchSize` is below its `contextSize`). Do not override it with `--force-geometry`; see [troubleshooting](../troubleshooting.md), "Sampled vectors: corruption/drift on long fragments".
+
+---
+
 ## v0.36.0: memory_stats + memory_rank diagnostics
 
 **No migration** — no schema change, no reindex, no re-embed, and no behaviour change

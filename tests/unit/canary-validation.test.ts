@@ -21,7 +21,10 @@ import {
   persistCanaryBaselineIfFirst,
   runSampledVectorValidation,
   cosineSim,
+  CANARY_PROBE_VERSION,
+  CANARY_ABSOLUTE_MARGIN_FLOOR,
 } from "../../src/canary.ts";
+import { FALLBACK_EMBED_CONTEXT_TOKENS, EMBED_CHARS_PER_TOKEN } from "../../src/limits.ts";
 import { retryOnBusyAsync, isSqliteBusyError } from "../../src/busy-retry.ts";
 import { createStore, canonicalDocId, EmbedLeaseLostError, type Store } from "../../src/store.ts";
 import { acquireWorkerLease } from "../../src/worker-lease.ts";
@@ -37,21 +40,48 @@ import { splitDocument } from "../../src/splitter.ts";
 // Canary battery
 // ---------------------------------------------------------------------------
 
-/** Healthy fake embedder: related/echo/term/trunc pairs close, unrelated far. */
+/** Healthy fake embedder: related/echo/term/trunc pairs close, unrelated far. The v2
+ *  long-input probes get their own directions: long_doc is mostly its head topic with a
+ *  minority of its tail topic (what whole-sequence pooling produces), so it sits nearer
+ *  long_head than long_tail. */
+const LONG_BASES: Record<string, number[]> = {
+  long_head: [0, 0, 0, 1],
+  long_tail: [0, 0, 1, 0],
+  long_doc: [0, 0, 0.35, 1],
+};
 function healthyEmbed(text: string): { embedding: Float32Array; model: string } {
   // Deterministic direction per SEMANTIC bucket, tiny per-text jitter.
   const inputs = canaryProbeInputs();
   let bucket = 0; // default
+  let longBase: number[] | undefined;
   for (const [id, t] of inputs) {
     if (t === text) {
+      longBase = LONG_BASES[id];
       bucket = id === "unrel" ? 1 : id.startsWith("rel") ? 2 : 3; // unrel orthogonal; rel + tech/term/trunc two clusters
       break;
     }
   }
   const jitter = (createHash("sha256").update(text).digest()[0]! / 255) * 0.05;
-  const base = bucket === 1 ? [0, 1, 0, 0] : bucket === 2 ? [1, 0, 0, 0] : [0.9, 0, 0.45, 0];
+  const base = longBase ?? (bucket === 1 ? [0, 1, 0, 0] : bucket === 2 ? [1, 0, 0, 0] : [0.9, 0, 0.45, 0]);
   const v = new Float32Array([base[0]! + jitter, base[1]!, base[2]!, base[3]! + jitter * 0.5]);
   return { embedding: v, model: "fake" };
+}
+
+/** In-process ubatch size the 5n0ew defect sliced at, and a conservative chars/token
+ *  (the long probe measured 680 EmbeddingGemma tokens in 3358 chars ≈ 4.9 chars/token). */
+const DEFECT_UBATCH_TOKENS = 512;
+const MEASURED_CHARS_PER_TOKEN = 5;
+
+/** Sliced fake embedder — mimics the pre-v0.36.26 in-process arm. An input longer than one
+ *  512-token ubatch is evaluated as non-attending slices and the pooled vector is effectively
+ *  the LAST slice alone (measured: cos(sliced long_doc, its tail) 0.96). For the probe set,
+ *  the last slice of long_doc is its tail topic, so it embeds as long_tail does. Every
+ *  shorter input embeds exactly as the healthy arm does — the v1 probes cannot see this. */
+function slicedEmbed(text: string): { embedding: Float32Array; model: string } {
+  if (text.length > DEFECT_UBATCH_TOKENS * MEASURED_CHARS_PER_TOKEN) {
+    return healthyEmbed(canaryProbeInputs().get("long_tail")!);
+  }
+  return healthyEmbed(text);
 }
 
 /** Collapsed fake embedder: EVERY text maps to (nearly) the same vector — self-sim stays ~1.0. */
@@ -109,6 +139,76 @@ describe("geometry canary battery", () => {
     if ("unavailable" in out) throw new Error("unexpected unavailable");
     expect(out.pass).toBe(false);
     expect(out.failures.some(f => f.includes("mixed dimensions") || f.includes("mixed models"))).toBe(true);
+  });
+});
+
+describe("long-input control m_long (v2, master-harness-vn4rz.60)", () => {
+  it("probe v2 is keyed v2 — a v1 baseline is never consulted", async () => {
+    expect(CANARY_PROBE_VERSION).toBe(2);
+    expect(canaryProfileKey("embeddinggemma", 768)).toBe("v2:embeddinggemma:768");
+    const asked: string[] = [];
+    const out = await runCanaryBattery(async t => healthyEmbed(t), key => {
+      asked.push(key);
+      return key.startsWith("v1:") ? { probes: new Map(), pairMargins: { m_rel: 9 } } : null;
+    });
+    if ("unavailable" in out) throw new Error("unavailable");
+    expect(asked).toEqual(["v2:fake:4"]);
+    expect(out.driftChecked).toBe(false);
+    expect(out.pass).toBe(true);
+  });
+
+  it("long_doc is over one 512-token ubatch and under the in-process char cap; refs are short, non-verbatim", () => {
+    const inputs = canaryProbeInputs();
+    const doc = inputs.get("long_doc")!;
+    expect(doc.length).toBeGreaterThan(DEFECT_UBATCH_TOKENS * MEASURED_CHARS_PER_TOKEN);
+    expect(doc.length).toBeLessThanOrEqual(FALLBACK_EMBED_CONTEXT_TOKENS * EMBED_CHARS_PER_TOKEN);
+    for (const ref of ["long_head", "long_tail"]) {
+      const body = inputs.get(ref)!.replace(/^title: none \| text: /, "");
+      expect(inputs.get(ref)!.length).toBeLessThan(DEFECT_UBATCH_TOKENS);
+      expect(doc.includes(body)).toBe(false);
+    }
+  });
+
+  it("computes m_long and passes it on a healthy (whole-sequence) arm", async () => {
+    const out = await runCanaryBattery(async t => healthyEmbed(t), () => null);
+    if ("unavailable" in out) throw new Error("unavailable");
+    expect(Object.keys(out.margins)).toContain("m_long");
+    expect(out.margins.m_long!).toBeGreaterThan(CANARY_ABSOLUTE_MARGIN_FLOOR);
+    expect(out.pass).toBe(true);
+  });
+
+  it("FAILS on sliced evaluation — m_long is the only margin that sees it", async () => {
+    const out = await runCanaryBattery(async t => slicedEmbed(t), () => null);
+    if ("unavailable" in out) throw new Error("unavailable");
+    expect(out.pass).toBe(false);
+    expect(out.margins.m_long!).toBeLessThan(0);
+    expect(out.failures).toHaveLength(1);
+    expect(out.failures[0]!).toStartWith("m_long = ");
+    for (const name of ["m_rel", "m_echo", "m_term", "m_trunc"]) {
+      expect(out.margins[name]!).toBeGreaterThan(CANARY_ABSOLUTE_MARGIN_FLOOR);
+    }
+  });
+
+  it("stays RED even against a baseline recorded on the same sliced arm (intrinsic, not relative)", async () => {
+    const seeded = await runCanaryBattery(async t => slicedEmbed(t), () => null);
+    if ("unavailable" in seeded) throw new Error("unavailable");
+    const out = await runCanaryBattery(async t => slicedEmbed(t), key => key === seeded.profileKey ? { probes: seeded.vectors, pairMargins: seeded.margins } : null);
+    if ("unavailable" in out) throw new Error("unavailable");
+    expect(out.driftChecked).toBe(true);
+    expect(out.pass).toBe(false);
+    expect(out.failures.some(f => f.startsWith("m_long = "))).toBe(true);
+    expect(out.failures.some(f => f.startsWith("drift:"))).toBe(false);
+  });
+
+  it("a v2 baseline seeds first-healthy after the bump and records m_long", async () => {
+    const store = createStore(":memory:");
+    const healthy = await runCanaryBattery(async t => healthyEmbed(t), () => null);
+    if ("unavailable" in healthy) throw new Error("unavailable");
+    expect(store.getCanaryBaseline(healthy.profileKey)).toBeNull();
+    expect(persistCanaryBaselineIfFirst(store, healthy, { recalibrate: false })).toBe(true);
+    const stored = store.getCanaryBaseline("v2:fake:4")!;
+    expect(stored.pairMargins.m_long).toBeCloseTo(healthy.margins.m_long!, 5);
+    expect([...stored.probes.keys()]).toEqual(expect.arrayContaining(["long_doc", "long_head", "long_tail"]));
   });
 });
 

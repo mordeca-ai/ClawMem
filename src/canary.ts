@@ -17,8 +17,19 @@
  * control (prefix vs full text — unstable under the broken geometry). Register coverage
  * matters: the incident's basic-English pairs looked healthy while technical text collapsed.
  *
+ * Long-input control (v2, master-harness-vn4rz.60): every probe above is far under 512
+ * tokens, so the 5n0ew defect — an in-process context evaluating a >512-token input in
+ * 512-token ubatch slices that never attend to each other — was invisible to the battery.
+ * `long_doc` is a ~680-token document (EmbeddingGemma tokenizer) whose first ~80% is one
+ * topic and whose last paragraph is a different one. Evaluated whole, its vector sits
+ * nearer a short summary of its head than of its tail; evaluated in slices, the pooled
+ * vector is effectively the last slice alone, and the relation inverts. m_long compares
+ * the two WITHIN one battery, so it needs no baseline — a baseline recorded on the same
+ * sliced arm would otherwise bless the bug.
+ *
  * Versioned: changing any probe text bumps CANARY_PROBE_VERSION and invalidates baselines
- * (the profile key embeds the version).
+ * (the profile key embeds the version). v2 added the long-input probes; the v2 baseline
+ * seeds itself on the next verified `clawmem embed` run (persistCanaryBaselineIfFirst).
  */
 import { formatDocForEmbedding, formatQueryForEmbedding } from "./llm.ts";
 import { embedArmOf, parseEmbedInputFp, sentEmbedInput, sha256Hex } from "./embed-fingerprint.ts";
@@ -26,7 +37,7 @@ import { buildEmbedFrontmatter } from "./embed-input.ts";
 import { splitDocument } from "./splitter.ts";
 import { canonicalDocId, type Store } from "./store.ts";
 
-export const CANARY_PROBE_VERSION = 1;
+export const CANARY_PROBE_VERSION = 2;
 
 // Probe texts — generic register, deliberately vault-agnostic.
 const REL_A = "the cat sat on the mat";
@@ -37,6 +48,40 @@ const TECH_ECHO = "The sandbox policy uses a syscall filter so the manifest is u
 const TERM_A = "the deploy pipeline reads the manifest file and validates its signature";
 const TERM_B = "the deploy pipeline reads the manifest file and validates its checksum";
 const TRUNC_FULL = `${TECH_ECHO} The filter is compiled at startup and applied to every worker process before any user code runs.`;
+
+// Long-input control (m_long). LONG_HEAD_TOPIC is ~536 tokens, LONG_TAIL_TOPIC ~140; the
+// formatted long_doc input is ~680 tokens / 3358 chars — over the 512-token ubatch the
+// 5n0ew defect sliced at, and under both the 2048-token context and the in-process char
+// cap (FALLBACK_EMBED_CONTEXT_TOKENS × EMBED_CHARS_PER_TOKEN = 4096), so no arm truncates
+// it at default settings. An arm that does truncate (CLAWMEM_EMBED_MAX_CHARS) keeps the
+// head, which only strengthens the head-over-tail relation the margin checks.
+const LONG_HEAD_TOPIC = [
+  "The lighthouse on the northern headland was built from local granite in the middle of the nineteenth century, and for most of its working life it was tended by a keeper who lived in the cottage at its base.",
+  "Every evening, an hour before sunset, the keeper climbed the spiral stair to the lantern room, trimmed the wicks of the oil lamp, polished the brass fittings, and wiped salt spray from the inside of the glass panes.",
+  "The lamp itself sat at the focus of a large glass lens made of concentric prisms, which gathered the light of a single flame and bent it into a narrow horizontal beam that ships could see from more than twenty miles away.",
+  "A clockwork mechanism, wound by hand every few hours through the night, turned the lens slowly on a bath of mercury so that the beam swept the horizon and produced the station's characteristic pattern of flashes.",
+  "Sailors learned each lighthouse by that pattern: two short flashes and a long dark interval marked the headland, while the harbour light to the south showed a steady red that never turned.",
+  "The keeper recorded the weather, the state of the sea, and every passing vessel in a logbook, and in fog he sounded a horn at fixed intervals until the air cleared, sometimes for two days without rest.",
+  "Supplies of lamp oil, wicks, and food arrived by boat once a month when the weather allowed, and in hard winters the station could be cut off for weeks, so the storeroom was always kept full.",
+  "When the light was converted to electricity, the oil lamp was replaced by a bulb, the clockwork by an electric motor, and eventually the keeper by an automatic controller that switched the beam on at dusk.",
+  "The old lens was kept in place, because no modern optic produced a cleaner beam, and it still turns above the headland every night, although no one climbs the stair to trim a wick any more.",
+  "The keeper's cottage became a small museum, where visitors can read the logbooks, see the brass oil cans and the spare wicks, and climb the stair on summer afternoons to stand beside the lens.",
+  "The granite tower has needed little repair in a century and a half, apart from repointing the mortar after winter storms and repainting the iron gallery rail that circles the lantern room.",
+  "Local boatmen still say they trust the light more than their instruments, because the beam has marked the reef off the headland every night for as long as anyone in the village can remember.",
+  "Other lighthouses along the coast followed the same path from oil to electricity to automation, and most of their keepers' cottages now stand empty or have been sold as holiday homes.",
+].join(" ");
+const LONG_TAIL_TOPIC = [
+  "Bread dough rises because yeast ferments the sugars released from flour starch, producing carbon dioxide that is trapped by a stretchy network of gluten proteins formed during kneading.",
+  "A longer, cooler fermentation gives lactic and acetic acid bacteria time to develop, which is why slow sourdough loaves taste more sour and keep longer than quickly risen bread.",
+  "In the oven the trapped gas expands, the yeast dies as the dough passes about sixty degrees, and the crust browns through Maillard reactions between sugars and amino acids.",
+  "Bakers shape the risen dough gently to keep its gas, score the top with a blade so it can open in a controlled way, and bake it in a steamy oven so the crust stays soft long enough for the loaf to spring up.",
+].join(" ");
+const LONG_DOC = `${LONG_HEAD_TOPIC} ${LONG_TAIL_TOPIC}`;
+/** Short summaries of the two parts. Neither is a verbatim slice of LONG_DOC: a verbatim
+ *  tail reference lets a lexical embedder score the tail as high as the head, which is not
+ *  the relation the margin tests (the head summary is an abridged opening). */
+const LONG_HEAD_REF = "The lighthouse on the northern headland was built from local granite in the middle of the nineteenth century, and for most of its working life it was tended by a keeper who lived in the cottage at its base. Every evening the keeper climbed the spiral stair to the lantern room, trimmed the wicks of the oil lamp, and polished the brass fittings.";
+const LONG_TAIL_REF = "Yeast ferments the sugars in bread dough into gas that the gluten traps, so the loaf rises and bakes into a crust.";
 
 /** probeId → the exact embed input (production-formatted). */
 export function canaryProbeInputs(): Map<string, string> {
@@ -49,6 +94,9 @@ export function canaryProbeInputs(): Map<string, string> {
     ["term_a", formatDocForEmbedding(TERM_A)],
     ["term_b", formatDocForEmbedding(TERM_B)],
     ["trunc_full", formatDocForEmbedding(TRUNC_FULL)],
+    ["long_doc", formatDocForEmbedding(LONG_DOC)],
+    ["long_head", formatDocForEmbedding(LONG_HEAD_REF)],
+    ["long_tail", formatDocForEmbedding(LONG_TAIL_REF)],
   ]);
 }
 
@@ -74,6 +122,13 @@ export function canaryMargins(vecs: Map<string, Float32Array>): Record<string, n
     m_term: cosineSim(v("term_a"), v("term_b")) - unrelBase("term_a"),
     // truncation control: a prefix must stay near its full text
     m_trunc: cosineSim(v("trunc_full"), v("tech_echo")) - unrelBase("trunc_full"),
+    // long-input control (v2): a >512-token document that is mostly head topic must sit
+    // nearer its head summary than its tail paragraph. INTRINSIC — both references are
+    // embedded in the same battery. Sliced evaluation (non-attending 512-token ubatches)
+    // returns ~the last slice, which inverts the sign. Measured on embeddinggemma:
+    // remote (ollama) +0.415, in-process batchSize=contextSize +0.413, in-process
+    // default batchSize 512 −0.583 (the pre-v0.36.26 defect). Floor: the shared 0.10.
+    m_long: cosineSim(v("long_doc"), v("long_head")) - cosineSim(v("long_doc"), v("long_tail")),
   };
 }
 
