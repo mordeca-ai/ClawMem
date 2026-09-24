@@ -3148,7 +3148,7 @@ async function cmdDoctor(args: string[] = []) {
         }
       } else if (outcome.pass) {
         const m = outcome.margins;
-        console.log(`${c.green}✓${c.reset} Geometry canary: separation healthy (rel ${m.m_rel!.toFixed(2)}, echo ${m.m_echo!.toFixed(2)}, term ${m.m_term!.toFixed(2)}, trunc ${m.m_trunc!.toFixed(2)})${outcome.driftChecked ? " · drift vs baseline OK" : " · no baseline yet (absolute floors)"}`);
+        console.log(`${c.green}✓${c.reset} Geometry canary: separation healthy (rel ${m.m_rel!.toFixed(2)}, echo ${m.m_echo!.toFixed(2)}, term ${m.m_term!.toFixed(2)}, trunc ${m.m_trunc!.toFixed(2)}, long ${m.m_long!.toFixed(2)})${outcome.driftChecked ? " · drift vs baseline OK" : " · no baseline yet (absolute floors)"}`);
       } else {
         console.log(`${c.red}✗${c.reset} Geometry canary: FAILED — embedding server produces non-discriminating or drifted vectors`);
         for (const f of outcome.failures.slice(0, 6)) console.log(`   ${c.dim}${f}${c.reset}`);

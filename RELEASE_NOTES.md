@@ -4,6 +4,25 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.28 — Geometry canary: long-input probe catches sliced (>512-token) evaluation
+
+The geometry canary only probed short inputs, so the v0.36.26 defect (the in-process arm evaluating any input over 512 tokens as 512-token slices that never attend to each other) passed every margin (master-harness-vn4rz.60). With the defect reintroduced, the four existing margins were unchanged to the fourth decimal.
+
+- **New probe set (`CANARY_PROBE_VERSION` 2).** `long_doc` is a 3358-char document, 680 EmbeddingGemma tokens: over one 512-token ubatch, under the 2048-token context and the 4096-char in-process cap, so no arm truncates it at default settings. Its first ~80% is one topic and its last paragraph another. `long_head` and `long_tail` are short summaries of the two parts; neither is a verbatim slice of the document.
+- **New margin `m_long` = cos(long_doc, long_head) − cos(long_doc, long_tail).** Evaluated whole, the document sits nearer its head. Evaluated in slices, the pooled vector is effectively the last slice alone (cos 0.96 to the tail text), and the sign flips. Both references are embedded in the same battery, so the check needs no baseline; a baseline recorded on a slicing arm cannot bless it. It uses the shared absolute floor (0.10); with a stored baseline the floor is max(0.10, 0.5 × baseline).
+- **Measured (embeddinggemma, `bun scripts/canary-measure.ts`):**
+  - remote arm (ollama on the GPU host): m_long +0.415, PASS
+  - in-process arm, `batchSize = contextSize`: m_long +0.413, PASS
+  - in-process arm with the v0.36.26 fix reverted (node-llama-cpp default batch 512): m_long −0.583, FAIL (`m_long = -0.583 < floor 0.100`); the other four margins identical to the fixed arm
+  - Margin of safety: 0.31 above the floor on both healthy arms, 0.68 below it on the sliced arm.
+- `clawmem doctor` prints `long` alongside the other margins. `scripts/canary-measure.ts` runs the battery once against the configured arm, read-only (no vault, no baseline), and exits 0 pass / 1 fail / 2 unavailable.
+
+**Upgrade note — the canary baseline re-seeds.** The profile key embeds the probe version (`v2:<model>:<dim>`), so v1 baselines are no longer consulted. The first verified `clawmem embed` run after upgrading (a timer-fired incremental run is enough) seeds the v2 baseline as first-healthy; no `--recalibrate-canary` is needed. Until then the canary runs on absolute floors only, and `clawmem doctor --clear-taint` refuses at the canary gate ("no stored canary baseline for v2:...") because drift cannot be checked. Run `clawmem embed` first if a taint clear is pending.
+
+6 new unit tests in `tests/unit/canary-validation.test.ts`: version/profile key, probe-length bounds, m_long pass on a whole-sequence stub, m_long fail on a sliced stub (the only failing margin), and fail against a baseline seeded on the same sliced arm, v2 baseline seeding. The healthy test stubs in `canary-validation` and `taint-clear` gained directions for the three new probes.
+
+---
+
 ## v0.36.27 — `doctor --clear-taint`: clear the embed-geometry taint on evidence, without a full rebuild
 
 `embed_geometry_taint` is set when an embed run could not verify its geometry (no preflight, an unverified end, or mid-run drift). Until now only a verified full `clawmem embed --force` cleared it: about three hours of GPU on the live vault, with recall degraded for the duration. That was the only way out even after the affected rows had been re-embedded with `embed --requeue-hashes` (master-harness-vn4rz.59).

@@ -9,12 +9,13 @@
  *
  * WHY a bag-of-words hash embedding and not a constant/content-hash vector: the
  * geometry canary (src/canary.ts) runs BEFORE every branch these tests exercise and
- * FAILS CLOSED. Its four pair-separation margins require an embedding that genuinely
+ * FAILS CLOSED. Its pair-separation margins require an embedding that genuinely
  * discriminates related from unrelated text. A content-hash vector scores ~0 on every
  * margin and aborts the run at the canary — every downstream assertion would then be
  * testing the canary, not the branch under test. Hashed word-token vectors clear the
  * 0.10 absolute floor with min margin ~0.236 at dim 512 and 1024 (measured), so the
- * canary passes and control reaches the branch being tested.
+ * canary passes and control reaches the branch being tested. The v2 long-input margin
+ * m_long (master-harness-vn4rz.60) measures 0.21–0.27 across CANARY_SAFE_DIMS.
  *
  * The margin is dim-SENSITIVE (a hash collision between the `rel_a`/`unrel` probe tokens
  * drops m_rel to 0.046 at dims 128/256/384/768 — which aborts at the canary and would

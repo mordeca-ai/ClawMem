@@ -25,14 +25,16 @@ import {
 const TAINT_REASON = "no preflight validation at 2026-09-18T09:19:13Z";
 
 /** Healthy canary geometry for probe inputs (same shape as canary-validation.test.ts). */
+const LONG_BASES: Record<string, number[]> = { long_head: [0, 0, 0, 1], long_tail: [0, 0, 1, 0], long_doc: [0, 0, 0.35, 1] };
 function healthyProbe(text: string): Float32Array | null {
   let bucket = 0;
+  let longBase: number[] | undefined;
   for (const [id, t] of canaryProbeInputs()) {
-    if (t === text) { bucket = id === "unrel" ? 1 : id.startsWith("rel") ? 2 : 3; break; }
+    if (t === text) { longBase = LONG_BASES[id]; bucket = id === "unrel" ? 1 : id.startsWith("rel") ? 2 : 3; break; }
   }
   if (bucket === 0) return null;
   const jitter = (createHash("sha256").update(text).digest()[0]! / 255) * 0.05;
-  const base = bucket === 1 ? [0, 1, 0, 0] : bucket === 2 ? [1, 0, 0, 0] : [0.9, 0, 0.45, 0];
+  const base = longBase ?? (bucket === 1 ? [0, 1, 0, 0] : bucket === 2 ? [1, 0, 0, 0] : [0.9, 0, 0.45, 0]);
   return new Float32Array([base[0]! + jitter, base[1]!, base[2]!, base[3]! + jitter * 0.5]);
 }
 
