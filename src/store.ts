@@ -4263,10 +4263,27 @@ export function ftsScoreFromBm25(bm25Score: number): number {
   return m / (1 + m);
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }): SearchResult[] {
-  const ftsQuery = buildFTS5Query(query);
-  if (!ftsQuery) return [];
+export type SearchFTSFilters = {
+  collectionId?: number;
+  collections?: string[];
+  dateRange?: { start: string; end: string };
+  excludeCollections?: string[];
+  observationsOnly?: boolean;
+};
 
+/**
+ * Build the SQL + bound params for searchFTS. Exported so the join-order regression test can
+ * EXPLAIN QUERY PLAN the exact statement searchFTS runs (master-harness-b1q42.82).
+ */
+export function buildSearchFTSSql(ftsQuery: string, limit: number, filters: SearchFTSFilters = {}): { sql: string; params: (string | number)[] } {
+  const { collectionId, collections, dateRange, excludeCollections, observationsOnly } = filters;
+  // WHY CROSS JOIN (master-harness-b1q42.82): with a selective-looking predicate on d
+  // (e.g. d.collection IN (...) over a large collection), bun's bundled SQLite 3.51.x
+  // planner picks `documents` as the OUTER loop via idx_documents_collection and re-runs
+  // the FTS MATCH once per document row (`SCAN f VIRTUAL TABLE INDEX 0:=M3`) — 38s+ on a
+  // 21k-doc collection. CROSS JOIN is SQLite's documented join-order pin: the FTS scan stays
+  // the outer loop and each hit is a rowid (INTEGER PRIMARY KEY) lookup into documents (~40ms).
+  // Do not "simplify" this back to a plain JOIN.
   let sql = `
     SELECT
       'clawmem://' || d.collection || '/' || d.path as filepath,
@@ -4277,7 +4294,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.modified_at,
       bm25(documents_fts, 10.0, 1.0) as bm25_score
     FROM documents_fts f
-    JOIN documents d ON d.id = f.rowid
+    CROSS JOIN documents d ON d.id = f.rowid
     JOIN content ON content.hash = d.hash
     WHERE documents_fts MATCH ? AND d.active = 1 AND d.invalidated_at IS NULL
   `;
@@ -4313,13 +4330,22 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   // selection, so `limit` is satisfied with eligible observation documents by construction —
   // a post-filter over a fixed overfetch could be starved by higher-ranked non-observation
   // internal artifacts.
-  if (opts?.observationsOnly) {
+  if (observationsOnly) {
     sql += ` AND d.path LIKE 'observations/%' AND d.observation_type IS NOT NULL`;
   }
 
   // bm25 lower is better; sort ascending.
   sql += ` ORDER BY bm25_score ASC LIMIT ?`;
   params.push(limit);
+
+  return { sql, params };
+}
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, excludeCollections?: string[], opts?: { observationsOnly?: boolean }): SearchResult[] {
+  const ftsQuery = buildFTS5Query(query);
+  if (!ftsQuery) return [];
+
+  const { sql, params } = buildSearchFTSSql(ftsQuery, limit, { collectionId, collections, dateRange, excludeCollections, observationsOnly: opts?.observationsOnly });
 
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; modified_at: string; bm25_score: number }[];
   return rows.map(row => {
