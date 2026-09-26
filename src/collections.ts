@@ -128,6 +128,11 @@ interface ConfigCacheEntry {
 
 let configCache: ConfigCacheEntry | null = null;
 
+// Bumped on every clearConfigCache() (i.e. every saveConfig). Folded into
+// configIdentityStamp() so a derived memo is busted by an in-process write even if the
+// rewrite lands inside the same mtime tick with an identical byte size.
+let configGeneration = 0;
+
 /**
  * Ops bypass: `CLAWMEM_DISABLE_CONFIG_CACHE=true` forces the uncached path.
  * Read at call time (same convention as ftsBypassEnabled() in src/search-utils.ts)
@@ -140,6 +145,22 @@ export function configCacheDisabled(): boolean {
 /** Drop the memo. Used by saveConfig() and by tests. */
 export function clearConfigCache(): void {
   configCache = null;
+  configGeneration++;
+}
+
+/**
+ * master-harness-apktc: an opaque stamp of the config's current identity — resolved
+ * path + (mtimeMs, size) + in-process write generation. Any memo DERIVED from
+ * loadConfig() (e.g. store.ts getContextForFile) keys on this, so a saveConfig(), an
+ * out-of-band edit, or a config.yaml/index.yml switch invalidates it exactly when
+ * loadConfig() itself would re-parse. Returns null when the config cache is bypassed
+ * (CLAWMEM_DISABLE_CONFIG_CACHE=true): derived memos must bypass too.
+ */
+export function configIdentityStamp(): string | null {
+  if (configCacheDisabled()) return null;
+  const configPath = getConfigFilePath();
+  const { mtimeMs, size } = configFileIdentity(configPath);
+  return `${configPath}\0${mtimeMs}\0${size}\0${configGeneration}`;
 }
 
 /** Identity of the config file right now; (-1, -1) means "does not exist". */
