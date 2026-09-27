@@ -22,6 +22,7 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   sanitizeExpandedQueries,
+  anchorExpansions,
   expansionFallback,
   isFallbackExpansion,
   LOCAL_EMBED_ARM_LABEL,
@@ -5117,7 +5118,9 @@ export type ExpandedQuery = {
 // prompt garbage simply never hit again and age out of llm_cache via LRU (no manual
 // purge). The provider fingerprint will distinguish qmd from a future zegen lex
 // provider (P4) so a provider swap also invalidates the cache by construction.
-const EXPAND_CACHE_VERSION = "v3-qmd-terse-typed";
+// v4 (master-harness-b1q42.83): cached rows are post-anchor-gate; a deliberate
+// empty list ([]) is a valid cached decision. v3 rows are unfiltered and must never hit.
+const EXPAND_CACHE_VERSION = "v4-qmd-anchored";
 const EXPAND_PROVIDER_FINGERPRINT = "qmd-terse";
 
 /**
@@ -5142,6 +5145,9 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   if (cached) {
     try {
       const parsed = JSON.parse(cached) as unknown;
+      // A cached [] is the anchor gate's deliberate "no usable expansion" decision
+      // (only ever written below, never by a failure path) — honour it.
+      if (Array.isArray(parsed) && parsed.length === 0) return [];
       // Accept ONLY a fully-valid, already-clean typed payload. A shape error on ANY
       // element, an empty array, or anything sanitization would drop/rewrite → treat
       // the entry as stale and re-expand (never return partial or dirty cached data).
@@ -5181,7 +5187,22 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
       .map(r => ({ type: r.type, query: r.text }));
   }
 
-  const expanded: ExpandedQuery[] = cleaned.map(r => ({ type: r.type, query: r.text }));
+  // Query-anchored relevance gate (master-harness-b1q42.83): drop lex/vec legs that
+  // share too few content tokens with the query (live-model jargon noise such as
+  // "combine rent watch" for "integrator lease guard", or stopword fragments like
+  // "how does the"). If nothing survives, the answer is an EMPTY expansion list —
+  // the original query still runs on both backends at 2x weight in every caller —
+  // never the garbage and never the fallback stub. The empty result IS cached: the
+  // model samples at temperature 0.7, so a cached decision keeps a query's retrieval
+  // deterministic and spares the hook path a ~300-460ms regeneration on every call.
+  const anchored = anchorExpansions(cleaned, query);
+  const droppedCount = cleaned.length - anchored.length;
+  if (droppedCount > 0) {
+    // Counts only — no query text on stderr (hook/MCP stdout stays clean).
+    console.error(`[expandQuery] anchor gate dropped ${droppedCount}/${cleaned.length} expansion legs (kept ${anchored.length})`);
+  }
+
+  const expanded: ExpandedQuery[] = anchored.map(r => ({ type: r.type, query: r.text }));
   setCachedResult(db, cacheKey, JSON.stringify(expanded));
   return expanded;
 }
