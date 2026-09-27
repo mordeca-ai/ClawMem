@@ -41,6 +41,7 @@ import {
   renameCollection as collectionsRenameCollection,
   setGlobalContext,
   loadConfig as collectionsLoadConfig,
+  configIdentityStamp,
   type NamedCollection,
 } from "./collections.ts";
 import { getVaultPath } from "./config.ts";
@@ -3852,17 +3853,77 @@ export function getContextForPath(db: Database, collectionName: string, path: st
   return contexts.length > 0 ? contexts.join('\n\n') : null;
 }
 
-/**
- * Get context for a file path (virtual or filesystem).
- * Resolves the collection and relative path using the YAML collections config.
- */
-export function getContextForFile(db: Database, filepath: string): string | null {
-  // Handle undefined or null filepath
-  if (!filepath) return null;
+// -----------------------------------------------------------------------------
+// getContextForFile memo (master-harness-apktc)
+// -----------------------------------------------------------------------------
+//
+// After hxa17's loadConfig memo, getContextForFile still cost ~2.9 ms/row: every call
+// went through listCollections() + loadConfig() + getCollection(), i.e. three stat()s
+// and three structuredClone()s of the whole config, and it runs per row per leg across
+// all six retrieval legs (up to ~360 calls/prompt) over heavily recurring filepaths.
+//
+// The answer splits cleanly in two:
+//   1. CONFIG-derived — which collection + relative path a filepath resolves to, and the
+//      assembled global + prefix context string. Pure in (config, filepath): memoized
+//      here, keyed on filepath, and dropped wholesale whenever collections'
+//      configIdentityStamp() (path, mtimeMs, size, in-process write generation) moves —
+//      the same identity loadConfig() re-parses on, so a context/collection change busts
+//      it exactly when it would have been re-read. Stale context is worse than slow.
+//   2. DB-derived — "is this document active?" — is NOT memoized: it is one indexed
+//      UNIQUE(collection, path) probe per call, so a deactivated doc never serves stale
+//      context and the memo needs no DB identity in its key.
+//
+// Bounded: an insertion-ordered Map used as an LRU, capped at CONTEXT_MEMO_MAX_ENTRIES.
+// Bypass: CLAWMEM_DISABLE_CONTEXT_MEMO=true, or CLAWMEM_DISABLE_CONFIG_CACHE=true (a
+// derived memo must never outlive a bypassed source cache).
 
-  // Get all collections from YAML config
-  const collections = collectionsListCollections();
+/** Config-derived resolution of a filepath; null = resolves to no configured collection. */
+type FileContextResolution = { collectionName: string; relativePath: string; context: string | null } | null;
+
+export const CONTEXT_MEMO_MAX_ENTRIES = 4096;
+
+/** One parsed config, shared by every miss under a given stamp. */
+type ConfigSnapshot = { config: ReturnType<typeof collectionsLoadConfig>; collections: NamedCollection[] };
+
+const contextMemo = new Map<string, FileContextResolution>();
+let contextMemoStamp: string | null = null;
+let contextMemoSnapshot: ConfigSnapshot | null = null;
+const contextMemoCounters = { hits: 0, misses: 0, invalidations: 0, bypassed: 0 };
+
+function dropContextMemoEntries(): void {
+  contextMemo.clear();
+  contextMemoStamp = null;
+  contextMemoSnapshot = null;
+}
+
+/** Drop the getContextForFile memo and zero its counters. Config changes bust entries automatically. */
+export function clearContextMemo(): void {
+  dropContextMemoEntries();
+  contextMemoCounters.hits = 0;
+  contextMemoCounters.misses = 0;
+  contextMemoCounters.invalidations = 0;
+  contextMemoCounters.bypassed = 0;
+}
+
+/** Memo observability: live size + hit/miss/config-invalidation/bypass counts since the last clear. */
+export function contextMemoStats(): { size: number; hits: number; misses: number; invalidations: number; bypassed: number } {
+  return { size: contextMemo.size, ...contextMemoCounters };
+}
+
+function contextMemoDisabled(): boolean {
+  return process.env.CLAWMEM_DISABLE_CONTEXT_MEMO === "true";
+}
+
+/** Read the config once: listCollections() + getCollection() are both views of loadConfig(). */
+function loadConfigSnapshot(): ConfigSnapshot {
   const config = collectionsLoadConfig();
+  const collections = Object.entries(config.collections).map(([name, c]) => ({ name, ...c }));
+  return { config, collections };
+}
+
+/** The config-side resolution. Sole source of truth for context semantics. */
+function resolveFileContext(filepath: string, snap: ConfigSnapshot): FileContextResolution {
+  const { collections, config } = snap;
 
   // Parse virtual path format: clawmem://collection/path
   let collectionName: string | null = null;
@@ -3891,19 +3952,10 @@ export function getContextForFile(db: Database, filepath: string): string | null
     if (!collectionName || relativePath === null) return null;
   }
 
-  // Get the collection from config
-  const coll = getCollection(collectionName);
-  if (!coll) return null;
-
-  // Verify this document exists in the database
-  const doc = db.prepare(`
-    SELECT d.path
-    FROM documents d
-    WHERE d.collection = ? AND d.path = ? AND d.active = 1
-    LIMIT 1
-  `).get(collectionName, relativePath) as { path: string } | null;
-
-  if (!doc) return null;
+  // Get the collection from config (same semantics as collections.getCollection)
+  const collEntry = config.collections[collectionName];
+  if (!collEntry) return null;
+  const coll = { name: collectionName, ...collEntry };
 
   // Collect ALL matching contexts (global + all path prefixes)
   const contexts: string[] = [];
@@ -3936,7 +3988,65 @@ export function getContextForFile(db: Database, filepath: string): string | null
   }
 
   // Join all contexts with double newline
-  return contexts.length > 0 ? contexts.join('\n\n') : null;
+  return { collectionName, relativePath, context: contexts.length > 0 ? contexts.join('\n\n') : null };
+}
+
+/** resolveFileContext through the bounded, config-stamped memo. */
+function resolveFileContextMemo(filepath: string): FileContextResolution {
+  const stamp = contextMemoDisabled() ? null : configIdentityStamp();
+  if (stamp === null) {
+    if (contextMemo.size > 0 || contextMemoSnapshot !== null) dropContextMemoEntries();
+    contextMemoCounters.bypassed++;
+    return resolveFileContext(filepath, loadConfigSnapshot());
+  }
+  if (stamp !== contextMemoStamp || contextMemoSnapshot === null) {
+    if (contextMemoStamp !== null) contextMemoCounters.invalidations++;
+    contextMemo.clear();
+    contextMemoStamp = stamp;
+    contextMemoSnapshot = loadConfigSnapshot();
+  }
+  if (contextMemo.has(filepath)) {
+    const hit = contextMemo.get(filepath)!;
+    // LRU touch: re-insert so the Map's insertion order tracks recency.
+    contextMemo.delete(filepath);
+    contextMemo.set(filepath, hit);
+    contextMemoCounters.hits++;
+    return hit;
+  }
+  contextMemoCounters.misses++;
+  const value = resolveFileContext(filepath, contextMemoSnapshot);
+  contextMemo.set(filepath, value);
+  if (contextMemo.size > CONTEXT_MEMO_MAX_ENTRIES) {
+    const oldest = contextMemo.keys().next().value;
+    if (oldest !== undefined) contextMemo.delete(oldest);
+  }
+  return value;
+}
+
+/**
+ * Get context for a file path (virtual or filesystem).
+ * Resolves the collection and relative path using the YAML collections config
+ * (memoized per config identity — master-harness-apktc), then verifies the document
+ * is active in the database (never memoized).
+ */
+export function getContextForFile(db: Database, filepath: string): string | null {
+  // Handle undefined or null filepath
+  if (!filepath) return null;
+
+  const resolved = resolveFileContextMemo(filepath);
+  if (!resolved) return null;
+
+  // Verify this document exists in the database
+  const doc = db.prepare(`
+    SELECT d.path
+    FROM documents d
+    WHERE d.collection = ? AND d.path = ? AND d.active = 1
+    LIMIT 1
+  `).get(resolved.collectionName, resolved.relativePath) as { path: string } | null;
+
+  if (!doc) return null;
+
+  return resolved.context;
 }
 
 /**
@@ -4609,21 +4719,23 @@ export interface VecSearchDetailedResult {
 // hot-path perf cliff; past this the result carries an explicit degraded marker instead.
 const VEC_ESCALATION_HARD_CAP = 4096;
 
-// Hydration + visibility classification for one escalation round. Include-collections and
-// dateRange are SQL predicates (a row failing them was never a candidate); EXCLUSION is
-// classified in JS because the excluded-doc count is part of the degraded contract (T5-M2).
-function hydrateVecResultsClassified(
-  db: Database,
-  vecResults: { hash_seq: string; distance: number }[],
-  limit: number,
-  opts: VecSearchDetailedOpts,
-  exclude: Set<string>
-): { results: SearchResult[]; allowedDocs: number; excludedDocsSeen: number } {
-  if (vecResults.length === 0) return { results: [], allowedDocs: 0, excludedDocsSeen: 0 };
-
-  const hashSeqs = vecResults.map(r => r.hash_seq);
-  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
-  const placeholders = hashSeqs.map(() => '?').join(',');
+/**
+ * Hydration SQL for hydrateVecResultsClassified. Exported for the EXPLAIN QUERY PLAN
+ * regression test only (tests/unit/store.hydrate-classified-plan.test.ts).
+ *
+ * master-harness-apktc: same rewrite hxa17 applied to hydrateVecResults. The predicate used
+ * to be `WHERE cv.hash || '_' || cv.seq IN (...)` — a computed expression no index can
+ * serve, so the plan inverted to `SCAN d USING INDEX idx_documents_effective_time` (a full
+ * scan of `documents`). Filtering on the indexed `cv.hash` with the DISTINCT hashes implied
+ * by the requested hash_seq list gives `SEARCH d USING INDEX idx_documents_hash (hash=?)`;
+ * fragments of those hashes that were NOT requested are dropped by the caller in JS.
+ */
+export function buildClassifiedHydrateQuery(hashSeqs: string[], opts: VecSearchDetailedOpts): { sql: string; params: string[] } {
+  const hashes = [...new Set(hashSeqs.map(hs => {
+    const i = hs.lastIndexOf('_');
+    return i === -1 ? hs : hs.slice(0, i);
+  }))];
+  const placeholders = hashes.map(() => '?').join(',');
   let docSql = `
     SELECT
       cv.hash || '_' || cv.seq as hash_seq,
@@ -4640,9 +4752,9 @@ function hydrateVecResultsClassified(
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL
     JOIN content ON content.hash = d.hash
-    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+    WHERE cv.hash IN (${placeholders})
   `;
-  const params: string[] = [...hashSeqs];
+  const params: string[] = [...hashes];
 
   if (opts.collections && opts.collections.length > 0) {
     const colPlaceholders = opts.collections.map(() => '?').join(',');
@@ -4661,11 +4773,34 @@ function hydrateVecResultsClassified(
     docSql += ` AND d.path LIKE 'observations/%' AND d.observation_type IS NOT NULL`;
   }
 
-  const docRows = db.prepare(docSql).all(...params) as {
+  return { sql: docSql, params };
+}
+
+// Hydration + visibility classification for one escalation round. Include-collections and
+// dateRange are SQL predicates (a row failing them was never a candidate); EXCLUSION is
+// classified in JS because the excluded-doc count is part of the degraded contract (T5-M2).
+function hydrateVecResultsClassified(
+  db: Database,
+  vecResults: { hash_seq: string; distance: number }[],
+  limit: number,
+  opts: VecSearchDetailedOpts,
+  exclude: Set<string>
+): { results: SearchResult[]; allowedDocs: number; excludedDocsSeen: number } {
+  if (vecResults.length === 0) return { results: [], allowedDocs: 0, excludedDocsSeen: 0 };
+
+  const hashSeqs = vecResults.map(r => r.hash_seq);
+  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
+  const requestedHashSeqs = new Set(hashSeqs);
+  const { sql: docSql, params } = buildClassifiedHydrateQuery(hashSeqs, opts);
+
+  // Drop fragments of a requested hash that were not themselves requested (the SQL now
+  // filters by hash, not hash_seq) BEFORE exclusion accounting, so excludedDocsSeen counts
+  // exactly the docs it did under the old predicate.
+  const docRows = (db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; collection: string; filepath: string;
     display_path: string; title: string; body: string; modified_at: string;
     fragment_type: string | null; fragment_label: string | null;
-  }[];
+  }[]).filter(row => requestedHashSeqs.has(row.hash_seq));
 
   const excludedDocs = new Set<string>();
   const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
@@ -4681,8 +4816,12 @@ function hydrateVecResultsClassified(
     }
   }
 
+  // Total order (bestDist, filepath) — same reasoning as hydrateVecResults (hxa17): with a
+  // distance-only comparator an exact-distance tie group crossing `limit` is resolved by SQL
+  // row order, which is a query-plan artifact and changed with the predicate rewrite above.
+  // filepath is unique after the per-filepath dedupe, so the result is plan-independent.
   const results = Array.from(seen.values())
-    .sort((a, b) => a.bestDist - b.bestDist)
+    .sort((a, b) => a.bestDist - b.bestDist || (a.row.filepath < b.row.filepath ? -1 : a.row.filepath > b.row.filepath ? 1 : 0))
     .slice(0, limit)
     .map(({ row, bestDist }) => ({
       filepath: row.filepath,
