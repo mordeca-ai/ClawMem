@@ -223,6 +223,13 @@ const EXPANSION_JUNK_PATTERNS: RegExp[] = [
   /keyword search terms \(/i,
   /semantic search queries \(/i,
   /hypothetical document passage that answers the query/i,
+  // Zero-information hyde boilerplate the qmd finetune emits when it does not
+  // recognise the query's jargon (verified live 2026-09-26, master-harness-b1q42.83:
+  // "The topic of integrator lease guard covers combined rental guard. Proper
+  // implementation follows established patterns and best practices."). The exact
+  // closing clause carries no retrievable content; kept to that literal phrase so a
+  // real passage that merely mentions "best practices" is never rejected.
+  /proper implementation follows established patterns and best practices/i,
 ];
 
 /** True if an expansion text is empty or matches a known template-residue pattern. */
@@ -291,6 +298,84 @@ export function isFallbackExpansion(items: Queryable[], query: string): boolean 
   const fb = expansionFallback(query);
   return items.length === fb.length
     && items.every((q, i) => q.type === fb[i]!.type && q.text === fb[i]!.text);
+}
+
+// =============================================================================
+// Query-anchored relevance gate (master-harness-b1q42.83)
+// =============================================================================
+
+/**
+ * English function words + question words that carry no retrieval signal. Tokens
+ * shorter than 3 chars are already excluded by contentTokens, so only >=3-char
+ * words need listing here.
+ */
+const ANCHOR_STOPWORDS: ReadonlySet<string> = new Set([
+  "the", "and", "for", "but", "nor", "yet", "not", "are", "was", "were", "been", "being",
+  "does", "did", "done", "doing", "has", "have", "had", "having", "its", "this", "that",
+  "these", "those", "there", "here", "then", "than", "with", "without", "within", "from",
+  "into", "onto", "about", "above", "below", "over", "under", "after", "before", "while",
+  "during", "between", "via", "per", "any", "all", "some", "such", "own", "same", "too",
+  "very", "just", "also", "only", "more", "most", "other", "again", "can", "could",
+  "should", "would", "will", "shall", "may", "might", "must", "you", "your", "our",
+  "they", "them", "their", "his", "her", "she", "him", "who", "whom", "whose", "what",
+  "when", "where", "which", "why", "how", "whether", "get", "gets", "got", "use", "used",
+  "using", "way", "ways", "one", "each", "every", "out", "off",
+]);
+
+/**
+ * Light suffix stemmer: one of ies→y / ing / ed (not "-eed") / s (not "-ss"), then a
+ * trailing "e" (so the "-es" plural reduces via s-then-e: "worktrees" -> "worktree"
+ * -> "worktre"), keeping a stem of at least 3 chars. Deliberately crude — it only
+ * needs "lease"/"leases"/"leased", "cache"/"caching" and "retry"/"retries" to meet,
+ * not linguistic accuracy.
+ */
+export function lightStem(token: string): string {
+  let t = token;
+  if (t.length > 4 && t.endsWith("ies")) t = t.slice(0, -3) + "y";
+  else if (t.length > 5 && t.endsWith("ing")) t = t.slice(0, -3);
+  else if (t.length > 4 && t.endsWith("ed") && !t.endsWith("eed")) t = t.slice(0, -2);
+  else if (t.length > 3 && t.endsWith("s") && !t.endsWith("ss")) t = t.slice(0, -1);
+  if (t.length > 3 && t.endsWith("e")) t = t.slice(0, -1);
+  return t;
+}
+
+/**
+ * Stemmed content tokens of a text: lowercase alphanumeric runs of length >= 3,
+ * minus ANCHOR_STOPWORDS, passed through lightStem. Returned as a set (a repeated
+ * word counts once).
+ */
+export function contentTokens(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const raw of text.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length < 3 || ANCHOR_STOPWORDS.has(raw)) continue;
+    out.add(lightStem(raw));
+  }
+  return out;
+}
+
+/**
+ * Query-anchored relevance gate for expansion legs. Unlike sanitizeExpandedQueries
+ * (query-free by contract), this DOES look at the original query: a lex or vec leg
+ * must share at least `need` stemmed content tokens with it, where
+ * need = 1 when the query has <= 2 content tokens, else 2. hyde legs are exempt
+ * (a hypothetical passage legitimately paraphrases). A query with no content tokens
+ * disables the gate (nothing to anchor on).
+ *
+ * Why: the live qmd finetune, on jargon it does not know, emits same-shaped but
+ * unrelated legs ("integrator lease guard" -> "combine rent watch", "multi lease
+ * care") and stopword fragments ("how does the"). Those legs pull unrelated docs
+ * into RRF fusion at 1x weight. Pure; returns the surviving items in input order.
+ */
+export function anchorExpansions(items: Queryable[], query: string): Queryable[] {
+  const q = contentTokens(query);
+  if (q.size === 0) return items.slice();
+  const need = q.size <= 2 ? 1 : 2;
+  return items.filter(item => {
+    if (item.type === "hyde") return true;
+    let shared = 0;
+    for (const t of contentTokens(item.text)) if (q.has(t)) shared++;
+    return shared >= need;
+  });
 }
 
 /**

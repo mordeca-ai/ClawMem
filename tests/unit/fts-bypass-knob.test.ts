@@ -31,10 +31,12 @@ const fakeLlm = {
   query: async () => null,
   expandQuery: async (q: string) => {
     expandCalls++;
-    // Valid, non-echo, non-fallback-shaped variants — survives sanitization and CACHES.
+    // Valid, non-echo, non-fallback-shaped, query-anchored variants — survives
+    // sanitization AND the b1q42.83 anchor gate (each leg shares the query's
+    // content tokens), so it CACHES.
     return [
       { type: "lex", text: `${q} alternate` },
-      { type: "vec", text: "related concept probe" },
+      { type: "vec", text: `related ${q} concept probe` },
     ];
   },
 } as any;
