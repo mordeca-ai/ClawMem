@@ -46,7 +46,10 @@ const GOOD_SET: Queryable[] = [
   { type: "lex", text: "dolt lock contention retries" },
   { type: "lex", text: "bd dolt retry backoff" },
   { type: "vec", text: "retrying bd commands when the dolt database is contended" },
-  { type: "hyde", text: "When several bd processes write at once, dolt reports contention and bd retries the transaction with backoff." },
+  {
+    type: "hyde",
+    text: "When several bd processes write at once, dolt reports contention and bd retries the transaction with backoff.",
+  },
 ];
 
 describe("lightStem / contentTokens", () => {
@@ -60,17 +63,22 @@ describe("lightStem / contentTokens", () => {
   });
 
   it("drops stopwords, question words and <3-char tokens", () => {
-    expect([...contentTokens("how does the worktree pruner decide a branch is stale")].sort())
-      .toEqual(["branch", "decid", "pruner", "stal", "worktre"].sort());
+    expect(
+      [...contentTokens("how does the worktree pruner decide a branch is stale")].sort(),
+    ).toEqual(["branch", "decid", "pruner", "stal", "worktre"].sort());
     expect(contentTokens("what is it").size).toBe(0);
-    expect([...contentTokens("bd dolt contention retry")].sort()).toEqual(["contention", "dolt", "retry"]);
+    expect([...contentTokens("bd dolt contention retry")].sort()).toEqual([
+      "contention",
+      "dolt",
+      "retry",
+    ]);
   });
 });
 
 describe("anchorExpansions (pure gate)", () => {
   it("drops the jargon specimen's lex+vec legs ('combine rent watch', 'multi lease care')", () => {
     const kept = anchorExpansions(JARGON_LIVE, JARGON_QUERY);
-    expect(kept.filter(k => k.type !== "hyde")).toEqual([]);
+    expect(kept.filter((k) => k.type !== "hyde")).toEqual([]);
   });
 
   it("drops stopword-fragment legs but keeps an anchored paraphrase", () => {
@@ -88,11 +96,16 @@ describe("anchorExpansions (pure gate)", () => {
       { type: "lex", text: "lease renewal" },
       { type: "vec", text: "rental agreement" },
     ];
-    expect(anchorExpansions(items, "integrator leases")).toEqual([{ type: "lex", text: "lease renewal" }]);
+    expect(anchorExpansions(items, "integrator leases")).toEqual([
+      { type: "lex", text: "lease renewal" },
+    ]);
   });
 
   it("exempts hyde legs from the overlap rule", () => {
-    const hyde: Queryable = { type: "hyde", text: "A passage with no shared vocabulary whatsoever." };
+    const hyde: Queryable = {
+      type: "hyde",
+      text: "A passage with no shared vocabulary whatsoever.",
+    };
     expect(anchorExpansions([hyde], JARGON_QUERY)).toEqual([hyde]);
   });
 
@@ -108,7 +121,10 @@ describe("hyde boilerplate junk pattern", () => {
   });
 
   it("keeps a real passage that merely mentions best practices", () => {
-    const real: Queryable = { type: "hyde", text: "The integrator lease guard follows best practices for lease expiry." };
+    const real: Queryable = {
+      type: "hyde",
+      text: "The integrator lease guard follows best practices for lease expiry.",
+    };
     expect(sanitizeExpandedQueries([real])).toEqual([real]);
   });
 });
@@ -123,7 +139,10 @@ describe("store.expandQuery with the anchor gate", () => {
     calls = 0;
     next = [];
     setDefaultLlamaCpp({
-      expandQuery: async () => { calls++; return next; },
+      expandQuery: async () => {
+        calls++;
+        return next;
+      },
     } as never);
     store = createStore(":memory:");
     errSpy = spyOn(console, "error").mockImplementation(() => {});
@@ -156,8 +175,10 @@ describe("store.expandQuery with the anchor gate", () => {
   it("passes a good set through and emits no gate log", async () => {
     next = GOOD_SET;
     const out = await store.expandQuery(GOOD_QUERY);
-    expect(out).toEqual(GOOD_SET.map(g => ({ type: g.type, query: g.text })));
-    expect(errSpy.mock.calls.some((c: unknown[]) => String(c[0]).includes("anchor gate"))).toBe(false);
+    expect(out).toEqual(GOOD_SET.map((g) => ({ type: g.type, query: g.text })));
+    expect(errSpy.mock.calls.some((c: unknown[]) => String(c[0]).includes("anchor gate"))).toBe(
+      false,
+    );
   });
 
   it("the cache version bump means a pre-seeded v3 (unfiltered) row is never returned", async () => {
@@ -167,10 +188,14 @@ describe("store.expandQuery with the anchor gate", () => {
       provider: "qmd-terse",
     });
     expect(expandQueryCacheKey(JARGON_QUERY)).not.toBe(oldKey);
-    setCachedResult(store.db, oldKey, JSON.stringify([
-      { type: "lex", query: "combine rent watch" },
-      { type: "vec", query: "multi lease care" },
-    ]));
+    setCachedResult(
+      store.db,
+      oldKey,
+      JSON.stringify([
+        { type: "lex", query: "combine rent watch" },
+        { type: "vec", query: "multi lease care" },
+      ]),
+    );
     next = JARGON_LIVE;
     expect(await store.expandQuery(JARGON_QUERY)).toEqual([]);
     expect(calls).toBe(1);
