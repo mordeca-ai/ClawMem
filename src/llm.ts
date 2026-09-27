@@ -1990,6 +1990,14 @@ Final Output:`;
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    // master-harness-zz3nx: fail fast BEFORE touching node-llama-cpp. Under the knob every
+    // local model load throws in resolveModel() anyway, but only after the native module
+    // import + getLlama() (~1s); the caller degrades on this throw exactly as before.
+    if (process.env.CLAWMEM_NO_LOCAL_MODELS === "true") {
+      throw new Error(
+        "Local rerank blocked (CLAWMEM_NO_LOCAL_MODELS=true) and no remote reranker scored the batch. Set CLAWMEM_RERANK_URL to use a GPU reranker."
+      );
+    }
     const context = await this.ensureRerankContext();
 
     // Build a map from document text to original indices (for lookup after sorting)

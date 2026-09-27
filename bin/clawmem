@@ -71,11 +71,19 @@ if [[ -z "${CLAWMEM_LLM_URL+x}" ]]; then
   export CLAWMEM_LLM_URL_SOURCE="default"
 fi
 export CLAWMEM_LLM_URL="${CLAWMEM_LLM_URL:-http://localhost:8089}"
-# Cross-encoder reranker (zerank-2 recommended, -ub must match -b)
-export CLAWMEM_RERANK_URL="${CLAWMEM_RERANK_URL:-http://localhost:8090}"
 # Allow node-llama-cpp to auto-download models if no server is running.
 # Set to "true" in remote/distributed setups to prevent surprise downloads.
 export CLAWMEM_NO_LOCAL_MODELS="${CLAWMEM_NO_LOCAL_MODELS:-false}"
+# Cross-encoder reranker (zerank-2 recommended, -ub must match -b)
+# master-harness-zz3nx: under CLAWMEM_NO_LOCAL_MODELS=true an UNSET rerank URL
+# stays unset. The stock localhost:8090 default is a guess about a local
+# server; in the remote/distributed setup the knob declares, that guess
+# pointed every query at a port that hangs, and the rerank fetch rode its
+# full 60s deadline (65s vs 4s measured) before degrading. Unset + knob =
+# "no reranker": the rerank leg fails fast and the caller degrades.
+if [[ -z "${CLAWMEM_RERANK_URL+x}" && "$CLAWMEM_NO_LOCAL_MODELS" != "true" ]]; then
+  export CLAWMEM_RERANK_URL="http://localhost:8090"
+fi
 BUN=$(find_bun) || { echo "Error: bun not found. Install from https://bun.sh" >&2; exit 1; }
 
 exec "$BUN" "$SCRIPT_DIR/../src/clawmem.ts" "$@"

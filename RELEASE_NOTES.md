@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.31 — NO_LOCAL_MODELS covers the rerank leg
+
+CLAWMEM_NO_LOCAL_MODELS=true now covers the rerank leg: bin/clawmem no longer injects the stock localhost:8090 rerank URL under the knob (it hung for the full 60s fetch deadline), and LlamaCpp.rerank refuses before any node-llama-cpp import. Knob-arm query latency 65.35s -> 3.28s.
+
+---
+
 ## v0.36.30 — Query expansion: drop legs that share no vocabulary with the query
 
 On jargon it does not recognise, the live qmd-query-expansion-1.7B model returns legs of the right shape but on the wrong subject (master-harness-b1q42.83). Measured on the GPU host, 300-460 ms per call, temperature 0.7:
