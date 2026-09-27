@@ -4,6 +4,13 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.32 — index-serve classified hydrate; memoize getContextForFile
+
+- `hydrateVecResultsClassified` now filters on the indexed `cv.hash` column instead of the computed `cv.hash || "_" || cv.seq` expression, so its query plan is `SEARCH d USING INDEX idx_documents_hash` rather than a full scan of `documents` (the same fix hxa17 made to `hydrateVecResults`).
+- `getContextForFile` memoizes its config-derived half per process, keyed on the config identity stamp (LRU 4096). The active-document DB probe still runs live. On the fixture, 60 calls dropped from 0.58-1.86 to about 0.07 ms/row. Set `CLAWMEM_DISABLE_CONTEXT_MEMO=true` to bypass the memo.
+
+---
+
 ## v0.36.31 — NO_LOCAL_MODELS covers the rerank leg
 
 CLAWMEM_NO_LOCAL_MODELS=true now covers the rerank leg: bin/clawmem no longer injects the stock localhost:8090 rerank URL under the knob (it hung for the full 60s fetch deadline), and LlamaCpp.rerank refuses before any node-llama-cpp import. Knob-arm query latency 65.35s -> 3.28s.
