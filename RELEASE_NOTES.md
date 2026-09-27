@@ -4,6 +4,32 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.31 — NO_LOCAL_MODELS covers the rerank leg
+
+CLAWMEM_NO_LOCAL_MODELS=true now covers the rerank leg: bin/clawmem no longer injects the stock localhost:8090 rerank URL under the knob (it hung for the full 60s fetch deadline), and LlamaCpp.rerank refuses before any node-llama-cpp import. Knob-arm query latency 65.35s -> 3.28s.
+
+---
+
+## v0.36.30 — Query expansion: drop legs that share no vocabulary with the query
+
+On jargon it does not recognise, the live qmd-query-expansion-1.7B model returns legs of the right shape but on the wrong subject (master-harness-b1q42.83). Measured on the GPU host, 300-460 ms per call, temperature 0.7:
+
+- `integrator lease guard` → lex/vec `combine rent watch`, `multi lease care`; hyde `The topic of integrator lease guard covers combined rental guard. Proper implementation follows established patterns and best practices.`
+- `how does the worktree pruner decide a branch is stale` → lex `what causes a`, `how does the`
+- `bd dolt contention retry` → five on-topic legs
+
+Each such leg is a 1× RRF list, so it pulls unrelated documents into fusion. The earlier "5 ms" observation of this noise was an `llm_cache` hit, not the fallback.
+
+- **New gate `anchorExpansions(items, query)`** (`src/llm.ts`, pure), applied in `store.expandQuery` after `sanitizeExpandedQueries`. Content tokens are lowercase alphanumeric runs of 3+ characters, minus an English stopword/question-word list, lightly stemmed (`ies`→`y`, `ing`, `ed`, `s`, then a trailing `e`). A lex or vec leg must share at least 1 content token with the query when the query has 1-2, and at least 2 when it has 3 or more. hyde legs are exempt. A query with no content tokens is not filtered. `sanitizeExpandedQueries` stays query-free.
+- **New junk pattern:** the literal hyde clause `Proper implementation follows established patterns and best practices` is rejected. A passage that only mentions "best practices" is kept.
+- **All legs dropped → `[]`.** No garbage and no fallback stub; the original query still runs on both backends at 2× weight. The empty list is cached so repeat calls stay deterministic and the hook path skips a regeneration. The CLI `query`, MCP `query`, and the context-surfacing deep-escalation path all already handle an empty expansion list.
+- **Cache version `v3-qmd-terse-typed` → `v4-qmd-anchored`.** Unfiltered v3 rows never hit and age out through the LRU trim.
+- When legs are dropped, stderr gets one line with counts only (no query text): `[expandQuery] anchor gate dropped N/M expansion legs (kept K)`.
+
+14 new unit tests in `tests/unit/expansion-anchor.test.ts`: stemming and tokenising, the jargon specimen, stopword fragments, a good set passing unchanged, the 1-token threshold, hyde exemption, the no-content-token query, the boilerplate pattern and its near-miss, store-level `[]` plus cache hit, the log line, and a pre-seeded v3 row that must not be returned.
+
+---
+
 ## v0.36.28 — Geometry canary: long-input probe catches sliced (>512-token) evaluation
 
 The geometry canary only probed short inputs, so the v0.36.26 defect (the in-process arm evaluating any input over 512 tokens as 512-token slices that never attend to each other) passed every margin (master-harness-vn4rz.60). With the defect reintroduced, the four existing margins were unchanged to the fourth decimal.
