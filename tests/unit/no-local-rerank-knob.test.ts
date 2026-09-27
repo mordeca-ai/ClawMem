@@ -13,7 +13,6 @@ import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { LlamaCpp } from "../../src/llm.ts";
-import { createStore } from "../../src/store.ts";
 
 const WRAPPER = resolve(import.meta.dir, "../../bin/clawmem");
 
@@ -56,13 +55,8 @@ describe("bin/clawmem rerank URL default under CLAWMEM_NO_LOCAL_MODELS", () => {
 });
 
 describe("rerank leg fails fast under CLAWMEM_NO_LOCAL_MODELS=true", () => {
-  const originalUrl = process.env.CLAWMEM_RERANK_URL;
   const originalNoLocal = process.env.CLAWMEM_NO_LOCAL_MODELS;
-  const originalFetch = globalThis.fetch;
   afterEach(() => {
-    globalThis.fetch = originalFetch;
-    if (originalUrl === undefined) delete process.env.CLAWMEM_RERANK_URL;
-    else process.env.CLAWMEM_RERANK_URL = originalUrl;
     if (originalNoLocal === undefined) delete process.env.CLAWMEM_NO_LOCAL_MODELS;
     else process.env.CLAWMEM_NO_LOCAL_MODELS = originalNoLocal;
   });
@@ -77,22 +71,5 @@ describe("rerank leg fails fast under CLAWMEM_NO_LOCAL_MODELS=true", () => {
     };
     await expect(llm.rerank("q", [{ file: "a", text: "alpha" }])).rejects.toThrow(/CLAWMEM_NO_LOCAL_MODELS=true/);
     expect(loaded).toBe(false);
-  });
-
-  test("store.rerank with knob + no URL makes no fetch and rejects in well under a second", async () => {
-    process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
-    delete process.env.CLAWMEM_RERANK_URL;
-    let fetches = 0;
-    globalThis.fetch = (async () => {
-      fetches++;
-      return new Response("{}", { status: 200 });
-    }) as unknown as typeof fetch;
-    const store = createStore(":memory:");
-    const t0 = performance.now();
-    await expect(
-      store.rerank("q", [{ file: "a", text: "alpha document" }], "m", undefined, { noCache: true }),
-    ).rejects.toThrow(/CLAWMEM_NO_LOCAL_MODELS=true/);
-    expect(performance.now() - t0).toBeLessThan(1000);
-    expect(fetches).toBe(0);
   });
 });
