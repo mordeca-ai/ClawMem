@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.35 — doctor: unreachable reranker is not degenerate
+
+`clawmem doctor` and `clawmem rerank-health` now report an unreachable reranker as **UNREACHABLE** instead of "FAILED discrimination probe". Previously an outage (every probe request failing, no local fallback) left zero observed scores, which the calibration arm misread as a score collapse and answered with the zerank-2 "re-deploy the seq-cls sidecar" advice. The probe result gains `probeErrors` and `unreachable`; the calibration arm now judges observed scores only; partial transport errors get their own advice ahead of the coverage arm. Exit codes are unchanged (master-harness-xso4y).
+
+---
+
 ## v0.36.34 — Count frontmatter that parses but declares no title/content_type
 
 Frontmatter written in another vocabulary (`name:`, `type:`, `metadata.type`) parses cleanly, but `parseDocument` reads only `title:` and `content_type:`. Those documents were indexed with no title and a fallback content_type, and nothing counted it. On the live memory-topics collection, all 416 documents with frontmatter are affected.

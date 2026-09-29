@@ -3111,7 +3111,14 @@ async function cmdDoctor(args: string[] = []) {
     const s = getStore();
     const { probeRerankHealth, rerankFailureAdvice } = await import("./health/rerank-health.ts");
     const health = await probeRerankHealth(s, { timeoutMs: 8000 });
-    if (health.ok) {
+    if (health.unreachable) {
+      // Availability failure, NOT a discrimination verdict — no score was observed, so the
+      // "FAILED discrimination probe" line below would misdiagnose an outage (master-harness-xso4y).
+      console.log(`${c.red}✗${c.reset} Reranker: UNREACHABLE (0/${health.pairsTotal} probe requests answered — endpoint down or blocked, not degenerate)`);
+      for (const f of health.failures.slice(0, 2)) console.log(`   ${c.dim}${f}${c.reset}`);
+      console.log(`   ${c.dim}${rerankFailureAdvice(health)}${c.reset}`);
+      issues++;
+    } else if (health.ok) {
       console.log(`${c.green}✓${c.reset} Reranker: discriminates (coverage ${health.pairsScored}/${health.pairsTotal}, 0 inversions, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min logit margin ${health.minLogitMargin.toFixed(2)} ≥ ${health.thresholds.discrimLogitMargin})`);
     } else {
       console.log(`${c.red}✗${c.reset} Reranker: FAILED discrimination probe (coverage ${health.pairsScored}/${health.pairsTotal}, ${health.inversions} inverted, max score ${health.maxScore.toExponential(1)}, min logit margin ${health.minLogitMargin.toFixed(2)})`);
@@ -3391,6 +3398,10 @@ async function cmdRerankHealth(args: string[]) {
 
   if (values.json) {
     console.log(JSON.stringify(health));
+  } else if (health.unreachable) {
+    console.log(`${c.red}✗ Reranker UNREACHABLE${c.reset} — 0/${health.pairsTotal} probe requests answered; endpoint down or blocked, not degenerate`);
+    for (const f of health.failures) console.log(`  - ${f}`);
+    console.log(rerankFailureAdvice(health));
   } else if (health.ok) {
     console.log(`${c.green}✓ Reranker healthy${c.reset} — coverage ${health.pairsScored}/${health.pairsTotal}, 0 inversions, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min logit margin ${health.minLogitMargin.toFixed(2)} ≥ ${health.thresholds.discrimLogitMargin}`);
   } else {
