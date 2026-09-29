@@ -14,6 +14,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import pg from "pg";
+import { assertNotProductionDatabase, PG_TEST_SETUP_TIMEOUT_MS } from "./pg-test-schema.ts";
 import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -94,6 +95,8 @@ d("PG vault isolation", () => {
     try {
       const c = await p.connect();
       try {
+        // vn4rz.73: never run migration DDL against a production vault database.
+        await assertNotProductionDatabase(c);
         // The extensions are bootstrap's job in production
         // (infra/clawmem-pg/bootstrap/1?-*.sql), not the migrations' — a fresh
         // ephemeral database has neither, so the fixture stands them up itself.
@@ -147,7 +150,7 @@ d("PG vault isolation", () => {
     setEnv("CLAWMEM_PG_URL", dbUrl(SFW_DB));
     setEnv("CLAWMEM_PG_NSFW_URL", dbUrl(NSFW_DB));
     resetVaultCache();
-  });
+  }, PG_TEST_SETUP_TIMEOUT_MS);
 
   afterAll(async () => {
     await closePool();

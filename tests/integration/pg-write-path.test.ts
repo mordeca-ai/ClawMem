@@ -19,6 +19,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import pg from "pg";
+import { createPgTestSchema, PG_TEST_SETUP_TIMEOUT_MS, type PgTestSchema } from "./pg-test-schema.ts";
 import { readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
@@ -57,32 +58,28 @@ function vec(fill: number, n = DIM): number[] {
 d("PG write path", () => {
   let pool: pg.Pool;
   let schema: string;
+  let harness: PgTestSchema | undefined;
 
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: URL_ });
-    schema = `clawmem_test_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-    const c = await pool.connect();
-    try {
-      await c.query(`CREATE SCHEMA ${schema}`);
-      await c.query(`SET search_path TO ${schema}, public`);
-      for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
-        const sql = substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM);
-        await c.query(sql);
-      }
-    } finally {
-      c.release();
-    }
+    // vn4rz.73: guarded, single-transaction setup (tests/integration/pg-test-schema.ts).
+    harness = createPgTestSchema({
+      url: URL_!,
+      prefix: "clawmem_test",
+      dim: DIM,
+    });
+    ({ pool, schema } = harness);
+    await harness.setup();
     // THE POINT OF THE SCHEMA KNOB: from here on the REAL exported write
     // functions resolve their unqualified tables inside this throwaway schema,
     // so the suite exercises src/pg/write.ts itself rather than a copy of it.
     setPgSchema(schema);
-  });
+  }, PG_TEST_SETUP_TIMEOUT_MS);
 
   afterAll(async () => {
+    await harness?.settled(); // a timed-out beforeAll finishes before anything is torn down
     setPgSchema(null);
     await closePool();
-    if (schema) await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-    await pool.end();
+    await harness?.teardown(); // DROP SCHEMA … CASCADE + pool.end()
   });
 
   /** Run fn on a client pinned to the test schema. */

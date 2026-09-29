@@ -41,9 +41,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import pg from "pg";
-import { readFileSync, readdirSync } from "fs";
-import { join } from "path";
-import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
+import { createPgTestSchema, PG_TEST_SETUP_TIMEOUT_MS, type PgTestSchema } from "./pg-test-schema.ts";
 import { closePool, toVectorLiteral } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
 import { pgSearchVec, type PgVecEmbedder } from "../../src/pg/search.ts";
@@ -98,45 +96,44 @@ const pathsOf = (rs: { displayPath: string }[]) => rs.map(r => r.displayPath);
 d("PG hybrid (RRF) read path", () => {
   let pool: pg.Pool;
   let schema: string;
+  let harness: PgTestSchema | undefined;
 
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: URL_ });
-    schema = `clawmem_hybridtest_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-    const c = await pool.connect();
-    try {
-      await c.query(`CREATE SCHEMA ${schema}`);
-      await c.query(`SET search_path TO ${schema}, public`);
-      for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
-        await c.query(substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM));
-      }
-      // Fixtures by direct SQL: setup, not the code under test. `content` MUST
-      // land first — the FTS trigger reads the body out of it by hash.
-      for (const [i, fx] of FIXTURES.entries()) {
-        const hash = String(i).repeat(64).slice(0, 64);
-        await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, fx.body]);
-        await c.query(
-          `INSERT INTO documents (collection, path, title, hash, active) VALUES ($1, $2, $3, $4, true)`,
-          [fx.collection, fx.path, fx.title, hash],
-        );
-        if (fx.angleDeg !== undefined) {
+    // vn4rz.73: guarded, single-transaction setup (tests/integration/pg-test-schema.ts).
+    harness = createPgTestSchema({
+      url: URL_!,
+      prefix: "clawmem_hybridtest",
+      dim: DIM,
+      seed: async (c) => {
+        // Fixtures by direct SQL: setup, not the code under test. `content` MUST
+        // land first — the FTS trigger reads the body out of it by hash.
+        for (const [i, fx] of FIXTURES.entries()) {
+          const hash = String(i).repeat(64).slice(0, 64);
+          await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, fx.body]);
           await c.query(
-            `INSERT INTO content_vectors (hash, seq, pos, model, embedding)
-             VALUES ($1, 0, 0, $2, $3::vector)`,
-            [hash, VAULT_MODEL, toVectorLiteral(atAngle(fx.angleDeg))],
+            `INSERT INTO documents (collection, path, title, hash, active) VALUES ($1, $2, $3, $4, true)`,
+            [fx.collection, fx.path, fx.title, hash],
           );
+          if (fx.angleDeg !== undefined) {
+            await c.query(
+              `INSERT INTO content_vectors (hash, seq, pos, model, embedding)
+               VALUES ($1, 0, 0, $2, $3::vector)`,
+              [hash, VAULT_MODEL, toVectorLiteral(atAngle(fx.angleDeg))],
+            );
+          }
         }
-      }
-    } finally {
-      c.release();
-    }
+      },
+    });
+    ({ pool, schema } = harness);
+    await harness.setup();
     setPgSchema(schema);
-  });
+  }, PG_TEST_SETUP_TIMEOUT_MS);
 
   afterAll(async () => {
+    await harness?.settled(); // a timed-out beforeAll finishes before anything is torn down
     setPgSchema(null);
     await closePool();
-    if (schema) await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-    await pool.end();
+    await harness?.teardown(); // DROP SCHEMA … CASCADE + pool.end()
   });
 
   async function withSchema<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
