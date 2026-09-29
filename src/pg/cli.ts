@@ -22,6 +22,7 @@ import {
   dropLegacyDocumentRows, dropPartitionsBefore, listPartitions, loadOriginCollection,
 } from "./origin.ts";
 import { listCollections } from "../collections.ts";
+import { formatFrontmatterVocab } from "../indexer.ts";
 
 function flagValue(argv: string[], name: string): string | undefined {
   const i = argv.indexOf(name);
@@ -219,6 +220,11 @@ async function main() {
           );
           for (const [path, msg] of fmFailures) console.log(`    ${path}: ${msg}`);
         }
+        // The silent sibling of the line above (master-harness-wzwh8): the block
+        // parsed, but under keys the indexer never reads, so the title fell back
+        // to the first heading and content_type to filename inference.
+        const vocabLine = formatFrontmatterVocab(s.frontmatterVocab);
+        if (vocabLine) console.log(`  ${vocabLine}`);
         const backlog = Object.entries(s.contentTypeRetagBacklog);
         if (backlog.length > 0) {
           console.log(

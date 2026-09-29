@@ -58,7 +58,7 @@ import {
 import { formatSearchResults, type OutputFormat } from "./formatter.ts";
 import { runEval, IMPLEMENTED_PROFILES, EvalIntegrityError, type EvalProfile, type RunEvalResult } from "./eval/run.ts";
 import { GoldFileError } from "./eval/gold.ts";
-import { indexCollection, parseDocument, hashContent } from "./indexer.ts";
+import { indexCollection, parseDocument, hashContent, formatFrontmatterVocab, type IndexStats } from "./indexer.ts";
 import type { Store as StoreType } from "./store.ts";
 import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
@@ -275,6 +275,7 @@ async function cmdUpdate(args: string[]) {
     console.log(`${c.cyan}Indexing ${col.name}${c.reset} (${col.path})`);
     const stats = await indexCollection(s, col.name, col.path, col.pattern, { defaultContentType: col.content_type });
     console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged, ${c.red}-${stats.removed}${c.reset} removed`);
+    printFrontmatterVocab(stats);
   }
 
   // Auto-embed if --embed flag is set
@@ -2841,7 +2842,18 @@ async function cmdReindex(args: string[]) {
     console.log(`Indexing ${c.bold}${col.name}${c.reset} (${col.path})...`);
     const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich, force, defaultContentType: col.content_type });
     console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed`);
+    printFrontmatterVocab(stats);
   }
+}
+
+/**
+ * master-harness-wzwh8: per-collection count of parsed frontmatter blocks that
+ * declared no title / content_type. Covers only the files this pass PARSED —
+ * unchanged files skip parsing — so `reindex --force` gives the full count.
+ */
+function printFrontmatterVocab(stats: IndexStats): void {
+  const line = stats.frontmatterVocab ? formatFrontmatterVocab(stats.frontmatterVocab) : null;
+  if (line) console.log(`  ${c.yellow}${line}${c.reset} [new/changed files only]`);
 }
 
 // =============================================================================
