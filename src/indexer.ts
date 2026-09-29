@@ -44,6 +44,121 @@ export interface ParsedDocument {
    * presence, not off `meta` being empty.
    */
   frontmatterError?: FrontmatterParseFailure;
+  /**
+   * Which of the three frontmatter outcomes this document had
+   * (master-harness-wzwh8): no block at all, a block that parsed, or a block
+   * the parser refused (the vn4rz.34 case, which also sets frontmatterError).
+   */
+  frontmatter: "absent" | "parsed" | "failed";
+  /**
+   * Set ONLY when a block parsed cleanly but did not yield a usable `title`
+   * and/or `content_type` (master-harness-wzwh8). Diagnostic only: it never
+   * changes any `meta` value.
+   */
+  vocabGap?: FrontmatterVocabGap;
+}
+
+/**
+ * Frontmatter keys that look like a title / content type but that
+ * parseDocument does NOT read. Recorded so a gap count says WHY a document is
+ * title-less ("declared name:") rather than only THAT it is.
+ */
+export type UnconsumedFrontmatterKey = "name" | "type" | "metadata.type";
+
+/**
+ * A frontmatter block that parsed cleanly yet declared no usable `title` and/or
+ * no usable `content_type` (master-harness-wzwh8). Unlike vn4rz.34's parse
+ * failure there is no error here — the YAML is valid, it just uses keys the
+ * indexer never reads — which is exactly why it went uncounted.
+ */
+export interface FrontmatterVocabGap {
+  /** No string `title` — the stored title falls back to the first heading / filename. */
+  titleMissing: boolean;
+  /** No string `content_type` — falls back to the collection default / filename inference. */
+  contentTypeMissing: boolean;
+  /** Unconsumed look-alike keys the block DID declare, in fixed order. */
+  declaredKeys: UnconsumedFrontmatterKey[];
+}
+
+/**
+ * Per-collection fold of parseDocument outcomes (master-harness-wzwh8).
+ * `examined` counts every document folded in, whatever its outcome.
+ */
+export interface FrontmatterVocabCounts {
+  examined: number;
+  noFrontmatter: number;
+  unparseable: number;
+  titleless: number;
+  titlelessDeclaringName: number;
+  contentTypeless: number;
+  contentTypelessDeclaringType: number;
+  contentTypelessDeclaringMetadataType: number;
+}
+
+export function emptyFrontmatterVocabCounts(): FrontmatterVocabCounts {
+  return {
+    examined: 0, noFrontmatter: 0, unparseable: 0,
+    titleless: 0, titlelessDeclaringName: 0,
+    contentTypeless: 0, contentTypelessDeclaringType: 0, contentTypelessDeclaringMetadataType: 0,
+  };
+}
+
+/**
+ * Fold one parsed document into the collection counts. Pure, so both the
+ * sqlite indexer and `pg reindex` share one definition of what is counted.
+ */
+export function noteFrontmatterVocab(
+  counts: FrontmatterVocabCounts,
+  doc: Pick<ParsedDocument, "frontmatter" | "vocabGap">,
+): void {
+  counts.examined++;
+  if (doc.frontmatter === "absent") { counts.noFrontmatter++; return; }
+  if (doc.frontmatter === "failed") { counts.unparseable++; return; }
+  const gap = doc.vocabGap;
+  if (!gap) return;
+  if (gap.titleMissing) {
+    counts.titleless++;
+    if (gap.declaredKeys.includes("name")) counts.titlelessDeclaringName++;
+  }
+  if (gap.contentTypeMissing) {
+    counts.contentTypeless++;
+    if (gap.declaredKeys.includes("type")) counts.contentTypelessDeclaringType++;
+    if (gap.declaredKeys.includes("metadata.type")) counts.contentTypelessDeclaringMetadataType++;
+  }
+}
+
+/**
+ * One summary line, or null when no parsed block lacked a title/content_type
+ * (same report-only-when-non-zero convention as the vn4rz.34 counter).
+ */
+export function formatFrontmatterVocab(c: FrontmatterVocabCounts): string | null {
+  if (c.titleless === 0 && c.contentTypeless === 0) return null;
+  return (
+    `frontmatter: ${c.titleless} title-less (${c.titlelessDeclaringName} declare name:), ` +
+    `${c.contentTypeless} content_type-less (${c.contentTypelessDeclaringType} declare type:, ` +
+    `${c.contentTypelessDeclaringMetadataType} declare metadata.type); ` +
+    `${c.noFrontmatter} without frontmatter, ${c.unparseable} unparseable (of ${c.examined} examined)`
+  );
+}
+
+/** Build the gap record from gray-matter's `data`; undefined when there is no gap. */
+function frontmatterVocabGap(
+  data: unknown,
+  title: string | undefined,
+  contentType: string | undefined,
+): FrontmatterVocabGap | undefined {
+  if (title !== undefined && contentType !== undefined) return undefined;
+  const declaredKeys: UnconsumedFrontmatterKey[] = [];
+  if (data !== null && typeof data === "object" && !Array.isArray(data)) {
+    const d = data as Record<string, unknown>;
+    if (d.name != null) declaredKeys.push("name");
+    if (d.type != null) declaredKeys.push("type");
+    const m = d.metadata;
+    if (m !== null && typeof m === "object" && !Array.isArray(m) && (m as Record<string, unknown>).type != null) {
+      declaredKeys.push("metadata.type");
+    }
+  }
+  return { titleMissing: title === undefined, contentTypeMissing: contentType === undefined, declaredKeys };
 }
 
 export interface DocumentMeta {
@@ -94,6 +209,14 @@ export interface IndexStats {
   removed: number;
   /** §51.1: dated-only metadata transitions (authored_at set without touching modified_at / A-MEM) */
   dated: number;
+  /**
+   * master-harness-wzwh8: frontmatter vocabulary gaps among the documents this
+   * pass actually PARSED (new, changed, reactivated, or every file under
+   * `--force`). Unchanged files take the content-hash short-circuit and are not
+   * parsed, so an incremental pass reports only what it touched. Optional so
+   * callers that build their own aggregate IndexStats keep compiling.
+   */
+  frontmatterVocab?: FrontmatterVocabCounts;
 }
 
 // =============================================================================
@@ -172,9 +295,19 @@ export function parseDocument(content: string, relativePath: string, defaultCont
     // report a clean parse for a malformed document.
     // Passing an options object takes the uncached path. Parsing is otherwise
     // unchanged: gray-matter fills every default from `{}`.
-    const { data, content: body } = matter(content, {});
+    const parsed = matter(content, {});
+    const { data, content: body } = parsed;
+    // master-harness-wzwh8: was a block PRESENT? gray-matter reports "---\n---"
+    // with matter === "" but isEmpty === true, and no block at all as
+    // matter === "" with isEmpty false.
+    const blockPresent = parsed.matter !== "" || (parsed as { isEmpty?: boolean }).isEmpty === true;
+    const vocabGap = blockPresent
+      ? frontmatterVocabGap(data, str(data.title), str(data.content_type))
+      : undefined;
     return {
       body,
+      frontmatter: blockPresent ? "parsed" : "absent",
+      ...(vocabGap ? { vocabGap } : {}),
       meta: {
         title: str(data.title),
         description: str(data.description),
@@ -225,6 +358,7 @@ export function parseDocument(content: string, relativePath: string, defaultCont
         content_type: (defaultContentType as ContentType | undefined) || inferContentType(relativePath),
       },
       frontmatterError: { path: relativePath, message },
+      frontmatter: "failed",
     };
   }
 }
@@ -303,7 +437,8 @@ export async function indexCollection(
       `it cannot be reconciled against a root.`,
     );
   }
-  const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0 };
+  const frontmatterVocab = emptyFrontmatterVocabCounts();
+  const stats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0, frontmatterVocab };
   const activePaths = new Set<string>();
 
   // importMode: an additive DB-born ingest routed through the filesystem pipeline via a
@@ -418,7 +553,9 @@ export async function indexCollection(
         // only. modified_at is preserved, stored confidence stays untouched,
         // and no A-MEM enrichment is queued — re-mining an existing vault dates
         // documents without operational side-effects.
-        const { body, meta } = parseDocument(content, relativePath, options?.defaultContentType);
+        const parsedDoc = parseDocument(content, relativePath, options?.defaultContentType);
+        noteFrontmatterVocab(frontmatterVocab, parsedDoc);
+        const { body, meta } = parsedDoc;
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
         const docHash = hashContent(body);
         const contentType = meta.content_type || inferContentType(relativePath);
@@ -504,7 +641,9 @@ export async function indexCollection(
         }
         const inactive = inactiveRow;
 
-        const { body, meta } = parseDocument(content, relativePath, options?.defaultContentType);
+        const parsedDoc = parseDocument(content, relativePath, options?.defaultContentType);
+        noteFrontmatterVocab(frontmatterVocab, parsedDoc);
+        const { body, meta } = parsedDoc;
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
         const docHash = hashContent(body);
         const contentType = meta.content_type || inferContentType(relativePath);

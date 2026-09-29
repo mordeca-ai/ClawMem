@@ -38,8 +38,8 @@ import { readFileSync, statSync } from "fs";
 import { join } from "path";
 import {
   authoredAtFromFrontmatter, computeQualityScore, extractTitle, hashContent, parseDocument,
-  shouldExclude,
-  type FrontmatterParseFailure,
+  shouldExclude, emptyFrontmatterVocabCounts, noteFrontmatterVocab,
+  type FrontmatterParseFailure, type FrontmatterVocabCounts,
 } from "../indexer.ts";
 import { listCollections } from "../collections.ts";
 import { getDefaultLlamaCpp, formatDocForEmbedding } from "../llm.ts";
@@ -106,6 +106,15 @@ export interface ReindexStats {
    * decay curve), and had their raw YAML embedded as body prose.
    */
   frontmatterParseFailures: Record<string, string>;
+  /**
+   * Documents whose frontmatter PARSED but declared no usable `title` and/or
+   * `content_type`, with the look-alike keys they used instead (name:, type:,
+   * metadata.type) — master-harness-wzwh8. The silent sibling of
+   * frontmatterParseFailures above: valid YAML under keys the indexer never
+   * reads, so the declared value is dropped with no error to count. Counts
+   * only (not path-keyed): the steady-state number is in the thousands.
+   */
+  frontmatterVocab: FrontmatterVocabCounts;
   /**
    * Files the glob matched but shouldExclude() rejected as out-of-default-scope,
    * path -> the segment that triggered the rejection (master-harness-vn4rz.7 pass D).
@@ -286,7 +295,8 @@ export async function reindexCollection(
   const stats: ReindexStats = {
     collection: name, filesSeen: files.length, documentsWritten: 0,
     fragmentsEmbedded: 0, embedFailures: 0, contentTypeRetagBacklog: {},
-    frontmatterParseFailures: {}, skippedOutOfScope: {},
+    frontmatterParseFailures: {}, frontmatterVocab: emptyFrontmatterVocabCounts(),
+    skippedOutOfScope: {},
     documentsDeactivated: 0, deactivatedPaths: [], sweepSkippedReason: null,
     wallClockMs: 0,
   };
@@ -411,10 +421,13 @@ export async function reindexCollection(
       continue;
     }
     const hash = hashContent(raw);
-    const { body, meta, frontmatterError } = parseDocument(raw, rel);
+    const parsedDoc = parseDocument(raw, rel);
+    const { body, meta, frontmatterError } = parsedDoc;
     // parseDocument already emitted the per-file warning; this is the COUNT
     // that reaches the summary (vn4rz.34).
     noteFrontmatterFailure(stats, rel, frontmatterError);
+    // And the silent sibling: parsed, but no title / content_type (wzwh8).
+    noteFrontmatterVocab(stats.frontmatterVocab, parsedDoc);
     const title = meta.title ?? extractTitle(raw, rel);
 
     // The retag backlog: counted here so the enum decision has a number attached
