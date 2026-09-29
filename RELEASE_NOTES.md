@@ -4,6 +4,16 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.34 — Count frontmatter that parses but declares no title/content_type
+
+Frontmatter written in another vocabulary (`name:`, `type:`, `metadata.type`) parses cleanly, but `parseDocument` reads only `title:` and `content_type:`. Those documents were indexed with no title and a fallback content_type, and nothing counted it. On the live memory-topics collection, all 416 documents with frontmatter are affected.
+
+- `parseDocument` now reports `frontmatter` (`absent` / `parsed` / `failed`) and, when a parsed block lacks `title` or `content_type`, a `vocabGap` naming which of `name` / `type` / `metadata.type` it declared instead.
+- `update`/`reindex` (sqlite, new/changed files only) and pg `reindex` (every file) print a per-collection `frontmatter:` summary line next to the vn4rz.34 unparseable counter.
+- No change to indexed values: titles, content_type and scores are identical. Which vocabulary is canonical is still an open decision (master-harness-wzwh8.1).
+
+---
+
 ## v0.36.33 — Session id resolves from CLAUDE_CODE_SESSION_ID
 
 `clawmem focus` and the session-focus collection scope on `search`/`vsearch`/`query` read the session id from `CLAUDE_SESSION_ID`, which Claude Code never sets (it injects `CLAUDE_CODE_SESSION_ID`). Inside a Claude Code session, `clawmem focus` without `--session-id` died with "No session id", and direct searches never picked up the session's focus scope. Hook paths were unaffected because hook wrappers write `CLAUDE_SESSION_ID` from the payload.
