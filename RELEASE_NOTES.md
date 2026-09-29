@@ -4,6 +4,15 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.33 — Session id resolves from CLAUDE_CODE_SESSION_ID
+
+`clawmem focus` and the session-focus collection scope on `search`/`vsearch`/`query` read the session id from `CLAUDE_SESSION_ID`, which Claude Code never sets (it injects `CLAUDE_CODE_SESSION_ID`). Inside a Claude Code session, `clawmem focus` without `--session-id` died with "No session id", and direct searches never picked up the session's focus scope. Hook paths were unaffected because hook wrappers write `CLAUDE_SESSION_ID` from the payload.
+
+- New `resolveEnvSessionId` (`src/session-focus.ts`) reads `CLAUDE_CODE_SESSION_ID`, then `CLAUDE_SESSION_ID`, then `CLAWMEM_SESSION_ID`, skipping blanks. Both CLI call sites use it; `--session-id` still wins.
+- Docs (`cli.md`, `hooks-vs-mcp.md`, `upgrading.md`) no longer claim Claude Code exposes `CLAUDE_SESSION_ID`.
+
+---
+
 ## v0.36.32 — index-serve classified hydrate; memoize getContextForFile
 
 - `hydrateVecResultsClassified` now filters on the indexed `cv.hash` column instead of the computed `cv.hash || "_" || cv.seq` expression, so its query plan is `SEARCH d USING INDEX idx_documents_hash` rather than a full scan of `documents` (the same fix hxa17 made to `hydrateVecResults`).

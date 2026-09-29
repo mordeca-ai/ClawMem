@@ -96,6 +96,7 @@ import {
   clearSessionFocus,
   focusFilePath,
   resolveSessionTopic,
+  resolveEnvSessionId,
 } from "./session-focus.ts";
 import { computeCollectionScope, type CollectionScope } from "./collection-scope.ts";
 import { createBackup } from "./backup.ts";
@@ -1457,7 +1458,8 @@ async function cmdList(args: string[]) {
  * on an unknown -c name.
  *
  * Session id is resolved (for focus only) from the explicit --session-id arg,
- * then CLAUDE_SESSION_ID (Claude Code exposes this), then CLAWMEM_SESSION_ID.
+ * then the environment via resolveEnvSessionId (CLAUDE_CODE_SESSION_ID, which
+ * Claude Code injects, then CLAUDE_SESSION_ID, then CLAWMEM_SESSION_ID).
  * Any missing id / unset focus is fail-open (unscoped).
  */
 function resolveCollectionScope(
@@ -1465,11 +1467,7 @@ function resolveCollectionScope(
   sessionIdArg: string | undefined,
 ): CollectionScope | undefined {
   const knownNames = collectionsList().map(c => c.name);
-  const sid =
-    (sessionIdArg?.trim() ||
-      process.env.CLAUDE_SESSION_ID ||
-      process.env.CLAWMEM_SESSION_ID ||
-      "").trim() || undefined;
+  const sid = sessionIdArg?.trim() || resolveEnvSessionId();
   const focus = resolveSessionTopic(sid, process.env.CLAWMEM_SESSION_FOCUS);
   const result = computeCollectionScope(flag, focus, knownNames);
   if (result && "error" in result) die(result.error);
@@ -3575,16 +3573,12 @@ async function cmdFocus(args: string[]) {
   function resolveSessionId(rest: string[]): string {
     const sidIdx = rest.indexOf("--session-id");
     if (sidIdx >= 0 && rest[sidIdx + 1]) return rest[sidIdx + 1]!;
-    const envSid = (
-      process.env.CLAUDE_SESSION_ID ||
-      process.env.CLAWMEM_SESSION_ID ||
-      ""
-    ).trim();
+    const envSid = resolveEnvSessionId();
     if (envSid) return envSid;
     die(
-      "No session id. Pass --session-id <id>, or set CLAUDE_SESSION_ID " +
-        "(Claude Code exposes this) or CLAWMEM_SESSION_ID env var before " +
-        "invoking this command."
+      "No session id. Pass --session-id <id>, or set CLAUDE_CODE_SESSION_ID " +
+        "(Claude Code sets this in its sessions), CLAUDE_SESSION_ID or " +
+        "CLAWMEM_SESSION_ID before invoking this command."
     );
   }
 

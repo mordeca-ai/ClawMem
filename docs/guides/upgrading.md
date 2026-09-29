@@ -541,7 +541,7 @@ No configuration required. You can verify the block appears by running `echo "te
 Three new subcommands write a per-session focus file that steers context-surfacing for that session only:
 
 ```bash
-clawmem focus set "authentication flow"                       # uses CLAUDE_SESSION_ID env var
+clawmem focus set "authentication flow"                       # uses CLAUDE_CODE_SESSION_ID env var
 clawmem focus set "authentication flow" --session-id abc123   # explicit
 clawmem focus show --session-id abc123
 clawmem focus clear --session-id abc123
