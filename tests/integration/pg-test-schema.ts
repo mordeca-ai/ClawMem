@@ -55,6 +55,14 @@ export const PRODUCTION_VAULT_DATABASES: readonly string[] = ["clawmem", "clawme
 export const ALLOW_PRODUCTION_ENV = "CLAWMEM_PG_TEST_ALLOW_PRODUCTION";
 /** bun beforeAll timeout for any hook that applies the migrations. */
 export const PG_TEST_SETUP_TIMEOUT_MS = 120_000;
+/**
+ * bun afterAll timeout for any hook that runs DROP DATABASE. DROP DATABASE forces an
+ * immediate checkpoint, so its latency scales with every dirty buffer on the shared
+ * server, not with the test: the 2026-09-29 nightly full sweep measured a 9.0s
+ * checkpoint and a 9.6s DROP, past bun's 5s default. The hook timed out, and the
+ * second vault database was never dropped (master-harness-83qk0.120).
+ */
+export const PG_TEST_TEARDOWN_TIMEOUT_MS = 120_000;
 /** Functions every fully-migrated schema must contain (the 2026-09-29 victims). */
 export const EXPECTED_SCHEMA_FUNCTIONS: readonly string[] = [
   "documents_fts_refresh",
