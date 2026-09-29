@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.37 — PG teardown hooks that DROP DATABASE get an explicit 120s timeout
+
+Nightly full sweep 2026-09-29 went RED on clawmem-pg-vault: pg-vault-isolation afterAll timed out at bun's 5s default because DROP DATABASE forced a 9.0s checkpoint (9.6s statement) and leaked the nsfw throwaway DB. Adds PG_TEST_TEARDOWN_TIMEOUT_MS=120s to pg-vault-isolation and pg-content-type-enum teardowns, plus tests/unit/pg-teardown-timeout-guard.test.ts (RED when a DROP DATABASE teardown lacks a >=60s timeout).
+
+---
+
 ## v0.36.36 — clawmem PG integration suites can redefine the REAL database's public functions when a beforeAll times out (search_path fallback to public + afterAll DROP SCHEMA race)
 
 PG integration suites: production-vault guard, schema+migrations in one txn with SET LOCAL search_path (no public fallback), teardown awaits in-flight setup, 120s beforeAll timeouts; race regression test.

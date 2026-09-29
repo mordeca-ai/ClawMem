@@ -23,7 +23,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import pg from "pg";
-import { assertNotProductionDatabase, PG_TEST_SETUP_TIMEOUT_MS } from "./pg-test-schema.ts";
+import { assertNotProductionDatabase, PG_TEST_SETUP_TIMEOUT_MS, PG_TEST_TEARDOWN_TIMEOUT_MS } from "./pg-test-schema.ts";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
@@ -263,7 +263,7 @@ dbDescribe("003 against an ephemeral database", () => {
       await admin.query(`DROP DATABASE IF EXISTS ${dbName}`);
       await admin.end();
     }
-  });
+  }, PG_TEST_TEARDOWN_TIMEOUT_MS);
 
   async function withEphemeral<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
     const c = await ephemeral.connect();

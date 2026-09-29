@@ -14,7 +14,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import pg from "pg";
-import { assertNotProductionDatabase, PG_TEST_SETUP_TIMEOUT_MS } from "./pg-test-schema.ts";
+import { assertNotProductionDatabase, PG_TEST_SETUP_TIMEOUT_MS, PG_TEST_TEARDOWN_TIMEOUT_MS } from "./pg-test-schema.ts";
 import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -166,7 +166,7 @@ d("PG vault isolation", () => {
       }
       await admin.end();
     }
-  });
+  }, PG_TEST_TEARDOWN_TIMEOUT_MS);
 
   // =========================================================================
   // The core assertion: private content lands in the nsfw database ONLY
