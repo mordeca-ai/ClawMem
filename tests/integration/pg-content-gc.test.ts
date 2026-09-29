@@ -13,9 +13,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import pg from "pg";
-import { readFileSync, readdirSync } from "fs";
-import { join } from "path";
-import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
+import { createPgTestSchema, PG_TEST_SETUP_TIMEOUT_MS, type PgTestSchema } from "./pg-test-schema.ts";
 import { closePool, toVectorLiteral } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
 import {
@@ -34,32 +32,25 @@ const d = URL_ ? describe : describe.skip;
 d("PG content GC", () => {
   let pool: pg.Pool;
   let schema: string;
+  let harness: PgTestSchema | undefined;
 
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: URL_ });
-    schema = `clawmem_test_gc_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-    const c = await pool.connect();
-    try {
-      await c.query(`CREATE SCHEMA ${schema}`);
-      await c.query(`SET search_path TO ${schema}, public`);
-      for (const f of readdirSync(MIGRATIONS_DIR)
-        .filter((f) => f.endsWith(".sql"))
-        .sort()) {
-        await c.query(
-          substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM),
-        );
-      }
-    } finally {
-      c.release();
-    }
+    // vn4rz.73: guarded, single-transaction setup (tests/integration/pg-test-schema.ts).
+    harness = createPgTestSchema({
+      url: URL_!,
+      prefix: "clawmem_test_gc",
+      dim: DIM,
+    });
+    ({ pool, schema } = harness);
+    await harness.setup();
     setPgSchema(schema);
-  });
+  }, PG_TEST_SETUP_TIMEOUT_MS);
 
   afterAll(async () => {
+    await harness?.settled(); // a timed-out beforeAll finishes before anything is torn down
     setPgSchema(null);
     await closePool();
-    if (schema) await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-    await pool.end();
+    await harness?.teardown(); // DROP SCHEMA … CASCADE + pool.end()
   });
 
   async function q<T extends pg.QueryResultRow>(sql: string, params: unknown[] = []): Promise<T[]> {
