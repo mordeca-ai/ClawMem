@@ -291,7 +291,7 @@ Replays gold-labeled queries through the real `query` tool handler and scores re
 Per-session topic biasing for the context-surfacing hook. Writes a focus file at `~/.cache/clawmem/sessions/<session_id>.focus` that steers query expansion, reranking, snippet extraction, and applies a post-composite-score topic boost (1.4× match, 0.75× demote, NO-OP on zero matches). Session-scoped — never writes to SQLite or mutates any lifecycle column.
 
 ```bash
-clawmem focus set "<topic>"                        # uses CLAUDE_SESSION_ID / CLAWMEM_SESSION_ID env
+clawmem focus set "<topic>"                        # uses CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID / CLAWMEM_SESSION_ID env
 clawmem focus set "<topic>" --session-id <id>      # explicit session id
 clawmem focus show                                 # reads session id from env
 clawmem focus show --session-id <id>
@@ -299,7 +299,7 @@ clawmem focus clear                                # uses env-resolved session i
 clawmem focus clear --session-id <id>
 ```
 
-The session ID is resolved from `--session-id <id>`, then `CLAUDE_SESSION_ID`, then `CLAWMEM_SESSION_ID`. `CLAWMEM_SESSION_FOCUS` env var is a debug-only override that does NOT provide per-session scoping on multi-session hosts. `CLAWMEM_FOCUS_ROOT` overrides the focus file root directory for hermetic testing.
+The session ID is resolved from `--session-id <id>`, then `CLAUDE_CODE_SESSION_ID` (set by Claude Code), then `CLAUDE_SESSION_ID`, then `CLAWMEM_SESSION_ID`. `CLAWMEM_SESSION_FOCUS` env var is a debug-only override that does NOT provide per-session scoping on multi-session hosts. `CLAWMEM_FOCUS_ROOT` overrides the focus file root directory for hermetic testing.
 
 ## Environment variables
 

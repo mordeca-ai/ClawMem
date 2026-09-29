@@ -84,7 +84,7 @@ clawmem focus show --session-id abc123
 clawmem focus clear --session-id abc123
 ```
 
-The session ID is resolved from `--session-id <id>`, then `CLAUDE_SESSION_ID`, then `CLAWMEM_SESSION_ID` — Claude Code exposes `CLAUDE_SESSION_ID` natively so the env-var path works automatically inside a Claude Code session. The focus file lives at `~/.cache/clawmem/sessions/<session_id>.focus`.
+The session ID is resolved from `--session-id <id>`, then `CLAUDE_CODE_SESSION_ID`, then `CLAUDE_SESSION_ID`, then `CLAWMEM_SESSION_ID` — Claude Code sets `CLAUDE_CODE_SESSION_ID` in every session (it does not set `CLAUDE_SESSION_ID`; hook wrappers may), so the env-var path works automatically inside a Claude Code session. The focus file lives at `~/.cache/clawmem/sessions/<session_id>.focus`.
 
 When a focus topic is active:
 
