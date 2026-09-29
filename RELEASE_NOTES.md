@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.36 — clawmem PG integration suites can redefine the REAL database's public functions when a beforeAll times out (search_path fallback to public + afterAll DROP SCHEMA race)
+
+PG integration suites: production-vault guard, schema+migrations in one txn with SET LOCAL search_path (no public fallback), teardown awaits in-flight setup, 120s beforeAll timeouts; race regression test.
+
+---
+
 ## v0.36.35 — doctor: unreachable reranker is not degenerate
 
 `clawmem doctor` and `clawmem rerank-health` now report an unreachable reranker as **UNREACHABLE** instead of "FAILED discrimination probe". Previously an outage (every probe request failing, no local fallback) left zero observed scores, which the calibration arm misread as a score collapse and answered with the zerank-2 "re-deploy the seq-cls sidecar" advice. The probe result gains `probeErrors` and `unreachable`; the calibration arm now judges observed scores only; partial transport errors get their own advice ahead of the coverage arm. Exit codes are unchanged (master-harness-xso4y).
