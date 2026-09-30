@@ -20,21 +20,24 @@
  *  - "the budget is one deadline that DECREMENTS" is proven by (a) a hybrid
  *    that eats the whole deadline, which must leave the reranker's call count
  *    at ZERO (the count, not just the status), (b) the timeoutMs the reranker
- *    actually receives being the REMAINDER and strictly less than the
- *    deadline, and (c) totalMs staying inside deadlineMs + slack even when the
- *    reranker overruns. Hand the reranker the full deadline instead of the
- *    remainder and (b) and (c) both go red.
+ *    actually receives being EXACTLY the remainder, and (c) totalMs staying
+ *    inside deadlineMs even when the reranker overruns. Hand the reranker the
+ *    full deadline instead of the remainder and (b) and (c) both go red.
  *  - "blendRerank, not blendFusionAndRerank" is proven by the partial-coverage
  *    case (a reranker returning a subset must not DROP the unscored
  *    documents — blendFusionAndRerank maps over the rerank output and would)
  *    and by the degenerate case (the floor + onFallback hook, which
  *    blendFusionAndRerank has no equivalent of).
  *
- * The timing cases use deliberately coarse sleeps and a generous slack so they
- * assert the ARITHMETIC rather than the scheduler.
+ * The timing cases assert the ARITHMETIC, not the scheduler: a FAKE CLOCK is
+ * injected through the `now` seam and every "slow" stage ADVANCES it instead of
+ * sleeping, so every budget and every reported timing is an exact number.
+ * (master-harness-vn4rz.78: the previous real sleeps + a fixed 300 ms slack
+ * flaked the lander's `bun test` gate under host load.) The real-clock
+ * behaviour is covered by tests/integration/pg-search-reranked.test.ts.
  */
 
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, beforeEach } from "bun:test";
 import {
   pgSearchReranked,
   pgSearchRerankedDetailed,
@@ -50,10 +53,36 @@ import type { PgHybridArms } from "../../src/pg/search-hybrid.ts";
 import type { SearchResult } from "../../src/store.ts";
 
 const MODEL = "embeddinggemma";
-/** Timing slack, ms. Coarse on purpose: these cases assert arithmetic, not the scheduler. */
-const SLACK = 300;
 
-const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+/** A fake monotonic clock, handed to the code under test as `now`. */
+type FakeClock = { now: () => number; advance: (ms: number) => void };
+function fakeClock(start = 1_000_000): FakeClock {
+  let t = start;
+  return { now: () => t, advance: (ms) => { t += ms; } };
+}
+let clock: FakeClock = fakeClock();
+beforeEach(() => { clock = fakeClock(); });
+
+/**
+ * Run `fn` with setTimeout swapped for a FAKE TIMER: each timer records the
+ * delay the code armed, advances the fake clock by it (the time "passes") and
+ * fires on the next macrotask. A timer cleared before then never fires and
+ * never advances the clock. Needed because the clock seam does not route
+ * timers — the rerank race in withDeadline is a real setTimeout.
+ */
+async function withFakeTimers<T>(fn: (armed: number[]) => Promise<T>): Promise<T> {
+  const realSetTimeout = globalThis.setTimeout;
+  const armed: number[] = [];
+  globalThis.setTimeout = ((cb: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+    armed.push(Number(ms));
+    return realSetTimeout(() => { clock.advance(Number(ms)); cb(...rest); }, 0);
+  }) as typeof setTimeout;
+  try {
+    return await fn(armed);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+}
 
 // ===========================================================================
 // Fakes: one client serving both arms, plus a recording reranker
@@ -69,7 +98,7 @@ type ArmPlan = {
   vecThrows?: Error;
   ftsThrows?: Error;
   embedder?: PgVecEmbedder;
-  /** Wall clock the vec ANN leg burns — how the hybrid is made to eat the deadline. */
+  /** Fake-clock time the vec ANN leg costs — how the hybrid is made to eat the deadline. */
   vecDelayMs?: number;
 };
 
@@ -97,7 +126,7 @@ function hybridClient(plan: ArmPlan = {}): PgQueryable {
         return { rows: (plan.vecModels ?? [MODEL]).map(model => ({ model })) as never[] };
       }
       if (text.includes("<=>")) {
-        if (plan.vecDelayMs) await sleep(plan.vecDelayMs);
+        if (plan.vecDelayMs) clock.advance(plan.vecDelayMs);
         if (plan.vecThrows) throw plan.vecThrows;
         return { rows: (plan.vecRows ?? []) as never[] };
       }
@@ -121,12 +150,20 @@ type Recorder = {
 /** A reranker that records every call, then answers via `score`. */
 function recording(
   score: (doc: { file: string; text: string }, i: number) => { file: string; score: number }[] | number | undefined,
-  behaviour: { sleepMs?: number; throws?: Error; subsetOf?: (files: string[]) => string[] } = {},
+  behaviour: {
+    /** Fake-clock time the rerank costs. */
+    sleepMs?: number;
+    /** Never settle, ignoring timeoutMs AND the signal — only the race can end it. */
+    hangs?: boolean;
+    throws?: Error;
+    subsetOf?: (files: string[]) => string[];
+  } = {},
 ): Recorder {
   const calls: Recorder["calls"] = [];
   const reranker: PgReranker = async (query, documents, opts) => {
     calls.push({ query, documents, ...(opts?.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }) });
-    if (behaviour.sleepMs) await sleep(behaviour.sleepMs);
+    if (behaviour.sleepMs) clock.advance(behaviour.sleepMs);
+    if (behaviour.hangs) await new Promise<never>(() => {});
     if (behaviour.throws) throw behaviour.throws;
     const files = behaviour.subsetOf ? behaviour.subsetOf(documents.map(d => d.file)) : documents.map(d => d.file);
     return files.map((file, i) => {
@@ -158,7 +195,7 @@ const THREE: ArmPlan = {
 
 function run(plan: ArmPlan = THREE, opts: Record<string, unknown> = {}) {
   return pgSearchRerankedDetailed(hybridClient(plan), "zebrafish", {
-    collections: "research", embedder: plan.embedder ?? embedder, ...opts,
+    collections: "research", embedder: plan.embedder ?? embedder, now: clock.now, ...opts,
   });
 }
 
@@ -288,10 +325,13 @@ describe("pgSearchRerankedDetailed — the status matrix", () => {
     expect(out.hybrid.armFailures).toEqual([
       { arm: "fts", kind: "degraded", reason: "budget-exhausted" },
     ]);
-    expect(out.rerankReason).toContain(`${PG_RERANK_MIN_BUDGET_MS}ms floor`);
-    // …and the call did not run long past its budget waiting to discover that.
-    expect(out.timings.totalMs).toBeLessThanOrEqual(100 + SLACK);
-    expect(out.timings.hybridMs).toBeGreaterThanOrEqual(100);
+    expect(out.rerankReason).toBe(
+      `-20ms left of a 100ms deadline, below the ${PG_RERANK_MIN_BUDGET_MS}ms floor`,
+    );
+    // …and the call did not run past its budget waiting to discover that: the
+    // hybrid's 120 ms is the WHOLE call, not a millisecond spent after it.
+    expect(out.timings.hybridMs).toBe(120);
+    expect(out.timings.totalMs).toBe(out.timings.hybridMs);
   });
 
   it("degenerate: every score at/below the floor ⇒ onFallback becomes the STATUS", async () => {
@@ -361,35 +401,39 @@ describe("pgSearchRerankedDetailed — the decrementing deadline", () => {
     const out = await run({ ...THREE, vecDelayMs: 300 }, { reranker: rr.reranker, deadlineMs });
     expect(rr.calls).toHaveLength(1);
     const handed = rr.calls[0]!.timeoutMs!;
-    // Strictly less than the deadline by roughly the hybrid's own cost. Pass
+    // Less than the deadline by EXACTLY the hybrid's own cost. Pass
     // `deadlineMs` here instead of `remaining` and this goes red.
-    expect(handed).toBeLessThan(deadlineMs);
-    expect(handed).toBeLessThanOrEqual(deadlineMs - out.timings.hybridMs + 1);
-    expect(handed).toBeGreaterThan(deadlineMs - out.timings.hybridMs - SLACK);
+    expect(out.timings.hybridMs).toBe(300);
+    expect(handed).toBe(deadlineMs - out.timings.hybridMs);
+    expect(handed).toBe(700);
   });
 
   it("an OVERRUNNING reranker fails inside the deadline rather than blowing it", async () => {
-    // The reranker ignores its timeoutMs and sleeps past the remainder. The
-    // call must still land inside deadlineMs: hand it the full deadline and
-    // both assertions here go red (status would be "applied", totalMs > budget).
-    const rr = recording(() => 0.9, { sleepMs: 600 });
+    // The reranker ignores its timeoutMs AND its signal and never answers, so
+    // only the race timer can end the stage. The call must still land inside
+    // deadlineMs: hand the race the full deadline and the armed delay, the
+    // reason and totalMs here all go red (700 armed, totalMs 1000 > budget).
+    const rr = recording(() => 0.9, { hangs: true });
     const deadlineMs = 700;
-    const out = await run({ ...THREE, vecDelayMs: 300 }, { reranker: rr.reranker, deadlineMs });
+    const out = await withFakeTimers(async armed => {
+      const o = await run({ ...THREE, vecDelayMs: 300 }, { reranker: rr.reranker, deadlineMs });
+      expect(armed.at(-1)).toBe(400); // the rerank race: 700 - the 300 ms hybrid
+      return o;
+    });
     expect(out.rerank).toBe("failed");
-    expect(out.rerankReason).toContain("remaining budget");
-    expect(out.timings.totalMs).toBeLessThanOrEqual(deadlineMs + SLACK);
+    expect(out.rerankReason).toBe("pg rerank exceeded its remaining budget of 400ms");
+    expect(out.timings.totalMs).toBe(deadlineMs); // inside it, to the millisecond
   });
 
   it("reports measured stage timings that ADD UP", async () => {
     const rr = recording(() => 0.9, { sleepMs: 40 });
     const out = await run({ ...THREE, vecDelayMs: 60 }, { reranker: rr.reranker, deadlineMs: 2000 });
     expect(out.rerank).toBe("applied");
-    expect(out.timings.hybridMs).toBeGreaterThanOrEqual(60);
-    expect(out.timings.rerankMs).toBeGreaterThanOrEqual(40);
+    expect(out.timings.hybridMs).toBe(60);
+    expect(out.timings.rerankMs).toBe(40);
     // The whole point of returning these: the budget is ADDITIVE and readable,
-    // not inferred.
-    expect(out.timings.totalMs).toBeGreaterThanOrEqual(out.timings.hybridMs + out.timings.rerankMs);
-    expect(out.timings.totalMs).toBeLessThanOrEqual(out.timings.hybridMs + out.timings.rerankMs + SLACK);
+    // not inferred. On the fake clock the sum is exact, not "within slack".
+    expect(out.timings.totalMs).toBe(out.timings.hybridMs + out.timings.rerankMs);
   });
 
   it("the DEFAULT deadline is what an omitted deadlineMs means", async () => {

@@ -210,6 +210,18 @@ export interface PgSearchVecOptions {
    */
   deadlineAt?: number;
   /**
+   * TEST SEAM for every clock reading this call takes (master-harness-vn4rz.78).
+   * Omitted ⇒ the real clocks, exactly as before (`Date.now()` for the
+   * `timeoutMs` budget, `performance.now()` for `deadlineAt`). Injected ⇒ this one
+   * function replaces them all, and any `deadlineAt` must be an instant on IT.
+   * Only differences between readings matter, so it need not share an epoch
+   * with either real clock. Timers (setTimeout / AbortSignal.timeout) are
+   * NOT routed through it: a unit test
+   * drives the budget arithmetic with a fake clock and fake "sleeps" that
+   * advance it, so the asserted numbers are exact instead of scheduler-bound.
+   */
+  now?: () => number;
+  /**
    * `hnsw.ef_search` for the ANN-scan transaction only. Default
    * DEFAULT_PG_SEARCH_HNSW_EF_SEARCH (100); integer in 1..1000. Transaction-local
    * (`SET LOCAL`), so a pooled connection never inherits it. See the default's
@@ -566,7 +578,10 @@ export async function pgSearchVecDetailed(
   const collections = normalizeCollections(opts.collections);
   const scope = collections ? collections.join(", ") : "(all collections)";
   const fragmentLimit = opts.overfetch ?? Math.max(limit * 8, 64);
-  const deadline = opts.timeoutMs === undefined ? undefined : Date.now() + opts.timeoutMs;
+  // Two real clocks, as before; ONE injected clock when the seam is used.
+  const wallNow = opts.now ?? Date.now;
+  const monoNow = opts.now ?? (() => performance.now());
+  const deadline = opts.timeoutMs === undefined ? undefined : wallNow() + opts.timeoutMs;
   const statementTimeoutMs = opts.statementTimeoutMs ?? DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS;
   const hnswEfSearch = opts.hnswEfSearch ?? DEFAULT_PG_SEARCH_HNSW_EF_SEARCH;
   // Refuse a bad value BEFORE any SQL or embed round trip is spent.
@@ -581,7 +596,7 @@ export async function pgSearchVecDetailed(
   const legStatementTimeout = (): number | null =>
     deadlineAt === undefined
       ? statementTimeoutMs
-      : clampLegStatementTimeout(statementTimeoutMs, deadlineAt - performance.now());
+      : clampLegStatementTimeout(statementTimeoutMs, deadlineAt - monoNow());
 
   // The fence FIRST: a cheap DISTINCT beats paying for an embed we are about to
   // refuse. It also means a mismatched endpoint reports the mismatch rather than
@@ -596,13 +611,13 @@ export async function pgSearchVecDetailed(
   const llm = opts.embedder ?? getDefaultLlamaCpp();
   let signal: AbortSignal | undefined;
   if (deadline !== undefined) {
-    const remaining = deadline - Date.now();
+    const remaining = deadline - wallNow();
     if (remaining <= 0) return degraded("budget-exhausted-pre-embed", storedModels.length);
     signal = AbortSignal.timeout(remaining);
   }
   let embedBudgetMs: number | undefined;
   if (deadlineAt !== undefined) {
-    const remaining = Math.floor(deadlineAt - performance.now());
+    const remaining = Math.floor(deadlineAt - monoNow());
     if (remaining < PG_SEARCH_MIN_LEG_BUDGET_MS) {
       return degraded("budget-exhausted-pre-embed", storedModels.length);
     }
@@ -633,7 +648,7 @@ export async function pgSearchVecDetailed(
   // enough — a fence nobody calls is a fence with a gate next to it.
   assertQueryModelMatchesStored(storedModels, embedded.model, scope);
 
-  if (deadline !== undefined && Date.now() >= deadline) {
+  if (deadline !== undefined && wallNow() >= deadline) {
     return degraded("budget-exhausted-pre-sql", storedModels.length, embedded.model);
   }
 

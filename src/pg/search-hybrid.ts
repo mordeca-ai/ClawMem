@@ -189,6 +189,18 @@ export interface PgSearchHybridOptions {
    * it is not a throw. Omitted ⇒ behaviour identical to before slice 10.
    */
   deadlineAt?: number;
+  /**
+   * TEST SEAM for every clock reading this call takes (master-harness-vn4rz.78).
+   * Omitted ⇒ the real clocks, exactly as before (`performance.now()` here; the
+   * seam is forwarded to BOTH arms, so one clock governs the whole call). Injected ⇒ this one
+   * function replaces them all, and any `deadlineAt` must be an instant on IT.
+   * Only differences between readings matter, so it need not share an epoch
+   * with either real clock. Timers (setTimeout / AbortSignal.timeout) are
+   * NOT routed through it: a unit test
+   * drives the budget arithmetic with a fake clock and fake "sleeps" that
+   * advance it, so the asserted numbers are exact instead of scheduler-bound.
+   */
+  now?: () => number;
   /** Embedding backend for the vec arm. Defaults to the vec arm's default. */
   embedder?: PgVecEmbedder;
   /** Fragment overfetch for the vec arm's ANN pass. */
@@ -272,6 +284,7 @@ export async function pgSearchHybridDetailed(
     limit: candidateLimit,
     ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
     ...(opts.statementTimeoutMs === undefined ? {} : { statementTimeoutMs: opts.statementTimeoutMs }),
+    ...(opts.now === undefined ? {} : { now: opts.now }),
   };
 
   // SEQUENTIAL, NOT CONCURRENT — AND THAT IS A CORRECTNESS CONSTRAINT, NOT A
@@ -301,9 +314,10 @@ export async function pgSearchHybridDetailed(
   // are clamped to what is left after its earlier ones. The worst case becomes
   // deadline + one leg's cancellation latency + the non-SQL tail.
   const deadlineAt = opts.deadlineAt;
+  const now = opts.now ?? (() => performance.now());
   const armBudget = (): { timeoutMs?: number; statementTimeoutMs?: number } | null => {
     if (deadlineAt === undefined) return shared;
-    const remaining = Math.floor(deadlineAt - performance.now());
+    const remaining = Math.floor(deadlineAt - now());
     const statementTimeoutMs = clampLegStatementTimeout(
       opts.statementTimeoutMs ?? DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS,
       remaining,
