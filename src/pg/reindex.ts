@@ -49,9 +49,10 @@ import { canonicalDocId } from "../store.ts";
 import { embedDim } from "./config.ts";
 import { vaultIsConfigured } from "./config.ts";
 import {
-  deactivateAbsentDocuments, gcOrphanedContent, insertEmbeddingsBatch, upsertDocument,
-  type ContentGcResult, type EmbeddingWrite,
+  deactivateAbsentDocuments, gcOrphanedContent, insertEmbeddingsBatch, reconcileDocTierForVault,
+  upsertDocument, type ContentGcResult, type DocTierReconcileResult, type EmbeddingWrite,
 } from "./write.ts";
+import { VAULTS, type Vault } from "./vaults.ts";
 import { embedInputFingerprint } from "../embed-fingerprint.ts";
 
 /** Mirrors indexer.ts's brace expansion — Bun.Glob has no brace support. */
@@ -84,6 +85,12 @@ export interface ReindexOptions {
   gc?: boolean;
   /** Receives the GC result, or a skip reason when the GC did not run. */
   onContentGc?: (r: ContentGcResult | { skipped: string }) => void;
+  /**
+   * Receives one doc_tier reconcile result (or skip reason) per configured
+   * vault, after the GC (master-harness-vn4rz.77). The reconcile always runs;
+   * it is the self-heal for the flag the partial HNSW index depends on.
+   */
+  onDocTierReconcile?: (r: DocTierReconcileResult | { vault: Vault; skipped: string }) => void;
   onProgress?: (msg: string) => void;
 }
 
@@ -546,6 +553,31 @@ export async function reindexCollection(
   return stats;
 }
 
+/**
+ * Run the doc_tier reconcile for every configured vault, ONE vault's fault
+ * never failing another's pass (master-harness-vn4rz.77). A throw (e.g. nsfw
+ * unreachable, or unmigrated in a way the column probe does not catch) is
+ * reported through `onResult` as a `skipped` entry — never silent, never
+ * fatal: the reconcile is a self-heal, and the sfw pass must not fail at its
+ * very end over the other vault. `reconcile`/`configured` are test seams.
+ */
+export async function reconcileDocTierAllVaults(
+  onResult: ReindexOptions["onDocTierReconcile"],
+  reconcile: typeof reconcileDocTierForVault = reconcileDocTierForVault,
+  configured: (v: Vault) => boolean = vaultIsConfigured,
+): Promise<void> {
+  for (const v of VAULTS) {
+    if (!configured(v)) continue;
+    let res: Awaited<ReturnType<typeof reconcileDocTierForVault>>;
+    try {
+      res = await reconcile(v);
+    } catch (e) {
+      res = { vault: v, skipped: `reconcile failed: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    onResult?.(res);
+  }
+}
+
 /** Reindex every configured collection (or the named subset). */
 export async function reindex(opts: ReindexOptions = {}): Promise<ReindexStats[]> {
   const wanted = new Set(opts.collections ?? []);
@@ -566,5 +598,12 @@ export async function reindex(opts: ReindexOptions = {}): Promise<ReindexStats[]
   } else {
     opts.onContentGc?.(await gcOrphanedContent({ vault: "sfw" }));
   }
+  // DOC_TIER RECONCILE (master-harness-vn4rz.77): after the GC, so vectors it
+  // just deleted are not re-examined. Migration 010's triggers keep
+  // content_vectors.doc_tier current on every committed write but cannot see a
+  // concurrent writer's uncommitted row; this pass closes that window. Both
+  // vaults, because reindex routes collections to either (0ynkd). Cheap on a
+  // converged vault: two scans, zero rows written.
+  await reconcileDocTierAllVaults(opts.onDocTierReconcile);
   return out;
 }

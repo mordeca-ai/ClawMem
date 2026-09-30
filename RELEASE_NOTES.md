@@ -4,6 +4,22 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.40 — clawmem PG read path: hybrid query vec leg exceeds its 1200ms statement timeout under fleet load (PgVecSearchTimeoutError, degraded/0 results) — blocks the vn4rz.11 cutover
+
+PG ANN reader: doc-tier partial HNSW index (master-harness-vn4rz.77).
+
+72% of content_vectors belong to the ADR-0162 origin tier, which no ANN reader ever searches. The documents-scoped strict_order ANN scan walked ~17k origin tuples per probe in origin-dense regions (2.5-6.1 s against the 1200 ms statement timeout), so hybrid recall hit PgVecSearchTimeoutError under fleet load.
+
+- Migration 010: content_vectors.doc_tier boolean kept current by triggers on content_vectors and documents.
+- Migration 011: backfill of doc_tier.
+- Migration 012: CREATE INDEX CONCURRENTLY partial HNSW WHERE doc_tier (~67k vectors instead of 240k).
+- search.ts: the ANN query and model fence carry `cv.doc_tier` so the planner uses the partial index. The column is detected per vault, and the predicate is omitted on an unmigrated vault (clawmem_nsfw stays at 006 until the operator authorizes it).
+- reindex: reconcile doc_tier per vault after GC, isolated per vault so one vault's fault cannot fail the other.
+
+Behaviour is unchanged until the migrations are applied. Scratch proof at live scale: origin-region probes 15-17k -> 180-290 tuples; top-20 recall 20/20.
+
+---
+
 ## v0.36.39 — wzwh8 phase 2: frontmatter vocab direction — per-collection key map (name:/metadata.type -> title/content_type) + ADR-0054 amendment
 
 Per-collection opt-in `frontmatter_map` (master-harness-wzwh8.1). A collection in index.yml can declare where its title and content_type live when its files follow someone else's frontmatter spec (Claude Code auto-memory `name:` + `metadata.type`, Agent Skills `name:`). The canonical `title:`/`content_type:` keys always win; the mapped key is read only when they are absent. Mapped content_type values pass through an optional `content_type_values` map and must be a valid ContentType, or they are not stored (fallback chain unchanged, rejection counted). A malformed map fails at config load. Every indexing path applies it (update/reindex/watch, MCP + REST reindex, precompact hook, pg reindex, pg origin-load title-only). The `frontmatter:` summary line gains a mapped-fill tail only when a map acts. Default off: with no `frontmatter_map`, indexing is byte-identical to v0.36.38.
