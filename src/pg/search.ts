@@ -58,6 +58,21 @@
  * on commit AND on rollback, with no finally to forget. A cancelled statement
  * surfaces as PgVecSearchTimeoutError — never as a raw driver throw and never as
  * an empty result, which a caller cannot tell apart from "nothing matched".
+ *
+ * THE DOC-TIER PARTIAL INDEX (master-harness-vn4rz.77). content_vectors also
+ * holds the ADR-0162 origin tier's vectors (origin_documents shares the content
+ * store so a tier move never re-embeds), and NO reader here ever returns them.
+ * Measured 2026-09-29 on the live vault: 239,805 vectors, 172,929 (72%) origin-
+ * only. Through the full index, a query landing in an origin-dense region walked
+ * ~16.7k-20k tuples (the max_scan_tuples cap) discarding origin rows at the
+ * documents JOIN: 2.5-6.1 s per probe vs the 1200 ms timeout, 3/10 live hybrid
+ * runs PgVecSearchTimeoutError (ann-scan); documents-region probes ran 30 ms.
+ * Migration 010 materialises "some documents row references this hash" as
+ * `content_vectors.doc_tier` (trigger-maintained, reconciled by reindex) and 011
+ * builds `content_vectors_embedding_doc_hnsw_idx ... WHERE doc_tier`. BOTH
+ * queries below carry `cv.doc_tier` — that literal predicate is what lets the
+ * planner prove the partial index applies. Drop it and the ANN scan silently
+ * returns to the full index and the multi-second origin walk.
  */
 
 import type { SearchResult } from "../store.ts";
@@ -250,8 +265,14 @@ export function normalizeCollections(c: string | string[] | undefined): string[]
 
 /**
  * Build the ANN query. Pure — no client, no I/O — so the SQL contract
- * (the `<=>` order-by, the `active` fence, the collection filter, the limit)
- * is assertable in the unit tier rather than only observable in a live plan.
+ * (the `<=>` order-by, the `cv.doc_tier` partial-index predicate, the `active`
+ * fence, the collection filter, the limit) is assertable in the unit tier
+ * rather than only observable in a live plan.
+ *
+ * `cv.doc_tier` is NOT a correctness filter — the documents JOIN already drops
+ * origin-only vectors. It is the planner's licence to scan the partial index
+ * content_vectors_embedding_doc_hnsw_idx (migration 011), which holds no origin
+ * rows and so has nothing for the iterative scan to walk past (vn4rz.77).
  *
  * `pg` uses $1-style placeholders and NOTHING is interpolated into the text:
  * the vector arrives as a bind parameter cast to ::vector, the collections as a
@@ -286,7 +307,8 @@ export function buildVecSearchQuery(
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash
     JOIN content ON content.hash = cv.hash
-    WHERE d.active = true
+    WHERE cv.doc_tier
+    AND d.active = true
     AND d.invalidated_at IS NULL${filter}
     ORDER BY cv.embedding <=> $1::vector
     LIMIT ${limitParam}
@@ -322,13 +344,15 @@ export async function getStoredVecModels(
   // model set for 34/34 live collections. Semantics unchanged: the set of
   // models behind at least one active, non-invalidated, in-scope vector. Every
   // scope predicate MUST stay inside the EXISTS — the outer scan is unfiltered.
+  // `cv.doc_tier` (vn4rz.77) is one of them: the fence must see exactly the rows
+  // the ANN query can return, and that query reads only doc_tier vectors.
   const { rows } = await c.query<{ model: string }>(
     `SELECT m.model AS model
      FROM (SELECT DISTINCT model FROM content_vectors) m
      WHERE EXISTS (
        SELECT 1 FROM content_vectors cv
        JOIN documents d ON d.hash = cv.hash
-       WHERE cv.model = m.model
+       WHERE cv.model = m.model AND cv.doc_tier
          AND d.active = true AND d.invalidated_at IS NULL${filter}
      )
      ORDER BY 1`,

@@ -93,6 +93,21 @@ describe("buildVecSearchQuery — the SQL contract", () => {
   it("applies the fragment limit as a bind parameter, not literal text", () => {
     expect(buildVecSearchQuery("[0.1]", null, 7).values.at(-1)).toBe(7);
   });
+
+  it("carries the literal `cv.doc_tier` predicate that licenses the partial HNSW index (vn4rz.77)", () => {
+    // content_vectors_embedding_doc_hnsw_idx is `... WHERE doc_tier`; the
+    // planner only uses a partial index when the query's own WHERE implies its
+    // predicate. Without this line the scan silently reverts to the full index
+    // and the 2.5-6.1 s origin-region walk. Both filter shapes must carry it.
+    for (const cols of [null, ["research"]]) {
+      const q = buildVecSearchQuery("[0.1]", cols, 64);
+      const where = q.text.slice(q.text.indexOf("WHERE"), q.text.indexOf("ORDER BY"));
+      expect(where).toMatch(/\bcv\.doc_tier\b/);
+      // A bare boolean column, not `= $n`: a bind parameter cannot prove a
+      // partial-index predicate at plan time for a generic plan.
+      expect(where).not.toMatch(/doc_tier\s*=/);
+    }
+  });
 });
 
 describe("normalizeCollections", () => {
@@ -130,7 +145,7 @@ describe("getStoredVecModels — scoped to the rows the search will read", () =>
     const outer = text.slice(0, existsAt);
     const inner = text.slice(existsAt);
     expect(outer).toContain("SELECT DISTINCT model FROM content_vectors");
-    for (const pred of ["d.active = true", "d.invalidated_at IS NULL", "d.collection = ANY($1::text[])"]) {
+    for (const pred of ["cv.doc_tier", "d.active = true", "d.invalidated_at IS NULL", "d.collection = ANY($1::text[])"]) {
       expect(outer).not.toContain(pred);
       expect(inner).toContain(pred);
     }

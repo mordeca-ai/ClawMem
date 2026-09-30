@@ -49,9 +49,10 @@ import { canonicalDocId } from "../store.ts";
 import { embedDim } from "./config.ts";
 import { vaultIsConfigured } from "./config.ts";
 import {
-  deactivateAbsentDocuments, gcOrphanedContent, insertEmbeddingsBatch, upsertDocument,
-  type ContentGcResult, type EmbeddingWrite,
+  deactivateAbsentDocuments, gcOrphanedContent, insertEmbeddingsBatch, reconcileDocTierForVault,
+  upsertDocument, type ContentGcResult, type DocTierReconcileResult, type EmbeddingWrite,
 } from "./write.ts";
+import { VAULTS, type Vault } from "./vaults.ts";
 import { embedInputFingerprint } from "../embed-fingerprint.ts";
 
 /** Mirrors indexer.ts's brace expansion — Bun.Glob has no brace support. */
@@ -84,6 +85,12 @@ export interface ReindexOptions {
   gc?: boolean;
   /** Receives the GC result, or a skip reason when the GC did not run. */
   onContentGc?: (r: ContentGcResult | { skipped: string }) => void;
+  /**
+   * Receives one doc_tier reconcile result (or skip reason) per configured
+   * vault, after the GC (master-harness-vn4rz.77). The reconcile always runs;
+   * it is the self-heal for the flag the partial HNSW index depends on.
+   */
+  onDocTierReconcile?: (r: DocTierReconcileResult | { vault: Vault; skipped: string }) => void;
   onProgress?: (msg: string) => void;
 }
 
@@ -565,6 +572,16 @@ export async function reindex(opts: ReindexOptions = {}): Promise<ReindexStats[]
     opts.onContentGc?.({ skipped: "sfw vault not configured" });
   } else {
     opts.onContentGc?.(await gcOrphanedContent({ vault: "sfw" }));
+  }
+  // DOC_TIER RECONCILE (master-harness-vn4rz.77): after the GC, so vectors it
+  // just deleted are not re-examined. Migration 010's triggers keep
+  // content_vectors.doc_tier current on every committed write but cannot see a
+  // concurrent writer's uncommitted row; this pass closes that window. Both
+  // vaults, because reindex routes collections to either (0ynkd). Cheap on a
+  // converged vault: two scans, zero rows written.
+  for (const v of VAULTS) {
+    if (!vaultIsConfigured(v)) continue;
+    opts.onDocTierReconcile?.(await reconcileDocTierForVault(v));
   }
   return out;
 }

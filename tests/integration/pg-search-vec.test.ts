@@ -513,7 +513,10 @@ d("PG vector read path — filtered-HNSW starvation", () => {
         await c.query("SET LOCAL hnsw.iterative_scan = off");
         await c.query("SET LOCAL hnsw.ef_search = 40");
         const plan = await c.query<{ "QUERY PLAN": string }>(`EXPLAIN (COSTS OFF) ${text}`, values);
-        expect(plan.rows.map(r => r["QUERY PLAN"]).join("\n")).toContain("content_vectors_embedding_hnsw_idx");
+        // vn4rz.77: the ANN query carries `cv.doc_tier`, so it is served by the
+        // PARTIAL index (011). Inactive documents' vectors are still doc_tier
+        // (ANY documents row counts), so the starvation reproduces through it.
+        expect(plan.rows.map(r => r["QUERY PLAN"]).join("\n")).toContain("content_vectors_embedding_doc_hnsw_idx");
         const { rows } = await c.query<{ path: string }>(text, values);
         // The target exists and is active, yet the starved scan cannot see it.
         expect(rows.map(r => r.path)).not.toContain(STARVE_TARGET);
