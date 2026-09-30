@@ -62,7 +62,21 @@ export const TYPE_BASELINES: Record<string, number> = {
 // Content Type Inference
 // =============================================================================
 
-export type ContentType = "decision" | "deductive" | "preference" | "hub" | "research" | "project" | "handoff" | "conversation" | "progress" | "milestone" | "problem" | "note";
+/**
+ * The ContentType vocabulary as a runtime value (master-harness-wzwh8.1), so a
+ * value arriving from config or a mapped frontmatter key can be CHECKED rather
+ * than cast. The type is derived from this list, so the two cannot drift.
+ */
+export const CONTENT_TYPE_VALUES = [
+  "decision", "deductive", "preference", "hub", "research", "project",
+  "handoff", "conversation", "progress", "milestone", "problem", "note",
+] as const;
+
+export type ContentType = (typeof CONTENT_TYPE_VALUES)[number];
+
+export function isContentType(value: unknown): value is ContentType {
+  return typeof value === "string" && (CONTENT_TYPE_VALUES as readonly string[]).includes(value);
+}
 
 export function inferContentType(path: string, explicitType?: string): ContentType {
   if (explicitType && explicitType in TYPE_BASELINES) return explicitType as ContentType;

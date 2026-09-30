@@ -251,6 +251,7 @@ async function main() {
       const limitRaw = flagValue(argv, "--limit");
       const s = await loadOriginCollection({
         collection: c.name, root: c.path, pattern: c.pattern,
+        frontmatterMap: c.frontmatter_map,
         month: flagValue(argv, "--month"),
         limit: limitRaw ? Number(limitRaw) : undefined,
         skipEmbed: argv.includes("--no-embed"),

@@ -13,6 +13,7 @@ import type { Store } from "./store.ts";
 import { inferContentType, confidenceScore, type ContentType } from "./memory.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import { normalizeIsoTimestamp } from "./normalize.ts";
+import { applyFrontmatterMap, type FrontmatterMap, type FrontmatterMapOutcome } from "./frontmatter-map.ts";
 
 // =============================================================================
 // Types
@@ -56,6 +57,12 @@ export interface ParsedDocument {
    * changes any `meta` value.
    */
   vocabGap?: FrontmatterVocabGap;
+  /**
+   * Set ONLY when the collection declared a frontmatter_map AND a block parsed
+   * (master-harness-wzwh8.1): which fields the map filled, and any mapped
+   * content_type value that was rejected (not a valid ContentType).
+   */
+  frontmatterMap?: FrontmatterMapOutcome;
 }
 
 /**
@@ -93,6 +100,15 @@ export interface FrontmatterVocabCounts {
   contentTypeless: number;
   contentTypelessDeclaringType: number;
   contentTypelessDeclaringMetadataType: number;
+  /**
+   * master-harness-wzwh8.1: fills made by a collection's frontmatter_map, kept
+   * separate from canonical `title:` / `content_type:` so a mapped fill is never
+   * mistaken for an authored one. Always 0 on a collection without a map.
+   */
+  titleMapped: number;
+  contentTypeMapped: number;
+  /** Mapped content_type values that were not a valid ContentType and so NOT stored. */
+  contentTypeMapRejected: number;
 }
 
 export function emptyFrontmatterVocabCounts(): FrontmatterVocabCounts {
@@ -100,6 +116,7 @@ export function emptyFrontmatterVocabCounts(): FrontmatterVocabCounts {
     examined: 0, noFrontmatter: 0, unparseable: 0,
     titleless: 0, titlelessDeclaringName: 0,
     contentTypeless: 0, contentTypelessDeclaringType: 0, contentTypelessDeclaringMetadataType: 0,
+    titleMapped: 0, contentTypeMapped: 0, contentTypeMapRejected: 0,
   };
 }
 
@@ -109,11 +126,17 @@ export function emptyFrontmatterVocabCounts(): FrontmatterVocabCounts {
  */
 export function noteFrontmatterVocab(
   counts: FrontmatterVocabCounts,
-  doc: Pick<ParsedDocument, "frontmatter" | "vocabGap">,
+  doc: Pick<ParsedDocument, "frontmatter" | "vocabGap" | "frontmatterMap">,
 ): void {
   counts.examined++;
   if (doc.frontmatter === "absent") { counts.noFrontmatter++; return; }
   if (doc.frontmatter === "failed") { counts.unparseable++; return; }
+  const mapped = doc.frontmatterMap;
+  if (mapped) {
+    if (mapped.titleMapped) counts.titleMapped++;
+    if (mapped.contentTypeMapped) counts.contentTypeMapped++;
+    if (mapped.contentTypeRejected !== undefined) counts.contentTypeMapRejected++;
+  }
   const gap = doc.vocabGap;
   if (!gap) return;
   if (gap.titleMissing) {
@@ -129,15 +152,23 @@ export function noteFrontmatterVocab(
 
 /**
  * One summary line, or null when no parsed block lacked a title/content_type
- * (same report-only-when-non-zero convention as the vn4rz.34 counter).
+ * and no frontmatter_map fill/rejection happened (same report-only-when-non-zero
+ * convention as the vn4rz.34 counter). On a collection without a map the line
+ * is byte-identical to phase 1; the `; frontmatter_map ...` tail appears only
+ * when the map did something.
  */
 export function formatFrontmatterVocab(c: FrontmatterVocabCounts): string | null {
-  if (c.titleless === 0 && c.contentTypeless === 0) return null;
-  return (
+  const mappedAny = c.titleMapped + c.contentTypeMapped + c.contentTypeMapRejected > 0;
+  if (c.titleless === 0 && c.contentTypeless === 0 && !mappedAny) return null;
+  const base =
     `frontmatter: ${c.titleless} title-less (${c.titlelessDeclaringName} declare name:), ` +
     `${c.contentTypeless} content_type-less (${c.contentTypelessDeclaringType} declare type:, ` +
     `${c.contentTypelessDeclaringMetadataType} declare metadata.type); ` +
-    `${c.noFrontmatter} without frontmatter, ${c.unparseable} unparseable (of ${c.examined} examined)`
+    `${c.noFrontmatter} without frontmatter, ${c.unparseable} unparseable (of ${c.examined} examined)`;
+  if (!mappedAny) return base;
+  return (
+    `${base}; frontmatter_map filled ${c.titleMapped} title, ${c.contentTypeMapped} content_type, ` +
+    `rejected ${c.contentTypeMapRejected} content_type value(s)`
   );
 }
 
@@ -276,7 +307,18 @@ export function extractTitle(content: string, filename: string): string {
 // Frontmatter Parsing
 // =============================================================================
 
-export function parseDocument(content: string, relativePath: string, defaultContentType?: string): ParsedDocument {
+/**
+ * `frontmatterMap` (master-harness-wzwh8.1) is the collection's OPT-IN key map;
+ * undefined = canonical keys only, byte-for-byte the pre-map behaviour. Every
+ * indexing path passes it from the same collection config entry (sqlite via
+ * collectionIndexOptions, pg reindex / origin-load from the listed collection).
+ */
+export function parseDocument(
+  content: string,
+  relativePath: string,
+  defaultContentType?: string,
+  frontmatterMap?: FrontmatterMap,
+): ParsedDocument {
   // gray-matter coerces YAML values: `title: 2023-09-27` → Date, `title: true` → boolean.
   // All frontmatter fields must be runtime-checked to prevent SQLite binding errors.
   const str = (v: unknown): string | undefined =>
@@ -301,22 +343,36 @@ export function parseDocument(content: string, relativePath: string, defaultCont
     // with matter === "" but isEmpty === true, and no block at all as
     // matter === "" with isEmpty false.
     const blockPresent = parsed.matter !== "" || (parsed as { isEmpty?: boolean }).isEmpty === true;
+    // master-harness-wzwh8.1: canonical keys first; the collection's map fills
+    // only what they left absent. Without a map these ARE the canonical values.
+    let title = str(data.title);
+    let declaredContentType = str(data.content_type);
+    let mapOutcome: FrontmatterMapOutcome | undefined;
+    if (frontmatterMap && blockPresent) {
+      const m = applyFrontmatterMap(data, frontmatterMap, title, declaredContentType);
+      title = m.title;
+      declaredContentType = m.contentType;
+      mapOutcome = m.outcome;
+    }
     const vocabGap = blockPresent
-      ? frontmatterVocabGap(data, str(data.title), str(data.content_type))
+      ? frontmatterVocabGap(data, title, declaredContentType)
       : undefined;
     return {
       body,
       frontmatter: blockPresent ? "parsed" : "absent",
       ...(vocabGap ? { vocabGap } : {}),
+      ...(mapOutcome ? { frontmatterMap: mapOutcome } : {}),
       meta: {
-        title: str(data.title),
+        title,
         description: str(data.description),
         tags: Array.isArray(data.tags) ? data.tags.map(String) : undefined,
         domain: str(data.domain),
         workstream: str(data.workstream),
         // Precedence (rvzn8.2): explicit frontmatter > per-collection default > filename
         // inference. A configured default KILLS inference for the collection.
-        content_type: (str(data.content_type) as ContentType)
+        // A mapped value reaching here is already a valid ContentType (a rejected
+        // one was dropped by applyFrontmatterMap), so it falls through like absence.
+        content_type: (declaredContentType as ContentType)
           || (defaultContentType as ContentType | undefined)
           || inferContentType(relativePath),
         review_by: str(data.review_by),
@@ -429,7 +485,11 @@ export async function indexCollection(
   collectionName: string,
   collectionPath: string,
   pattern: string = "**/*.md",
-  options?: { forceEnrich?: boolean; force?: boolean; importMode?: boolean; defaultContentType?: string }
+  options?: {
+    forceEnrich?: boolean; force?: boolean; importMode?: boolean; defaultContentType?: string;
+    /** master-harness-wzwh8.1: the collection's frontmatter_map; pass via collectionIndexOptions(). */
+    frontmatterMap?: FrontmatterMap;
+  }
 ): Promise<IndexStats> {
   if (RESERVED_COLLECTIONS.has(collectionName)) {
     throw new Error(
@@ -533,7 +593,7 @@ export async function indexCollection(
           if (existingRow.authored_at === null && content.startsWith("---")) {
             const fmEnd = content.indexOf("\n---", 3);
             if (fmEnd !== -1 && content.slice(0, fmEnd).includes("authored_at")) {
-              const { meta: adoptMeta } = parseDocument(content, relativePath);
+              const { meta: adoptMeta } = parseDocument(content, relativePath, options?.defaultContentType, options?.frontmatterMap);
               if (typeof adoptMeta.authored_at === "string") {
                 store.updateDocumentMeta(existing.id, { authored_at: adoptMeta.authored_at });
                 stats.dated++;
@@ -553,7 +613,7 @@ export async function indexCollection(
         // only. modified_at is preserved, stored confidence stays untouched,
         // and no A-MEM enrichment is queued — re-mining an existing vault dates
         // documents without operational side-effects.
-        const parsedDoc = parseDocument(content, relativePath, options?.defaultContentType);
+        const parsedDoc = parseDocument(content, relativePath, options?.defaultContentType, options?.frontmatterMap);
         noteFrontmatterVocab(frontmatterVocab, parsedDoc);
         const { body, meta } = parsedDoc;
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
@@ -641,7 +701,7 @@ export async function indexCollection(
         }
         const inactive = inactiveRow;
 
-        const parsedDoc = parseDocument(content, relativePath, options?.defaultContentType);
+        const parsedDoc = parseDocument(content, relativePath, options?.defaultContentType, options?.frontmatterMap);
         noteFrontmatterVocab(frontmatterVocab, parsedDoc);
         const { body, meta } = parsedDoc;
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);

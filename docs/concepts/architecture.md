@@ -30,6 +30,36 @@ collections:
 
 Only markdown files are indexed. Binary files, code, and credentials are never indexed.
 
+### Frontmatter key map (`frontmatter_map`, opt-in, default off)
+
+The indexer reads a document's title from frontmatter `title:` and its content type from `content_type:`. Files written to someone else's spec use other keys — Claude Code auto-memory writes `name:` plus `metadata.type` (`user`, `feedback`, `project`, `reference`), and Agent Skills write `name:`. You usually can't rewrite those files, so a collection can say where its title and content type are:
+
+```yaml
+collections:
+  memory-topics:
+    path: ~/.claude/projects/my-project/memory
+    pattern: "**/*.md"
+    content_type: note                 # optional collection default (unchanged meaning)
+    frontmatter_map:
+      title: name                      # source key for the title
+      content_type: metadata.type      # source key for content_type
+      content_type_values:             # optional: source value -> content_type (values here are illustrative)
+        feedback: preference
+        user: preference
+        reference: hub
+        # `project` is already a valid content_type, so it passes through as-is
+```
+
+Rules:
+
+- **Per collection, opt-in.** A collection without `frontmatter_map` indexes exactly as before. No global alias exists, and one collection's map never applies to another.
+- **The canonical key wins.** `title:` / `content_type:` are used whenever the document has them. The mapped key is read only when the canonical key is missing.
+- **Key paths** are frontmatter keys. Use `.` to reach into a nested mapping (`metadata.type`). A key that itself contains a `.` can't be addressed.
+- **The content type must be valid.** The mapped value goes through `content_type_values` if you define it, and the result must be one of `decision`, `deductive`, `preference`, `hub`, `research`, `project`, `handoff`, `conversation`, `progress`, `milestone`, `problem` or `note`. If it isn't, the value is **not stored**. The document falls back to the usual chain (collection `content_type` default, then filename inference), and the rejection is counted.
+- **A malformed map fails loudly at config load.** Examples: an unknown key, a non-string or empty key path, a `content_type_values` entry that isn't a valid content type, or `content_type_values` without `content_type`. Every command that loads the config stops with an error that names the collection and the field. A malformed map is never silently ignored.
+
+Every indexing path applies the map: `clawmem update`/`reindex`/`watch`, the MCP and REST reindex endpoints, the precompact hook reindex, `pg reindex`, and `pg origin-load` (title only there). The per-collection `frontmatter:` summary line reports mapped fills separately from authored ones. When a map does anything, the line ends with `; frontmatter_map filled N title, N content_type, rejected N content_type value(s)`. On a collection without a map the line is unchanged.
+
 ### What to index
 
 The retrieval pipeline surfaces better results from a richer corpus. Beyond the default memory and session log patterns, consider adding collections for research notes, architecture decisions, domain references, project specs, and any markdown you regularly consult during agent sessions. The broader the indexed field, the more likely context-surfacing will find something relevant to the current task.

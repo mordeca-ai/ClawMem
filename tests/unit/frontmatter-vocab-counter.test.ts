@@ -170,6 +170,10 @@ describe("clean and absent frontmatter are distinguishable (A2)", () => {
       contentTypeless: 2,
       contentTypelessDeclaringType: 1,
       contentTypelessDeclaringMetadataType: 1,
+      // wzwh8.1: no frontmatter_map was passed, so the map counters stay zero.
+      titleMapped: 0,
+      contentTypeMapped: 0,
+      contentTypeMapRejected: 0,
     });
     expect(formatFrontmatterVocab(counts)).toBe(
       "frontmatter: 2 title-less (2 declare name:), 2 content_type-less " +

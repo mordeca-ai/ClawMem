@@ -39,9 +39,10 @@ import { join } from "path";
 import {
   authoredAtFromFrontmatter, computeQualityScore, extractTitle, hashContent, parseDocument,
   shouldExclude, emptyFrontmatterVocabCounts, noteFrontmatterVocab,
-  type FrontmatterParseFailure, type FrontmatterVocabCounts,
+  type FrontmatterParseFailure, type FrontmatterVocabCounts, type DocumentMeta,
 } from "../indexer.ts";
 import { listCollections } from "../collections.ts";
+import type { FrontmatterMap } from "../frontmatter-map.ts";
 import { getDefaultLlamaCpp, formatDocForEmbedding } from "../llm.ts";
 import { splitDocument } from "../splitter.ts";
 import { canonicalDocId } from "../store.ts";
@@ -271,11 +272,37 @@ export function sweepDecision(
   return { sweep: true, reason: null };
 }
 
+/**
+ * Parse one walked file and fold its outcome into the collection's summary
+ * counters. The SOLE parseDocument call on the pg reindex path — exported so
+ * the frontmatter_map threading (master-harness-wzwh8.1) is testable without a
+ * Postgres. Deliberately passes NO collection default content_type: the pg path
+ * has never honoured one (pre-existing, unchanged here); a rejected mapped
+ * value therefore falls back to filename inference, exactly as an absent one.
+ */
+export function parseForReindex(
+  stats: Pick<ReindexStats, "frontmatterParseFailures" | "frontmatterVocab">,
+  raw: string,
+  rel: string,
+  frontmatterMap?: FrontmatterMap,
+): { body: string; meta: DocumentMeta; title: string } {
+  const parsedDoc = parseDocument(raw, rel, undefined, frontmatterMap);
+  const { body, meta, frontmatterError } = parsedDoc;
+  // parseDocument already emitted the per-file warning; this is the COUNT
+  // that reaches the summary (vn4rz.34).
+  noteFrontmatterFailure(stats, rel, frontmatterError);
+  // And the silent sibling: parsed, but no title / content_type (wzwh8).
+  noteFrontmatterVocab(stats.frontmatterVocab, parsedDoc);
+  return { body, meta, title: meta.title ?? extractTitle(raw, rel) };
+}
+
 export async function reindexCollection(
   name: string,
   root: string,
   pattern: string,
   opts: ReindexOptions = {},
+  /** master-harness-wzwh8.1: this collection's config frontmatter_map (opt-in). */
+  frontmatterMap?: FrontmatterMap,
 ): Promise<ReindexStats> {
   const t0 = Date.now();
   const log = opts.onProgress ?? (() => {});
@@ -421,14 +448,7 @@ export async function reindexCollection(
       continue;
     }
     const hash = hashContent(raw);
-    const parsedDoc = parseDocument(raw, rel);
-    const { body, meta, frontmatterError } = parsedDoc;
-    // parseDocument already emitted the per-file warning; this is the COUNT
-    // that reaches the summary (vn4rz.34).
-    noteFrontmatterFailure(stats, rel, frontmatterError);
-    // And the silent sibling: parsed, but no title / content_type (wzwh8).
-    noteFrontmatterVocab(stats.frontmatterVocab, parsedDoc);
-    const title = meta.title ?? extractTitle(raw, rel);
+    const { body, meta, title } = parseForReindex(stats, raw, rel, frontmatterMap);
 
     // The retag backlog: counted here so the enum decision has a number attached
     // to it rather than a shrug.
@@ -532,7 +552,7 @@ export async function reindex(opts: ReindexOptions = {}): Promise<ReindexStats[]
   const out: ReindexStats[] = [];
   for (const c of listCollections()) {
     if (wanted.size > 0 && !wanted.has(c.name)) continue;
-    out.push(await reindexCollection(c.name, c.path, c.pattern, opts));
+    out.push(await reindexCollection(c.name, c.path, c.pattern, opts, c.frontmatter_map));
   }
   // CONTENT GC (master-harness-vn4rz.49): its own transactions, AFTER the whole
   // pass, so no document upsert of this run is still pending. Orphan-hood is

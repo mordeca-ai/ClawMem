@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs
 import { join } from "path";
 import { homedir } from "os";
 import YAML from "yaml";
+import { validateFrontmatterMap, type FrontmatterMap } from "./frontmatter-map.ts";
 
 // ============================================================================
 // Types
@@ -38,6 +39,24 @@ export interface Collection {
                           // PRIVATE_ROOTS tripwire in src/pg/vaults.ts is the
                           // guarantee half, and it overrides a wrong declaration
                           // by REFUSING the write rather than by re-routing it.
+  frontmatter_map?: FrontmatterMap; // OPT-IN per-collection frontmatter key map
+                          // (master-harness-wzwh8.1, src/frontmatter-map.ts): where this
+                          // collection's title / content_type live when the files use
+                          // another spec's keys (e.g. `name:`, `metadata.type`). Absent =
+                          // canonical keys only. Validated at config load; malformed = throw.
+}
+
+/**
+ * The per-collection parse options every indexing path must pass through to
+ * parseDocument (master-harness-wzwh8.1). One helper so the collection default
+ * content_type and the frontmatter map can never be threaded to one call site
+ * and forgotten at another — tests/unit/frontmatter-map.test.ts asserts every
+ * configured-collection indexCollection() call goes through here.
+ */
+export function collectionIndexOptions(
+  col: Pick<Collection, "content_type" | "frontmatter_map">,
+): { defaultContentType?: string; frontmatterMap?: FrontmatterMap } {
+  return { defaultContentType: col.content_type, frontmatterMap: col.frontmatter_map };
 }
 
 /**
@@ -233,6 +252,19 @@ function parseConfigFile(configPath: string): CollectionConfig {
       }
     }
 
+    // master-harness-wzwh8.1: a malformed frontmatter_map fails LOUD here. Silently
+    // ignoring it would index the collection with canonical keys only while the
+    // operator believes the map is live — the exact invisible-gap class wzwh8 exists
+    // to close. The thrown message names the collection and the offending field.
+    for (const [name, col] of Object.entries(config.collections)) {
+      if (col && typeof col === "object" && "frontmatter_map" in col) {
+        col.frontmatter_map = validateFrontmatterMap(
+          (col as { frontmatter_map?: unknown }).frontmatter_map,
+          `collection ${JSON.stringify(name)}`,
+        );
+      }
+    }
+
     // Parse lifecycle policy if present. (Historically this re-parsed `content` a second
     // time into `raw`; one parse is equivalent — the lifecycle fields are read off the
     // object before `config.lifecycle` is reassigned.)
@@ -328,6 +360,9 @@ export function addCollection(
     // `clawmem collection add` — which the PRIVATE_ROOTS tripwire would then refuse,
     // but only after the config had already been rewritten wrong.
     vault: config.collections[name]?.vault,
+    // Preserve the frontmatter key map (master-harness-wzwh8.1) — dropping it would
+    // silently turn mapping off on the next `clawmem collection add`.
+    frontmatter_map: config.collections[name]?.frontmatter_map,
   };
 
   saveConfig(config);

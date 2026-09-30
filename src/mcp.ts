@@ -38,7 +38,7 @@ import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFt
 import { selectScoringRegime, rankRawPrimary, VECTOR_SCORE_BASIS, FTS_SCORE_BASIS, COMPOSITE_SCORE_BASIS } from "./scoring-regime.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
-import { listCollections } from "./collections.ts";
+import { listCollections, collectionIndexOptions } from "./collections.ts";
 import { decomposeQuery, extractTemporalConstraint, type IntentType } from "./intent.ts";
 import { runCausalRetrieval, hasCausalSignal, hasTimelineSignal, type CausalAssociation } from "./causal-retrieval.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
@@ -1426,7 +1426,7 @@ This is the recommended entry point for ALL memory queries.`,
       const totalStats: IndexStats = { added: 0, updated: 0, unchanged: 0, removed: 0, dated: 0 };
 
       for (const col of collections) {
-        const stats = await indexCollection(store, col.name, col.path, col.pattern, { defaultContentType: col.content_type });
+        const stats = await indexCollection(store, col.name, col.path, col.pattern, { ...collectionIndexOptions(col) });
         totalStats.added += stats.added;
         totalStats.updated += stats.updated;
         totalStats.unchanged += stats.unchanged;
