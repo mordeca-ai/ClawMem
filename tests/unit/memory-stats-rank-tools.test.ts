@@ -30,7 +30,9 @@ import { setDefaultLlamaCpp } from "../../src/llm.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { clearConfigCache } from "../../src/config.ts";
 
-const TEST_DB = "/tmp/clawmem-memory-stats-rank-test.sqlite";
+// Per-run unique root: fixed /tmp paths are clobbered by overlapping runs and poisoned by stale -wal/-shm sidecars (vn4rz.79).
+const TEST_ROOT = mkdtempSync(join(tmpdir(), "clawmem-memory-stats-rank-"));
+const TEST_DB = join(TEST_ROOT, "test.sqlite");
 
 const fakeLlm = {
   embed: async () => ({ embedding: new Float32Array([0, 0, 0, 1]), model: "stats-fake" }),
@@ -135,6 +137,7 @@ afterAll(async () => {
   clearConfigCache();
   try { unlinkSync(TEST_DB); } catch { /* already gone */ }
   if (tmpConfigDir) rmSync(tmpConfigDir, { recursive: true, force: true });
+  rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
 type ToolResult = { structuredContent?: any; isError?: boolean; content: { type: string; text?: string }[] };

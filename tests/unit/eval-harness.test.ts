@@ -14,7 +14,9 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
  * (context_usage / recall_events / memory_relations untouched).
  */
 
-import { unlinkSync, writeFileSync, readFileSync, rmSync, existsSync } from "fs";
+import { unlinkSync, writeFileSync, readFileSync, rmSync, existsSync, mkdtempSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { createHash } from "crypto";
 import { createStore, canonicalDocId, type Store } from "../../src/store.ts";
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
@@ -23,13 +25,15 @@ import { computeDocMetrics, mean, p95 } from "../../src/eval/metrics.ts";
 import { parseGoldFile, resolveGoldExamples, GoldFileError } from "../../src/eval/gold.ts";
 import { runEval, resolveRetrievedDocId, EvalIntegrityError } from "../../src/eval/run.ts";
 
-const TEST_DB = "/tmp/clawmem-eval-harness-test.sqlite";
-const OUT_DIR = "/tmp/clawmem-eval-harness-out";
+// Per-run unique root: fixed /tmp paths are clobbered by overlapping runs and poisoned by stale -wal/-shm sidecars (vn4rz.79).
+const TEST_ROOT = mkdtempSync(join(tmpdir(), "clawmem-eval-harness-"));
+const TEST_DB = join(TEST_ROOT, "test.sqlite");
+const OUT_DIR = join(TEST_ROOT, "out");
 const MODEL = "eval-fake";
 
 const goldFiles: string[] = [];
 function writeGold(name: string, lines: unknown[]): string {
-  const p = `/tmp/clawmem-eval-harness-gold-${name}.jsonl`;
+  const p = join(TEST_ROOT, `gold-${name}.jsonl`);
   writeFileSync(p, lines.map(l => (typeof l === "string" ? l : JSON.stringify(l))).join("\n") + "\n");
   goldFiles.push(p);
   return p;
@@ -104,6 +108,7 @@ afterAll(() => {
   try { unlinkSync(TEST_DB); } catch { /* gone */ }
   try { rmSync(OUT_DIR, { recursive: true }); } catch { /* gone */ }
   for (const p of goldFiles) { try { unlinkSync(p); } catch { /* gone */ } }
+  rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
 describe("computeDocMetrics", () => {
@@ -544,7 +549,7 @@ describe("eval CLI (subprocess)", () => {
     const fracLimit = runCli(["--gold", p, "--limit", "1.5"]);
     expect(fracLimit.exitCode).toBe(1);
     expect(fracLimit.stderr.toString()).toContain("positive integer");
-    const badDb = runCli(["--gold", p, "--db", "/tmp/clawmem-eval-no-such-snapshot.sqlite"]);
+    const badDb = runCli(["--gold", p, "--db", "/tmp/clawmem-eval-no-such-snapshot.sqlite"]);  // safe: negative probe: the CLI dies on !existsSync(--db) before opening anything; never created
     expect(badDb.exitCode).toBe(1);
     expect(badDb.stderr.toString()).toContain("snapshot not found");
   }, 60000);

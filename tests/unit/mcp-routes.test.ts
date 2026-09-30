@@ -12,7 +12,9 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
  * incident composite-ranking fixture (exclusion restores true-match ordering).
  */
 
-import { unlinkSync } from "fs";
+import { unlinkSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { createHash } from "crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -24,7 +26,9 @@ import { applyCompositeScoring } from "../../src/memory.ts";
 import { enrichResults } from "../../src/search-utils.ts";
 import { rankRawPrimary } from "../../src/scoring-regime.ts";
 
-const TEST_DB = "/tmp/clawmem-mcp-routes-test.sqlite";
+// Per-run unique root: fixed /tmp paths are clobbered by overlapping runs and poisoned by stale -wal/-shm sidecars (vn4rz.79).
+const TEST_ROOT = mkdtempSync(join(tmpdir(), "clawmem-mcp-routes-"));
+const TEST_DB = join(TEST_ROOT, "test.sqlite");
 const MODEL = "route-fake";
 
 // Keyword-steered fake embedder: queries/docs about "sealed acceptance" cluster together;
@@ -142,6 +146,7 @@ afterAll(() => {
   setDefaultLlamaCpp(null);
   delete Bun.env.INDEX_PATH;
   try { unlinkSync(TEST_DB); } catch { /* gone */ }
+  rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
 type ToolResult = { structuredContent?: any; content?: { type: string; text?: string }[] };

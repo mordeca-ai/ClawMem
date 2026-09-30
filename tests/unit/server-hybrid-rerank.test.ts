@@ -9,13 +9,17 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test";
-import { unlinkSync } from "fs";
+import { unlinkSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { createStore, type Store, type SearchResult } from "../../src/store.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { startServer } from "../../src/server.ts";
 import { fuseAndRerank, type RankedResult } from "../../src/search-utils.ts";
 
-const TEST_DB = "/tmp/clawmem-server-hybrid-rerank-test.sqlite";
+// Per-run unique root: fixed /tmp paths are clobbered by overlapping runs and poisoned by stale -wal/-shm sidecars (vn4rz.79).
+const TEST_ROOT = mkdtempSync(join(tmpdir(), "clawmem-server-hybrid-rerank-"));
+const TEST_DB = join(TEST_ROOT, "test.sqlite");
 const PORT = 17461;
 const BASE = `http://127.0.0.1:${PORT}`;
 const QUERY = "kitchen kiosk casting strategy for cast receivers";
@@ -75,6 +79,7 @@ afterAll(() => {
   server.stop();
   store.close();
   rmDb();
+  rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
 const r = (t: string) => byTitle.get(t)!;

@@ -7,6 +7,8 @@
 import { test, expect, describe, afterEach } from "bun:test";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import type { Socket } from "bun";
 import {
   startVectorDaemon,
@@ -18,9 +20,12 @@ import {
 import { VecReadModelMismatchError, type Store } from "../../src/store.ts";
 
 let seq = 0;
+// dbPath is only a hash key for the socket path (never created on disk); a random per-run token replaces the recyclable pid (vn4rz.79).
+const RUN = randomUUID();
+const uniqueDbPath = () => `${tmpdir()}/vd-test-${RUN}-${seq++}.sqlite`;
 // Only `.dbPath` is read when a scan is injected — the default scan's `store.db` is never touched.
 function fakeStore(): Store {
-  return { dbPath: `/tmp/vd-test-${process.pid}-${seq++}.sqlite` } as unknown as Store;
+  return { dbPath: uniqueDbPath() } as unknown as Store;
 }
 
 // Minimal raw client: send one framed payload, resolve the first newline-terminated response line.
@@ -196,7 +201,7 @@ describe("searchVecBounded routing + client failure modes", () => {
     const sentinel = [{ filepath: "clawmem://c/x.md", score: 0.9 }] as unknown as Awaited<ReturnType<typeof searchVecBounded>>;
     let called = false;
     const store = {
-      dbPath: `/tmp/vd-test-${process.pid}-${seq++}.sqlite`,
+      dbPath: uniqueDbPath(),
       searchVec: async () => { called = true; return sentinel; },
     } as unknown as Store;
     const out = await searchVecBounded(store, "q", "m", 5);
@@ -211,7 +216,7 @@ describe("searchVecBounded routing + client failure modes", () => {
   });
 
   test("malformed daemon response → {status:'error'}", async () => {
-    const dbPath = `/tmp/vd-test-${process.pid}-${seq++}.sqlite`;
+    const dbPath = uniqueDbPath();
     const srv = fakeServer(vecDaemonSocketPath(dbPath), (s) => { s.write("not json at all\n"); s.end(); });
     try {
       const out = await daemonVecMatch(dbPath, { query: "q", model: "m", limit: 5 }, 1000);
@@ -220,7 +225,7 @@ describe("searchVecBounded routing + client failure modes", () => {
   });
 
   test("daemon closes without responding → {status:'error'}", async () => {
-    const dbPath = `/tmp/vd-test-${process.pid}-${seq++}.sqlite`;
+    const dbPath = uniqueDbPath();
     const srv = fakeServer(vecDaemonSocketPath(dbPath), (s) => { s.end(); });
     try {
       const out = await daemonVecMatch(dbPath, { query: "q", model: "m", limit: 5 }, 1000);
@@ -229,7 +234,7 @@ describe("searchVecBounded routing + client failure modes", () => {
   });
 
   test("hung daemon (no response) → {status:'error'} at the IPC deadline", async () => {
-    const dbPath = `/tmp/vd-test-${process.pid}-${seq++}.sqlite`;
+    const dbPath = uniqueDbPath();
     const srv = fakeServer(vecDaemonSocketPath(dbPath), () => { /* receive, never respond */ });
     try {
       const out = await daemonVecMatch(dbPath, { query: "q", model: "m", limit: 5 }, 200);

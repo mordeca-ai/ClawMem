@@ -499,8 +499,11 @@ describe("retryOnBusyAsync (design (f).2)", () => {
 
 describe("no-work run end verification (T10-M1)", () => {
   it("a fully-embedded vault with an unavailable preflight exits NONZERO without setting taint", async () => {
-    const dbPath = `/tmp/clawmem-nowork-taint-${process.pid}.sqlite`;
-    const { unlinkSync } = await import("node:fs");
+    const { unlinkSync, mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "clawmem-nowork-taint-")); // unique per run (vn4rz.79)
+    const dbPath = join(root, "index.sqlite");
     try { unlinkSync(dbPath); } catch { /* absent */ }
     // Seed: one synced doc WITH a vector — a no-work run (nothing pending).
     const store = createStore(dbPath);
@@ -533,6 +536,7 @@ describe("no-work run end verification (T10-M1)", () => {
     expect(check.getVaultFlag("embed_geometry_taint")).toBeNull();
     check.close();
     try { unlinkSync(dbPath); } catch { /* gone */ }
+    rmSync(root, { recursive: true, force: true });
   }, 30_000);
 
   it("a run that writes vectors without a validated preflight exits NONZERO and sets taint", async () => {

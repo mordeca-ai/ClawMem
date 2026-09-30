@@ -156,8 +156,8 @@ describe("getDefaultBackupDir", () => {
   });
 
   it("honors CLAWMEM_BACKUP_DIR override", () => {
-    Bun.env.CLAWMEM_BACKUP_DIR = "/tmp/custom-clawmem-backups";
-    expect(getDefaultBackupDir()).toBe("/tmp/custom-clawmem-backups");
+    Bun.env.CLAWMEM_BACKUP_DIR = "/tmp/custom-clawmem-backups";  // safe: env-var string compared to getDefaultBackupDir(); the directory is never created
+    expect(getDefaultBackupDir()).toBe("/tmp/custom-clawmem-backups");  // safe: assertion literal only
   });
 
   it("defaults to <cache>/clawmem/backups when unset", () => {

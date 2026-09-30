@@ -64,7 +64,7 @@ const stubExecHook: ExecHookFn = async (
 // this with a resolver that returns undefined.
 const stubSessionFileResolver: ResolveSessionFileFn = (params) => {
   if (!params.sessionId) return undefined;
-  return `/tmp/test-state/agents/${params.agentId ?? "main"}/sessions/${params.sessionId}.jsonl`;
+  return `/tmp/test-state/agents/${params.agentId ?? "main"}/sessions/${params.sessionId}.jsonl`;  // safe: stub resolver returns a string; the handler runner is mocked, so the path is never opened
 };
 
 const undefinedResolver: ResolveSessionFileFn = () => undefined;
@@ -282,7 +282,7 @@ describe("Shipping Condition 1 — precompact via before_prompt_build, never via
     await handleBeforeReset(
       mockCfg,
       mockLogger,
-      { sessionFile: "/tmp/explicit-session.jsonl", reason: "reset" },
+      { sessionFile: "/tmp/explicit-session.jsonl", reason: "reset" },  // safe: transcript_path value passed to a mocked runner; never touched on disk
       { sessionId: "session-reset", agentId: "main" },
     );
 
@@ -295,7 +295,7 @@ describe("Shipping Condition 1 — precompact via before_prompt_build, never via
     // event payload (not the resolver fallback).
     for (const name of ["decision-extractor", "handoff-generator", "feedback-loop"]) {
       const call = calls.find((c) => c.name === name);
-      expect(call?.input.transcript_path).toBe("/tmp/explicit-session.jsonl");
+      expect(call?.input.transcript_path).toBe("/tmp/explicit-session.jsonl");  // safe: assertion literal only
     }
   });
 
@@ -319,7 +319,7 @@ describe("Shipping Condition 1 — precompact via before_prompt_build, never via
     await handleBeforeReset(
       mockCfg,
       mockLogger,
-      { sessionFile: "/tmp/session.jsonl", reason: "reset" },
+      { sessionFile: "/tmp/session.jsonl", reason: "reset" },  // safe: transcript_path value passed to a mocked runner; never touched on disk
       {},
     );
 

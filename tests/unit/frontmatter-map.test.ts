@@ -17,8 +17,9 @@
  * Fixtures are inline: this repo's .gitignore ignores `*.md` behind an allowlist.
  */
 import { describe, it, expect, beforeEach, afterEach, afterAll } from "bun:test";
-import { mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync, statSync } from "fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, statSync } from "fs";
 import { join } from "path";
+import { tmpdir } from "os";
 import {
   parseDocument,
   indexCollection,
@@ -257,7 +258,7 @@ describe("A5: a malformed frontmatter_map fails loud", () => {
   });
 
   describe("at config load", () => {
-    const DIR = `/tmp/clawmem-wzwh8.1-config-${process.pid}`;
+    const DIR = mkdtempSync(join(tmpdir(), "clawmem-wzwh8.1-config-")); // unique per run (vn4rz.79)
     const saved = process.env.CLAWMEM_CONFIG_DIR;
     beforeEach(() => {
       rmSync(DIR, { recursive: true, force: true });
@@ -323,7 +324,7 @@ describe("A5: a malformed frontmatter_map fails loud", () => {
       // No cross-collection bleed: the other collection has no map.
       expect(collectionIndexOptions(cfg.collections.plain!).frontmatterMap).toBeUndefined();
 
-      addCollection("memory-topics", "/tmp/nowhere", "**/*.md");
+      addCollection("memory-topics", "/tmp/nowhere", "**/*.md");  // safe: collection path is a config string; addCollection writes only to the temp config dir, never touches this path
       clearConfigCache();
       expect(loadConfig().collections["memory-topics"]!.frontmatter_map).toEqual(MAP);
     });
@@ -332,7 +333,7 @@ describe("A5: a malformed frontmatter_map fails loud", () => {
 
 describe("A6: every indexing path honours the map", () => {
   describe("sqlite indexCollection (insert and changed-content update paths)", () => {
-    const ROOT = `/tmp/clawmem-wzwh8.1-index-${process.pid}`;
+    const ROOT = mkdtempSync(join(tmpdir(), "clawmem-wzwh8.1-index-")); // unique per run (vn4rz.79)
     const CONTENT = `${ROOT}/content`;
     let store: Store;
     const deadLlm = {

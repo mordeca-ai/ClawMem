@@ -12,16 +12,19 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
  * on purpose — the host runs real inference servers on the default ports.
  */
 
-import { mkdirSync, rmSync, writeFileSync, unlinkSync, appendFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, unlinkSync, appendFileSync } from "fs";
 import { join } from "path";
+import { tmpdir } from "os";
 import { createHash } from "crypto";
 import { Database } from "bun:sqlite";
 import { createStore } from "../../src/store.ts";
 import { enrichResults } from "../../src/search-utils.ts";
 
 const REPO_ROOT = new URL("../..", import.meta.url).pathname;
-const TEST_DB = "/tmp/clawmem-authored-cli-test.sqlite";
-const SRC = `/tmp/clawmem-authored-cli-src-${Date.now()}`;
+// Per-run unique root: fixed /tmp paths are clobbered by overlapping runs and poisoned by stale -wal/-shm sidecars (vn4rz.79).
+const TEST_ROOT = mkdtempSync(join(tmpdir(), "clawmem-authored-cli-"));
+const TEST_DB = join(TEST_ROOT, "test.sqlite");
+const SRC = join(TEST_ROOT, "src");
 
 const cliEnv = {
   ...Bun.env,
@@ -83,6 +86,7 @@ beforeAll(() => {
 afterAll(() => {
   try { unlinkSync(TEST_DB); } catch { /* absent */ }
   rmSync(SRC, { recursive: true, force: true });
+  rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
 describe("mine identity + authored_at capture (D10/D3/D4 e2e)", () => {
