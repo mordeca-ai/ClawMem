@@ -25,6 +25,7 @@ import {
   buildVecSearchQuery,
   dedupeToSearchResults,
   getStoredVecModels,
+  hasDocTierColumn,
   normalizeCollections,
   pgSearchVec,
   pgSearchVecDetailed,
@@ -93,6 +94,89 @@ describe("buildVecSearchQuery — the SQL contract", () => {
   it("applies the fragment limit as a bind parameter, not literal text", () => {
     expect(buildVecSearchQuery("[0.1]", null, 7).values.at(-1)).toBe(7);
   });
+
+  it("carries the literal `cv.doc_tier` predicate that licenses the partial HNSW index (vn4rz.77)", () => {
+    // content_vectors_embedding_doc_hnsw_idx is `... WHERE doc_tier`; the
+    // planner only uses a partial index when the query's own WHERE implies its
+    // predicate. Without this line the scan silently reverts to the full index
+    // and the 2.5-6.1 s origin-region walk. Both filter shapes must carry it.
+    for (const cols of [null, ["research"]]) {
+      const q = buildVecSearchQuery("[0.1]", cols, 64);
+      const where = q.text.slice(q.text.indexOf("WHERE"), q.text.indexOf("ORDER BY"));
+      expect(where).toMatch(/\bcv\.doc_tier\b/);
+      // A bare boolean column, not `= $n`: a bind parameter cannot prove a
+      // partial-index predicate at plan time for a generic plan.
+      expect(where).not.toMatch(/doc_tier\s*=/);
+    }
+  });
+});
+
+describe("doc_tier predicate is conditional on the column existing (vn4rz.77 skeptic fix)", () => {
+  it("buildVecSearchQuery carries the literal cv.doc_tier predicate by default", () => {
+    expect(buildVecSearchQuery("[0.1]", null, 64).text).toMatch(/WHERE cv\.doc_tier\s+AND d\.active = true/);
+  });
+
+  it("buildVecSearchQuery OMITS cv.doc_tier when the column is absent, keeping every other predicate", () => {
+    const q = buildVecSearchQuery("[0.1]", ["research"], 64, false);
+    expect(q.text).not.toContain("doc_tier");
+    expect(q.text).toMatch(/WHERE d\.active = true/);
+    expect(q.text).toContain("d.invalidated_at IS NULL");
+    expect(q.text).toContain("d.collection = ANY($2::text[])");
+    expect(q.values).toEqual(["[0.1]", ["research"], 64]);
+  });
+
+  it("the model fence carries cv.doc_tier by default and omits it when absent", async () => {
+    const withTier = fakeClient(() => []);
+    await getStoredVecModels(withTier, null);
+    expect(withTier.calls[0]!.text).toContain("cv.doc_tier");
+    const without = fakeClient(() => []);
+    await getStoredVecModels(without, ["research"], false);
+    expect(without.calls[0]!.text).not.toContain("doc_tier");
+    expect(without.calls[0]!.text).toContain("cv.model = m.model");
+    expect(without.calls[0]!.text).toContain("d.collection = ANY($1::text[])");
+  });
+
+  it("pgSearchVec on a vault WITHOUT the column issues neither query with doc_tier", async () => {
+    const c = searchClient({ storedModels: ["embeddinggemma"], rows: [row({ path: "old.md" })], docTierPresent: false });
+    const out = await pgSearchVec(c, "hello", { embedder: fakeEmbedder("embeddinggemma") });
+    expect(out.map(r => r.displayPath)).toEqual(["research/old.md"]);
+    const shaped = c.calls.filter(x => x.text.includes("<=>") || x.text.includes("SELECT DISTINCT model"));
+    expect(shaped).toHaveLength(2);
+    for (const x of shaped) expect(x.text).not.toContain("doc_tier");
+  });
+
+  it("pgSearchVec on a migrated vault keeps cv.doc_tier in BOTH queries", async () => {
+    const c = searchClient({ storedModels: ["embeddinggemma"], rows: [row()] });
+    await pgSearchVec(c, "hello", { embedder: fakeEmbedder("embeddinggemma") });
+    const shaped = c.calls.filter(x => x.text.includes("<=>") || x.text.includes("SELECT DISTINCT model"));
+    expect(shaped).toHaveLength(2);
+    for (const x of shaped) expect(x.text).toContain("cv.doc_tier");
+  });
+
+  it("an explicit docTier option skips the probe entirely", async () => {
+    const c = searchClient({ storedModels: ["embeddinggemma"], rows: [row()] });
+    await pgSearchVec(c, "hello", { embedder: fakeEmbedder("embeddinggemma"), docTier: false });
+    expect(c.calls.some(x => x.text.includes("attname = 'doc_tier'"))).toBe(false);
+  });
+
+  it("hasDocTierColumn caches per connection identity and re-probes a client with none", async () => {
+    const probes = { n: 0 };
+    const mk = (id: object, present: boolean) => Object.assign(
+      { async query() { probes.n++; return { rows: [{ present }] as never[] }; } }, id,
+    ) as PgQueryable;
+    const migrated = mk({ database: "vault_a", host: "h", port: 1 }, true);
+    expect(await hasDocTierColumn(migrated)).toBe(true);
+    expect(await hasDocTierColumn(migrated)).toBe(true);
+    expect(probes.n).toBe(1); // cached
+    // A different database is a different key: not answered from vault_a's entry.
+    expect(await hasDocTierColumn(mk({ database: "vault_b", host: "h", port: 1 }, false))).toBe(false);
+    expect(probes.n).toBe(2);
+    // No identity (a fake): never cached.
+    const anon = mk({}, true);
+    await hasDocTierColumn(anon);
+    await hasDocTierColumn(anon);
+    expect(probes.n).toBe(4);
+  });
 });
 
 describe("normalizeCollections", () => {
@@ -130,7 +214,7 @@ describe("getStoredVecModels — scoped to the rows the search will read", () =>
     const outer = text.slice(0, existsAt);
     const inner = text.slice(existsAt);
     expect(outer).toContain("SELECT DISTINCT model FROM content_vectors");
-    for (const pred of ["d.active = true", "d.invalidated_at IS NULL", "d.collection = ANY($1::text[])"]) {
+    for (const pred of ["cv.doc_tier", "d.active = true", "d.invalidated_at IS NULL", "d.collection = ANY($1::text[])"]) {
       expect(outer).not.toContain(pred);
       expect(inner).toContain(pred);
     }
@@ -280,12 +364,15 @@ function fakeEmbedder(model: string, embedding = [0.1, 0.2]): PgVecEmbedder & {
  * A recording fake that answers the whole pgSearchVec conversation: the
  * transaction verbs, the DISTINCT model fence, and the ANN scan.
  */
-function searchClient(opts: { storedModels: string[]; rows?: PgVecRow[] }) {
+function searchClient(opts: { storedModels: string[]; rows?: PgVecRow[]; docTierPresent?: boolean }) {
   const calls: { text: string; values: unknown[] }[] = [];
   const client: PgQueryable & { calls: typeof calls } = {
     calls,
     async query(text: string, values: unknown[] = []) {
       calls.push({ text, values });
+      if (text.includes("attname = 'doc_tier'")) {
+        return { rows: [{ present: opts.docTierPresent ?? true }] as never[] };
+      }
       if (text.includes("SELECT DISTINCT model FROM content_vectors")) {
         return { rows: opts.storedModels.map(m => ({ model: m })) as never[] };
       }

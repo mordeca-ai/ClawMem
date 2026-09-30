@@ -220,18 +220,22 @@ d("PG write path", () => {
     expect(await snapshot()).toBe(before);
   });
 
-  it("built the HNSW index VALID, not INVALID", async () => {
+  it("built BOTH HNSW indexes VALID, not INVALID (002 full + 012 doc-tier partial)", async () => {
     const { rows } = await withSchema(c =>
       c.query<{ relname: string; indisvalid: boolean }>(
         `SELECT ci.relname, i.indisvalid FROM pg_index i
            JOIN pg_class ci ON ci.oid = i.indexrelid
            JOIN pg_namespace n ON n.oid = ci.relnamespace
-          WHERE n.nspname = $1 AND ci.relname LIKE '%hnsw%'`,
+          WHERE n.nspname = $1 AND ci.relname LIKE '%hnsw%'
+          ORDER BY ci.relname`,
         [schema],
       ),
     );
-    expect(rows.length).toBe(1);
-    expect(rows[0]!.indisvalid).toBe(true);
+    expect(rows.map(r => r.relname)).toEqual([
+      "content_vectors_embedding_doc_hnsw_idx",
+      "content_vectors_embedding_hnsw_idx",
+    ]);
+    for (const r of rows) expect(r.indisvalid).toBe(true);
   });
 
   it("has NO vault column anywhere (ADR-0162 §1: database-per-vault)", async () => {

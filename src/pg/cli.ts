@@ -17,6 +17,7 @@ import { pgSearchVec } from "./search.ts";
 import { retrieveCli } from "./retrieve.ts";
 import {
   assertSchemaGeometry, CONTENT_GC_DEFAULTS, gcOrphanedContent, getVecModels, type ContentGcResult,
+  type DocTierReconcileResult,
 } from "./write.ts";
 import {
   dropLegacyDocumentRows, dropPartitionsBefore, listPartitions, loadOriginCollection,
@@ -39,6 +40,18 @@ function printContentGc(r: ContentGcResult | { skipped: string }): void {
     `${r.eligibleVectors} vectors, within grace ${r.withinGraceContent}, deleted ` +
     `${r.contentDeleted} content / ${r.vectorsDeleted} vectors in ${r.batches} batch(es)` +
     (r.capped ? ", CAPPED (run again to continue)" : ""),
+  );
+}
+
+/** One line per vault: what the doc_tier self-heal repaired (master-harness-vn4rz.77). */
+function printDocTierReconcile(r: DocTierReconcileResult | { vault: Vault; skipped: string }): void {
+  if ("skipped" in r) {
+    console.log(`doc_tier reconcile (${r.vault}) SKIPPED: ${r.skipped}`);
+    return;
+  }
+  console.log(
+    `doc_tier reconcile (${r.vault}): marked true ${r.markedTrue}, marked false ` +
+    `${r.markedFalse} in ${r.wallClockMs}ms`,
   );
 }
 
@@ -147,6 +160,7 @@ async function main() {
     }
     case "reindex": {
       const gcLines: (ContentGcResult | { skipped: string })[] = [];
+      const tierLines: Parameters<typeof printDocTierReconcile>[0][] = [];
       const cols = flagValue(argv, "--collection");
       const limitRaw = flagValue(argv, "--limit");
       const stats = await reindex({
@@ -159,6 +173,7 @@ async function main() {
         embedBatchSize: argv.includes("--batch-size") ? Number(flagValue(argv, "--batch-size")) : undefined,
         gc: !argv.includes("--no-gc"),
         onContentGc: r => gcLines.push(r),
+        onDocTierReconcile: r => tierLines.push(r),
         onProgress: m => console.log(m),
       });
       for (const s of stats) {
@@ -235,6 +250,7 @@ async function main() {
         }
       }
       for (const g of gcLines) printContentGc(g);
+      for (const t of tierLines) printDocTierReconcile(t);
       break;
     }
     // ---------------------------------------------------------------------

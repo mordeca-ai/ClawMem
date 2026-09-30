@@ -813,3 +813,82 @@ export async function gcOrphanedContent(opts: ContentGcOptions = {}): Promise<Co
   result.capped = !converged;
   return result;
 }
+
+// ===========================================================================
+// doc_tier self-heal (master-harness-vn4rz.77)
+// ===========================================================================
+
+/**
+ * What one doc_tier reconcile pass changed. Nonzero counts on a quiet vault are
+ * the signal worth reading: the triggers from migration 010 keep the flag
+ * current on every committed write, so a repair means a concurrent-insert race
+ * (or a hand edit) left it stale.
+ */
+export interface DocTierReconcileResult {
+  vault: Vault;
+  /** Vectors whose hash HAS a documents row but were flagged false (hidden from ANN). */
+  markedTrue: number;
+  /** Vectors whose hash has NO documents row but were flagged true (index walk cost only). */
+  markedFalse: number;
+  wallClockMs: number;
+}
+
+/**
+ * Re-derive `content_vectors.doc_tier` from its definition — "ANY documents row
+ * references this hash" — on the client's current schema. Two set-based
+ * UPDATEs; each rewrites only rows whose flag is actually wrong, so a converged
+ * vault pays two scans and writes nothing.
+ *
+ * WHY THIS EXISTS. Migration 010's triggers run under the writer's snapshot and
+ * cannot see another transaction's uncommitted row: a vector inserted while its
+ * documents row is still in flight (or the mirror delete-vs-insert race) is
+ * left with a stale flag. A stale FALSE hides a live document's vectors from
+ * the ANN reader (search.ts filters `cv.doc_tier` so it can use the partial
+ * HNSW index), so the flag is a maintained cache and this is its repair.
+ *
+ * Runs inside the caller's transaction; does not open one.
+ */
+export async function reconcileDocTier(
+  c: Pick<PoolClient, "query">,
+): Promise<{ markedTrue: number; markedFalse: number }> {
+  const up = await c.query(
+    `UPDATE content_vectors cv SET doc_tier = true
+      WHERE NOT cv.doc_tier
+        AND EXISTS (SELECT 1 FROM documents d WHERE d.hash = cv.hash)`,
+  );
+  const down = await c.query(
+    `UPDATE content_vectors cv SET doc_tier = false
+      WHERE cv.doc_tier
+        AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = cv.hash)`,
+  );
+  return { markedTrue: up.rowCount ?? 0, markedFalse: down.rowCount ?? 0 };
+}
+
+/**
+ * reconcileDocTier for one vault, in its own transaction, behind the same
+ * database belt as every other write. Returns `{ skipped }` instead of throwing
+ * when the vault's schema predates migration 010 (e.g. an nsfw vault not yet
+ * migrated): a reindex pass must not fail at its very end over a column the
+ * operator has not been asked to create yet — but the skip is reported, never
+ * silent.
+ */
+export async function reconcileDocTierForVault(
+  vault: Vault,
+): Promise<DocTierReconcileResult | { vault: Vault; skipped: string }> {
+  const t0 = Date.now();
+  return withTransaction(vault, async c => {
+    await assertVaultDatabase(c, vault);
+    const { rows } = await c.query<{ present: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM pg_attribute
+          WHERE attrelid = to_regclass('content_vectors')
+            AND attname = 'doc_tier' AND NOT attisdropped
+       ) AS present`,
+    );
+    if (!rows[0]?.present) {
+      return { vault, skipped: "content_vectors.doc_tier absent (migration 010 not applied)" };
+    }
+    const r = await reconcileDocTier(c);
+    return { vault, ...r, wallClockMs: Date.now() - t0 };
+  });
+}
