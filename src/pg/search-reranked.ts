@@ -293,7 +293,11 @@ export async function pgSearchRerankedDetailed(
   // ONE t0 FOR THE WHOLE CALL. Every budget decision below is derived from this
   // single reading; taking a second clock reading per stage is how a
   // "per-stage timeout" creeps back in (ruling 4).
-  const t0 = performance.now();
+  // `opts.now` is the test seam (master-harness-vn4rz.78): omitted ⇒
+  // performance.now(), exactly as before; it is forwarded to the hybrid so ONE
+  // clock governs the whole call.
+  const now = opts.now ?? (() => performance.now());
+  const t0 = now();
   const deadlineMs = opts.deadlineMs ?? DEFAULT_PG_RERANK_DEADLINE_MS;
   const limit = opts.limit ?? 20;
   const rerankCap = opts.rerankCap ?? Math.max(limit, PG_RERANK_CAP_FLOOR);
@@ -308,6 +312,7 @@ export async function pgSearchRerankedDetailed(
     ...(opts.embedder === undefined ? {} : { embedder: opts.embedder as PgVecEmbedder }),
     ...(opts.overfetch === undefined ? {} : { overfetch: opts.overfetch }),
     ...(opts.rrfK === undefined ? {} : { rrfK: opts.rrfK }),
+    ...(opts.now === undefined ? {} : { now: opts.now }),
     // The SAME t0-derived instant, handed down so each arm is bounded by what
     // remains of the overall deadline rather than by its own full timeout.
     deadlineAt: t0 + deadlineMs,
@@ -318,7 +323,7 @@ export async function pgSearchRerankedDetailed(
   // problems, not RETRIEVAL problems, and folding the two together would make
   // "we could not look" unreachable again.
   const hybrid = await pgSearchHybridDetailed(c, query, hybridOpts);
-  const hybridMs = performance.now() - t0;
+  const hybridMs = now() - t0;
 
   /** Every non-"applied" exit: the fused order, byte-identically (ruling 2). */
   const degradeToFusion = (
@@ -332,7 +337,7 @@ export async function pgSearchRerankedDetailed(
     ...("rerankError" in extra ? { rerankError: extra.rerankError } : {}),
     candidateCount: extra.candidateCount ?? 0,
     ...(extra.rerankedCount === undefined ? {} : { rerankedCount: extra.rerankedCount }),
-    timings: { hybridMs, rerankMs: 0, totalMs: performance.now() - t0 },
+    timings: { hybridMs, rerankMs: 0, totalMs: now() - t0 },
     deadlineMs,
   });
 
@@ -354,7 +359,7 @@ export async function pgSearchRerankedDetailed(
     return degradeToFusion("skipped-no-text", { candidateCount: documents.length });
   }
 
-  const remaining = deadlineMs - (performance.now() - t0);
+  const remaining = deadlineMs - (now() - t0);
   if (remaining < PG_RERANK_MIN_BUDGET_MS) {
     return degradeToFusion("skipped-budget", {
       candidateCount: documents.length,
@@ -364,7 +369,7 @@ export async function pgSearchRerankedDetailed(
     });
   }
 
-  const rerankStart = performance.now();
+  const rerankStart = now();
   let reranked: { file: string; score: number }[];
   try {
     // `remaining`, NOT `deadlineMs`. Handing the reranker the full deadline is
@@ -377,7 +382,7 @@ export async function pgSearchRerankedDetailed(
       rerankReason: error instanceof Error ? error.message : String(error),
     });
   }
-  const rerankMs = performance.now() - rerankStart;
+  const rerankMs = now() - rerankStart;
 
   // `onFallback` fires iff blendRerank found no usable signal — an empty
   // response or every score at/below the floor. That IS the "degenerate"
@@ -400,7 +405,7 @@ export async function pgSearchRerankedDetailed(
         rerankedCount: reranked.length,
         rerankReason: fallbackReason,
       }),
-      timings: { hybridMs, rerankMs, totalMs: performance.now() - t0 },
+      timings: { hybridMs, rerankMs, totalMs: now() - t0 },
     };
   }
 
@@ -420,7 +425,7 @@ export async function pgSearchRerankedDetailed(
     rerank: "applied",
     candidateCount: documents.length,
     rerankedCount: reranked.length,
-    timings: { hybridMs, rerankMs, totalMs: performance.now() - t0 },
+    timings: { hybridMs, rerankMs, totalMs: now() - t0 },
     deadlineMs,
   };
 }

@@ -4,6 +4,18 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.42 — pg reindex honours the collection content_type default (vn4rz.76)
+
+pg reindex honours the collection content_type default (parity with sqlite)
+
+---
+
+## v0.36.41 — load-robust pg search deadline tests via injectable clock (vn4rz.78)
+
+pg search deadline/timing tests are load-robust: an optional injectable `now?: () => number` clock seam on the vec/fts/hybrid(/reranked) search options (production default unchanged — same Date.now()/performance.now() reads when omitted), and the pg-search-reranked / pg-search-hybrid unit tests now drive a fake clock and assert exact budget arithmetic instead of wall-clock SLACK tolerances. Removes the host-load flakes that blocked clawmem landings (master-harness-vn4rz.78).
+
+---
+
 ## v0.36.40 — clawmem PG read path: hybrid query vec leg exceeds its 1200ms statement timeout under fleet load (PgVecSearchTimeoutError, degraded/0 results) — blocks the vn4rz.11 cutover
 
 PG ANN reader: doc-tier partial HNSW index (master-harness-vn4rz.77).

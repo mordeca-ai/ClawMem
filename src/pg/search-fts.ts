@@ -95,6 +95,17 @@ export interface PgSearchFtsOptions {
    * (PostgreSQL's own meaning for statement_timeout = 0).
    */
   statementTimeoutMs?: number;
+  /**
+   * TEST SEAM for every clock reading this call takes (master-harness-vn4rz.78).
+   * Omitted ⇒ the real clocks, exactly as before (`Date.now()`). Injected ⇒ this one
+   * function replaces them all, and any `deadlineAt` must be an instant on IT.
+   * Only differences between readings matter, so it need not share an epoch
+   * with either real clock. Timers (setTimeout / AbortSignal.timeout) are
+   * NOT routed through it: a unit test
+   * drives the budget arithmetic with a fake clock and fake "sleeps" that
+   * advance it, so the asserted numbers are exact instead of scheduler-bound.
+   */
+  now?: () => number;
 }
 
 /** What one ranked FTS row looks like on the wire. Exported for the unit layer. */
@@ -258,7 +269,8 @@ export async function pgSearchFtsDetailed(
   // The wall-clock budget is checked BEFORE the transaction opens: opening one
   // just to discover we have no time left is a round trip spent on nothing.
   if (opts.timeoutMs !== undefined && opts.timeoutMs <= 0) return degraded("budget-exhausted");
-  const deadline = opts.timeoutMs === undefined ? undefined : Date.now() + opts.timeoutMs;
+  const now = opts.now ?? Date.now;
+  const deadline = opts.timeoutMs === undefined ? undefined : now() + opts.timeoutMs;
 
   const built = buildFtsSearchQuery(query, collections, limit);
   if (built === null) return degraded("empty-tsquery");
@@ -271,7 +283,7 @@ export async function pgSearchFtsDetailed(
     "fts-scan",
     async (): Promise<PgFtsSearchDetailedResult> => {
       if (await isEmptyTsquery(c, tsquery)) return degraded("empty-tsquery");
-      if (deadline !== undefined && Date.now() >= deadline) return degraded("budget-exhausted");
+      if (deadline !== undefined && now() >= deadline) return degraded("budget-exhausted");
       const { rows } = await c.query<PgFtsRow>(text, values);
       // GENUINE-EMPTY lives here: zero rows is `degraded: false`. We looked.
       return { results: toSearchResults(rows, limit), degraded: false, scannedRows: rows.length };
