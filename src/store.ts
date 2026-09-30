@@ -4673,7 +4673,14 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
 // In-process vector search — Step 1 (MATCH) + Step 2 (hydrate) composed. Public contract unchanged;
 // the daemon-backed hook path (context-surfacing) instead calls searchVecMatch (in the daemon) +
 // hydrateVecResults (locally), so the blocking MATCH never runs on the hook's event loop.
+//
+// vn4rz.69: a collection / collectionId / dateRange scope routes through searchVecDetailed,
+// whose pre-filtered KNN fills `limit` in-scope docs. Post-filtering the global top limit*3
+// here returned ~1 doc for a small collection. The unscoped path below is unchanged.
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, collections?: string[], dateRange?: { start: string; end: string }, deadlineMs?: number): Promise<SearchResult[]> {
+  if (hasVecIncludeScope({ collectionId, collections, dateRange })) {
+    return (await searchVecDetailed(db, query, model, limit, { collectionId, collections, dateRange, deadlineMs })).results;
+  }
   const vecResults = await searchVecMatch(db, query, model, limit, deadlineMs);
   return hydrateVecResults(db, vecResults, limit, collectionId, collections, dateRange);
 }
@@ -4701,6 +4708,9 @@ export interface VecSearchDetailedOpts {
   deadlineMs?: number;
   /** Override the hard MATCH-depth cap (default 4096). Primarily for tests. */
   escalationCap?: number;
+  /** Override the pre-filter scope-size threshold (vn4rz.69; default VEC_PREFILTER_MAX_SCOPE).
+   * Primarily for tests — 0 forces the post-filter escalation fallback. */
+  prefilterMaxScope?: number;
   /** WHY observation lane (v0.32.0): restrict candidates to `_clawmem` observation documents
    * (path 'observations/%' + observation_type set) inside the hydration SQL, so the escalation
    * loop fills `limit` with eligible observations by construction. */
@@ -4736,7 +4746,7 @@ export function buildClassifiedHydrateQuery(hashSeqs: string[], opts: VecSearchD
     return i === -1 ? hs : hs.slice(0, i);
   }))];
   const placeholders = hashes.map(() => '?').join(',');
-  let docSql = `
+  const docSql = `
     SELECT
       cv.hash || '_' || cv.seq as hash_seq,
       cv.hash,
@@ -4754,26 +4764,41 @@ export function buildClassifiedHydrateQuery(hashSeqs: string[], opts: VecSearchD
     JOIN content ON content.hash = d.hash
     WHERE cv.hash IN (${placeholders})
   `;
-  const params: string[] = [...hashes];
+  const filter = buildVecDocFilterPredicates(opts);
+  return { sql: docSql + filter.sql, params: [...hashes, ...filter.params] };
+}
 
+/**
+ * The document-level filter predicates shared by the classified hydrate query and the
+ * pre-filter scope query (vn4rz.69), so the two can never disagree on what "in scope" means.
+ * Each predicate is appended as ` AND ...` against alias `d` (documents).
+ */
+function buildVecDocFilterPredicates(opts: VecSearchDetailedOpts): { sql: string; params: string[] } {
+  let sql = "";
+  const params: string[] = [];
   if (opts.collections && opts.collections.length > 0) {
     const colPlaceholders = opts.collections.map(() => '?').join(',');
-    docSql += ` AND d.collection IN (${colPlaceholders})`;
+    sql += ` AND d.collection IN (${colPlaceholders})`;
     params.push(...opts.collections);
   } else if (opts.collectionId) {
-    docSql += ` AND d.collection = ?`;
+    sql += ` AND d.collection = ?`;
     params.push(String(opts.collectionId));
   }
   if (opts.dateRange) {
     // §51.1: content-time predicate — authorship when known, filing time otherwise.
-    docSql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
+    sql += ` AND COALESCE(d.authored_at, d.modified_at) >= ? AND COALESCE(d.authored_at, d.modified_at) <= ?`;
     params.push(opts.dateRange.start, opts.dateRange.end);
   }
   if (opts.observationsOnly) {
-    docSql += ` AND d.path LIKE 'observations/%' AND d.observation_type IS NOT NULL`;
+    sql += ` AND d.path LIKE 'observations/%' AND d.observation_type IS NOT NULL`;
   }
+  return { sql, params };
+}
 
-  return { sql: docSql, params };
+/** True when the caller narrows the candidate set by an INCLUDE scope (collections /
+ * collectionId / dateRange). Exclusion and observationsOnly are handled separately. */
+function hasVecIncludeScope(opts: Pick<VecSearchDetailedOpts, "collectionId" | "collections" | "dateRange">): boolean {
+  return (!!opts.collections && opts.collections.length > 0) || !!opts.collectionId || !!opts.dateRange;
 }
 
 // Hydration + visibility classification for one escalation round. Include-collections and
@@ -4844,6 +4869,102 @@ function hydrateVecResultsClassified(
   return { results, allowedDocs: seen.size, excludedDocsSeen: excludedDocs.size };
 }
 
+// vn4rz.69 — pre-filtered exact vector search for INCLUDE-scoped queries.
+//
+// sqlite-vec's vec0 MATCH is a brute-force flat scan, so post-filtering the global top
+// limit*3 by collection starves any small collection (memory-topics = 0.7% of the vault got
+// 1 doc for limit 10), and each escalation round re-scans the whole table. vec0 accepts a
+// primary-key constraint inside the KNN query (`hash_seq IN (...)`), which it applies DURING
+// the scan: the returned rows are the exact nearest in-scope fragments, for the cost of a
+// single scan. Measured on the live 236k-fragment vault: ~1 plain MATCH worth of latency.
+//
+// Scopes larger than VEC_PREFILTER_MAX_SCOPE fragments return null and fall back to the
+// post-filter escalation loop — such a scope is a large fraction of the vault, so the loop
+// fills quickly, and it bounds the scope-enumeration + IN-set cost.
+const VEC_PREFILTER_MAX_SCOPE = 50_000;
+// sqlite-vec's hard limit on `k` in a KNN query.
+const VEC_KNN_K_MAX = 4096;
+
+function searchVecPrefiltered(
+  db: Database,
+  embedding: Float32Array,
+  limit: number,
+  opts: VecSearchDetailedOpts,
+  exclude: Set<string>,
+  hardCap: number
+): VecSearchDetailedResult | null {
+  const maxScope = opts.prefilterMaxScope ?? VEC_PREFILTER_MAX_SCOPE;
+  const filter = buildVecDocFilterPredicates(opts);
+  // Enumerate the in-scope fragments (bounded: one row past the threshold is enough to
+  // decide the fallback). Same active/invalidated/filter predicates as the hydrate query.
+  const scopeRows = db.prepare(`
+    SELECT cv.hash || '_' || cv.seq AS hash_seq, d.collection,
+      'clawmem://' || d.collection || '/' || d.path AS filepath
+    FROM documents d
+    JOIN content_vectors cv ON cv.hash = d.hash
+    WHERE d.active = 1 AND d.invalidated_at IS NULL${filter.sql}
+    LIMIT ?
+  `).all(...filter.params, maxScope + 1) as { hash_seq: string; collection: string; filepath: string }[];
+  if (scopeRows.length > maxScope) return null;
+
+  const docsByFragment = new Map<string, string[]>();
+  const excludedDocs = new Set<string>();
+  for (const row of scopeRows) {
+    if (exclude.has(row.collection)) {
+      excludedDocs.add(row.filepath);
+      continue;
+    }
+    const docs = docsByFragment.get(row.hash_seq);
+    if (docs) docs.push(row.filepath);
+    else docsByFragment.set(row.hash_seq, [row.filepath]);
+  }
+  const allowedIds = [...docsByFragment.keys()];
+  const empty: VecSearchDetailedResult = { results: [], degraded: false, scannedFragments: 0, excludedDocsSeen: excludedDocs.size };
+  if (allowedIds.length === 0) return empty;
+  if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
+
+  // One scan. k covers every allowed fragment when the scope fits under the k limit (exact
+  // and exhaustive); otherwise the k nearest in-scope fragments, which still yields the exact
+  // top docs whenever they dedupe to >= limit docs (a doc absent from the window has its
+  // best fragment farther than every fragment in it).
+  const kCap = Math.min(hardCap, VEC_KNN_K_MAX);
+  const k = Math.min(allowedIds.length, kCap);
+  const raw = db.prepare(`
+    SELECT hash_seq, distance FROM vectors_vec
+    WHERE embedding MATCH ? AND k = ? AND hash_seq IN (SELECT value FROM json_each(?))
+  `).all(embedding, k, JSON.stringify(allowedIds)) as { hash_seq: string; distance: number }[];
+
+  // Per-doc best fragment, total order (bestDist, filepath) — hxa17.
+  const best = new Map<string, { hash_seq: string; distance: number }>();
+  for (const hit of raw) {
+    for (const filepath of docsByFragment.get(hit.hash_seq) ?? []) {
+      const cur = best.get(filepath);
+      if (!cur || hit.distance < cur.distance) best.set(filepath, hit);
+    }
+  }
+  const topDocs = [...best.entries()]
+    .sort((a, b) => a[1].distance - b[1].distance || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .slice(0, limit);
+  // Hydrate only the winning fragments: each top doc's best fragment is present, so the
+  // hydrate's own dedupe + total sort reproduces exactly this top-limit (a doc sharing a
+  // winning content hash has the identical fragment set, hence the identical best distance).
+  const winners = [...new Map(topDocs.map(([, hit]) => [hit.hash_seq, hit])).values()];
+  const classified = hydrateVecResultsClassified(db, winners, limit, opts, exclude);
+
+  const underfilled = classified.allowedDocs < limit;
+  const capPreventedExhaustion = allowedIds.length > k;
+  const degraded = underfilled && capPreventedExhaustion;
+  return {
+    results: classified.results,
+    degraded,
+    degradedReason: degraded
+      ? (excludedDocs.size >= (limit - classified.allowedDocs) ? "excluded-dominant" : "cap-truncation")
+      : undefined,
+    scannedFragments: raw.length,
+    excludedDocsSeen: excludedDocs.size,
+  };
+}
+
 /**
  * Eval-only + internal core: detailed vector search from a PRECOMPUTED query vector.
  * Runs the SAME shared compatibility guard as the production path (T3-M2/T4-M4) — the
@@ -4868,6 +4989,14 @@ export function searchVecDetailedWithVector(
   const hardCap = opts.escalationCap ?? VEC_ESCALATION_HARD_CAP;
   const effectiveCap = Math.min(hardCap, tableRows);
 
+  // vn4rz.69: an INCLUDE scope (collections / collectionId / dateRange) small enough to
+  // enumerate is served by ONE exact pre-filtered KNN scan instead of post-filtering the
+  // global nearest neighbours (which starved a 0.7% collection down to ~1 doc).
+  if (hasVecIncludeScope(opts)) {
+    const pre = searchVecPrefiltered(db, queryVec.embedding, limit, opts, exclude, hardCap);
+    if (pre) return pre;
+  }
+
   const matchStmt = db.prepare(`SELECT hash_seq, distance FROM vectors_vec WHERE embedding MATCH ? AND k = ?`);
 
   let k = Math.min(limit * 3, effectiveCap);
@@ -4878,9 +5007,10 @@ export function searchVecDetailedWithVector(
   // DOCUMENTS (post-dedup) hydrate, the effective cap is hit, or the deadline passes.
   // `observationsOnly` filters in the hydration SQL exactly like a collection exclusion does,
   // so it engages the same escalation — otherwise nearer non-observation internals could
-  // starve the observation lane out of its first limit*3 raw candidates. Without any
-  // filtering this runs exactly once at limit*3 — today's semantics.
-  const filteringActive = exclude.size > 0 || !!opts.observationsOnly;
+  // starve the observation lane out of its first limit*3 raw candidates. An INCLUDE scope
+  // too large for the pre-filter path (vn4rz.69) is a SQL filter too and escalates the same
+  // way. Without any filtering this runs exactly once at limit*3 — today's semantics.
+  const filteringActive = exclude.size > 0 || !!opts.observationsOnly || hasVecIncludeScope(opts);
   for (;;) {
     raw = matchStmt.all(queryVec.embedding, k) as { hash_seq: string; distance: number }[];
     classified = hydrateVecResultsClassified(db, raw, limit, opts, exclude);

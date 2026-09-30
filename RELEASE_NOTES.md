@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.38 — vn4rz.69: collection-scoped vector search fills limit (pre-filtered KNN)
+
+Collection-scoped vector search no longer starves small collections. An include scope (collections, collectionId, dateRange) with up to 50,000 in-scope fragments now runs one exact pre-filtered vec0 KNN scan (hash_seq IN scope). Before, it post-filtered the global top limit*3, which returned about 1 doc for memory-topics (0.7% of a 236k-fragment vault). Larger scopes fall back to the escalation loop, which now engages for include scopes. Unscoped search is unchanged. memory-topics-recall-v1 vsearch R@10 goes from 0.11 to 0.39 at the 0.30 floor and from 0.67 to 1.00 at --min-score 0. library-baseline holds at 0.88. Eval record: master-harness r60.
+
+---
+
 ## v0.36.37 — PG teardown hooks that DROP DATABASE get an explicit 120s timeout
 
 Nightly full sweep 2026-09-29 went RED on clawmem-pg-vault: pg-vault-isolation afterAll timed out at bun's 5s default because DROP DATABASE forced a 9.0s checkpoint (9.6s statement) and leaked the nsfw throwaway DB. Adds PG_TEST_TEARDOWN_TIMEOUT_MS=120s to pg-vault-isolation and pg-content-type-enum teardowns, plus tests/unit/pg-teardown-timeout-guard.test.ts (RED when a DROP DATABASE teardown lacks a >=60s timeout).
