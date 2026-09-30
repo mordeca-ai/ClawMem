@@ -4,6 +4,43 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.37 — PG teardown hooks that DROP DATABASE get an explicit 120s timeout
+
+Nightly full sweep 2026-09-29 went RED on clawmem-pg-vault: pg-vault-isolation afterAll timed out at bun's 5s default because DROP DATABASE forced a 9.0s checkpoint (9.6s statement) and leaked the nsfw throwaway DB. Adds PG_TEST_TEARDOWN_TIMEOUT_MS=120s to pg-vault-isolation and pg-content-type-enum teardowns, plus tests/unit/pg-teardown-timeout-guard.test.ts (RED when a DROP DATABASE teardown lacks a >=60s timeout).
+
+---
+
+## v0.36.36 — clawmem PG integration suites can redefine the REAL database's public functions when a beforeAll times out (search_path fallback to public + afterAll DROP SCHEMA race)
+
+PG integration suites: production-vault guard, schema+migrations in one txn with SET LOCAL search_path (no public fallback), teardown awaits in-flight setup, 120s beforeAll timeouts; race regression test.
+
+---
+
+## v0.36.35 — doctor: unreachable reranker is not degenerate
+
+`clawmem doctor` and `clawmem rerank-health` now report an unreachable reranker as **UNREACHABLE** instead of "FAILED discrimination probe". Previously an outage (every probe request failing, no local fallback) left zero observed scores, which the calibration arm misread as a score collapse and answered with the zerank-2 "re-deploy the seq-cls sidecar" advice. The probe result gains `probeErrors` and `unreachable`; the calibration arm now judges observed scores only; partial transport errors get their own advice ahead of the coverage arm. Exit codes are unchanged (master-harness-xso4y).
+
+---
+
+## v0.36.34 — Count frontmatter that parses but declares no title/content_type
+
+Frontmatter written in another vocabulary (`name:`, `type:`, `metadata.type`) parses cleanly, but `parseDocument` reads only `title:` and `content_type:`. Those documents were indexed with no title and a fallback content_type, and nothing counted it. On the live memory-topics collection, all 416 documents with frontmatter are affected.
+
+- `parseDocument` now reports `frontmatter` (`absent` / `parsed` / `failed`) and, when a parsed block lacks `title` or `content_type`, a `vocabGap` naming which of `name` / `type` / `metadata.type` it declared instead.
+- `update`/`reindex` (sqlite, new/changed files only) and pg `reindex` (every file) print a per-collection `frontmatter:` summary line next to the vn4rz.34 unparseable counter.
+- No change to indexed values: titles, content_type and scores are identical. Which vocabulary is canonical is still an open decision (master-harness-wzwh8.1).
+
+---
+
+## v0.36.33 — Session id resolves from CLAUDE_CODE_SESSION_ID
+
+`clawmem focus` and the session-focus collection scope on `search`/`vsearch`/`query` read the session id from `CLAUDE_SESSION_ID`, which Claude Code never sets (it injects `CLAUDE_CODE_SESSION_ID`). Inside a Claude Code session, `clawmem focus` without `--session-id` died with "No session id", and direct searches never picked up the session's focus scope. Hook paths were unaffected because hook wrappers write `CLAUDE_SESSION_ID` from the payload.
+
+- New `resolveEnvSessionId` (`src/session-focus.ts`) reads `CLAUDE_CODE_SESSION_ID`, then `CLAUDE_SESSION_ID`, then `CLAWMEM_SESSION_ID`, skipping blanks. Both CLI call sites use it; `--session-id` still wins.
+- Docs (`cli.md`, `hooks-vs-mcp.md`, `upgrading.md`) no longer claim Claude Code exposes `CLAUDE_SESSION_ID`.
+
+---
+
 ## v0.36.32 — index-serve classified hydrate; memoize getContextForFile
 
 - `hydrateVecResultsClassified` now filters on the indexed `cv.hash` column instead of the computed `cv.hash || "_" || cv.seq` expression, so its query plan is `SEARCH d USING INDEX idx_documents_hash` rather than a full scan of `documents` (the same fix hxa17 made to `hydrateVecResults`).

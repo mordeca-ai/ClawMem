@@ -33,9 +33,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import pg from "pg";
-import { readFileSync, readdirSync } from "fs";
-import { join } from "path";
-import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
+import { createPgTestSchema, PG_TEST_SETUP_TIMEOUT_MS, type PgTestSchema } from "./pg-test-schema.ts";
 import { closePool } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
 import { pgSearchFts, pgSearchFtsDetailed } from "../../src/pg/search-fts.ts";
@@ -97,42 +95,40 @@ const FIXTURES: Fixture[] = [
 d("PG lexical (FTS) read path", () => {
   let pool: pg.Pool;
   let schema: string;
+  let harness: PgTestSchema | undefined;
 
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: URL_ });
-    schema = `clawmem_ftstest_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-    const c = await pool.connect();
-    try {
-      await c.query(`CREATE SCHEMA ${schema}`);
-      await c.query(`SET search_path TO ${schema}, public`);
-      for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
-        const sql = substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM);
-        await c.query(sql);
-      }
-      // Fixtures. Direct SQL: this is setup, not the code under test. `content`
-      // MUST be inserted first — the FTS trigger reads the body out of it by
-      // hash when the document row lands.
-      for (const [i, fx] of FIXTURES.entries()) {
-        const hash = String(i).repeat(64).slice(0, 64);
-        await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, fx.body]);
-        await c.query(
-          `INSERT INTO documents (collection, path, title, hash, active, invalidated_at)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [fx.collection, fx.path, fx.title, hash, fx.active ?? true,
-           fx.invalidated ? new Date() : null],
-        );
-      }
-    } finally {
-      c.release();
-    }
+    // vn4rz.73: guarded, single-transaction setup (tests/integration/pg-test-schema.ts).
+    harness = createPgTestSchema({
+      url: URL_!,
+      prefix: "clawmem_ftstest",
+      dim: DIM,
+      seed: async (c) => {
+        // Fixtures. Direct SQL: this is setup, not the code under test. `content`
+        // MUST be inserted first — the FTS trigger reads the body out of it by
+        // hash when the document row lands.
+        for (const [i, fx] of FIXTURES.entries()) {
+          const hash = String(i).repeat(64).slice(0, 64);
+          await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, fx.body]);
+          await c.query(
+            `INSERT INTO documents (collection, path, title, hash, active, invalidated_at)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [fx.collection, fx.path, fx.title, hash, fx.active ?? true,
+             fx.invalidated ? new Date() : null],
+          );
+        }
+      },
+    });
+    ({ pool, schema } = harness);
+    await harness.setup();
     setPgSchema(schema);
-  });
+  }, PG_TEST_SETUP_TIMEOUT_MS);
 
   afterAll(async () => {
+    await harness?.settled(); // a timed-out beforeAll finishes before anything is torn down
     setPgSchema(null);
     await closePool();
-    if (schema) await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-    await pool.end();
+    await harness?.teardown(); // DROP SCHEMA … CASCADE + pool.end()
   });
 
   /** Run fn on a client pinned to the test schema. */

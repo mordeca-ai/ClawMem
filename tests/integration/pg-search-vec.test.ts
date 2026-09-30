@@ -38,9 +38,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import pg from "pg";
-import { readFileSync, readdirSync } from "fs";
-import { join } from "path";
-import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
+import { createPgTestSchema, PG_TEST_SETUP_TIMEOUT_MS, type PgTestSchema } from "./pg-test-schema.ts";
 import { closePool, toVectorLiteral } from "../../src/pg/client.ts";
 import { setPgSchema } from "../../src/pg/config.ts";
 import {
@@ -100,51 +98,49 @@ const FIXTURES: Fixture[] = [
 d("PG vector read path", () => {
   let pool: pg.Pool;
   let schema: string;
+  let harness: PgTestSchema | undefined;
 
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: URL_ });
-    schema = `clawmem_rtest_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-    const c = await pool.connect();
-    try {
-      await c.query(`CREATE SCHEMA ${schema}`);
-      await c.query(`SET search_path TO ${schema}, public`);
-      for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
-        const sql = substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM);
-        await c.query(sql);
-      }
-      // Fixtures. Direct SQL: this is setup, not the code under test.
-      for (const [i, fx] of FIXTURES.entries()) {
-        const hash = String(i).repeat(64).slice(0, 64);
-        await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, `body of ${fx.path}`]);
+    // vn4rz.73: guarded, single-transaction setup (tests/integration/pg-test-schema.ts).
+    harness = createPgTestSchema({
+      url: URL_!,
+      prefix: "clawmem_rtest",
+      dim: DIM,
+      seed: async (c) => {
+        // Fixtures. Direct SQL: this is setup, not the code under test.
+        for (const [i, fx] of FIXTURES.entries()) {
+          const hash = String(i).repeat(64).slice(0, 64);
+          await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, `body of ${fx.path}`]);
+          await c.query(
+            `INSERT INTO documents (collection, path, title, hash, active)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [fx.collection, fx.path, fx.path.replace(/\.md$/, ""), hash, fx.active ?? true],
+          );
+          await c.query(
+            `INSERT INTO content_vectors (hash, seq, pos, model, embedding)
+             VALUES ($1, 0, 0, $2, $3::vector)`,
+            [hash, fx.model ?? VAULT_MODEL, toVectorLiteral(atAngle(fx.angleDeg))],
+          );
+        }
+        // A collection with documents but NO vectors — "nothing embedded yet".
+        const bare = "e".repeat(64);
+        await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [bare, "unembedded"]);
         await c.query(
-          `INSERT INTO documents (collection, path, title, hash, active)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [fx.collection, fx.path, fx.path.replace(/\.md$/, ""), hash, fx.active ?? true],
+          `INSERT INTO documents (collection, path, title, hash) VALUES ('drafts', 'raw.md', 'raw', $1)`,
+          [bare],
         );
-        await c.query(
-          `INSERT INTO content_vectors (hash, seq, pos, model, embedding)
-           VALUES ($1, 0, 0, $2, $3::vector)`,
-          [hash, fx.model ?? VAULT_MODEL, toVectorLiteral(atAngle(fx.angleDeg))],
-        );
-      }
-      // A collection with documents but NO vectors — "nothing embedded yet".
-      const bare = "e".repeat(64);
-      await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [bare, "unembedded"]);
-      await c.query(
-        `INSERT INTO documents (collection, path, title, hash) VALUES ('drafts', 'raw.md', 'raw', $1)`,
-        [bare],
-      );
-    } finally {
-      c.release();
-    }
+      },
+    });
+    ({ pool, schema } = harness);
+    await harness.setup();
     setPgSchema(schema);
-  });
+  }, PG_TEST_SETUP_TIMEOUT_MS);
 
   afterAll(async () => {
+    await harness?.settled(); // a timed-out beforeAll finishes before anything is torn down
     setPgSchema(null);
     await closePool();
-    if (schema) await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-    await pool.end();
+    await harness?.teardown(); // DROP SCHEMA … CASCADE + pool.end()
   });
 
   /** Run fn on a client pinned to the test schema. */
@@ -455,42 +451,41 @@ function nearQuery(i: number): number[] {
 d("PG vector read path — filtered-HNSW starvation", () => {
   let pool: pg.Pool;
   let schema: string;
+  let harness: PgTestSchema | undefined;
 
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: URL_ });
-    schema = `clawmem_rtest_starve_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-    const c = await pool.connect();
-    try {
-      await c.query(`CREATE SCHEMA ${schema}`);
-      await c.query(`SET search_path TO ${schema}, public`);
-      for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
-        await c.query(substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM));
-      }
-      const seed = async (i: number, path: string, active: boolean, vec: number[]) => {
-        const hash = `${i}`.padStart(64, "f");
-        await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, `body of ${path}`]);
-        await c.query(
-          `INSERT INTO documents (collection, path, title, hash, active) VALUES ('starve', $1, $1, $2, $3)`,
-          [path, hash, active],
-        );
-        await c.query(
-          `INSERT INTO content_vectors (hash, seq, pos, model, embedding) VALUES ($1, 0, 0, $2, $3::vector)`,
-          [hash, VAULT_MODEL, toVectorLiteral(vec)],
-        );
-      };
-      for (let i = 0; i < STARVE_INACTIVE; i++) await seed(i, `retired-${i}.md`, false, nearQuery(i));
-      // The one ACTIVE document: 30 degrees off the query, farther than every inactive row.
-      await seed(STARVE_INACTIVE, STARVE_TARGET, true, atAngle(30));
-      await c.query(`ANALYZE content_vectors`);
-      await c.query(`ANALYZE documents`);
-    } finally {
-      c.release();
-    }
-  });
+    // vn4rz.73: guarded, single-transaction setup (tests/integration/pg-test-schema.ts).
+    harness = createPgTestSchema({
+      url: URL_!,
+      prefix: "clawmem_rtest_starve",
+      dim: DIM,
+      seed: async (c) => {
+        const seed = async (i: number, path: string, active: boolean, vec: number[]) => {
+          const hash = `${i}`.padStart(64, "f");
+          await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, `body of ${path}`]);
+          await c.query(
+            `INSERT INTO documents (collection, path, title, hash, active) VALUES ('starve', $1, $1, $2, $3)`,
+            [path, hash, active],
+          );
+          await c.query(
+            `INSERT INTO content_vectors (hash, seq, pos, model, embedding) VALUES ($1, 0, 0, $2, $3::vector)`,
+            [hash, VAULT_MODEL, toVectorLiteral(vec)],
+          );
+        };
+        for (let i = 0; i < STARVE_INACTIVE; i++) await seed(i, `retired-${i}.md`, false, nearQuery(i));
+        // The one ACTIVE document: 30 degrees off the query, farther than every inactive row.
+        await seed(STARVE_INACTIVE, STARVE_TARGET, true, atAngle(30));
+        await c.query(`ANALYZE content_vectors`);
+        await c.query(`ANALYZE documents`);
+      },
+    });
+    ({ pool, schema } = harness);
+    await harness.setup();
+  }, PG_TEST_SETUP_TIMEOUT_MS);
 
   afterAll(async () => {
-    if (schema) await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-    await pool.end();
+    await harness?.settled(); // a timed-out beforeAll finishes before anything is torn down
+    await harness?.teardown(); // DROP SCHEMA … CASCADE + pool.end()
   });
 
   /** A client in the starvation schema with seq scans + explicit sorts disabled for the session; always reset. */
@@ -562,46 +557,45 @@ const FENCE_OUT_OF_SCOPE = "out-of-scope-model";
 d("PG vector read path — cheap model fence semantics", () => {
   let pool: pg.Pool;
   let schema: string;
+  let harness: PgTestSchema | undefined;
 
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: URL_ });
-    schema = `clawmem_rtest_fence_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-    const c = await pool.connect();
-    try {
-      await c.query(`CREATE SCHEMA ${schema}`);
-      await c.query(`SET search_path TO ${schema}, public`);
-      for (const f of readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith(".sql")).sort()) {
-        await c.query(substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, f), "utf-8"), schema, DIM));
-      }
-      const seed = async (
-        i: number, collection: string, model: string, active: boolean, invalidated: boolean,
-      ) => {
-        const hash = `${i}`.padStart(64, "c");
-        await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, `fence body ${i}`]);
-        await c.query(
-          `INSERT INTO documents (collection, path, title, hash, active, invalidated_at)
-           VALUES ($1, $2, $2, $3, $4, $5)`,
-          [collection, `fence-${i}.md`, hash, active, invalidated ? new Date() : null],
-        );
-        await c.query(
-          `INSERT INTO content_vectors (hash, seq, pos, model, embedding) VALUES ($1, 0, 0, $2, $3::vector)`,
-          [hash, model, toVectorLiteral(atAngle(i * 10))],
-        );
-      };
-      await seed(1, "scope", VAULT_MODEL, true, false);
-      await seed(2, "scope", FENCE_FOREIGN_INACTIVE, false, false);
-      await seed(3, "scope", FENCE_FOREIGN_INVALIDATED, true, true);
-      await seed(4, "elsewhere", FENCE_OUT_OF_SCOPE, true, false);
-      await c.query(`ANALYZE content_vectors`);
-      await c.query(`ANALYZE documents`);
-    } finally {
-      c.release();
-    }
-  });
+    // vn4rz.73: guarded, single-transaction setup (tests/integration/pg-test-schema.ts).
+    harness = createPgTestSchema({
+      url: URL_!,
+      prefix: "clawmem_rtest_fence",
+      dim: DIM,
+      seed: async (c) => {
+        const seed = async (
+          i: number, collection: string, model: string, active: boolean, invalidated: boolean,
+        ) => {
+          const hash = `${i}`.padStart(64, "c");
+          await c.query(`INSERT INTO content (hash, doc) VALUES ($1, $2)`, [hash, `fence body ${i}`]);
+          await c.query(
+            `INSERT INTO documents (collection, path, title, hash, active, invalidated_at)
+             VALUES ($1, $2, $2, $3, $4, $5)`,
+            [collection, `fence-${i}.md`, hash, active, invalidated ? new Date() : null],
+          );
+          await c.query(
+            `INSERT INTO content_vectors (hash, seq, pos, model, embedding) VALUES ($1, 0, 0, $2, $3::vector)`,
+            [hash, model, toVectorLiteral(atAngle(i * 10))],
+          );
+        };
+        await seed(1, "scope", VAULT_MODEL, true, false);
+        await seed(2, "scope", FENCE_FOREIGN_INACTIVE, false, false);
+        await seed(3, "scope", FENCE_FOREIGN_INVALIDATED, true, true);
+        await seed(4, "elsewhere", FENCE_OUT_OF_SCOPE, true, false);
+        await c.query(`ANALYZE content_vectors`);
+        await c.query(`ANALYZE documents`);
+      },
+    });
+    ({ pool, schema } = harness);
+    await harness.setup();
+  }, PG_TEST_SETUP_TIMEOUT_MS);
 
   afterAll(async () => {
-    if (schema) await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-    await pool.end();
+    await harness?.settled(); // a timed-out beforeAll finishes before anything is torn down
+    await harness?.teardown(); // DROP SCHEMA … CASCADE + pool.end()
   });
 
   async function withFenceSchema<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {

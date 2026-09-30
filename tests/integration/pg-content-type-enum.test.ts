@@ -23,6 +23,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import pg from "pg";
+import { assertNotProductionDatabase, PG_TEST_SETUP_TIMEOUT_MS, PG_TEST_TEARDOWN_TIMEOUT_MS } from "./pg-test-schema.ts";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { MIGRATIONS_DIR, substituteMigrationParams } from "../../src/pg/migrate.ts";
@@ -216,6 +217,8 @@ dbDescribe("003 against an ephemeral database", () => {
 
     const c = await ephemeral.connect();
     try {
+      // vn4rz.73: never run migration DDL against a production vault database.
+      await assertNotProductionDatabase(c);
       // 001 builds a pgvector column and a gin_trgm_ops index; a virgin
       // database has neither extension installed.
       await c.query("CREATE EXTENSION IF NOT EXISTS vector");
@@ -241,7 +244,7 @@ dbDescribe("003 against an ephemeral database", () => {
 
     priorUrl = process.env.CLAWMEM_PG_URL;
     process.env.CLAWMEM_PG_URL = ephemeralUrl;
-  });
+  }, PG_TEST_SETUP_TIMEOUT_MS);
 
   afterAll(async () => {
     if (priorUrl === undefined) delete process.env.CLAWMEM_PG_URL;
@@ -260,7 +263,7 @@ dbDescribe("003 against an ephemeral database", () => {
       await admin.query(`DROP DATABASE IF EXISTS ${dbName}`);
       await admin.end();
     }
-  });
+  }, PG_TEST_TEARDOWN_TIMEOUT_MS);
 
   async function withEphemeral<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
     const c = await ephemeral.connect();

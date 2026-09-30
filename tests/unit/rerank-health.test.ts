@@ -480,3 +480,90 @@ describe("rerankFailureAdvice — the zerank-2 prescription is gated to the cali
     expect(advice).toContain("did not score every probe doc");
   });
 });
+
+// ---------------------------------------------------------------------------
+// master-harness-xso4y — an UNREACHABLE reranker is an availability failure, not a degenerate one
+//
+// The bug: with every pair throwing a transport error, pairsScored stayed 0, maxScore stayed at its
+// 0 initialiser, and the calibration arm read that as "scores collapsed to ~0" — so doctor printed
+// the zerank-2 "re-deploy the seq-cls sidecar" prescription for what was simply an outage.
+// ---------------------------------------------------------------------------
+describe("probeRerankHealth — unreachable vs degenerate (xso4y)", () => {
+  const triples: GoldenTriple[] = [
+    { query: "q1", relevant: "r1", hardNegative: "n1" },
+    { query: "q2", relevant: "r2", hardNegative: "n2" },
+  ];
+  const storeFrom = (rerank: (q: string, d: { file: string; text: string }[]) => Promise<unknown>) =>
+    ({ rerank }) as unknown as Parameters<typeof probeRerankHealth>[0];
+  const refused = storeFrom(async () => {
+    throw new Error("Unable to connect. Is the computer able to access the url?");
+  });
+
+  test("every request fails in transport → unreachable, NOT a calibration (degenerate) failure", async () => {
+    const res = await probeRerankHealth(refused, { triples });
+    expect(res.ok).toBe(false);
+    expect(res.unreachable).toBe(true);
+    expect(res.probeErrors).toBe(2);
+    expect(res.pairsScored).toBe(0);
+    expect(res.calibrationFailed).toBe(false);
+    expect(res.failures[0]).toStartWith("unreachable:");
+    expect(res.failures.some((f) => f.includes("calibration"))).toBe(false);
+    const advice = rerankFailureAdvice(res);
+    expect(advice).toContain("availability failure");
+    expect(advice).not.toContain("zerank-2");
+  });
+
+  test("a genuinely collapsed reranker still reads as degenerate, never as unreachable", async () => {
+    const res = await probeRerankHealth(
+      storeFrom(async (_q, d) => d.map((x) => ({ file: x.file, score: 1e-11 }))),
+      { triples },
+    );
+    expect(res.unreachable).toBe(false);
+    expect(res.probeErrors).toBe(0);
+    expect(res.calibrationFailed).toBe(true);
+    expect(rerankFailureAdvice(res)).toContain("zerank-2");
+  });
+
+  test("one request fails, the rest discriminate → intermittent, not unreachable, not degenerate", async () => {
+    let calls = 0;
+    const flaky = storeFrom(async (_q, d) => {
+      if (calls++ === 0) throw new Error("The operation timed out.");
+      return d.map((x) => ({ file: x.file, score: x.file.endsWith("-rel") ? 0.9 : 0.1 }));
+    });
+    const res = await probeRerankHealth(flaky, { triples });
+    expect(res.ok).toBe(false);
+    expect(res.unreachable).toBe(false);
+    expect(res.probeErrors).toBe(1);
+    expect(res.pairsScored).toBe(1);
+    expect(res.calibrationFailed).toBe(false);
+    const advice = rerankFailureAdvice(res);
+    expect(advice).toContain("intermittently unavailable");
+    expect(advice).not.toContain("top_n");
+  });
+
+  test("the endpoint answered but omitted docs everywhere → coverage, not unreachable, not calibration", async () => {
+    const res = await probeRerankHealth(
+      storeFrom(async () => {
+        throw new RerankCoverageError(["x"]);
+      }),
+      { triples },
+    );
+    expect(res.unreachable).toBe(false);
+    expect(res.probeErrors).toBe(0);
+    expect(res.calibrationFailed).toBe(false);
+    expect(rerankFailureAdvice(res)).toContain("did not score every probe doc");
+  });
+
+  test("advice routes unreachable ahead of every discrimination arm", () => {
+    const advice = rerankFailureAdvice({
+      calibrationFailed: true,
+      inversions: 0,
+      pairsScored: 0,
+      pairsTotal: 8,
+      probeErrors: 8,
+      unreachable: true,
+    });
+    expect(advice).toContain("availability failure");
+    expect(advice).not.toContain("zerank-2");
+  });
+});

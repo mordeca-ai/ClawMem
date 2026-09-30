@@ -45,6 +45,33 @@ export function focusRoot(): string {
   return path.join(os.homedir(), ".cache", "clawmem", "sessions");
 }
 
+/**
+ * Env vars a CLI invocation reads its session id from, in precedence order.
+ * Claude Code injects CLAUDE_CODE_SESSION_ID into every session's environment;
+ * it never sets CLAUDE_SESSION_ID. CLAUDE_SESSION_ID stays as a fallback
+ * because hook wrappers (e.g. the master-harness recall hook) write it from
+ * the hook payload. CLAWMEM_SESSION_ID is the non-Claude-Code override.
+ */
+export const SESSION_ID_ENV_VARS = [
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_SESSION_ID",
+  "CLAWMEM_SESSION_ID",
+] as const;
+
+/**
+ * Resolve the session id from the environment (first non-blank var in
+ * SESSION_ID_ENV_VARS order, trimmed). Returns undefined when none is set.
+ */
+export function resolveEnvSessionId(
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  for (const name of SESSION_ID_ENV_VARS) {
+    const v = env[name]?.trim();
+    if (v) return v;
+  }
+  return undefined;
+}
+
 export function focusFilePath(sessionId: string): string {
   return path.join(focusRoot(), `${sessionId}.focus`);
 }

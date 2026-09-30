@@ -58,7 +58,7 @@ import {
 import { formatSearchResults, type OutputFormat } from "./formatter.ts";
 import { runEval, IMPLEMENTED_PROFILES, EvalIntegrityError, type EvalProfile, type RunEvalResult } from "./eval/run.ts";
 import { GoldFileError } from "./eval/gold.ts";
-import { indexCollection, parseDocument, hashContent } from "./indexer.ts";
+import { indexCollection, parseDocument, hashContent, formatFrontmatterVocab, type IndexStats } from "./indexer.ts";
 import type { Store as StoreType } from "./store.ts";
 import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
@@ -96,6 +96,7 @@ import {
   clearSessionFocus,
   focusFilePath,
   resolveSessionTopic,
+  resolveEnvSessionId,
 } from "./session-focus.ts";
 import { computeCollectionScope, type CollectionScope } from "./collection-scope.ts";
 import { createBackup } from "./backup.ts";
@@ -274,6 +275,7 @@ async function cmdUpdate(args: string[]) {
     console.log(`${c.cyan}Indexing ${col.name}${c.reset} (${col.path})`);
     const stats = await indexCollection(s, col.name, col.path, col.pattern, { defaultContentType: col.content_type });
     console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged, ${c.red}-${stats.removed}${c.reset} removed`);
+    printFrontmatterVocab(stats);
   }
 
   // Auto-embed if --embed flag is set
@@ -1457,7 +1459,8 @@ async function cmdList(args: string[]) {
  * on an unknown -c name.
  *
  * Session id is resolved (for focus only) from the explicit --session-id arg,
- * then CLAUDE_SESSION_ID (Claude Code exposes this), then CLAWMEM_SESSION_ID.
+ * then the environment via resolveEnvSessionId (CLAUDE_CODE_SESSION_ID, which
+ * Claude Code injects, then CLAUDE_SESSION_ID, then CLAWMEM_SESSION_ID).
  * Any missing id / unset focus is fail-open (unscoped).
  */
 function resolveCollectionScope(
@@ -1465,11 +1468,7 @@ function resolveCollectionScope(
   sessionIdArg: string | undefined,
 ): CollectionScope | undefined {
   const knownNames = collectionsList().map(c => c.name);
-  const sid =
-    (sessionIdArg?.trim() ||
-      process.env.CLAUDE_SESSION_ID ||
-      process.env.CLAWMEM_SESSION_ID ||
-      "").trim() || undefined;
+  const sid = sessionIdArg?.trim() || resolveEnvSessionId();
   const focus = resolveSessionTopic(sid, process.env.CLAWMEM_SESSION_FOCUS);
   const result = computeCollectionScope(flag, focus, knownNames);
   if (result && "error" in result) die(result.error);
@@ -2843,7 +2842,18 @@ async function cmdReindex(args: string[]) {
     console.log(`Indexing ${c.bold}${col.name}${c.reset} (${col.path})...`);
     const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich, force, defaultContentType: col.content_type });
     console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed`);
+    printFrontmatterVocab(stats);
   }
+}
+
+/**
+ * master-harness-wzwh8: per-collection count of parsed frontmatter blocks that
+ * declared no title / content_type. Covers only the files this pass PARSED —
+ * unchanged files skip parsing — so `reindex --force` gives the full count.
+ */
+function printFrontmatterVocab(stats: IndexStats): void {
+  const line = stats.frontmatterVocab ? formatFrontmatterVocab(stats.frontmatterVocab) : null;
+  if (line) console.log(`  ${c.yellow}${line}${c.reset} [new/changed files only]`);
 }
 
 // =============================================================================
@@ -3101,7 +3111,14 @@ async function cmdDoctor(args: string[] = []) {
     const s = getStore();
     const { probeRerankHealth, rerankFailureAdvice } = await import("./health/rerank-health.ts");
     const health = await probeRerankHealth(s, { timeoutMs: 8000 });
-    if (health.ok) {
+    if (health.unreachable) {
+      // Availability failure, NOT a discrimination verdict — no score was observed, so the
+      // "FAILED discrimination probe" line below would misdiagnose an outage (master-harness-xso4y).
+      console.log(`${c.red}✗${c.reset} Reranker: UNREACHABLE (0/${health.pairsTotal} probe requests answered — endpoint down or blocked, not degenerate)`);
+      for (const f of health.failures.slice(0, 2)) console.log(`   ${c.dim}${f}${c.reset}`);
+      console.log(`   ${c.dim}${rerankFailureAdvice(health)}${c.reset}`);
+      issues++;
+    } else if (health.ok) {
       console.log(`${c.green}✓${c.reset} Reranker: discriminates (coverage ${health.pairsScored}/${health.pairsTotal}, 0 inversions, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min logit margin ${health.minLogitMargin.toFixed(2)} ≥ ${health.thresholds.discrimLogitMargin})`);
     } else {
       console.log(`${c.red}✗${c.reset} Reranker: FAILED discrimination probe (coverage ${health.pairsScored}/${health.pairsTotal}, ${health.inversions} inverted, max score ${health.maxScore.toExponential(1)}, min logit margin ${health.minLogitMargin.toFixed(2)})`);
@@ -3381,6 +3398,10 @@ async function cmdRerankHealth(args: string[]) {
 
   if (values.json) {
     console.log(JSON.stringify(health));
+  } else if (health.unreachable) {
+    console.log(`${c.red}✗ Reranker UNREACHABLE${c.reset} — 0/${health.pairsTotal} probe requests answered; endpoint down or blocked, not degenerate`);
+    for (const f of health.failures) console.log(`  - ${f}`);
+    console.log(rerankFailureAdvice(health));
   } else if (health.ok) {
     console.log(`${c.green}✓ Reranker healthy${c.reset} — coverage ${health.pairsScored}/${health.pairsTotal}, 0 inversions, max score ${health.maxScore.toFixed(2)} ≥ ${health.thresholds.calibFloor}, min logit margin ${health.minLogitMargin.toFixed(2)} ≥ ${health.thresholds.discrimLogitMargin}`);
   } else {
@@ -3575,16 +3596,12 @@ async function cmdFocus(args: string[]) {
   function resolveSessionId(rest: string[]): string {
     const sidIdx = rest.indexOf("--session-id");
     if (sidIdx >= 0 && rest[sidIdx + 1]) return rest[sidIdx + 1]!;
-    const envSid = (
-      process.env.CLAUDE_SESSION_ID ||
-      process.env.CLAWMEM_SESSION_ID ||
-      ""
-    ).trim();
+    const envSid = resolveEnvSessionId();
     if (envSid) return envSid;
     die(
-      "No session id. Pass --session-id <id>, or set CLAUDE_SESSION_ID " +
-        "(Claude Code exposes this) or CLAWMEM_SESSION_ID env var before " +
-        "invoking this command."
+      "No session id. Pass --session-id <id>, or set CLAUDE_CODE_SESSION_ID " +
+        "(Claude Code sets this in its sessions), CLAUDE_SESSION_ID or " +
+        "CLAWMEM_SESSION_ID before invoking this command."
     );
   }
 

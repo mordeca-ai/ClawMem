@@ -101,6 +101,14 @@ export interface RerankHealthResult {
   /** True iff the SIGMOID calibration band failed — the only arm that implicates a score-head-less
    *  GGUF, and therefore the only one that may carry the "re-deploy the seq-cls sidecar" advice. */
   calibrationFailed: boolean;
+  /** Pairs whose rerank call threw a TRANSPORT-class error — neither the remote endpoint nor the
+   *  local fallback returned scores (connection refused, timeout, blocked, no local model). Coverage
+   *  and malformed-response errors are NOT counted: those mean the endpoint answered. */
+  probeErrors: number;
+  /** True iff EVERY pair failed with a transport-class error, so no score was ever observed. This is
+   *  an availability failure, not a discrimination verdict — the calibration and margin arms are not
+   *  evaluated, because "no scores" is not evidence that scores collapsed (master-harness-xso4y). */
+  unreachable: boolean;
   thresholds: { calibFloor: number; discrimLogitMargin: number };
 }
 
@@ -114,9 +122,23 @@ export interface RerankHealthResult {
  * actively wrong — it was told to an operator mid-incident while doctor printed `max score 1.0e+0`
  * one line above (master-harness-1nvlz).
  */
-export function rerankFailureAdvice(health: Pick<RerankHealthResult, "calibrationFailed" | "inversions" | "pairsScored" | "pairsTotal">): string {
+export function rerankFailureAdvice(
+  health: Pick<RerankHealthResult, "calibrationFailed" | "inversions" | "pairsScored" | "pairsTotal"> &
+    Partial<Pick<RerankHealthResult, "probeErrors" | "unreachable">>,
+): string {
+  // Availability before discrimination: an endpoint that never answered has produced no scores, so
+  // every discrimination-arm prescription below would be advice about data that does not exist
+  // (master-harness-xso4y — an outage used to print the zerank-2 re-deploy prescription).
+  if (health.unreachable) {
+    return `The reranker did not answer any probe request (no remote response and no local fallback) — this is an availability failure, NOT a discrimination failure. Check that the reranker service is running and that CLAWMEM_RERANK_URL resolves from this host. Do NOT re-deploy or recalibrate on this signal.`;
+  }
   if (health.calibrationFailed) {
     return `Scores collapsed to ~0 — likely the deprecated zerank-2 GGUF (no score head). Re-deploy the seq-cls sidecar. See CLAUDE.md "SOTA upgrade".`;
+  }
+  if ((health.probeErrors ?? 0) > 0) {
+    // Checked before the coverage arm: an errored pair also lowers pairsScored, and "check top_n /
+    // batch handling" is the wrong lead for a request that never got an answer.
+    return `${health.probeErrors} of ${health.pairsTotal} probe requests failed to reach the reranker — the endpoint is intermittently unavailable. Re-run the probe before acting on any other finding, and check the service's health and logs. Do NOT re-deploy on this signal alone.`;
   }
   if (health.pairsScored < health.pairsTotal) {
     return `The reranker did not score every probe doc — check the endpoint's top_n / batch handling and the request log. Do NOT re-deploy on this signal alone; the scores it did return may be fine.`;
@@ -160,6 +182,7 @@ export async function probeRerankHealth(
   let minLogitMargin = Infinity;
   let inversions = 0;
   let pairsScored = 0;
+  let probeErrors = 0;
 
   for (let i = 0; i < triples.length; i++) {
     const t = triples[i]!;
@@ -185,6 +208,7 @@ export async function probeRerankHealth(
       } else if (err instanceof RerankMalformedResponseError) {
         failures.push(`${label}: malformed response — ${err.problems.join("; ")}`);
       } else {
+        probeErrors++;
         failures.push(`${label}: probe error — ${(err as Error).message}`);
       }
       continue;
@@ -227,8 +251,18 @@ export async function probeRerankHealth(
     }
   }
 
+  const unreachable = triples.length > 0 && probeErrors === triples.length;
+  if (unreachable) {
+    failures.unshift(
+      `unreachable: all ${triples.length} probe requests failed before returning any score — the reranker endpoint is down or blocked, not degenerate`,
+    );
+  }
+
+  // The calibration band judges OBSERVED scores. With zero pairs scored, maxScore is still its 0
+  // initialiser — reading that as "scores collapsed to ~0" is what made an outage indistinguishable
+  // from the score-head-less GGUF (master-harness-xso4y). The per-pair failures already make ok=false.
   let calibrationFailed = false;
-  if (maxScore < calibFloor) {
+  if (pairsScored > 0 && maxScore < calibFloor) {
     calibrationFailed = true;
     failures.push(
       `calibration: max relevant-doc score ${maxScore.toExponential(2)} < floor ${calibFloor} — reranker is inert/degenerate (likely the deprecated zerank-2 GGUF; re-deploy the seq-cls sidecar)`,
@@ -246,6 +280,8 @@ export async function probeRerankHealth(
     pairsScored,
     failures,
     calibrationFailed,
+    probeErrors,
+    unreachable,
     thresholds: { calibFloor, discrimLogitMargin },
   };
 }
