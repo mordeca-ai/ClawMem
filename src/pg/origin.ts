@@ -34,8 +34,9 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import matter from "gray-matter";
 import {
-  extractTitle, hashContent, parseDocument,
+  extractTitle, hashContent, parseDocument, type DocumentMeta,
 } from "../indexer.ts";
+import type { FrontmatterMap } from "../frontmatter-map.ts";
 import { getDefaultLlamaCpp, formatDocForEmbedding } from "../llm.ts";
 import { splitDocument } from "../splitter.ts";
 import { canonicalDocId } from "../store.ts";
@@ -156,6 +157,26 @@ export interface OriginLoadOptions {
   embedBatchSize?: number;
   vault?: Vault;
   onProgress?: (m: string) => void;
+  /**
+   * master-harness-wzwh8.1: the collection's config frontmatter_map. On this
+   * path only the TITLE mapping has an effect — record_type is read from the
+   * raw frontmatter against the origin tier's own vocabulary, never from the
+   * ADR-0058 content_type the map targets.
+   */
+  frontmatterMap?: FrontmatterMap;
+}
+
+/**
+ * The SOLE parseDocument call on the origin-load path (master-harness-wzwh8.1),
+ * exported so the frontmatter_map threading is testable without a Postgres.
+ */
+export function parseOriginDocument(
+  raw: string,
+  rel: string,
+  frontmatterMap?: FrontmatterMap,
+): { body: string; meta: DocumentMeta } {
+  const { body, meta } = parseDocument(raw, rel, undefined, frontmatterMap);
+  return { body, meta };
 }
 
 export interface OriginLoadStats {
@@ -261,7 +282,7 @@ export async function loadOriginCollection(
     let raw: string;
     try { raw = readFileSync(join(opts.root, rel), "utf-8"); } catch { continue; }
 
-    const { body, meta } = parseDocument(raw, rel);
+    const { body, meta } = parseOriginDocument(raw, rel, opts.frontmatterMap);
     // Two reads of the same frontmatter, on purpose: `meta` for the narrowed
     // curated keys (title), `m` for the origin key set parseDocument drops.
     const m = rawFrontmatter(raw);

@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.39 — wzwh8 phase 2: frontmatter vocab direction — per-collection key map (name:/metadata.type -> title/content_type) + ADR-0054 amendment
+
+Per-collection opt-in `frontmatter_map` (master-harness-wzwh8.1). A collection in index.yml can declare where its title and content_type live when its files follow someone else's frontmatter spec (Claude Code auto-memory `name:` + `metadata.type`, Agent Skills `name:`). The canonical `title:`/`content_type:` keys always win; the mapped key is read only when they are absent. Mapped content_type values pass through an optional `content_type_values` map and must be a valid ContentType, or they are not stored (fallback chain unchanged, rejection counted). A malformed map fails at config load. Every indexing path applies it (update/reindex/watch, MCP + REST reindex, precompact hook, pg reindex, pg origin-load title-only). The `frontmatter:` summary line gains a mapped-fill tail only when a map acts. Default off: with no `frontmatter_map`, indexing is byte-identical to v0.36.38.
+
+---
+
 ## v0.36.38 — vn4rz.69: collection-scoped vector search fills limit (pre-filtered KNN)
 
 Collection-scoped vector search no longer starves small collections. An include scope (collections, collectionId, dateRange) with up to 50,000 in-scope fragments now runs one exact pre-filtered vec0 KNN scan (hash_seq IN scope). Before, it post-filtered the global top limit*3, which returned about 1 doc for memory-topics (0.7% of a 236k-fragment vault). Larger scopes fall back to the escalation loop, which now engages for include scopes. Unscoped search is unchanged. memory-topics-recall-v1 vsearch R@10 goes from 0.11 to 0.39 at the 0.30 floor and from 0.67 to 1.00 at --min-score 0. library-baseline holds at 0.88. Eval record: master-harness r60.

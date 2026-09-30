@@ -54,6 +54,7 @@ import {
   getCollection,
   isValidCollectionName,
   getConfigPath,
+  collectionIndexOptions,
 } from "./collections.ts";
 import { formatSearchResults, type OutputFormat } from "./formatter.ts";
 import { runEval, IMPLEMENTED_PROFILES, EvalIntegrityError, type EvalProfile, type RunEvalResult } from "./eval/run.ts";
@@ -273,7 +274,7 @@ async function cmdUpdate(args: string[]) {
     }
 
     console.log(`${c.cyan}Indexing ${col.name}${c.reset} (${col.path})`);
-    const stats = await indexCollection(s, col.name, col.path, col.pattern, { defaultContentType: col.content_type });
+    const stats = await indexCollection(s, col.name, col.path, col.pattern, { ...collectionIndexOptions(col) });
     console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged, ${c.red}-${stats.removed}${c.reset} removed`);
     printFrontmatterVocab(stats);
   }
@@ -2764,7 +2765,7 @@ async function cmdWatch() {
       console.log(`${c.dim}[${event}]${c.reset} ${col.name}/${relativePath}`);
 
       // Re-index just this collection
-      const stats = await indexCollection(s, col.name, col.path, col.pattern, { defaultContentType: col.content_type });
+      const stats = await indexCollection(s, col.name, col.path, col.pattern, { ...collectionIndexOptions(col) });
       if (stats.added > 0 || stats.updated > 0 || stats.removed > 0) {
         console.log(`  +${stats.added} ~${stats.updated} -${stats.removed}`);
       }
@@ -2840,7 +2841,7 @@ async function cmdReindex(args: string[]) {
 
   for (const col of collections) {
     console.log(`Indexing ${c.bold}${col.name}${c.reset} (${col.path})...`);
-    const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich, force, defaultContentType: col.content_type });
+    const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich, force, ...collectionIndexOptions(col) });
     console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed`);
     printFrontmatterVocab(stats);
   }

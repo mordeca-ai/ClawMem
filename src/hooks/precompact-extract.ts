@@ -20,7 +20,7 @@ import {
 import type { Store } from "../store.ts";
 import { extractDecisions } from "./decision-extractor.ts";
 import { indexCollection } from "../indexer.ts";
-import { loadConfig } from "../collections.ts";
+import { loadConfig, collectionIndexOptions } from "../collections.ts";
 
 // ---------------------------------------------------------------------------
 // Auto-memory path discovery
@@ -289,7 +289,7 @@ export async function precompactExtract(
       );
       if (memEntry) {
         const [colName, col] = memEntry;
-        await indexCollection(store, colName, col.path, col.pattern || "**/*.md", { defaultContentType: col.content_type });
+        await indexCollection(store, colName, col.path, col.pattern || "**/*.md", { ...collectionIndexOptions(col) });
       }
     } catch (e) {
       process.stderr.write(`precompact-extract: archive reindex failed (non-fatal): ${e}\n`);

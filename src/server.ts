@@ -15,7 +15,7 @@ import type { Store, SearchResult, TimelineResult } from "./store.ts";
 import { enrichResults, fuseAndRerank, toRanked, RERANK_DEGENERATE_FLOOR } from "./search-utils.ts";
 import { applyCompositeScoring, hasRecencyIntent, type EnrichedResult } from "./memory.ts";
 import { applyMMRDiversity } from "./mmr.ts";
-import { listCollections } from "./collections.ts";
+import { listCollections, collectionIndexOptions } from "./collections.ts";
 import { runCausalRetrieval, hasCausalSignal, hasTimelineSignal } from "./causal-retrieval.ts";
 import { capCausalWire } from "./causal-reader.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
@@ -581,7 +581,7 @@ async function handleReindex(req: Request, _url: URL, store: Store): Promise<Res
   let totalAdded = 0, totalUpdated = 0, totalRemoved = 0;
 
   for (const coll of targetCollections) {
-    const stats = await indexCollection(store, coll.name, coll.path, coll.pattern, { defaultContentType: coll.content_type });
+    const stats = await indexCollection(store, coll.name, coll.path, coll.pattern, { ...collectionIndexOptions(coll) });
     totalAdded += stats.added;
     totalUpdated += stats.updated;
     totalRemoved += stats.removed;
