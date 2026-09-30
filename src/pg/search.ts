@@ -78,11 +78,19 @@
  * 56-61k buffers per probe through the full index vs 180-290 tuples / ~5k
  * buffers through the partial one (9-73 ms), top-20 recall vs exact 14-19/20
  * -> 20/20; documents-region probes unchanged (2.6-23 ms).
+ *
+ * UNMIGRATED VAULTS. A vault whose content_vectors predates migration 010 (the
+ * nsfw vault, until it is migrated) has no `doc_tier` column, and a literal
+ * `cv.doc_tier` there is `column does not exist` on every search. So the column
+ * is detected per vault (hasDocTierColumn, cached) and the predicate is
+ * OMITTED when absent — the documents JOIN already drops origin-only vectors,
+ * so results are identical; only the partial-index speed-up is missing.
  */
 
 import type { SearchResult } from "../store.ts";
 import { formatQueryForEmbedding, getDefaultLlamaCpp } from "../llm.ts";
 import { toVectorLiteral, withClient } from "./client.ts";
+import { pgSchema } from "./config.ts";
 import type { Vault } from "./vaults.ts";
 import { PgVecReadModelMismatchError, PgVecSearchTimeoutError } from "./errors.ts";
 
@@ -213,6 +221,11 @@ export interface PgSearchVecOptions {
   /** Wall-clock budget in ms for the embed leg + the SQL leg. */
   timeoutMs?: number;
   /**
+   * Force the doc_tier predicate on (true) or off (false). Default: detect via
+   * hasDocTierColumn. Off is for a vault whose content_vectors predates 010.
+   */
+  docTier?: boolean;
+  /**
    * Server-side bound on EACH SQL leg, in ms. Default
    * DEFAULT_PG_SEARCH_STATEMENT_TIMEOUT_MS; 0 disables the bound entirely
    * (PostgreSQL's own meaning for statement_timeout = 0).
@@ -268,6 +281,48 @@ export function normalizeCollections(c: string | string[] | undefined): string[]
   return list.length > 0 ? list : null;
 }
 
+/** How long an "absent" answer is trusted; a "present" answer is permanent (a column is never dropped in service). */
+const DOC_TIER_ABSENT_TTL_MS = 60_000;
+const docTierCache = new Map<string, { present: boolean; at: number }>();
+
+/** Forget every cached doc_tier detection (tests; and after an operator applies 010 in-process). */
+export function resetDocTierColumnCache(): void {
+  docTierCache.clear();
+}
+
+/**
+ * Is `content_vectors.doc_tier` present in the schema this client resolves?
+ *
+ * ONE catalog probe per vault for the process lifetime when the column is there
+ * (cached by database + host + port + configured schema, which is what
+ * distinguishes the sfw and nsfw pools); an "absent" answer is re-checked after
+ * DOC_TIER_ABSENT_TTL_MS so a vault migrated while a long-lived server runs
+ * picks the partial index up without a restart. A client that exposes no
+ * connection identity (a test fake) is probed every time rather than cached
+ * under a key that could collide. The probe runs outside any transaction and
+ * takes no table lock (catalog read).
+ */
+export async function hasDocTierColumn(c: PgQueryable): Promise<boolean> {
+  const id = c as { database?: string; host?: string; port?: number };
+  const key = id.database === undefined
+    ? null
+    : `${id.host ?? ""}:${id.port ?? ""}/${id.database}|${pgSchema() ?? ""}`;
+  if (key !== null) {
+    const hit = docTierCache.get(key);
+    if (hit && (hit.present || Date.now() - hit.at < DOC_TIER_ABSENT_TTL_MS)) return hit.present;
+  }
+  const { rows } = await c.query<{ present: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass('content_vectors')
+          AND attname = 'doc_tier' AND NOT attisdropped
+     ) AS present`,
+  );
+  const present = rows[0]?.present === true;
+  if (key !== null) docTierCache.set(key, { present, at: Date.now() });
+  return present;
+}
+
 /**
  * Build the ANN query. Pure — no client, no I/O — so the SQL contract
  * (the `<=>` order-by, the `cv.doc_tier` partial-index predicate, the `active`
@@ -279,6 +334,9 @@ export function normalizeCollections(c: string | string[] | undefined): string[]
  * content_vectors_embedding_doc_hnsw_idx (migration 012), which holds no origin
  * rows and so has nothing for the iterative scan to walk past (vn4rz.77).
  *
+ * `docTier` (default true) is false ONLY for a vault whose content_vectors has
+ * no doc_tier column (hasDocTierColumn); the predicate is then omitted.
+ *
  * `pg` uses $1-style placeholders and NOTHING is interpolated into the text:
  * the vector arrives as a bind parameter cast to ::vector, the collections as a
  * text[] fed to `= ANY(...)`.
@@ -287,6 +345,7 @@ export function buildVecSearchQuery(
   vectorLiteral: string,
   collections: string[] | null,
   fragmentLimit: number,
+  docTier = true,
 ): { text: string; values: unknown[] } {
   const values: unknown[] = [vectorLiteral];
   let filter = "";
@@ -312,8 +371,7 @@ export function buildVecSearchQuery(
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash
     JOIN content ON content.hash = cv.hash
-    WHERE cv.doc_tier
-    AND d.active = true
+    WHERE ${docTier ? "cv.doc_tier\n    AND " : ""}d.active = true
     AND d.invalidated_at IS NULL${filter}
     ORDER BY cv.embedding <=> $1::vector
     LIMIT ${limitParam}
@@ -332,6 +390,7 @@ export function buildVecSearchQuery(
 export async function getStoredVecModels(
   c: PgQueryable,
   collections: string[] | null,
+  docTier = true,
 ): Promise<string[]> {
   const values: unknown[] = [];
   let filter = "";
@@ -357,7 +416,7 @@ export async function getStoredVecModels(
      WHERE EXISTS (
        SELECT 1 FROM content_vectors cv
        JOIN documents d ON d.hash = cv.hash
-       WHERE cv.model = m.model AND cv.doc_tier
+       WHERE cv.model = m.model${docTier ? " AND cv.doc_tier" : ""}
          AND d.active = true AND d.invalidated_at IS NULL${filter}
      )
      ORDER BY 1`,
@@ -618,8 +677,9 @@ export async function pgSearchVecDetailed(
   // still wait an unbounded time on a lock.
   const fenceTimeoutMs = legStatementTimeout();
   if (fenceTimeoutMs === null) return degraded("budget-exhausted-pre-fence", 0);
+  const docTier = opts.docTier ?? await hasDocTierColumn(c);
   const storedModels = await withBoundedTx(c, fenceTimeoutMs, scope, "model-fence", () =>
-    getStoredVecModels(c, collections));
+    getStoredVecModels(c, collections, docTier));
   if (storedModels.length === 0) return degraded("no-stored-vectors", 0);
 
   const llm = opts.embedder ?? getDefaultLlamaCpp();
@@ -670,6 +730,7 @@ export async function pgSearchVecDetailed(
     toVectorLiteral(embedded.embedding),
     collections,
     fragmentLimit,
+    docTier,
   );
 
   // Recomputed HERE, after the fence and the embed spent their share: under a

@@ -553,6 +553,31 @@ export async function reindexCollection(
   return stats;
 }
 
+/**
+ * Run the doc_tier reconcile for every configured vault, ONE vault's fault
+ * never failing another's pass (master-harness-vn4rz.77). A throw (e.g. nsfw
+ * unreachable, or unmigrated in a way the column probe does not catch) is
+ * reported through `onResult` as a `skipped` entry — never silent, never
+ * fatal: the reconcile is a self-heal, and the sfw pass must not fail at its
+ * very end over the other vault. `reconcile`/`configured` are test seams.
+ */
+export async function reconcileDocTierAllVaults(
+  onResult: ReindexOptions["onDocTierReconcile"],
+  reconcile: typeof reconcileDocTierForVault = reconcileDocTierForVault,
+  configured: (v: Vault) => boolean = vaultIsConfigured,
+): Promise<void> {
+  for (const v of VAULTS) {
+    if (!configured(v)) continue;
+    let res: Awaited<ReturnType<typeof reconcileDocTierForVault>>;
+    try {
+      res = await reconcile(v);
+    } catch (e) {
+      res = { vault: v, skipped: `reconcile failed: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    onResult?.(res);
+  }
+}
+
 /** Reindex every configured collection (or the named subset). */
 export async function reindex(opts: ReindexOptions = {}): Promise<ReindexStats[]> {
   const wanted = new Set(opts.collections ?? []);
@@ -579,9 +604,6 @@ export async function reindex(opts: ReindexOptions = {}): Promise<ReindexStats[]
   // concurrent writer's uncommitted row; this pass closes that window. Both
   // vaults, because reindex routes collections to either (0ynkd). Cheap on a
   // converged vault: two scans, zero rows written.
-  for (const v of VAULTS) {
-    if (!vaultIsConfigured(v)) continue;
-    opts.onDocTierReconcile?.(await reconcileDocTierForVault(v));
-  }
+  await reconcileDocTierAllVaults(opts.onDocTierReconcile);
   return out;
 }

@@ -84,14 +84,18 @@
 -- EXCLUSIVE, which readers do not wait on. The triggers land FIRST, so every
 -- write committed while 011 runs is already flagged correctly.
 --
--- ROLLBACK: DROP INDEX CONCURRENTLY content_vectors_embedding_doc_hnsw_idx
--- (012); DROP TRIGGER content_vectors_doc_tier_trg ON content_vectors;
--- DROP TRIGGER documents_doc_tier_ins_trg, documents_doc_tier_upd_trg,
--- documents_doc_tier_del_trg ON documents; DROP FUNCTION
--- content_vectors_doc_tier_on_insert(), documents_doc_tier_sync();
--- ALTER TABLE content_vectors DROP COLUMN doc_tier; DELETE the 010/011/012
--- rows from schema_migrations. The code change in search.ts must be reverted
--- FIRST — it references cv.doc_tier.
+-- ROLLBACK (run as separate statements, in this order; PG has no multi-trigger
+-- DROP TRIGGER). The code change in search.ts must be reverted FIRST — it
+-- references cv.doc_tier:
+--   DROP INDEX CONCURRENTLY content_vectors_embedding_doc_hnsw_idx;   -- 012
+--   DROP TRIGGER content_vectors_doc_tier_trg ON content_vectors;
+--   DROP TRIGGER documents_doc_tier_ins_trg ON documents;
+--   DROP TRIGGER documents_doc_tier_upd_trg ON documents;
+--   DROP TRIGGER documents_doc_tier_del_trg ON documents;
+--   DROP FUNCTION content_vectors_doc_tier_on_insert();
+--   DROP FUNCTION documents_doc_tier_sync();
+--   ALTER TABLE content_vectors DROP COLUMN doc_tier;
+--   DELETE FROM schema_migrations WHERE version LIKE '010\_%' OR version LIKE '011\_%' OR version LIKE '012\_%';
 --
 -- Functions pin `search_path = pg_catalog, :CLAWMEM_SCHEMA` and use
 -- unqualified table names, the 007 convention (CVE-2018-1058 hardening that
