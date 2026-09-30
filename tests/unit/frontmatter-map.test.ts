@@ -426,6 +426,39 @@ describe("A6: every indexing path honours the map", () => {
     expect(unmapped.meta.content_type).toBe(inferContentType(REL));
   });
 
+  describe("pg reindex honours the collection default content_type (vn4rz.76)", () => {
+    const mk = () => ({ frontmatterParseFailures: {}, frontmatterVocab: emptyFrontmatterVocabCounts() });
+    const PLAIN = "---\ntitle: T\n---\n\nBody.\n";
+    const OWN = "---\ntitle: T\ncontent_type: decision\n---\n\nBody.\n";
+    const BAD_MAPPED = "---\nname: Foo\nmetadata:\n  type: bogus-type\n---\n\nBody.\n";
+    // Pick a default that filename inference would NOT produce for REL.
+    const DEF = inferContentType(REL) === "reference" ? "note" : "reference";
+
+    it("applies the default when the doc has no content_type", () => {
+      expect(parseForReindex(mk(), PLAIN, REL, undefined, DEF).meta.content_type).toBe(DEF);
+    });
+    it("keeps the doc's own content_type over the default", () => {
+      expect(parseForReindex(mk(), OWN, REL, undefined, DEF).meta.content_type).toBe("decision");
+    });
+    it("no default -> filename inference unchanged", () => {
+      expect(parseForReindex(mk(), PLAIN, REL).meta.content_type).toBe(inferContentType(REL));
+    });
+    it("a rejected mapped value falls back to the collection default", () => {
+      const r = parseForReindex(mk(), BAD_MAPPED, REL, MAP, DEF);
+      expect(r.meta.content_type).toBe(DEF);
+      expect(parseForReindex(mk(), BAD_MAPPED, REL, MAP).meta.content_type).toBe(inferContentType(REL));
+    });
+    it("parity: pg parseForReindex content_type === sqlite's resolution", () => {
+      for (const raw of [PLAIN, OWN, BAD_MAPPED]) {
+        for (const def of [undefined, DEF]) {
+          const pg = parseForReindex(mk(), raw, REL, MAP, def).meta.content_type;
+          const sqlite = parseDocument(raw, REL, def, MAP).meta.content_type || inferContentType(REL);
+          expect(pg).toBe(sqlite);
+        }
+      }
+    });
+  });
+
   it("pg origin-load: parseOriginDocument (its sole parse call) maps the title", () => {
     expect(parseOriginDocument(MEMORY_TOPIC, REL, MAP).meta.title).toBe("Foo");
     expect(parseOriginDocument(MEMORY_TOPIC, REL).meta.title).toBeUndefined();
@@ -498,10 +531,10 @@ describe("A6: every indexing path honours the map", () => {
     it("pg reindex and origin-load each have exactly one parseDocument call, fed the map", () => {
       const reindex = read("pg/reindex.ts");
       expect([...reindex.matchAll(/\bparseDocument\(/g)].length).toBe(1);
-      expect(reindex).toContain("parseDocument(raw, rel, undefined, frontmatterMap)");
-      expect(reindex).toContain("parseForReindex(stats, raw, rel, frontmatterMap)");
+      expect(reindex).toContain("parseDocument(raw, rel, defaultContentType, frontmatterMap)");
+      expect(reindex).toContain("parseForReindex(stats, raw, rel, frontmatterMap, defaultContentType)");
       expect(reindex).toContain(
-        "reindexCollection(c.name, c.path, c.pattern, opts, c.frontmatter_map)",
+        "reindexCollection(c.name, c.path, c.pattern, opts, c.frontmatter_map, c.content_type)",
       );
 
       const origin = read("pg/origin.ts");

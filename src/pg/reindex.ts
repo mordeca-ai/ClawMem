@@ -283,17 +283,20 @@ export function sweepDecision(
  * Parse one walked file and fold its outcome into the collection's summary
  * counters. The SOLE parseDocument call on the pg reindex path — exported so
  * the frontmatter_map threading (master-harness-wzwh8.1) is testable without a
- * Postgres. Deliberately passes NO collection default content_type: the pg path
- * has never honoured one (pre-existing, unchanged here); a rejected mapped
- * value therefore falls back to filename inference, exactly as an absent one.
+ * Postgres. Passes the collection's default content_type (master-harness-vn4rz.76),
+ * exactly as sqlite's indexCollection does, so both backends resolve the same
+ * content_type (and ADR-0143 decay): own frontmatter value > collection default
+ * > filename inference. A rejected mapped value therefore falls back to the
+ * collection default first, then inference.
  */
 export function parseForReindex(
   stats: Pick<ReindexStats, "frontmatterParseFailures" | "frontmatterVocab">,
   raw: string,
   rel: string,
   frontmatterMap?: FrontmatterMap,
+  defaultContentType?: string,
 ): { body: string; meta: DocumentMeta; title: string } {
-  const parsedDoc = parseDocument(raw, rel, undefined, frontmatterMap);
+  const parsedDoc = parseDocument(raw, rel, defaultContentType, frontmatterMap);
   const { body, meta, frontmatterError } = parsedDoc;
   // parseDocument already emitted the per-file warning; this is the COUNT
   // that reaches the summary (vn4rz.34).
@@ -310,6 +313,8 @@ export async function reindexCollection(
   opts: ReindexOptions = {},
   /** master-harness-wzwh8.1: this collection's config frontmatter_map (opt-in). */
   frontmatterMap?: FrontmatterMap,
+  /** master-harness-vn4rz.76: this collection's config content_type default. */
+  defaultContentType?: string,
 ): Promise<ReindexStats> {
   const t0 = Date.now();
   const log = opts.onProgress ?? (() => {});
@@ -455,7 +460,7 @@ export async function reindexCollection(
       continue;
     }
     const hash = hashContent(raw);
-    const { body, meta, title } = parseForReindex(stats, raw, rel, frontmatterMap);
+    const { body, meta, title } = parseForReindex(stats, raw, rel, frontmatterMap, defaultContentType);
 
     // The retag backlog: counted here so the enum decision has a number attached
     // to it rather than a shrug.
@@ -584,7 +589,7 @@ export async function reindex(opts: ReindexOptions = {}): Promise<ReindexStats[]
   const out: ReindexStats[] = [];
   for (const c of listCollections()) {
     if (wanted.size > 0 && !wanted.has(c.name)) continue;
-    out.push(await reindexCollection(c.name, c.path, c.pattern, opts, c.frontmatter_map));
+    out.push(await reindexCollection(c.name, c.path, c.pattern, opts, c.frontmatter_map, c.content_type));
   }
   // CONTENT GC (master-harness-vn4rz.49): its own transactions, AFTER the whole
   // pass, so no document upsert of this run is still pending. Orphan-hood is
