@@ -125,7 +125,7 @@ describe("D9: a reindex must not undo forget or archival", () => {
     const docid = (store.db.prepare("SELECT substr(hash,1,8) AS d FROM documents WHERE path = 'rest.md'")
       .get() as { d: string }).d;
 
-    const server = startServer(store, 7439 + (process.pid % 200), "127.0.0.1");
+    const server = startServer(store, 0, "127.0.0.1");
     try {
       const res = await fetch(`http://127.0.0.1:${server.port}/documents/${docid}/forget`, { method: "POST" });
       expect(res.status).toBe(200);

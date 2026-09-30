@@ -20,8 +20,8 @@ import { fuseAndRerank, type RankedResult } from "../../src/search-utils.ts";
 // Per-run unique root: fixed /tmp paths are clobbered by overlapping runs and poisoned by stale -wal/-shm sidecars (vn4rz.79).
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "clawmem-server-hybrid-rerank-"));
 const TEST_DB = join(TEST_ROOT, "test.sqlite");
-const PORT = 17461;
-const BASE = `http://127.0.0.1:${PORT}`;
+// Port 0 = OS-assigned: a fixed port EADDRINUSEs against any overlapping run (vn4rz.83).
+let BASE: string;
 const QUERY = "kitchen kiosk casting strategy for cast receivers";
 
 let store: Store;
@@ -65,7 +65,8 @@ beforeAll(() => {
   original.searchFTS = store.searchFTS;
   original.searchVec = store.searchVec;
   original.rerank = store.rerank;
-  server = startServer(store, PORT);
+  server = startServer(store, 0);
+  BASE = `http://127.0.0.1:${server.port}`;
 });
 
 afterEach(() => {

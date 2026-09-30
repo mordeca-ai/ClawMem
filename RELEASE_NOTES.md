@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.44 — test servers bind port 0 (no fixed-port EADDRINUSE across overlapping runs)
+
+Test servers in `server.test.ts`, `server-hybrid-rerank.test.ts` and `indexer-boundary.test.ts` now bind port 0 and read the OS-assigned port back, instead of fixed ports (17438, 17461, 7439+pid%200) that failed with "Failed to start server. Is port … in use?" whenever an overlapping run held the same port. Test-only change, no src/ behaviour change (master-harness-vn4rz.83).
+
+---
+
 ## v0.36.43 — unique per-run test fixtures (no /tmp collisions)
 
 Test fixtures now use per-run unique temp roots (mkdtemp) instead of fixed shared /tmp paths, so two overlapping `bun test` runs on one host no longer clobber each other's SQLite DBs or fixture dirs ("unable to open database file" / "disk I/O error"), and stale -wal/-shm sidecars from a killed run can no longer poison the next run. 18 test files touched; remaining /tmp string literals are annotated `safe:` (never created on disk). Test-only change, no src/ behaviour change (master-harness-vn4rz.79).
