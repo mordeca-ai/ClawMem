@@ -15,8 +15,9 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
  * The mine/backfill CLI lane lives in authored-at-cli.test.ts.
  */
 
-import { unlinkSync, rmSync, mkdirSync, writeFileSync } from "fs";
+import { unlinkSync, rmSync, mkdirSync, mkdtempSync, writeFileSync } from "fs";
 import { join } from "path";
+import { tmpdir } from "os";
 import { createHash } from "crypto";
 import { createStore, canonicalDocId, type Store } from "../../src/store.ts";
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
@@ -42,8 +43,10 @@ import { generateDirectoryBlock, getDecisionsForDirectory } from "../../src/dire
 import { createEvalSession } from "../../src/eval/replay.ts";
 import type { DocumentRow } from "../../src/store.ts";
 
-const TEST_DB = "/tmp/clawmem-authored-at-test.sqlite";
-const TMP = `/tmp/clawmem-authored-at-fixtures-${Date.now()}`;
+// Per-run unique root: fixed /tmp paths are clobbered by overlapping runs and poisoned by stale -wal/-shm sidecars (vn4rz.79).
+const TEST_ROOT = mkdtempSync(join(tmpdir(), "clawmem-authored-at-"));
+const TEST_DB = join(TEST_ROOT, "test.sqlite");
+const TMP = join(TEST_ROOT, "fixtures");
 const MODEL = "authored-fake";
 
 function fakeVec(text: string): Float32Array {
@@ -99,6 +102,7 @@ afterAll(() => {
   try { store?.close(); } catch { /* already closed */ }
   try { unlinkSync(TEST_DB); } catch { /* absent */ }
   try { rmSync(TMP, { recursive: true, force: true }); } catch { /* absent */ }
+  rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
 // ─── D3: strict timestamp adapters ─────────────────────────────────
@@ -655,7 +659,7 @@ describe("caller pins: cutoffs and displayed dates run on effectiveAt (D14.7)", 
   // clock, so these pins cannot rot.
 
   it("postcompactInject: historical-authored decision excluded from 'last 7 days'; dates render as effectiveAt", async () => {
-    const out = await postcompactInject(store, { sessionId: "s511-pc", transcriptPath: "/tmp/nonexistent-s511" } as any);
+    const out = await postcompactInject(store, { sessionId: "s511-pc", transcriptPath: "/tmp/nonexistent-s511" } as any);  // safe: postcompactInject only existsSync-probes the parent dir of this path; never created or deleted
     const text = JSON.stringify(out);
     // seedDoc uses the path as the title, so rendered lines carry "b.md"/"a.md".
     expect(text).toContain(`**b.md** (${d13DayAgo.slice(0, 10)})`);

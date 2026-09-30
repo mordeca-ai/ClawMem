@@ -13,12 +13,15 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, writeFileSync, rmSync, unlinkSync } from "fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, unlinkSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { createStore, getReconcilableDocumentPaths, type Store } from "../../src/store.ts";
 import { indexCollection, hashContent } from "../../src/indexer.ts";
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
 
-const ROOT = "/tmp/clawmem-origin-reconciliation-test";
+// Per-run unique root (vn4rz.79): a fixed path is clobbered by overlapping runs; beforeEach/afterEach rmSync it, mkdirSync(CONTENT) recreates it.
+const ROOT = mkdtempSync(join(tmpdir(), "clawmem-origin-reconciliation-"));
 const CONTENT = `${ROOT}/content`;
 const DB = `${ROOT}/vault.sqlite`;
 

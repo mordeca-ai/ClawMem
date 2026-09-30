@@ -39,8 +39,8 @@ describe("§28.1 trim — home-resolution env value normalization", () => {
     expect(trim("null")).toBeUndefined();
   });
   test("returns trimmed value for real strings", () => {
-    expect(trim("  /tmp/foo  ")).toBe("/tmp/foo");
-    expect(trim("/tmp/foo")).toBe("/tmp/foo");
+    expect(trim("  /tmp/foo  ")).toBe("/tmp/foo");  // safe: pure trim() string assertion; no fs access
+    expect(trim("/tmp/foo")).toBe("/tmp/foo");  // safe: pure trim() string assertion; no fs access
   });
 });
 

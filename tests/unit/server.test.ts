@@ -3,7 +3,9 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { unlinkSync } from "fs";
+import { unlinkSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { createStore, type Store } from "../../src/store.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { startServer } from "../../src/server.ts";
@@ -12,7 +14,9 @@ let store: Store;
 let server: ReturnType<typeof startServer>;
 let authDocHash: string;
 let handoffDocHash: string;
-const TEST_DB = "/tmp/clawmem-server-test.sqlite";
+// Per-run unique root: fixed /tmp paths are clobbered by overlapping runs and poisoned by stale -wal/-shm sidecars (vn4rz.79).
+const TEST_ROOT = mkdtempSync(join(tmpdir(), "clawmem-server-"));
+const TEST_DB = join(TEST_ROOT, "test.sqlite");
 const PORT = 17438;
 const BASE = `http://127.0.0.1:${PORT}`;
 
@@ -52,6 +56,7 @@ afterAll(() => {
   try { unlinkSync(TEST_DB); } catch {}
   try { unlinkSync(TEST_DB + "-wal"); } catch {}
   try { unlinkSync(TEST_DB + "-shm"); } catch {}
+  rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
 describe("GET /health", () => {

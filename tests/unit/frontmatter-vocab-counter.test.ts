@@ -16,7 +16,9 @@
  * this repo's .gitignore ignores `*.md` behind an allowlist.
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, writeFileSync, rmSync } from "fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   parseDocument,
   indexCollection,
@@ -183,7 +185,7 @@ describe("clean and absent frontmatter are distinguishable (A2)", () => {
 });
 
 describe("the per-collection indexing summary carries the counter (A3)", () => {
-  const ROOT = `/tmp/clawmem-wzwh8-vocab-${process.pid}`;
+  const ROOT = mkdtempSync(join(tmpdir(), "clawmem-wzwh8-vocab-")); // unique per run (vn4rz.79); beforeEach/afterEach rmSync + mkdirSync(CONTENT) recreate it
   const CONTENT = `${ROOT}/content`;
   let store: Store;
   const deadLlm = {

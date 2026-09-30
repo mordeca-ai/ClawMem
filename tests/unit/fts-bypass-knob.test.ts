@@ -13,7 +13,9 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
  * verifies rows by this key).
  */
 
-import { unlinkSync } from "fs";
+import { unlinkSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { buildMcpServer } from "../../src/mcp.ts";
@@ -22,7 +24,9 @@ import { hasStrongFtsSignal, ftsBypassEnabled } from "../../src/search-utils.ts"
 import { setDefaultLlamaCpp } from "../../src/llm.ts";
 import { hashContent } from "../../src/indexer.ts";
 
-const TEST_DB = "/tmp/clawmem-fts-bypass-knob-test.sqlite";
+// Per-run unique root: fixed /tmp paths are clobbered by overlapping runs and poisoned by stale -wal/-shm sidecars (vn4rz.79).
+const TEST_ROOT = mkdtempSync(join(tmpdir(), "clawmem-fts-bypass-"));
+const TEST_DB = join(TEST_ROOT, "test.sqlite");
 const REPO_ROOT = new URL("../..", import.meta.url).pathname;
 
 let expandCalls = 0;
@@ -88,6 +92,7 @@ afterAll(() => {
   if (savedKnob === undefined) delete process.env.CLAWMEM_DISABLE_FTS_BYPASS; else process.env.CLAWMEM_DISABLE_FTS_BYPASS = savedKnob;
   if (savedIndexPath === undefined) delete Bun.env.INDEX_PATH; else Bun.env.INDEX_PATH = savedIndexPath;
   for (const suffix of ["", "-wal", "-shm"]) { try { unlinkSync(TEST_DB + suffix); } catch { /* gone */ } }
+  rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
 describe("ftsBypassEnabled — env parsing", () => {

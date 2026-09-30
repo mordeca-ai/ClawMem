@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.43 — unique per-run test fixtures (no /tmp collisions)
+
+Test fixtures now use per-run unique temp roots (mkdtemp) instead of fixed shared /tmp paths, so two overlapping `bun test` runs on one host no longer clobber each other's SQLite DBs or fixture dirs ("unable to open database file" / "disk I/O error"), and stale -wal/-shm sidecars from a killed run can no longer poison the next run. 18 test files touched; remaining /tmp string literals are annotated `safe:` (never created on disk). Test-only change, no src/ behaviour change (master-harness-vn4rz.79).
+
+---
+
 ## v0.36.42 — pg reindex honours the collection content_type default (vn4rz.76)
 
 pg reindex honours the collection content_type default (parity with sqlite)

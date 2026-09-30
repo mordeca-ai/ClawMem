@@ -10,7 +10,9 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
  * port, plus store-level provenance units on throwaway DBs.
  */
 
-import { unlinkSync } from "fs";
+import { unlinkSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { createHash } from "crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -22,7 +24,9 @@ import { hashContent } from "../../src/indexer.ts";
 import { adaptiveTraversal, mpfpTraversal } from "../../src/graph-traversal.ts";
 import { runCausalRetrieval, hasCausalSignal, hasTimelineSignal, baseAdmissible } from "../../src/causal-retrieval.ts";
 
-const TEST_DB = "/tmp/clawmem-causal-boundary-test.sqlite";
+// Per-run unique root: fixed /tmp paths are clobbered by overlapping runs and poisoned by stale -wal/-shm sidecars (vn4rz.79).
+const TEST_ROOT = mkdtempSync(join(tmpdir(), "clawmem-causal-boundary-"));
+const TEST_DB = join(TEST_ROOT, "test.sqlite");
 const MODEL = "causal-fake";
 
 // Keyword-steered fake embedder (mcp-routes pattern): query/doc clusters by marker word.
@@ -236,6 +240,7 @@ afterAll(() => {
   setDefaultLlamaCpp(null);
   delete Bun.env.INDEX_PATH;
   try { unlinkSync(TEST_DB); } catch { /* gone */ }
+  rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
 // =============================================================================
@@ -659,7 +664,7 @@ describe("entity_triple_provenance store contract", () => {
   });
 
   it("backfills legacy inline evidence across reopen, idempotently (migration)", () => {
-    const file = "/tmp/clawmem-causal-migration-test.sqlite";
+    const file = join(TEST_ROOT, "migration.sqlite");
     try { unlinkSync(file); } catch { /* absent */ }
     let store = createStore(file);
     store.db.prepare(`INSERT INTO entity_nodes (entity_id, entity_type, name, created_at) VALUES (?, 'concept', 'x', ?)`).run("default:concept:x", new Date().toISOString());
@@ -695,7 +700,7 @@ describe("entity_triple_provenance store contract", () => {
   });
 
   it("backfills an entirely-null legacy triple with one unattributed row across reopen (T6-F8)", () => {
-    const file = "/tmp/clawmem-causal-nullmigration-test.sqlite";
+    const file = join(TEST_ROOT, "nullmigration.sqlite");
     try { unlinkSync(file); } catch { /* absent */ }
     let store = createStore(file);
     store.db.prepare(`INSERT INTO entity_nodes (entity_id, entity_type, name, created_at) VALUES (?, 'concept', 'x', ?)`).run("default:concept:x", new Date().toISOString());
