@@ -17,8 +17,8 @@ let handoffDocHash: string;
 // Per-run unique root: fixed /tmp paths are clobbered by overlapping runs and poisoned by stale -wal/-shm sidecars (vn4rz.79).
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "clawmem-server-"));
 const TEST_DB = join(TEST_ROOT, "test.sqlite");
-const PORT = 17438;
-const BASE = `http://127.0.0.1:${PORT}`;
+// Port 0 = OS-assigned: a fixed port EADDRINUSEs against any overlapping run (vn4rz.83).
+let BASE: string;
 
 beforeAll(() => {
   try { unlinkSync(TEST_DB); } catch {}
@@ -47,7 +47,8 @@ beforeAll(() => {
   store.insertContent(apiHash, apiBody, now);
   store.insertDocument("test", "notes/api.md", "API Design", apiHash, now, now);
 
-  server = startServer(store, PORT);
+  server = startServer(store, 0);
+  BASE = `http://127.0.0.1:${server.port}`;
 });
 
 afterAll(() => {
