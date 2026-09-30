@@ -220,7 +220,7 @@ d("PG write path", () => {
     expect(await snapshot()).toBe(before);
   });
 
-  it("built BOTH HNSW indexes VALID, not INVALID (002 full + 011 doc-tier partial)", async () => {
+  it("built BOTH HNSW indexes VALID, not INVALID (002 full + 012 doc-tier partial)", async () => {
     const { rows } = await withSchema(c =>
       c.query<{ relname: string; indisvalid: boolean }>(
         `SELECT ci.relname, i.indisvalid FROM pg_index i

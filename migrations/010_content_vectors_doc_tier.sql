@@ -1,6 +1,6 @@
 -- 010_content_vectors_doc_tier.sql — mark which vectors the ANN reader can
--- ever return (master-harness-vn4rz.77). Pairs with 011, which builds the
--- partial HNSW index over the rows this column marks.
+-- ever return (master-harness-vn4rz.77). 011 backfills the column; 012
+-- builds the partial HNSW index over the rows it marks.
 --
 -- ===========================================================================
 -- THE DEFECT. content_vectors holds the vectors of BOTH tiers: the curated
@@ -70,23 +70,27 @@
 -- hnsw.max_scan_tuples / the timeout: pays the origin walk on every query
 -- instead of removing it.
 --
--- BACKFILL COST. `ADD COLUMN ... NOT NULL DEFAULT false` is metadata-only on
--- PG16. The backfill UPDATE writes a new heap tuple for every documents-tier
--- vector (66,876 live). The embedding is TOASTed and not modified, so the heap
--- tuple stays small, but it is a non-HOT update (doc_tier is in 011's index
--- predicate) and every existing index — including the full HNSW — receives
--- the new tuple. This migration is transactional, so ALTER TABLE's ACCESS
--- EXCLUSIVE lock is held for the whole backfill: apply it in the cutover
--- window, and VACUUM content_vectors afterwards to reclaim the dead tuples.
--- Measured on a scratch copy of the live vault: see the vn4rz.77 report.
+-- THREE MIGRATIONS, NOT ONE (a measured deviation from the one-file design).
+-- This file adds the column and the triggers only; 011 backfills; 012 builds
+-- the partial index. Measured on a scratch copy of the live vault (239,677
+-- vectors, 2026-09-29): the backfill UPDATE of 66,745 rows took 2 min 55 s,
+-- because each updated row is a non-HOT new tuple that the 821 MB full HNSW
+-- index must re-insert. In ONE transactional file that UPDATE runs under
+-- ADD COLUMN's ACCESS EXCLUSIVE lock, which blocks every search and every
+-- write on content_vectors for the whole three minutes (the reader's
+-- 1,200 ms statement_timeout turns that into a wall of degraded searches).
+-- Split, this file holds ACCESS EXCLUSIVE for milliseconds (ADD COLUMN with a
+-- constant default is metadata-only on PG16) and 011's UPDATE holds only ROW
+-- EXCLUSIVE, which readers do not wait on. The triggers land FIRST, so every
+-- write committed while 011 runs is already flagged correctly.
 --
 -- ROLLBACK: DROP INDEX CONCURRENTLY content_vectors_embedding_doc_hnsw_idx
--- (011); DROP TRIGGER content_vectors_doc_tier_trg ON content_vectors;
+-- (012); DROP TRIGGER content_vectors_doc_tier_trg ON content_vectors;
 -- DROP TRIGGER documents_doc_tier_ins_trg, documents_doc_tier_upd_trg,
 -- documents_doc_tier_del_trg ON documents; DROP FUNCTION
 -- content_vectors_doc_tier_on_insert(), documents_doc_tier_sync();
--- ALTER TABLE content_vectors DROP COLUMN doc_tier; DELETE the 010/011 rows
--- from schema_migrations. The code change in search.ts must be reverted
+-- ALTER TABLE content_vectors DROP COLUMN doc_tier; DELETE the 010/011/012
+-- rows from schema_migrations. The code change in search.ts must be reverted
 -- FIRST — it references cv.doc_tier.
 --
 -- Functions pin `search_path = pg_catalog, :CLAWMEM_SCHEMA` and use
@@ -96,13 +100,6 @@
 
 ALTER TABLE content_vectors
   ADD COLUMN IF NOT EXISTS doc_tier boolean NOT NULL DEFAULT false;
-
--- Backfill. `AND NOT doc_tier` keeps a re-run from rewriting rows that are
--- already correct.
-UPDATE content_vectors cv
-   SET doc_tier = true
- WHERE NOT cv.doc_tier
-   AND EXISTS (SELECT 1 FROM documents d WHERE d.hash = cv.hash);
 
 -- ---------------------------------------------------------------------------
 -- content_vectors: a vector inserted after its documents row is born true.
@@ -125,8 +122,8 @@ CREATE TRIGGER content_vectors_doc_tier_trg
 
 -- ---------------------------------------------------------------------------
 -- documents: keep the flag of the hash(es) a row change touches.
--- `AND doc_tier IS DISTINCT FROM <target>` keeps a no-op from writing a new
--- tuple (and a new HNSW entry) for every vector of the hash.
+-- The `AND NOT doc_tier` / `AND doc_tier` guards keep a no-op from writing a
+-- new tuple (and new HNSW entries) for every vector of the hash.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION documents_doc_tier_sync() RETURNS trigger AS $$
 BEGIN

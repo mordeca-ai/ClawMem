@@ -7,8 +7,8 @@
  * `clawmem-lander pg-itest -- bun test tests/integration/pg-doc-tier.test.ts`
  * so the URL points at a throwaway database.
  *
- * WHAT IS UNDER TEST. Migration 010's column + triggers, migration 011's
- * partial index, src/pg/write.ts reconcileDocTier, and src/pg/search.ts's use
+ * WHAT IS UNDER TEST. Migration 010's column + triggers, 011's backfill,
+ * 012's partial index, src/pg/write.ts reconcileDocTier, and src/pg/search.ts's use
  * of the flag. Writes go through the REAL write path (upsertDocument,
  * insertEmbeddingsBatch, dropLegacyDocumentRows) wherever one exists, because
  * the thing that must hold is "the writers this repo ships keep the flag
@@ -248,14 +248,46 @@ d("PG content_vectors.doc_tier (vn4rz.77)", () => {
     expect(await flags("h_race")).toEqual([true]);
   });
 
-  it("backfill: re-applying migration 010 onto an all-false column re-derives exactly the documents set", async () => {
-    // The state right after ADD COLUMN ... DEFAULT false on a populated table.
+  /** One migration file, substituted for this schema, as the runner would send it. */
+  function migrationSql(file: string): string {
+    return substituteMigrationParams(readFileSync(join(MIGRATIONS_DIR, file), "utf-8"), schema, DIM);
+  }
+
+  /** Can another session read content_vectors while `holder` keeps its transaction open? */
+  async function readerBlockedBy(holderSql: string): Promise<boolean> {
+    const holder = await pool.connect();
+    try {
+      await holder.query(`SET search_path TO ${schema}, public`);
+      await holder.query("BEGIN");
+      await holder.query(holderSql);
+      try {
+        await withSchema(async r => {
+          await r.query("BEGIN");
+          try {
+            await r.query("SET LOCAL lock_timeout = '300ms'");
+            await r.query("SELECT count(*) FROM content_vectors");
+          } finally {
+            await r.query("ROLLBACK");
+          }
+        });
+        return false;
+      } catch (e) {
+        if ((e as { code?: string }).code === "55P03") return true; // lock_not_available
+        throw e;
+      }
+    } finally {
+      await holder.query("ROLLBACK").catch(() => {});
+      holder.release();
+    }
+  }
+
+  it("backfill: re-applying migration 011 onto an all-false column re-derives exactly the documents set", async () => {
+    // The state right after 010's ADD COLUMN ... DEFAULT false on a populated table.
     await q(`UPDATE content_vectors SET doc_tier = false`);
-    const raw = readFileSync(join(MIGRATIONS_DIR, "010_content_vectors_doc_tier.sql"), "utf-8");
     await withSchema(async c => {
       await c.query("BEGIN");
       try {
-        await c.query(substituteMigrationParams(raw, schema, DIM)); // idempotent re-apply
+        await c.query(migrationSql("011_content_vectors_doc_tier_backfill.sql"));
         await c.query("COMMIT");
       } catch (e) {
         await c.query("ROLLBACK");
@@ -273,7 +305,22 @@ d("PG content_vectors.doc_tier (vn4rz.77)", () => {
     expect(await flags("h_born")).toEqual([true, true]);
   });
 
-  it("migration 011 built a VALID partial index whose predicate is doc_tier", async () => {
+  it("the 011 backfill does NOT block readers while it runs; 010's ADD COLUMN does (why they are split)", async () => {
+    // CONTROL first: 010's DDL (ADD COLUMN, DROP TRIGGER — re-applied
+    // idempotently here) takes ACCESS EXCLUSIVE, so a reader with a
+    // lock_timeout is refused. That is the lock the 2 min 55 s backfill would
+    // have run under had it stayed in 010 (measured on the scratch copy of the
+    // live vault); 010 alone holds it for milliseconds.
+    expect(await readerBlockedBy(migrationSql("010_content_vectors_doc_tier.sql"))).toBe(true);
+    // 011 holds only ROW EXCLUSIVE: the same reader proceeds.
+    await q(`UPDATE content_vectors SET doc_tier = false WHERE hash = 'h_born'`);
+    expect(await readerBlockedBy(migrationSql("011_content_vectors_doc_tier_backfill.sql"))).toBe(false);
+    // Both holders rolled back; put the flag right for the tests below.
+    await reconcileDocTierForVault("sfw");
+    expect(await flags("h_born")).toEqual([true, true]);
+  });
+
+  it("migration 012 built a VALID partial index whose predicate is doc_tier", async () => {
     const r = await q<{ def: string; valid: boolean }>(
       `SELECT pg_get_indexdef(i.indexrelid) def, i.indisvalid valid
          FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid

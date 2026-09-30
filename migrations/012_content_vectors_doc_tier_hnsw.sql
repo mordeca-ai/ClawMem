@@ -1,12 +1,12 @@
--- 011_content_vectors_doc_tier_hnsw.sql — the PARTIAL HNSW index the ANN
+-- 012_content_vectors_doc_tier_hnsw.sql — the PARTIAL HNSW index the ANN
 -- reader actually uses (master-harness-vn4rz.77).
 --
 -- ===========================================================================
 -- WHAT THIS IS. An HNSW index over ONLY the documents-tier vectors
--- (`WHERE doc_tier`, the column migration 010 adds and maintains). The ANN
--- query in src/pg/search.ts carries `AND cv.doc_tier`, which is what lets the
--- planner prove the predicate and pick this index; a query without it can
--- only use the full index from 002.
+-- (`WHERE doc_tier`: the column migration 010 adds and maintains and 011
+-- backfills). The ANN query in src/pg/search.ts carries `AND cv.doc_tier`,
+-- which is what lets the planner prove the predicate and pick this index; a
+-- query without it can only use the full index from 002.
 --
 -- WHY. On the live vault 72% of content_vectors are origin-tier vectors no ANN
 -- reader ever returns (010's header has the measurement). Under the full
@@ -33,7 +33,7 @@
 --
 -- ROLLBACK: DROP INDEX CONCURRENTLY IF EXISTS
 -- content_vectors_embedding_doc_hnsw_idx; DELETE FROM schema_migrations
--- WHERE version = '011_content_vectors_doc_tier_hnsw'. The search.ts
+-- WHERE version = '012_content_vectors_doc_tier_hnsw'. The search.ts
 -- predicate may stay: without this index the planner serves it from the full
 -- index with `doc_tier` as a filter (same results, the pre-vn4rz.77 latency).
 -- ===========================================================================

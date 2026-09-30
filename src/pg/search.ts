@@ -68,11 +68,16 @@
  * documents JOIN: 2.5-6.1 s per probe vs the 1200 ms timeout, 3/10 live hybrid
  * runs PgVecSearchTimeoutError (ann-scan); documents-region probes ran 30 ms.
  * Migration 010 materialises "some documents row references this hash" as
- * `content_vectors.doc_tier` (trigger-maintained, reconciled by reindex) and 011
- * builds `content_vectors_embedding_doc_hnsw_idx ... WHERE doc_tier`. BOTH
+ * `content_vectors.doc_tier` (trigger-maintained, reconciled by reindex), 011
+ * backfills it, and 012 builds `content_vectors_embedding_doc_hnsw_idx ...
+ * WHERE doc_tier`. BOTH
  * queries below carry `cv.doc_tier` — that literal predicate is what lets the
  * planner prove the partial index applies. Drop it and the ANN scan silently
- * returns to the full index and the multi-second origin walk.
+ * returns to the full index and the multi-second origin walk. Scratch copy of
+ * the live vault, fragmentLimit 160, 5 origin-region probes: 15-17k tuples /
+ * 56-61k buffers per probe through the full index vs 180-290 tuples / ~5k
+ * buffers through the partial one (9-73 ms), top-20 recall vs exact 14-19/20
+ * -> 20/20; documents-region probes unchanged (2.6-23 ms).
  */
 
 import type { SearchResult } from "../store.ts";
@@ -271,7 +276,7 @@ export function normalizeCollections(c: string | string[] | undefined): string[]
  *
  * `cv.doc_tier` is NOT a correctness filter — the documents JOIN already drops
  * origin-only vectors. It is the planner's licence to scan the partial index
- * content_vectors_embedding_doc_hnsw_idx (migration 011), which holds no origin
+ * content_vectors_embedding_doc_hnsw_idx (migration 012), which holds no origin
  * rows and so has nothing for the iterative scan to walk past (vn4rz.77).
  *
  * `pg` uses $1-style placeholders and NOTHING is interpolated into the text:
