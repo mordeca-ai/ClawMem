@@ -32,13 +32,13 @@
  *  4. EXPLICIT HOOK TIMEOUT — PG_TEST_SETUP_TIMEOUT_MS, passed as bun's
  *     beforeAll(fn, timeout), sits far above the 5s default.
  *
- * NON-TRANSACTIONAL MIGRATIONS. Migration 002 declares
- * `-- clawmem:no-transaction` for `CREATE INDEX CONCURRENTLY`, which cannot run
+ * NON-TRANSACTIONAL MIGRATIONS. Migrations 002/012 create an index and 013
+ * drops one CONCURRENTLY; neither operation can run
  * inside a transaction block. For a throwaway schema whose table was created
  * in this same transaction (and is empty), CONCURRENTLY buys nothing — it only
  * avoids blocking concurrent writers, and there are none — so
- * `migrationSqlForTransaction` rewrites it to a plain `CREATE INDEX` with the
- * identical definition. Any OTHER statement that cannot run in a transaction
+ * `migrationSqlForTransaction` rewrites those operations to plain CREATE/DROP
+ * INDEX with the identical resulting catalog. Any OTHER statement that cannot run in a transaction
  * block is refused loudly rather than guessed at. The migration runner's real
  * CONCURRENTLY path is still exercised verbatim by pg-write-path's
  * "applies twice" test, which re-applies the unmodified files after setup.
@@ -111,6 +111,7 @@ export async function assertNotProductionDatabase(
 
 const NO_TRANSACTION_DIRECTIVE = /^--\s*clawmem:no-transaction\s*$/m;
 const CREATE_INDEX_CONCURRENTLY = /\bCREATE(\s+UNIQUE)?\s+INDEX\s+CONCURRENTLY\b/gi;
+const DROP_INDEX_CONCURRENTLY = /\bDROP\s+INDEX\s+CONCURRENTLY\b/gi;
 /** Statements PostgreSQL refuses inside a transaction block (none may survive the rewrite). */
 const NON_TRANSACTIONAL = [
   /\bCONCURRENTLY\b/i,
@@ -147,11 +148,13 @@ export function migrationSqlForTransaction(
 ): string {
   let sql = substituteMigrationParams(raw, schema, dim);
   if (NO_TRANSACTION_DIRECTIVE.test(raw)) {
-    // Empty table created in this same transaction: a plain build is equivalent.
+    // The throwaway schema is created in this transaction and has no concurrent
+    // writers. Plain CREATE/DROP preserve the resulting catalog safely.
     sql = sql.replace(
       CREATE_INDEX_CONCURRENTLY,
       (_m, unique: string | undefined) => `CREATE${unique ?? ""} INDEX`,
     );
+    sql = sql.replace(DROP_INDEX_CONCURRENTLY, "DROP INDEX");
   }
   const code = executableText(sql);
   for (const re of NON_TRANSACTIONAL) {

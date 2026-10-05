@@ -104,6 +104,15 @@ describe("PG test harness — transactional migration text (DB-free)", () => {
     );
   });
 
+  it("rewrites 013's DROP INDEX CONCURRENTLY inside the isolated schema transaction", () => {
+    const f = "013_drop_full_content_vectors_hnsw.sql";
+    const raw = readFileSync(join(MIGRATIONS_DIR, f), "utf-8");
+    const sql = migrationSqlForTransaction(f, raw, "s", DIM);
+    const code = sql.split("\n").filter(l => !l.trim().startsWith("--")).join("\n");
+    expect(code).not.toMatch(/CONCURRENTLY/i);
+    expect(code).toMatch(/DROP INDEX IF EXISTS content_vectors_embedding_hnsw_idx/);
+  });
+
   it("refuses a statement no transaction can host", () => {
     expect(() => migrationSqlForTransaction("x.sql", "VACUUM documents;", "s", DIM)).toThrow(
       /cannot run inside/,

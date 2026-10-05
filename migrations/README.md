@@ -1,5 +1,12 @@
 # clawmem migrations — corrections live here, not in the `.sql`
 
+## 012 full-index retention was temporary
+
+Migration 012's immutable comment says the full HNSW index is kept because the
+master-harness reindex timer still names it. The timer now targets
+`content_vectors_embedding_doc_hnsw_idx`; migration 013 drops the full index
+concurrently. Applied migration text remains unchanged for checksum parity.
+
 ## Applied migrations are immutable
 
 `src/pg/migrate.ts` `loadMigrations()` checksums the **whole substituted file text**

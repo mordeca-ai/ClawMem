@@ -220,7 +220,7 @@ d("PG write path", () => {
     expect(await snapshot()).toBe(before);
   });
 
-  it("built BOTH HNSW indexes VALID, not INVALID (002 full + 012 doc-tier partial)", async () => {
+  it("kept the doc-tier HNSW index VALID and dropped the full index in 013", async () => {
     const { rows } = await withSchema(c =>
       c.query<{ relname: string; indisvalid: boolean }>(
         `SELECT ci.relname, i.indisvalid FROM pg_index i
@@ -233,7 +233,6 @@ d("PG write path", () => {
     );
     expect(rows.map(r => r.relname)).toEqual([
       "content_vectors_embedding_doc_hnsw_idx",
-      "content_vectors_embedding_hnsw_idx",
     ]);
     for (const r of rows) expect(r.indisvalid).toBe(true);
   });
