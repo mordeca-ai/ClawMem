@@ -59,6 +59,7 @@ import {
   postIndexEnrich,
 } from "./amem.ts";
 import { parseLegacyEdgeWitness } from "./causal-reader.ts";
+import { uniquePhysicalResults } from "./search-utils.ts";
 import {
   enrichDocumentEntities,
   searchEntities,
@@ -4456,10 +4457,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
-  const { sql, params } = buildSearchFTSSql(ftsQuery, limit, { collectionId, collections, dateRange, excludeCollections, observationsOnly: opts?.observationsOnly });
+  const unscoped = collectionId === undefined && (!collections || collections.length !== 1);
+  const { sql, params } = buildSearchFTSSql(ftsQuery, unscoped ? limit * 2 : limit, { collectionId, collections, dateRange, excludeCollections, observationsOnly: opts?.observationsOnly });
 
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; modified_at: string; bm25_score: number }[];
-  return rows.map(row => {
+  const results = rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     const score = ftsScoreFromBm25(row.bm25_score);
     return {
@@ -4477,6 +4479,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       source: "fts" as const,
     };
   });
+  return unscoped ? uniquePhysicalResults(results, limit) : results;
 }
 
 // =============================================================================
@@ -4681,8 +4684,11 @@ export async function searchVec(db: Database, query: string, model: string, limi
   if (hasVecIncludeScope({ collectionId, collections, dateRange })) {
     return (await searchVecDetailed(db, query, model, limit, { collectionId, collections, dateRange, deadlineMs })).results;
   }
-  const vecResults = await searchVecMatch(db, query, model, limit, deadlineMs);
-  return hydrateVecResults(db, vecResults, limit, collectionId, collections, dateRange);
+  const fetchLimit = limit * 2;
+  const vecResults = await searchVecMatch(db, query, model, fetchLimit, deadlineMs);
+  return uniquePhysicalResults(
+    hydrateVecResults(db, vecResults, fetchLimit, collectionId, collections, dateRange), limit,
+  );
 }
 
 // =============================================================================

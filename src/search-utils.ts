@@ -6,6 +6,9 @@
 
 import type { Store, SearchResult } from "./store.ts";
 import type { EnrichedResult } from "./memory.ts";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
+import { loadConfig } from "./collections.ts";
 
 /**
  * Runtime floor below which the whole reranker output is treated as degenerate (→ RRF fallback).
@@ -82,6 +85,39 @@ export type RankedResult = {
   score: number;
 };
 
+/** Resolve a virtual result to its source file, so overlapping collections share an identity. */
+export function physicalPathKey(file: string, roots: Record<string, string>): string {
+  const match = /^clawmem:\/\/([^/]+)\/(.+)$/.exec(file);
+  if (!match) return file;
+  const root = roots[match[1]!];
+  if (!root) return file;
+  const absolute = resolve(root, match[2]!);
+  try { return realpathSync(absolute); } catch { return absolute; }
+}
+
+function collectionRoots(): Record<string, string> {
+  return Object.fromEntries(Object.entries(loadConfig().collections).map(([name, col]) => [name, col.path]));
+}
+
+/** Preserve rank order while removing another collection's copy of the same source file. */
+export function uniquePhysicalResults<T extends { filepath: string }>(
+  results: T[], limit: number, roots?: Record<string, string>,
+): T[] {
+  if (limit <= 0) return [];
+  const physicalRoots = roots ?? (results.some(r => r.filepath.startsWith("clawmem://"))
+    ? collectionRoots() : {});
+  const seen = new Set<string>();
+  const unique: T[] = [];
+  for (const result of results) {
+    const key = physicalPathKey(result.filepath, physicalRoots);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(result);
+    if (unique.length >= limit) break;
+  }
+  return unique;
+}
+
 // =============================================================================
 // Reciprocal Rank Fusion
 // =============================================================================
@@ -94,7 +130,8 @@ export type RankedResult = {
 export function reciprocalRankFusion(
   resultLists: RankedResult[][],
   weights: number[],
-  k: number = 60
+  k: number = 60,
+  roots?: Record<string, string>,
 ): RankedResult[] {
   // Validate weights match result lists when explicitly provided
   if (weights.length > 0 && weights.length !== resultLists.length) {
@@ -113,24 +150,37 @@ export function reciprocalRankFusion(
     }
   }
 
-  const scores = new Map<string, { score: number; result: RankedResult }>();
+  const physicalRoots = roots ?? (resultLists.some(list => list.some(r => r.file.startsWith("clawmem://")))
+    ? collectionRoots() : {});
+
+  const scores = new Map<string, { score: number; result: RankedResult; bestRank: number }>();
 
   for (let i = 0; i < resultLists.length; i++) {
     const list = resultLists[i]!;
     const weight = weights[i] ?? 1;
     if (weight === 0) continue; // Skip zero-weight lists entirely
+    const seenInArm = new Set<string>();
+    let uniqueRank = 0;
     for (let rank = 0; rank < list.length; rank++) {
       const r = list[rank]!;
-      const existing = scores.get(r.file);
-      const rrfScore = weight / (k + rank + 1);
-      const bonus = rank === 0 ? 0.05 : rank <= 2 ? 0.02 : 0;
+      const key = physicalPathKey(r.file, physicalRoots);
+      if (seenInArm.has(key)) continue; // One source file gets one vote per arm.
+      seenInArm.add(key);
+      const existing = scores.get(key);
+      const rrfScore = weight / (k + uniqueRank + 1);
+      const bonus = uniqueRank === 0 ? 0.05 : uniqueRank <= 2 ? 0.02 : 0;
       const total = rrfScore + bonus;
 
       if (existing) {
         existing.score += total;
+        if (uniqueRank < existing.bestRank) {
+          existing.result = r;
+          existing.bestRank = uniqueRank;
+        }
       } else {
-        scores.set(r.file, { score: total, result: r });
+        scores.set(key, { score: total, result: r, bestRank: uniqueRank });
       }
+      uniqueRank++;
     }
   }
 
