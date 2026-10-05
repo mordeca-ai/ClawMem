@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.46 — clawmem PG: drop the full content_vectors HNSW index (836MB) and repoint clawmem-pg-hnsw-reindex timer to content_vectors_embedding_doc_hnsw_idx (vn4rz.77 follow-up)
+
+Drop unused full HNSW after >4 days with no recorded scan; partial index and timer are already live.
+
+---
+
 ## v0.36.45 — clawmem: 8 canon collections are subsets of docs, so unscoped queries return duplicate hits and lose top-10 slots
 
 Unscoped search, vector search, and hybrid fusion now identify results by their resolved source file. When a file belongs to both docs and a canon collection, it receives one result slot and one vote per retrieval arm. Retrieval over a single collection keeps its existing ordering. Query pools over-fetch before deduplication so the requested number of distinct files remains available.

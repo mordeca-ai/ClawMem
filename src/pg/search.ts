@@ -25,15 +25,15 @@
  *     degrade to "zero rows", which is indistinguishable from "no matches".
  *
  *  3. THE ANN PREDICATE. `ORDER BY cv.embedding <=> $1::vector LIMIT n` is the
- *     only shape content_vectors_embedding_hnsw_idx (vector_cosine_ops) can
+ *     only shape the document-tier HNSW index (vector_cosine_ops) can
  *     serve. Any rewrite that computes the distance in a projection and sorts on
  *     the alias, or that wraps the column, silently becomes a seq scan over
  *     every fragment in the vault.
  *
  * MEASURED PLANS (2026-09-09, live vault, pgvector 0.8.6, EXPLAIN COSTS OFF):
- *   - NO collection filter  -> `Index Scan using content_vectors_embedding_hnsw_idx`
- *     feeding a Memoize'd lookup of documents. The ANN index serves the order-by,
- *     which is the whole point of the shape above.
+ *   - Before migration 012, NO collection filter used the full HNSW index,
+ *     feeding a Memoize'd lookup of documents. Migration 012 supplied the
+ *     document-tier partial index; migration 013 retired the full one.
  *   - `--collection research` (141 docs / 8.5k fragments) -> the planner instead
  *     PRE-filters (`documents_collection_active_idx`) and sorts exactly. That is
  *     the RIGHT choice at that selectivity — it is exact rather than approximate —

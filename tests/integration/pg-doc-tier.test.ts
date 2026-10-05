@@ -334,12 +334,20 @@ d("PG content_vectors.doc_tier (vn4rz.77)", () => {
     expect(r[0]!.def).toMatch(/WHERE doc_tier/);
   });
 
-  it("the planner serves buildVecSearchQuery from the PARTIAL index, not the full one", async () => {
+  it("migration 013 removed the full index while preserving the partial one", async () => {
+    const r = await q<{ relname: string }>(
+      `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname IN ($2, $3) ORDER BY c.relname`,
+      [schema, PARTIAL_IDX, FULL_IDX],
+    );
+    expect(r.map(x => x.relname)).toEqual([PARTIAL_IDX]);
+  });
+
+  it("the planner serves buildVecSearchQuery from the PARTIAL index", async () => {
     // A fixture table is tiny, so seq scans and sorts are disabled to make the
     // planner choose between the ordered index paths it would take at scale.
-    // Of the two HNSW indexes, only the partial one proves the `cv.doc_tier`
-    // predicate — take that predicate out of the query and this goes RED
-    // (the plan falls back to content_vectors_embedding_hnsw_idx).
+    // The full index has been dropped; the partial one serves this order-by
+    // only because the query proves its `cv.doc_tier` predicate.
     const { text, values } = buildVecSearchQuery(toVectorLiteral(QUERY_VEC), null, 64);
     const plan = await withSchema(async c => {
       await c.query("BEGIN");
