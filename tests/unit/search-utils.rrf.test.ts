@@ -1,11 +1,49 @@
 import { describe, test, expect } from "bun:test";
-import { reciprocalRankFusion, type RankedResult } from "../../src/search-utils.ts";
+import { physicalPathKey, reciprocalRankFusion, uniquePhysicalResults, type RankedResult } from "../../src/search-utils.ts";
 
 function makeResult(file: string, score: number): RankedResult {
   return { file, displayPath: file, title: file, body: "", score };
 }
 
 describe("reciprocalRankFusion", () => {
+  const roots = { docs: "/vault/library/reference/documentation", canon: "/vault" };
+  const duplicate = "clawmem://canon/library/reference/documentation/postgres/rrf.md";
+  const original = "clawmem://docs/postgres/rrf.md";
+
+  test("one source indexed in two collections gets one vote and leaves N distinct slots", () => {
+    const rows = [
+      makeResult(original, 1), makeResult(duplicate, 0.9),
+      makeResult("clawmem://docs/second.md", 0.8), makeResult("clawmem://docs/third.md", 0.7),
+    ];
+    const fused = reciprocalRankFusion([rows], [1], 60, roots);
+    expect(fused).toHaveLength(3);
+    expect(fused.map(r => physicalPathKey(r.file, roots))).toEqual([
+      "/vault/library/reference/documentation/postgres/rrf.md",
+      "/vault/library/reference/documentation/second.md",
+      "/vault/library/reference/documentation/third.md",
+    ]);
+    expect(fused[0]!.score).toBeCloseTo(0.05 + 1 / 61);
+    expect(fused[1]!.score).toBeCloseTo(0.02 + 1 / 62);
+    expect(uniquePhysicalResults(rows.map(r => ({ filepath: r.file })), 3, roots)).toHaveLength(3);
+    expect(uniquePhysicalResults(rows.map(r => ({ filepath: r.file })), 0, roots)).toEqual([]);
+  });
+
+  test("single-collection ranking is unchanged", () => {
+    const scoped = [makeResult(original, 1), makeResult("clawmem://docs/second.md", 0.8)];
+    expect(reciprocalRankFusion([scoped], [1], 60, roots))
+      .toEqual(reciprocalRankFusion([scoped], [1], 60, {}));
+  });
+
+  test("the best-ranked collection copy represents a cross-arm source", () => {
+    const fused = reciprocalRankFusion([
+      [makeResult("clawmem://docs/other.md", 1), makeResult(original, 0.8)],
+      [makeResult(duplicate, 1)],
+    ], [1, 1], 60, roots);
+    expect(fused).toHaveLength(2);
+    expect(fused.find(r => physicalPathKey(r.file, roots).endsWith("postgres/rrf.md"))?.file)
+      .toBe(duplicate);
+  });
+
   test("merges two ranked lists", () => {
     const list1 = [makeResult("a.md", 1.0), makeResult("b.md", 0.8)];
     const list2 = [makeResult("b.md", 1.0), makeResult("c.md", 0.6)];
