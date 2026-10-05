@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.45 — clawmem: 8 canon collections are subsets of docs, so unscoped queries return duplicate hits and lose top-10 slots
+
+Unscoped search, vector search, and hybrid fusion now identify results by their resolved source file. When a file belongs to both docs and a canon collection, it receives one result slot and one vote per retrieval arm. Retrieval over a single collection keeps its existing ordering. Query pools over-fetch before deduplication so the requested number of distinct files remains available.
+
+---
+
 ## v0.36.44 — test servers bind port 0 (no fixed-port EADDRINUSE across overlapping runs)
 
 Test servers in `server.test.ts`, `server-hybrid-rerank.test.ts` and `indexer-boundary.test.ts` now bind port 0 and read the OS-assigned port back, instead of fixed ports (17438, 17461, 7439+pid%200) that failed with "Failed to start server. Is port … in use?" whenever an overlapping run held the same port. Test-only change, no src/ behaviour change (master-harness-vn4rz.83).
