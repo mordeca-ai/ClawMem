@@ -4,6 +4,18 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.47 — clawmem PG: documents-tier reindex is embed-incremental (skip hashes with a complete vector set; --reembed opt-out)
+
+PG reindex (documents tier) is now embed-incremental. Before this change, every reindex re-embedded every fragment of every document in the collection, even when only one file had changed. agents-skills re-embedded all ~16.4k fragments on each tick, which came to 10 runs, 164k embeds and 5.9 h of yoshiee embedder time on 10-07..08.
+
+- A hash is skipped when content_vectors already holds its complete fragment set: the row count equals the current split, and max(seq) = count-1. A partial or mismatched set is re-embedded. This uses the same rule as the origin tier and the sqlite path.
+- The coverage check is one batched query per vault for up to 500 hashes, made through the same vault routing and wrong-database tripwire as the vector write.
+- New `--reembed` flag (`reembed` option) brings back full re-embedding. Use it after a model or embed-input-format change that leaves the split unchanged.
+- The summary line adds `, N already embedded` after `D deactivated` and keeps the existing prefix, so older master-harness wrappers still parse it.
+- Tests: tests/integration/pg-reindex-embed-incremental.test.ts covers the second run, a one-file change, a partial set and reembed. tests/unit/pg-reindex-embed-incremental.test.ts covers the coverage rule and the summary format.
+
+---
+
 ## v0.36.46 — clawmem PG: drop the full content_vectors HNSW index (836MB) and repoint clawmem-pg-hnsw-reindex timer to content_vectors_embedding_doc_hnsw_idx (vn4rz.77 follow-up)
 
 Drop unused full HNSW after >4 days with no recorded scan; partial index and timer are already live.

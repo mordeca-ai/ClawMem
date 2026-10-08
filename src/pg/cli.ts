@@ -12,7 +12,7 @@ import { applyMigrations } from "./migrate.ts";
 import { closePool, withClient } from "./client.ts";
 import { resolvePgConfig } from "./config.ts";
 import { isVault, type Vault } from "./vaults.ts";
-import { reindex } from "./reindex.ts";
+import { formatReindexSummaryLine, reindex } from "./reindex.ts";
 import { pgSearchVec } from "./search.ts";
 import { retrieveCli } from "./retrieve.ts";
 import {
@@ -167,6 +167,11 @@ async function main() {
         collections: cols ? cols.split(",").map(s => s.trim()) : undefined,
         limit: limitRaw ? Number(limitRaw) : undefined,
         skipEmbed: argv.includes("--no-embed"),
+        // EMBED-INCREMENTAL is the default (master-harness-vn4rz.86): a hash the
+        // vault already holds a complete vector set for is not re-embedded.
+        // --reembed restores the full re-embed, for after a splitter / embed
+        // input format / model change.
+        reembed: argv.includes("--reembed"),
         // Two-directional convergence is the DEFAULT (master-harness-vn4rz.41);
         // --no-sweep is the opt-out, never the other way around.
         sweep: !argv.includes("--no-sweep"),
@@ -177,16 +182,7 @@ async function main() {
         onProgress: m => console.log(m),
       });
       for (const s of stats) {
-        console.log(
-          `${s.collection}: ${s.documentsWritten} docs written, ` +
-          // The deactivation count is APPENDED AFTER "embed failures" and
-          // before the wall-clock on purpose: master-harness's
-          // tools/clawmem-pg-reindex matches a PREFIX ending at "embed
-          // failures", so an older wrapper keeps parsing a newer summary.
-          `${s.fragmentsEmbedded} embedded, ${s.embedFailures} embed failures, ` +
-          `${s.documentsDeactivated} deactivated, ` +
-          `${(s.wallClockMs / 1000).toFixed(1)}s`,
-        );
+        console.log(formatReindexSummaryLine(s));
         // NEVER SILENTLY SKIP. A one-directional run that says nothing about
         // being one-directional is the vn4rz.41 defect wearing a green run as
         // camouflage, so the reason is always printed when there is one.
@@ -335,7 +331,7 @@ async function main() {
       console.error(
         "usage: bun src/pg/cli.ts <migrate|status|reindex|search|retrieve|origin-load|origin-partitions|" +
         "origin-drop-legacy|origin-retention|gc> [--vault sfw|nsfw] " +
-        "[--collection a,b] [--limit N] [--no-embed] [--no-sweep] [--month YYYY-MM] " +
+        "[--collection a,b] [--limit N] [--no-embed] [--reembed] [--no-sweep] [--month YYYY-MM] " +
         "[--before DATE] [--apply] [--query TEXT] [--timeout-ms N] [--no-gc] " +
         `[gc: --dry-run --batch-size N (${CONTENT_GC_DEFAULTS.batchSize}) ` +
         `--max-batches N (${CONTENT_GC_DEFAULTS.maxBatches}) --grace-seconds N (${CONTENT_GC_DEFAULTS.graceSeconds})]`,

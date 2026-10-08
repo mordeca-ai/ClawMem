@@ -49,10 +49,12 @@ import { canonicalDocId } from "../store.ts";
 import { embedDim } from "./config.ts";
 import { vaultIsConfigured } from "./config.ts";
 import {
-  deactivateAbsentDocuments, gcOrphanedContent, insertEmbeddingsBatch, reconcileDocTierForVault,
-  upsertDocument, type ContentGcResult, type DocTierReconcileResult, type EmbeddingWrite,
+  assertVaultDatabase, deactivateAbsentDocuments, gcOrphanedContent, insertEmbeddingsBatch,
+  reconcileDocTierForVault, upsertDocument, type ContentGcResult, type DocTierReconcileResult,
+  type EmbeddingWrite,
 } from "./write.ts";
-import { VAULTS, type Vault } from "./vaults.ts";
+import { withClient } from "./client.ts";
+import { resolveVault, VAULTS, type Vault } from "./vaults.ts";
 import { embedInputFingerprint } from "../embed-fingerprint.ts";
 
 /** Mirrors indexer.ts's brace expansion — Bun.Glob has no brace support. */
@@ -70,6 +72,14 @@ export interface ReindexOptions {
   embedBatchSize?: number;
   /** Skip embedding entirely (schema/parity smoke without touching yoshiee). */
   skipEmbed?: boolean;
+  /**
+   * Re-embed every fragment even when the vault already holds a COMPLETE vector
+   * set for the hash (master-harness-vn4rz.86). DEFAULT FALSE: the documents
+   * tier is EMBED-INCREMENTAL like the origin tier. Opt in after a splitter,
+   * embed-input-format or model change, when stored vectors are stale for a
+   * reason the content hash cannot see.
+   */
+  reembed?: boolean;
   /**
    * Deactivate PG rows whose source file is absent from the walk
    * (master-harness-vn4rz.41). DEFAULT TRUE — one-directional convergence is
@@ -99,6 +109,13 @@ export interface ReindexStats {
   filesSeen: number;
   documentsWritten: number;
   fragmentsEmbedded: number;
+  /**
+   * Distinct content hashes NOT re-embedded because the vault already held a
+   * complete vector set for them (master-harness-vn4rz.86; same name and
+   * meaning as origin.ts's OriginLoadStats.hashesAlreadyEmbedded). Always 0
+   * under `reembed` or `skipEmbed`.
+   */
+  hashesAlreadyEmbedded: number;
   embedFailures: number;
   /** content_type values that fell outside the closed ADR-0058 enum, with counts. */
   contentTypeRetagBacklog: Record<string, number>;
@@ -306,6 +323,97 @@ export function parseForReindex(
   return { body, meta, title: meta.title ?? extractTitle(raw, rel) };
 }
 
+/**
+ * The per-collection summary line `pg reindex` prints.
+ *
+ * THE PREFIX IS A CONTRACT: master-harness's tools/clawmem-pg-reindex parses
+ * `<col>: N docs written, M embedded, K embed failures` and then OPTIONAL
+ * trailing groups. New fields are therefore only ever APPENDED before the
+ * wall-clock — `D deactivated` (master-harness-vn4rz.41), then `N already
+ * embedded` (master-harness-vn4rz.86) — so an older wrapper keeps parsing a
+ * newer summary. Pure and exported (cli.ts runs main() at module scope and
+ * cannot be imported) so the format is unit-tested.
+ */
+export function formatReindexSummaryLine(
+  s: Pick<
+    ReindexStats,
+    | "collection" | "documentsWritten" | "fragmentsEmbedded" | "embedFailures"
+    | "documentsDeactivated" | "hashesAlreadyEmbedded" | "wallClockMs"
+  >,
+): string {
+  return (
+    `${s.collection}: ${s.documentsWritten} docs written, ` +
+    `${s.fragmentsEmbedded} embedded, ${s.embedFailures} embed failures, ` +
+    `${s.documentsDeactivated} deactivated, ` +
+    `${s.hashesAlreadyEmbedded} already embedded, ` +
+    `${(s.wallClockMs / 1000).toFixed(1)}s`
+  );
+}
+
+/**
+ * What the vault already holds for one content hash: the stored row count and
+ * the highest stored seq (master-harness-vn4rz.86).
+ */
+export interface StoredVectorCoverage {
+  rows: number;
+  maxSeq: number;
+}
+
+/**
+ * EMBED-INCREMENTAL decision for the documents tier (master-harness-vn4rz.86).
+ *
+ * A hash may be skipped ONLY when the vault already holds the COMPLETE fragment
+ * set the splitter produces for it now: exactly `fragmentCount` rows with seq
+ * 0..fragmentCount-1 (content_vectors' PK is (hash, seq), so rows === count and
+ * maxSeq === count-1 pins the set). Anything else re-embeds:
+ *   - no rows at all (new content);
+ *   - a PARTIAL set (an embed failure mid-document on an earlier run);
+ *   - a different count (the splitter now cuts the document differently).
+ * A zero-fragment document queues nothing either way, so it is never counted
+ * as "already embedded".
+ *
+ * Pure, so the rule is provable without a database.
+ */
+export function hashFullyEmbedded(
+  stored: StoredVectorCoverage | undefined,
+  fragmentCount: number,
+): boolean {
+  if (stored === undefined || fragmentCount <= 0) return false;
+  return stored.rows === fragmentCount && stored.maxSeq === fragmentCount - 1;
+}
+
+/**
+ * ONE batched read of the vault's stored vector coverage for `hashes`
+ * (master-harness-vn4rz.86). Reads the SAME vault the vector write for these
+ * hashes is routed to, with the same wrong-database tripwire the write path
+ * uses (master-harness-0ynkd): a coverage read against the wrong database would
+ * turn into a silently skipped embed.
+ */
+export async function storedVectorCoverage(
+  vault: Vault,
+  hashes: readonly string[],
+): Promise<Map<string, StoredVectorCoverage>> {
+  const out = new Map<string, StoredVectorCoverage>();
+  if (hashes.length === 0) return out;
+  await withClient(vault, async c => {
+    await assertVaultDatabase(c, vault);
+    const { rows } = await c.query<{ hash: string; n: string; max_seq: number }>(
+      `SELECT hash, count(*)::text AS n, max(seq) AS max_seq
+         FROM content_vectors WHERE hash = ANY($1::text[]) GROUP BY hash`,
+      [[...hashes]],
+    );
+    for (const r of rows) out.set(r.hash, { rows: Number(r.n), maxSeq: Number(r.max_seq) });
+  });
+  return out;
+}
+
+/**
+ * Hashes per coverage query. Bounds both the ANY($1) array and the fragments
+ * held in memory between checks; a collection the size of agents-skills
+ * (355 docs) resolves in one query.
+ */
+const COVERAGE_CHECK_BATCH = 500;
+
 export async function reindexCollection(
   name: string,
   root: string,
@@ -333,7 +441,7 @@ export async function reindexCollection(
 
   const stats: ReindexStats = {
     collection: name, filesSeen: files.length, documentsWritten: 0,
-    fragmentsEmbedded: 0, embedFailures: 0, contentTypeRetagBacklog: {},
+    fragmentsEmbedded: 0, hashesAlreadyEmbedded: 0, embedFailures: 0, contentTypeRetagBacklog: {},
     frontmatterParseFailures: {}, frontmatterVocab: emptyFrontmatterVocabCounts(),
     skippedOutOfScope: {},
     documentsDeactivated: 0, deactivatedPaths: [], sweepSkippedReason: null,
@@ -383,6 +491,41 @@ export async function reindexCollection(
   const hashesDone = new Set<string>();
 
   /**
+   * EMBED-INCREMENTAL (master-harness-vn4rz.86). A new-to-this-run hash's
+   * fragments wait here until one batched coverage query per vault decides
+   * which hashes the vault already holds a complete vector set for; only the
+   * rest reach `pending`. Without this, every run re-embedded the WHOLE
+   * collection on a one-file delta (agents-skills: 355 docs / ~16.4k
+   * fragments per run, ~30-38 min of embedder time). The origin tier has always
+   * done this check (origin.ts, EMBED-INCREMENTAL); `reembed` opts out.
+   */
+  type Candidate = { hash: string; vault: Vault; fragments: PendingFragment[] };
+  const candidates: Candidate[] = [];
+  const resolveCandidates = async () => {
+    if (candidates.length === 0) return;
+    const batch = candidates.splice(0, candidates.length);
+    if (opts.reembed) {
+      for (const cand of batch) pending.push(...cand.fragments);
+      return;
+    }
+    const byVault = new Map<Vault, string[]>();
+    for (const cand of batch) {
+      const hs = byVault.get(cand.vault);
+      if (hs) hs.push(cand.hash);
+      else byVault.set(cand.vault, [cand.hash]);
+    }
+    const coverage = new Map<Vault, Map<string, StoredVectorCoverage>>();
+    for (const [v, hs] of byVault) coverage.set(v, await storedVectorCoverage(v, hs));
+    for (const cand of batch) {
+      if (hashFullyEmbedded(coverage.get(cand.vault)?.get(cand.hash), cand.fragments.length)) {
+        stats.hashesAlreadyEmbedded++;
+        continue;
+      }
+      pending.push(...cand.fragments);
+    }
+  };
+
+  /**
    * Embed + write exactly ONE batch of fragments. sqlite chunks its flattened
    * fragment queue at a fixed batchSize; a single document can contribute up to
    * MAX_FRAGMENTS_PER_DOC fragments, so flushing "whatever accumulated" would
@@ -430,7 +573,8 @@ export async function reindexCollection(
   };
 
   const flush = async (force: boolean) => {
-    if (opts.skipEmbed) { pending.length = 0; return; }
+    if (opts.skipEmbed) { pending.length = 0; candidates.length = 0; return; }
+    await resolveCandidates();
     while (pending.length >= batchSize || (force && pending.length > 0)) {
       await embedAndWrite(pending.splice(0, Math.min(batchSize, pending.length)));
     }
@@ -496,7 +640,7 @@ export async function reindexCollection(
     stats.documentsWritten++;
     n++;
 
-    if (!hashesDone.has(hash)) {
+    if (!hashesDone.has(hash) && !opts.skipEmbed) {
       hashesDone.add(hash);
       // Inlines src/clawmem.ts::buildDocEmbedTask rather than importing it:
       // src/clawmem.ts calls main() at MODULE SCOPE, so importing it executes the
@@ -512,18 +656,28 @@ export async function reindexCollection(
       if (meta.description) frontmatter.description = meta.description;
       const fragments = splitDocument(body, frontmatter);
       const canonicalId = canonicalDocId(name, rel);
+      const queued: PendingFragment[] = [];
       for (let seq = 0; seq < fragments.length; seq++) {
         const frag = fragments[seq]!;
-        pending.push({
+        queued.push({
           hash, seq, pos: frag.startLine,
           text: formatDocForEmbedding(frag.content, frag.label || title),
           fragmentType: frag.type, fragmentLabel: frag.label, canonicalId,
           relPath: rel,
         });
       }
+      // Same vault the write path routes this document's vectors to (0ynkd).
+      candidates.push({ hash, vault: resolveVault(name, rel), fragments: queued });
+      if (candidates.length >= COVERAGE_CHECK_BATCH || opts.reembed) {
+        await resolveCandidates();
+      }
       if (pending.length >= batchSize) {
         await flush(false);
-        log(`[${name}] ${stats.documentsWritten}/${files.length} docs, ${stats.fragmentsEmbedded} fragments embedded`);
+        log(
+          `[${name}] ${stats.documentsWritten}/${files.length} docs, ` +
+          `${stats.fragmentsEmbedded} fragments embedded, ` +
+          `${stats.hashesAlreadyEmbedded} hashes already embedded`,
+        );
       }
     }
   }
