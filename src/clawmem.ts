@@ -1552,7 +1552,8 @@ async function cmdVsearch(args: string[]) {
   const results = await s.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, scope?.collections);
   const enriched = enrichResults(s, results, query);
   const scored = applyCompositeScoring(enriched, query)
-    .filter(r => r.compositeScore >= minScore)
+    // The floor measures vector relevance; recency and confidence only rank hits.
+    .filter(r => r.score >= minScore)
     .slice(0, limit);
 
   if (values.json) {
