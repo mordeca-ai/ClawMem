@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.48 — CLI vsearch floors raw cosine relevance
+
+CLI vsearch now applies --min-score to raw vector cosine; recency and confidence still rank results. The default 0.30 floor restores memory-topics recall without admitting weak vector matches.
+
+---
+
 ## v0.36.47 — clawmem PG: documents-tier reindex is embed-incremental (skip hashes with a complete vector set; --reembed opt-out)
 
 PG reindex (documents tier) is now embed-incremental. Before this change, every reindex re-embedded every fragment of every document in the collection, even when only one file had changed. agents-skills re-embedded all ~16.4k fragments on each tick, which came to 10 runs, 164k embeds and 5.9 h of yoshiee embedder time on 10-07..08.

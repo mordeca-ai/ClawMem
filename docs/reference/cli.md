@@ -85,7 +85,12 @@ Adds a post-import LLM fact extraction pass. After `indexCollection` commits the
 clawmem search <query>          # BM25 search
 clawmem search <query> --vec    # Vector search
 clawmem search <query> --hybrid # BM25 + vector (default)
+clawmem vsearch <query> -c <collection> -n 10 --min-score 0.3
 ```
+
+CLI `vsearch` filters `--min-score` against raw vector cosine similarity (default 0.3).
+Recency, confidence, and other metadata still affect result order and the displayed
+composite `score`; `--json` exposes raw cosine as `searchScore`.
 
 ## Bootstrap
 
