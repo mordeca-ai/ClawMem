@@ -50,8 +50,8 @@ import { embedDim } from "./config.ts";
 import { vaultIsConfigured } from "./config.ts";
 import {
   assertVaultDatabase, deactivateAbsentDocuments, gcOrphanedContent, insertEmbeddingsBatch,
-  reconcileDocTierForVault, upsertDocument, type ContentGcResult, type DocTierReconcileResult,
-  type EmbeddingWrite,
+  invalidationSourceColumnPresent, reconcileDocTierForVault, resolveFrontmatterSupersession,
+  upsertDocument, type ContentGcResult, type DocTierReconcileResult, type EmbeddingWrite,
 } from "./write.ts";
 import { withClient } from "./client.ts";
 import { resolveVault, VAULTS, type Vault } from "./vaults.ts";
@@ -465,6 +465,27 @@ export async function reindexCollection(
   const inScope = files.filter(rel => !noteOutOfScope(stats, rel));
 
   /**
+   * FRONTMATTER SUPERSESSION (master-harness-vn4rz.84). The invalidation write
+   * needs migration 014's invalidation_source column (the provenance that keeps
+   * a re-index from clearing another writer's invalidation). Probed once per
+   * collection. Absent + the map declares the supersession keys = refuse
+   * loudly before any write: silently skipping would leave every tombstoned
+   * document live in search. Absent otherwise = issue no invalidation
+   * statement, which is exactly the pre-014 write.
+   */
+  const declaresSupersession =
+    frontmatterMap?.invalidated_at !== undefined || frontmatterMap?.superseded_by !== undefined;
+  const invalidationColumn = await invalidationSourceColumnPresent(resolveVault(name));
+  if (!invalidationColumn && declaresSupersession) {
+    throw new Error(
+      `collection ${JSON.stringify(name)}: frontmatter_map declares invalidated_at/superseded_by, ` +
+      `but the vault's documents table has no invalidation_source column ` +
+      `(migration 014_documents_invalidation_source not applied). Run \`clawmem pg migrate\` first.`,
+    );
+  }
+  const supersessionQueue: { path: string; ref: string }[] = [];
+
+  /**
    * FRAGMENT-LEVEL EMBEDDING (delta amendment 1, master-harness-vn4rz.7 pass B).
    *
    * The first cut of this reindexer wrote ONE vector per document (seq=0 over the
@@ -636,7 +657,11 @@ export async function reindexCollection(
       contentHash: hash,
       origin: "fs",
       facets: deriveFacets(name, meta, rel),
+      invalidation: invalidationColumn ? meta.invalidation : undefined,
     });
+    if (invalidationColumn && meta.invalidation?.supersededBy) {
+      supersessionQueue.push({ path: rel, ref: meta.invalidation.supersededBy });
+    }
     stats.documentsWritten++;
     n++;
 
@@ -707,6 +732,13 @@ export async function reindexCollection(
       log(`[${name}] sweep deactivated ${res.deactivated} document(s) absent from the walk`);
     }
   }
+
+  // master-harness-vn4rz.84: superseded_by resolves against the collection's
+  // final active set, after the walk and the sweep, so file order never
+  // decides whether a replacement is found.
+  const sup = await resolveFrontmatterSupersession(name, supersessionQueue);
+  stats.frontmatterVocab.supersededByResolved += sup.resolved;
+  stats.frontmatterVocab.supersededByUnresolved += sup.unresolved;
 
   stats.wallClockMs = Date.now() - t0;
   return stats;

@@ -31,6 +31,7 @@ import { withTransaction, toVectorLiteral } from "./client.ts";
 import { embedDim, resolvePgConfig } from "./config.ts";
 import { resolveVault, type Vault } from "./vaults.ts";
 import { UNREPORTED_EMBED_ARM_LABEL } from "../llm.ts";
+import { supersededByPathCandidate, type FrontmatterInvalidation } from "../frontmatter-map.ts";
 import {
   ContentGcVaultRefusedError,
   PgSchemaGeometryError,
@@ -406,7 +407,17 @@ export interface DocumentWrite {
   origin?: string | null;
   memoryType?: string | null;
   facets?: Facets;
+  /**
+   * master-harness-vn4rz.84: the document's own supersession tombstone. An
+   * object APPLIES it, null CLEARS a frontmatter-sourced invalidation (and
+   * only that), undefined issues no statement at all, which is what a caller
+   * passes when the vault lacks migration 014 or the parse failed.
+   */
+  invalidation?: FrontmatterInvalidation | null;
 }
+
+/** The only invalidation_source a re-index may clear (mirrors indexer.ts). */
+export const PG_FRONTMATTER_INVALIDATION_SOURCE = "frontmatter";
 
 /**
  * Upsert content + document in ONE transaction.
@@ -488,7 +499,113 @@ export async function upsertDocument(d: DocumentWrite): Promise<number> {
         d.authoredAt ?? null, d.origin ?? null,
       ],
     );
-    return Number(rows[0]!.id);
+    const id = Number(rows[0]!.id);
+    if (d.invalidation !== undefined) await writeInvalidation(c, id, d.invalidation);
+    return id;
+  });
+}
+
+/**
+ * Apply or clear one document's frontmatter tombstone, inside the upsert's
+ * transaction (master-harness-vn4rz.84). Same rules as the sqlite
+ * writeFrontmatterInvalidation: APPLY never overwrites another source's
+ * invalidation; an explicit instant wins, else the earlier frontmatter stamp,
+ * else now(); superseded_by is reset and re-resolved after the pass. CLEAR
+ * touches only frontmatter-sourced rows.
+ */
+async function writeInvalidation(
+  c: PoolClient,
+  id: number,
+  inv: FrontmatterInvalidation | null,
+): Promise<void> {
+  if (inv === null) {
+    await c.query(
+      `UPDATE documents SET invalidated_at = NULL, invalidation_source = NULL, superseded_by = NULL
+        WHERE id = $1 AND invalidation_source = $2`,
+      [id, PG_FRONTMATTER_INVALIDATION_SOURCE],
+    );
+    return;
+  }
+  await c.query(
+    `UPDATE documents
+        SET invalidated_at = COALESCE($2::timestamptz,
+                                      CASE WHEN invalidation_source = $3 THEN invalidated_at END,
+                                      now()),
+            invalidation_source = $3,
+            superseded_by = NULL
+      WHERE id = $1 AND (invalidated_at IS NULL OR invalidation_source = $3)`,
+    [id, inv.at, PG_FRONTMATTER_INVALIDATION_SOURCE],
+  );
+}
+
+/**
+ * Does this vault's `documents` carry migration 014's invalidation_source
+ * column? `pg reindex` asks once per collection: without it, a collection
+ * that declares the supersession map keys refuses to run, and every other
+ * collection issues no invalidation statement at all (its pre-014 behaviour).
+ */
+export async function invalidationSourceColumnPresent(vault: Vault): Promise<boolean> {
+  return withTransaction(vault, async c => {
+    await assertVaultDatabase(c, vault);
+    const { rows } = await c.query<{ present: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM pg_attribute
+          WHERE attrelid = to_regclass('documents')
+            AND attname = 'invalidation_source' AND NOT attisdropped
+       ) AS present`,
+    );
+    return rows[0]?.present === true;
+  });
+}
+
+export interface SupersessionResolveResult {
+  resolved: number;
+  unresolved: number;
+}
+
+/**
+ * Resolve frontmatter superseded_by references to replacement document ids
+ * within one collection (master-harness-vn4rz.84), after the walk and sweep:
+ * exact collection-relative path of an active document first, then a title
+ * exactly ONE other active document carries. Only frontmatter-sourced rows are
+ * written; an unresolved reference leaves superseded_by NULL.
+ */
+export async function resolveFrontmatterSupersession(
+  collection: string,
+  items: readonly { path: string; ref: string }[],
+): Promise<SupersessionResolveResult> {
+  const out: SupersessionResolveResult = { resolved: 0, unresolved: 0 };
+  if (items.length === 0) return out;
+  const vault = resolveVault(collection);
+  return withTransaction(vault, async c => {
+    await assertVaultDatabase(c, vault);
+    for (const { path, ref } of items) {
+      let target: string | null = null;
+      const byPath = await c.query<{ id: string }>(
+        `SELECT id::text AS id FROM documents
+          WHERE collection = $1 AND path = $2 AND active AND path <> $3 LIMIT 1`,
+        [collection, supersededByPathCandidate(ref), path],
+      );
+      if (byPath.rows.length === 1) {
+        target = byPath.rows[0]!.id;
+      } else {
+        const byTitle = await c.query<{ id: string }>(
+          `SELECT id::text AS id FROM documents
+            WHERE collection = $1 AND title = $2 AND active AND path <> $3 LIMIT 2`,
+          [collection, ref, path],
+        );
+        if (byTitle.rows.length === 1) target = byTitle.rows[0]!.id;
+      }
+      const res = await c.query(
+        `UPDATE documents SET superseded_by = $3::bigint
+          WHERE collection = $1 AND path = $2 AND invalidation_source = $4`,
+        [collection, path, target, PG_FRONTMATTER_INVALIDATION_SOURCE],
+      );
+      if ((res.rowCount ?? 0) === 0) continue;
+      if (target === null) out.unresolved++;
+      else out.resolved++;
+    }
+    return out;
   });
 }
 
