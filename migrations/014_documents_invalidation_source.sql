@@ -1,0 +1,21 @@
+-- 014_documents_invalidation_source.sql — record WHO invalidated a document
+-- (master-harness-vn4rz.84).
+--
+-- A collection's frontmatter_map may now declare supersession keys
+-- (invalidated_at / superseded_by), so `pg reindex` writes
+-- documents.invalidated_at from a document's own frontmatter. That
+-- invalidation must be CLEARABLE: remove the tombstone, re-index, and the
+-- document is live again. An invalidation from any other writer must never be
+-- cleared by a re-index. This column is what tells the two apart:
+--
+--   'frontmatter'  the document's own tombstone; re-index may clear it
+--   anything else  another writer's decision; re-index never touches it
+--   NULL           legacy / unknown; treated as NOT frontmatter
+--
+-- Additive and nullable: no backfill, no rewrite, existing rows unchanged.
+-- `pg reindex` probes for the column; a collection that declares the
+-- supersession map keys refuses to run until this migration is applied, and
+-- every other collection writes exactly what it wrote before.
+-- Rollback: ALTER TABLE documents DROP COLUMN invalidation_source;
+
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS invalidation_source text;

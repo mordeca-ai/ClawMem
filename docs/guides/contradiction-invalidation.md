@@ -304,7 +304,7 @@ same-named documents in other collections.
 
 ```bash
 sqlite3 -header ~/.cache/clawmem/index.sqlite "
-  SELECT id, collection, path, invalidated_at, invalidated_by
+  SELECT id, collection, path, invalidated_at, invalidated_by, invalidation_source
   FROM documents WHERE invalidated_at IS NOT NULL
   ORDER BY invalidated_at DESC;"
 ```
@@ -313,7 +313,7 @@ Restore one document by `id`:
 
 ```bash
 sqlite3 ~/.cache/clawmem/index.sqlite "
-  UPDATE documents SET invalidated_at=NULL, invalidated_by=NULL WHERE id=<id>;"
+  UPDATE documents SET invalidated_at=NULL, invalidated_by=NULL, invalidation_source=NULL WHERE id=<id>;"
 ```
 
 Disarm and restore everything this path invalidated:
@@ -321,8 +321,9 @@ Disarm and restore everything this path invalidated:
 ```bash
 # remove the variable wherever you set it, then:
 sqlite3 ~/.cache/clawmem/index.sqlite "
-  UPDATE documents SET invalidated_at=NULL, invalidated_by=NULL
-  WHERE invalidated_at IS NOT NULL AND content_type='observation';"
+  UPDATE documents SET invalidated_at=NULL, invalidated_by=NULL, invalidation_source=NULL
+  WHERE invalidated_at IS NOT NULL AND content_type='observation'
+    AND invalidation_source IS NOT 'frontmatter';"
 ```
 
 Retrieval resumes immediately — no re-index and no re-embed, since neither the body nor its
@@ -342,9 +343,14 @@ in the document.
 > **Do not confuse this with consolidation's `supersede`.** Grepping the source for
 > `invalidated_at` returns two writers, but they target **different tables**: consolidation writes
 > `consolidated_observations.invalidated_at` (paired with `status='inactive'`, filtered by a
-> different mechanism), while this hook writes `documents.invalidated_at`. On the `documents`
-> table the hook is currently the only writer, so the statements above cannot disturb
-> consolidation's work.
+> different mechanism), while this hook writes `documents.invalidated_at`. The statements above
+> cannot disturb consolidation's work.
+>
+> On the `documents` table, the indexer also writes `invalidated_at` when a document declares its
+> own supersession tombstone through a collection's `frontmatter_map`. Those rows carry
+> `invalidation_source='frontmatter'`; this hook's rows carry `'contradiction'` (NULL on rows
+> written before that column existed). The bulk restore above excludes `frontmatter` rows. To
+> restore one of those, remove the tombstone from the file and re-index.
 
 ## Related
 

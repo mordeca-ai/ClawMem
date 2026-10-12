@@ -619,7 +619,8 @@ export function applyContradictionOutcomes(
           const res = store.db.prepare(`
             UPDATE documents
             SET invalidated_at = datetime('now'),
-                invalidated_by = ?
+                invalidated_by = ?,
+                invalidation_source = 'contradiction'
             WHERE id = ? AND invalidated_at IS NULL AND content_type = ?
           `).run(newFactDocIds[rel.new_idx] ?? null, existingDoc.id, INVALIDATION_ELIGIBLE_CONTENT_TYPE);
 

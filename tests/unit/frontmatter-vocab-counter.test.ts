@@ -176,6 +176,11 @@ describe("clean and absent frontmatter are distinguishable (A2)", () => {
       titleMapped: 0,
       contentTypeMapped: 0,
       contentTypeMapRejected: 0,
+      // vn4rz.84: no supersession map keys, so the supersession counters stay zero.
+      invalidatedByFrontmatter: 0,
+      invalidatedAtMapRejected: 0,
+      supersededByResolved: 0,
+      supersededByUnresolved: 0,
     });
     expect(formatFrontmatterVocab(counts)).toBe(
       "frontmatter: 2 title-less (2 declare name:), 2 content_type-less " +

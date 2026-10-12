@@ -935,10 +935,12 @@ describe("contradiction response — the production-wired unwrap → admit → a
       applyContradictionResponse(store, REL, [cand], ["f"], [null]);
 
       const row = (store as any).db.prepare(
-        `SELECT invalidated_at, invalidated_by FROM documents WHERE id = ?`)
-        .get(id) as { invalidated_at: string | null; invalidated_by: number | null };
+        `SELECT invalidated_at, invalidated_by, invalidation_source FROM documents WHERE id = ?`)
+        .get(id) as { invalidated_at: string | null; invalidated_by: number | null; invalidation_source: string | null };
       expect(row.invalidated_at).not.toBeNull();
       expect(row.invalidated_by).toBeNull();
+      // vn4rz.84: provenance, so a re-index (which clears only 'frontmatter') never undoes it.
+      expect(row.invalidation_source).toBe("contradiction");
     } finally {
       delete process.env.CLAWMEM_CONTRADICTION_INVALIDATE;
     }

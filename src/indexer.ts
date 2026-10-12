@@ -5,6 +5,7 @@
  */
 
 import { Glob } from "bun";
+import type { Database } from "bun:sqlite";
 import { readFileSync, statSync } from "fs";
 import { basename, relative } from "path";
 import matter from "gray-matter";
@@ -12,8 +13,10 @@ import { createHash } from "crypto";
 import type { Store } from "./store.ts";
 import { inferContentType, confidenceScore, type ContentType } from "./memory.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
-import { normalizeIsoTimestamp } from "./normalize.ts";
-import { applyFrontmatterMap, type FrontmatterMap, type FrontmatterMapOutcome } from "./frontmatter-map.ts";
+import {
+  applyFrontmatterMap, frontmatterInstant, readFrontmatterInvalidation, supersededByPathCandidate,
+  type FrontmatterInvalidation, type FrontmatterMap, type FrontmatterMapOutcome,
+} from "./frontmatter-map.ts";
 
 // =============================================================================
 // Types
@@ -109,6 +112,21 @@ export interface FrontmatterVocabCounts {
   contentTypeMapped: number;
   /** Mapped content_type values that were not a valid ContentType and so NOT stored. */
   contentTypeMapRejected: number;
+  /**
+   * master-harness-vn4rz.84: parsed documents that declared a supersession
+   * tombstone through the collection's frontmatter_map. Always 0 without the
+   * invalidated_at / superseded_by map keys.
+   */
+  invalidatedByFrontmatter: number;
+  /** Mapped invalidated_at values that were not an ISO date/datetime and so NOT applied. */
+  invalidatedAtMapRejected: number;
+  /**
+   * Write outcomes, filled after the pass: superseded_by references that
+   * resolved to a replacement document id, and those that did not (the
+   * tombstone still applies; the superseded_by column stays NULL).
+   */
+  supersededByResolved: number;
+  supersededByUnresolved: number;
 }
 
 export function emptyFrontmatterVocabCounts(): FrontmatterVocabCounts {
@@ -117,6 +135,8 @@ export function emptyFrontmatterVocabCounts(): FrontmatterVocabCounts {
     titleless: 0, titlelessDeclaringName: 0,
     contentTypeless: 0, contentTypelessDeclaringType: 0, contentTypelessDeclaringMetadataType: 0,
     titleMapped: 0, contentTypeMapped: 0, contentTypeMapRejected: 0,
+    invalidatedByFrontmatter: 0, invalidatedAtMapRejected: 0,
+    supersededByResolved: 0, supersededByUnresolved: 0,
   };
 }
 
@@ -126,7 +146,8 @@ export function emptyFrontmatterVocabCounts(): FrontmatterVocabCounts {
  */
 export function noteFrontmatterVocab(
   counts: FrontmatterVocabCounts,
-  doc: Pick<ParsedDocument, "frontmatter" | "vocabGap" | "frontmatterMap">,
+  doc: Pick<ParsedDocument, "frontmatter" | "vocabGap" | "frontmatterMap">
+    & { meta?: Pick<DocumentMeta, "invalidation"> },
 ): void {
   counts.examined++;
   if (doc.frontmatter === "absent") { counts.noFrontmatter++; return; }
@@ -136,7 +157,9 @@ export function noteFrontmatterVocab(
     if (mapped.titleMapped) counts.titleMapped++;
     if (mapped.contentTypeMapped) counts.contentTypeMapped++;
     if (mapped.contentTypeRejected !== undefined) counts.contentTypeMapRejected++;
+    if (mapped.invalidatedAtRejected !== undefined) counts.invalidatedAtMapRejected++;
   }
+  if (doc.meta?.invalidation) counts.invalidatedByFrontmatter++;
   const gap = doc.vocabGap;
   if (!gap) return;
   if (gap.titleMissing) {
@@ -152,24 +175,36 @@ export function noteFrontmatterVocab(
 
 /**
  * One summary line, or null when no parsed block lacked a title/content_type
- * and no frontmatter_map fill/rejection happened (same report-only-when-non-zero
- * convention as the vn4rz.34 counter). On a collection without a map the line
- * is byte-identical to phase 1; the `; frontmatter_map ...` tail appears only
- * when the map did something.
+ * and no frontmatter_map fill/rejection/tombstone happened (same
+ * report-only-when-non-zero convention as the vn4rz.34 counter). On a
+ * collection without a map the line is byte-identical to phase 1; the
+ * `; frontmatter_map ...` tail appears only when the map filled or rejected a
+ * title/content_type, and the `; supersession ...` tail (master-harness-vn4rz.84)
+ * only when a tombstone was declared, resolved or rejected.
  */
 export function formatFrontmatterVocab(c: FrontmatterVocabCounts): string | null {
   const mappedAny = c.titleMapped + c.contentTypeMapped + c.contentTypeMapRejected > 0;
-  if (c.titleless === 0 && c.contentTypeless === 0 && !mappedAny) return null;
-  const base =
+  const supersessionAny =
+    c.invalidatedByFrontmatter + c.invalidatedAtMapRejected +
+    c.supersededByResolved + c.supersededByUnresolved > 0;
+  if (c.titleless === 0 && c.contentTypeless === 0 && !mappedAny && !supersessionAny) return null;
+  let line =
     `frontmatter: ${c.titleless} title-less (${c.titlelessDeclaringName} declare name:), ` +
     `${c.contentTypeless} content_type-less (${c.contentTypelessDeclaringType} declare type:, ` +
     `${c.contentTypelessDeclaringMetadataType} declare metadata.type); ` +
     `${c.noFrontmatter} without frontmatter, ${c.unparseable} unparseable (of ${c.examined} examined)`;
-  if (!mappedAny) return base;
-  return (
-    `${base}; frontmatter_map filled ${c.titleMapped} title, ${c.contentTypeMapped} content_type, ` +
-    `rejected ${c.contentTypeMapRejected} content_type value(s)`
-  );
+  if (mappedAny) {
+    line +=
+      `; frontmatter_map filled ${c.titleMapped} title, ${c.contentTypeMapped} content_type, ` +
+      `rejected ${c.contentTypeMapRejected} content_type value(s)`;
+  }
+  if (supersessionAny) {
+    line +=
+      `; supersession ${c.invalidatedByFrontmatter} tombstoned, ` +
+      `superseded_by ${c.supersededByResolved} resolved / ${c.supersededByUnresolved} unresolved, ` +
+      `rejected ${c.invalidatedAtMapRejected} invalidated_at value(s)`;
+  }
+  return line;
 }
 
 /** Build the gap record from gray-matter's `data`; undefined when there is no gap. */
@@ -202,6 +237,13 @@ export interface DocumentMeta {
   review_by?: string;
   /** §51.1: authorship time (UTC ISO) from frontmatter; null = declared-but-invalid or absent → clears/leaves per branch */
   authored_at?: string | null;
+  /**
+   * master-harness-vn4rz.84: the document's own supersession tombstone, read
+   * through the collection's frontmatter_map. Same tri-state as authored_at:
+   * an object APPLIES the tombstone, null CLEARS a frontmatter-sourced one
+   * (and only that), undefined (frontmatter parse failure) leaves stored state.
+   */
+  invalidation?: FrontmatterInvalidation | null;
 }
 
 // =============================================================================
@@ -210,8 +252,9 @@ export interface DocumentMeta {
 
 // Strict date-only form, normalized to UTC midnight. Acceptance must not depend
 // on YAML quoting: quoted "2025-03-01" (string) and unquoted 2025-03-01
-// (gray-matter coerces to Date) are equivalent.
-const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+// (gray-matter coerces to Date) are equivalent. The parser itself lives in
+// frontmatter-map.ts (frontmatterInstant) so the mapped invalidated_at
+// (master-harness-vn4rz.84) shares this exact definition.
 
 /**
  * Frontmatter-specific adapter, distinct from the transcript rule: gray-matter
@@ -221,16 +264,7 @@ const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
  * notes — sub-day uncertainty is insignificant against ClawMem's half-lives.
  */
 export function authoredAtFromFrontmatter(value: unknown): string | null {
-  if (value instanceof Date) {
-    return isNaN(value.getTime()) ? null : value.toISOString();
-  }
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  const dateOnly = DATE_ONLY_RE.exec(trimmed);
-  if (dateOnly) {
-    return normalizeIsoTimestamp(`${trimmed}T00:00:00Z`);
-  }
-  return normalizeIsoTimestamp(trimmed);
+  return frontmatterInstant(value);
 }
 
 export interface IndexStats {
@@ -348,11 +382,21 @@ export function parseDocument(
     let title = str(data.title);
     let declaredContentType = str(data.content_type);
     let mapOutcome: FrontmatterMapOutcome | undefined;
+    // master-harness-vn4rz.84: null unless the map declares the supersession
+    // keys AND the document fills one; null CLEARS a frontmatter-sourced
+    // invalidation on write. The bare `invalidated_at:` / `superseded_by:` keys
+    // are deliberately not read without a map (see frontmatter-map.ts).
+    let invalidation: FrontmatterInvalidation | null = null;
     if (frontmatterMap && blockPresent) {
       const m = applyFrontmatterMap(data, frontmatterMap, title, declaredContentType);
       title = m.title;
       declaredContentType = m.contentType;
       mapOutcome = m.outcome;
+      const inv = readFrontmatterInvalidation(data, frontmatterMap);
+      invalidation = inv.invalidation;
+      if (inv.invalidatedAtRejected !== undefined) {
+        mapOutcome.invalidatedAtRejected = inv.invalidatedAtRejected;
+      }
     }
     const vocabGap = blockPresent
       ? frontmatterVocabGap(data, title, declaredContentType)
@@ -379,6 +423,7 @@ export function parseDocument(
         // §51.1: string | null — null means "not validly declared", which CLEARS
         // on the changed-content path (frontmatter is authoritative there).
         authored_at: authoredAtFromFrontmatter(data.authored_at),
+        invalidation,
       },
     };
   } catch (err) {
@@ -458,6 +503,77 @@ export function computeQualityScore(body: string, meta: DocumentMeta): number {
 }
 
 // =============================================================================
+// Frontmatter supersession writes (master-harness-vn4rz.84)
+// =============================================================================
+
+/**
+ * The `invalidation_source` a frontmatter tombstone is written with. It is the
+ * ONLY source a re-index may clear: an invalidation written by the decision
+ * extractor ('contradiction') or a legacy row with a NULL source survives every
+ * re-index, because the file never declared it and so cannot retract it.
+ */
+export const FRONTMATTER_INVALIDATION_SOURCE = "frontmatter";
+
+/**
+ * Apply (object) or clear (null) one document's frontmatter tombstone on its
+ * sqlite row; undefined (frontmatter parse failure) writes nothing. Returns
+ * true when the row now carries a frontmatter-sourced invalidation, so the
+ * caller can queue its superseded_by reference for resolution.
+ *
+ *   - APPLY never overwrites an invalidation from another source: the WHERE
+ *     admits only a live row or one this path already owns. An explicit
+ *     invalidated_at wins; otherwise the row keeps its earlier frontmatter
+ *     stamp, else gets index time (`now`). superseded_by is reset here and
+ *     re-resolved after the pass (resolveSupersededBy).
+ *   - CLEAR touches only rows whose invalidation_source is 'frontmatter'.
+ */
+export function writeFrontmatterInvalidation(
+  db: Database,
+  docId: number,
+  invalidation: FrontmatterInvalidation | null | undefined,
+  now: string,
+): boolean {
+  if (invalidation === undefined) return false;
+  if (invalidation === null) {
+    db.prepare(
+      `UPDATE documents SET invalidated_at = NULL, invalidation_source = NULL, superseded_by = NULL
+        WHERE id = $id AND invalidation_source = $src`,
+    ).run({ $id: docId, $src: FRONTMATTER_INVALIDATION_SOURCE });
+    return false;
+  }
+  const res = db.prepare(
+    `UPDATE documents
+        SET invalidated_at = COALESCE($at, CASE WHEN invalidation_source = $src THEN invalidated_at END, $now),
+            invalidation_source = $src,
+            superseded_by = NULL
+      WHERE id = $id AND (invalidated_at IS NULL OR invalidation_source = $src)`,
+  ).run({ $at: invalidation.at, $now: now, $id: docId, $src: FRONTMATTER_INVALIDATION_SOURCE });
+  return res.changes > 0;
+}
+
+/**
+ * Resolve a superseded_by reference to the replacement's document id within
+ * the same collection: the exact collection-relative path of an active
+ * document first, then a title that exactly ONE other active document
+ * carries. A document never resolves to itself. null = unresolved.
+ */
+export function resolveSupersededBy(
+  db: Database,
+  collection: string,
+  docId: number,
+  ref: string,
+): number | null {
+  const byPath = db.prepare(
+    `SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1 AND id != ? LIMIT 1`,
+  ).get(collection, supersededByPathCandidate(ref), docId) as { id: number } | null;
+  if (byPath) return byPath.id;
+  const byTitle = db.prepare(
+    `SELECT id FROM documents WHERE collection = ? AND title = ? AND active = 1 AND id != ? LIMIT 2`,
+  ).all(collection, ref, docId) as { id: number }[];
+  return byTitle.length === 1 ? byTitle[0]!.id : null;
+}
+
+// =============================================================================
 // Collection Indexing
 // =============================================================================
 
@@ -529,6 +645,16 @@ export async function indexCollection(
   // Collect doc IDs that need post-index enrichment (deferred until after commit)
   const enrichQueue: { docId: number; isNew: boolean }[] = [];
 
+  // master-harness-vn4rz.84: superseded_by references, resolved after the walk
+  // (and after the absence sweep) so a replacement indexed later in this same
+  // pass, in any file order, is found.
+  const supersessionQueue: { docId: number; ref: string }[] = [];
+  const applyInvalidation = (docId: number, meta: DocumentMeta, now: string): void => {
+    if (writeFrontmatterInvalidation(store.db, docId, meta.invalidation, now) && meta.invalidation?.supersededBy) {
+      supersessionQueue.push({ docId, ref: meta.invalidation.supersededBy });
+    }
+  };
+
   // Wrap all DB writes in a transaction for atomicity
   store.db.exec("BEGIN");
   try {
@@ -556,8 +682,11 @@ export async function indexCollection(
       if (existing) {
         // Check if content changed via content hash
         const existingRow = store.db.prepare(
-          "SELECT content_hash, authored_at, origin FROM documents WHERE id = ?"
-        ).get(existing.id) as { content_hash: string | null; authored_at: string | null; origin: string | null } | null;
+          "SELECT content_hash, authored_at, origin, invalidation_source, superseded_by FROM documents WHERE id = ?"
+        ).get(existing.id) as {
+          content_hash: string | null; authored_at: string | null; origin: string | null;
+          invalidation_source: string | null; superseded_by: number | null;
+        } | null;
 
         // Ownership-collision boundary: a row explicitly owned by the OPPOSITE origin is
         // never silently taken over — the same rule saveMemory enforces for API writes onto
@@ -600,6 +729,16 @@ export async function indexCollection(
               }
             }
           }
+          // master-harness-vn4rz.84: an unchanged tombstone whose superseded_by
+          // did not resolve when it was written is retried on every pass, so a
+          // replacement written AFTER the tombstone is linked without touching
+          // the superseded file. Only these rows pay the parse.
+          if (existingRow.invalidation_source === FRONTMATTER_INVALIDATION_SOURCE && existingRow.superseded_by === null) {
+            const { meta: tombMeta } = parseDocument(content, relativePath, options?.defaultContentType, options?.frontmatterMap);
+            if (tombMeta.invalidation?.supersededBy) {
+              supersessionQueue.push({ docId: existing.id, ref: tombMeta.invalidation.supersededBy });
+            }
+          }
           if (options?.forceEnrich) {
             // --enrich: queue unchanged docs for full enrichment (entity extraction, links)
             enrichQueue.push({ docId: existing.id, isNew: true });
@@ -619,6 +758,11 @@ export async function indexCollection(
         const title = (typeof meta.title === "string" && meta.title) ? meta.title : extractTitle(body, relativePath);
         const docHash = hashContent(body);
         const contentType = meta.content_type || inferContentType(relativePath);
+
+        // master-harness-vn4rz.84: before the dated-only short-circuit below,
+        // which `continue`s past the normal write — a tombstone added in the
+        // same edit as an authored_at change must still land.
+        applyInvalidation(existing.id, meta, now);
 
         const prev = store.db.prepare(
           "SELECT hash, title, domain, workstream, tags, content_type, review_by, authored_at FROM documents WHERE id = ?"
@@ -725,6 +869,7 @@ export async function indexCollection(
             quality_score: computeQualityScore(body, meta),
             authored_at: meta.authored_at,
           });
+          applyInvalidation(inactive.id, meta, now);
           enrichQueue.push({ docId: inactive.id, isNew: false });
         } else {
           // Truly new document
@@ -743,6 +888,7 @@ export async function indexCollection(
               authored_at: meta.authored_at,
             });
             store.db.prepare("UPDATE documents SET content_hash = ? WHERE id = ?").run(contentHash, newDoc.id);
+            applyInvalidation(newDoc.id, meta, now);
             enrichQueue.push({ docId: newDoc.id, isNew: true });
           }
         }
@@ -768,6 +914,16 @@ export async function indexCollection(
           stats.removed++;
         }
       }
+    }
+
+    // master-harness-vn4rz.84: resolve superseded_by against the collection's
+    // final active set. Unresolved leaves the column NULL; the tombstone stands.
+    for (const { docId, ref } of supersessionQueue) {
+      const target = resolveSupersededBy(store.db, collectionName, docId, ref);
+      store.db.prepare("UPDATE documents SET superseded_by = ? WHERE id = ? AND invalidation_source = ?")
+        .run(target, docId, FRONTMATTER_INVALIDATION_SOURCE);
+      if (target === null) frontmatterVocab.supersededByUnresolved++;
+      else frontmatterVocab.supersededByResolved++;
     }
 
     store.db.exec("COMMIT");

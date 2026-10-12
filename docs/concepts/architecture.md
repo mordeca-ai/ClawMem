@@ -60,6 +60,38 @@ Rules:
 
 Every indexing path applies the map: `clawmem update`/`reindex`/`watch`, the MCP and REST reindex endpoints, the precompact hook reindex, `pg reindex`, and `pg origin-load` (title only there). The per-collection `frontmatter:` summary line reports mapped fills separately from authored ones. When a map does anything, the line ends with `; frontmatter_map filled N title, N content_type, rejected N content_type value(s)`. On a collection without a map the line is unchanged.
 
+#### Supersession keys (`invalidated_at`, `superseded_by`)
+
+A document can declare that it is superseded. The search paths then drop it: every FTS, vector and hybrid query already filters `invalidated_at IS NULL`. Use this in place of age-based decay when you know a memory is out of date. Two more optional map keys turn it on for a collection:
+
+```yaml
+collections:
+  memory-topics:
+    frontmatter_map:
+      title: name
+      content_type: metadata.type
+      invalidated_at: invalidated_at   # ISO date or datetime
+      superseded_by: superseded_by     # path relative to the collection root, or a title
+```
+
+```markdown
+---
+name: Old deploy notes
+superseded_by: topics/deploy-v2.md
+invalidated_at: 2026-10-01
+---
+```
+
+- **`invalidated_at`** marks the document invalidated as of that instant (`2026-10-01` or `2026-10-01T09:30:00Z`). A value that is not an ISO date or datetime is not applied. It is counted as a rejection, and indexing continues. A future date hides the document now, because the date is recorded as provenance and is not a schedule.
+- **`superseded_by`** names the replacement. Its presence alone invalidates the document, with index time as the instant if no valid `invalidated_at` is given. The value resolves to the replacement's document id within the same collection: first as a collection-relative path (a leading `./` is ignored), then as a title that exactly one other active document carries. If neither matches, the `superseded_by` column stays NULL and the document stays hidden. An unresolved reference is retried on every pass, so a replacement written after the tombstone gets linked.
+- **Bare keys are not read.** Without these map entries, `invalidated_at:` and `superseded_by:` in a document do nothing, in any collection. If your files use those exact names, opt in with an identity map as above. This keeps an unmapped collection's results unchanged, including files that already use `superseded_by:` for some other purpose.
+- **Removing the tombstone restores the document.** Delete the keys, and the next index pass makes the document searchable again. The body and its vectors were never touched, so no re-embed is needed.
+- **A re-index never clears another writer's invalidation.** Each invalidation records its source in `documents.invalidation_source`: `frontmatter` for a tombstone, `contradiction` for the decision extractor. NULL marks a row written before the column existed. A re-index clears only `frontmatter` rows. A tombstone on a document that is already invalidated by another source changes nothing.
+- **A frontmatter parse failure leaves the stored state alone**, as it does for `authored_at`.
+- **After adding the keys to an existing collection, run a forced re-index** (`clawmem reindex --force`, or the next `pg reindex`). An incremental pass only parses files whose content changed.
+
+`clawmem update`/`reindex`/`watch`, the reindex endpoints, the precompact hook and `pg reindex` apply supersession. `pg origin-load` does not, because the origin tier has no invalidation columns. On PostgreSQL the column comes from migration `014_documents_invalidation_source`. Until `clawmem pg migrate` applies it, `pg reindex` refuses a collection that declares these keys and writes every other collection as before. When anything happens, the summary line gains `; supersession N tombstoned, superseded_by N resolved / N unresolved, rejected N invalidated_at value(s)`.
+
 ### What to index
 
 The retrieval pipeline surfaces better results from a richer corpus. Beyond the default memory and session log patterns, consider adding collections for research notes, architecture decisions, domain references, project specs, and any markdown you regularly consult during agent sessions. The broader the indexed field, the more likely context-surfacing will find something relevant to the current task.

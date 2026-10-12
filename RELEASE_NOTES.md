@@ -4,6 +4,17 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.49 — frontmatter-driven supersession tombstones (invalidated_at / superseded_by)
+
+Frontmatter-driven supersession (master-harness-vn4rz.84, ruling B). A collection's `frontmatter_map` may now declare `invalidated_at` and `superseded_by` source keys. A document whose frontmatter carries them is tombstoned at index time: `invalidated_at` is set and the document drops out of FTS search, vsearch and the hybrid query path; `superseded_by` resolves to the replacement document's id within the collection when it is indexed and active. Removing the tombstone and re-indexing restores the document.
+
+- Opt-in per collection. Bare `invalidated_at:` / `superseded_by:` keys are not read unless the map declares them (one corpus file already uses `superseded_by:` as a link).
+- Provenance: new `invalidation_source` column (sqlite on-open migration; PG migration 014). Tombstones are `frontmatter`; decision-extractor invalidations are now `contradiction`; NULL is legacy. A re-index clears only `frontmatter` rows and never touches another writer's invalidation.
+- Unparseable `invalidated_at` values are rejected and counted, never thrown. The per-collection summary line changes only when a supersession counter is non-zero.
+- PG: run `clawmem pg migrate` before any collection declares the keys; `pg reindex` refuses such a collection until migration 014 is applied. sqlite: adding the keys to an existing collection needs `clawmem reindex --force` to tombstone unchanged files.
+
+---
+
 ## v0.36.48 — CLI vsearch floors raw cosine relevance
 
 CLI vsearch now applies --min-score to raw vector cosine; recency and confidence still rank results. The default 0.30 floor restores memory-topics recall without admitting weak vector matches.

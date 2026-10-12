@@ -520,12 +520,13 @@ describe("A6: every indexing path honours the map", () => {
       }
     });
 
-    it("indexCollection passes the map to all three of its parseDocument calls", () => {
+    it("indexCollection passes the map to all four of its parseDocument calls", () => {
+      // vn4rz.84 added the fourth: the unchanged-path retry of an unresolved superseded_by.
       const src = read("indexer.ts");
       const calls = [...src.matchAll(/parseDocument\(content, relativePath[^)]*\)/g)].map(
         (m) => m[0],
       );
-      expect(calls.length).toBe(3);
+      expect(calls.length).toBe(4);
       for (const c of calls) expect(c).toContain("options?.frontmatterMap");
     });
 

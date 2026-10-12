@@ -927,6 +927,12 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
     ["invalidated_at", "ALTER TABLE documents ADD COLUMN invalidated_at TEXT"],
     ["invalidated_by", "ALTER TABLE documents ADD COLUMN invalidated_by INTEGER"],
     ["superseded_by", "ALTER TABLE documents ADD COLUMN superseded_by INTEGER"],
+    // master-harness-vn4rz.84: WHO set invalidated_at. 'frontmatter' = the
+    // document's own tombstone (indexer; cleared when the tombstone is removed
+    // and the file re-indexed); 'contradiction' = the decision extractor. NULL
+    // on an invalidated row = legacy/unknown, treated as NOT frontmatter, so a
+    // re-index can never clear it.
+    ["invalidation_source", "ALTER TABLE documents ADD COLUMN invalidation_source TEXT"],
   ];
   for (const [col, sql] of invalidationMigrations) {
     if (!colNames.has(col)) {
