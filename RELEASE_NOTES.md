@@ -4,6 +4,17 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.50 — vector-leg fixed overhead: W1 guard fast path + scoped path skips vec0 count(*)
+
+Vector-leg fixed overhead (master-harness-vn4rz.89). Every `vsearch` / `query` vector leg on the live vault paid two costs that did not depend on the collection searched:
+
+- The read-path model guard (W1) joined every vector row to `documents` to keep only active docs: 0.65-1.1s, once per CLI process. It now reads the distinct model set from `content_vectors` alone (~0.17s) and runs the active-scoped join only when that set is not exactly the endpoint's model. Verdicts are unchanged: a foreign model on an inactive document still never counts, and any real mismatch still throws `VecReadModelMismatchError`.
+- A collection-scoped search served by the pre-filter path no longer runs `count(*)` on `vectors_vec` (115-240ms per leg). Unscoped searches still count it to bound the escalation loop.
+
+Measured live (median of 3, `-n 10`, results identical): `vsearch -c docs` 2.02s → 1.51s; `query -c docs` 4.98s → 3.58s; `query -c monchujo` 5.66s → 4.87s. The remaining floor is the sqlite-vec brute-force MATCH, about 1.0-1.4s per vector leg across the whole table whatever the scope.
+
+---
+
 ## v0.36.49 — frontmatter-driven supersession tombstones (invalidated_at / superseded_by)
 
 Frontmatter-driven supersession (master-harness-vn4rz.84, ruling B). A collection's `frontmatter_map` may now declare `invalidated_at` and `superseded_by` source keys. A document whose frontmatter carries them is tombstoned at index time: `invalidated_at` is set and the document drops out of FTS search, vsearch and the hybrid query path; `superseded_by` resolves to the replacement document's id within the collection when it is indexed and active. Removing the tombstone and re-indexing restores the document.
