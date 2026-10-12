@@ -4509,10 +4509,30 @@ const verifiedQueryEmbedModels = new WeakMap<Database, { dataVersion: number; mo
  * other model's vectors still pollute the space. Throws VecReadModelMismatchError otherwise; no-ops
  * when the vault has no vectors yet.
  */
+/** Distinct embedding models across ALL vector rows, active or not (vn4rz.89 guard fast path). */
+function getAllVecModelsUnscoped(db: Database): string[] {
+  return (db.prepare(
+    `SELECT DISTINCT model FROM content_vectors WHERE model IS NOT NULL AND model != ''`
+  ).all() as { model: string }[]).map(r => r.model);
+}
+
 function assertQueryEmbedModelConsistent(db: Database, endpointModel: string): void {
   const dataVersion = (db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version;
   const cached = verifiedQueryEmbedModels.get(db);
   if (cached && cached.dataVersion === dataVersion && cached.model === endpointModel) return;
+
+  // vn4rz.89 fast path: getVecModels() joins every vector row to `documents` to keep only ACTIVE
+  // docs, and that join scans `documents` (~0.65-1.1s on the 341k-fragment live vault — paid once
+  // per CLI process, since this cache is per-connection). The unjoined DISTINCT reads
+  // content_vectors alone (~0.17s). When it yields exactly [endpointModel], the active subset is
+  // either [] (no-op) or [endpointModel] (consistent) — both pass, so the verdict is identical.
+  // Any other answer falls through to the exact active-scoped query.
+  const allModels = getAllVecModelsUnscoped(db);
+  if (allModels.length === 0) return; // no vectors at all — nothing to be inconsistent with
+  if (allModels.length === 1 && allModels[0] === endpointModel) {
+    verifiedQueryEmbedModels.set(db, { dataVersion, model: endpointModel });
+    return;
+  }
 
   const storedModels = getVecModels(db);
   if (storedModels.length === 0) return; // nothing embedded yet — nothing to be inconsistent with
@@ -4996,18 +5016,22 @@ export function searchVecDetailedWithVector(
   assertQueryVectorCompatible(db, queryVec.endpointModel, queryVec.embedding.length);
 
   const exclude = new Set(opts.excludeCollections ?? []);
-  const tableRows = (db.prepare(`SELECT count(*) as c FROM vectors_vec`).get() as { c: number }).c;
-  if (tableRows === 0) return empty;
   const hardCap = opts.escalationCap ?? VEC_ESCALATION_HARD_CAP;
-  const effectiveCap = Math.min(hardCap, tableRows);
 
   // vn4rz.69: an INCLUDE scope (collections / collectionId / dateRange) small enough to
   // enumerate is served by ONE exact pre-filtered KNN scan instead of post-filtering the
   // global nearest neighbours (which starved a 0.7% collection down to ~1 doc).
+  // vn4rz.89: this runs BEFORE the vec0 count(*) below, which costs ~115-240ms per leg on the
+  // live vault and is only needed to bound the escalation loop. An empty table already yields
+  // an empty scope here (no content_vectors rows), so no early-exit is lost.
   if (hasVecIncludeScope(opts)) {
     const pre = searchVecPrefiltered(db, queryVec.embedding, limit, opts, exclude, hardCap);
     if (pre) return pre;
   }
+
+  const tableRows = (db.prepare(`SELECT count(*) as c FROM vectors_vec`).get() as { c: number }).c;
+  if (tableRows === 0) return empty;
+  const effectiveCap = Math.min(hardCap, tableRows);
 
   const matchStmt = db.prepare(`SELECT hash_seq, distance FROM vectors_vec WHERE embedding MATCH ? AND k = ?`);
 
