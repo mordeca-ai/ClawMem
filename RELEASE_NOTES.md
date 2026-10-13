@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.59 — clawmem scoped vector scan: cut the ~1.9 GB RSS peak and the remaining 2.0s floor (startup 0.57s + scope_load 1.05s) — carries the vn4rz.100 miss
+
+Bound CLI collection-scoped vector scans to a 128 MiB SQLite mmap budget per read connection. This keeps the exact chunk-targeted retrieval path while reducing peak memory use and query latency on the live docs collection. The existing CLAWMEM_SQLITE_MMAP_MB setting remains an explicit override; unscoped read paths retain their prior default.
+
+---
+
 ## v0.36.58 — MCP `query` overlaps expansion with the original vector leg
 
 The MCP `query` tool now starts the original query's vector leg while query expansion runs, matching CLI `query` (master-harness-vn4rz.101, building on vn4rz.96 and vn4rz.97).
