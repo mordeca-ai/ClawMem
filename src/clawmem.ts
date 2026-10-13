@@ -66,6 +66,7 @@ import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, HALF_LIVES, type EnrichedResult } from "./memory.ts";
 import { enrichResults, toRanked, fuseAndRerank, hasStrongFtsSignal, ftsBypassEnabled, applyQueryVecLegCap, type RankedResult } from "./search-utils.ts";
 import { vecLegParallelism, runVecLegs, createWorkerLegPool } from "./vec-legs.ts";
+import { QueryTimer, queryTimingEnabled } from "./query-timing.ts";
 import { splitDocument } from "./splitter.ts";
 import { buildEmbedFrontmatter } from "./embed-input.ts";
 import { getProfile, updateProfile, isProfileStale, type ProfileUpdateOutcome } from "./profile.ts";
@@ -1591,7 +1592,11 @@ async function cmdQuery(args: string[]) {
   const query = positionals.join(" ");
   if (!query) die("Usage: clawmem query <query> [--fail-on-empty]");
 
+  // CLAWMEM_QUERY_TIMING=1 prints a per-stage breakdown to stderr (vn4rz.97); off by default.
+  const timer = new QueryTimer(queryTimingEnabled());
+  const endStore = timer.start("store_open");
   const s = getStore();
+  endStore();
   const limit = parseInt(values.num!, 10);
   const minScore = parseFloat(values["min-score"]!);
 
@@ -1609,7 +1614,9 @@ async function cmdQuery(args: string[]) {
   const POOL = RERANK_CAP * 2;
 
   // Step 1: BM25 for strong signal check
+  const endFts = timer.start("fts");
   const ftsResults = s.searchFTS(query, POOL, undefined, scopeCols);
+  endFts();
   const strongSignal = ftsBypassEnabled() && hasStrongFtsSignal(ftsResults);
 
   // Step 2: Query expansion (skip if strong BM25 signal). expandQuery now returns
@@ -1618,7 +1625,7 @@ async function cmdQuery(args: string[]) {
   let expandedQueries: ExpandedQuery[] = [];
   if (!strongSignal) {
     try {
-      expandedQueries = await s.expandQuery(query, DEFAULT_QUERY_MODEL);
+      expandedQueries = await timer.time("expand", () => s.expandQuery(query, DEFAULT_QUERY_MODEL));
     } catch {
       // Fallback: no expansion
     }
@@ -1634,6 +1641,9 @@ async function cmdQuery(args: string[]) {
   const vecQueries = [query, ...expandedQueries.filter(e => e.type !== "lex").map(e => e.query)];
   const par = vecLegParallelism();
   let vecLegResults: SearchResult[][];
+  timer.count("vec_legs", vecQueries.length);
+  timer.count("lex_legs", expandedQueries.length - (vecQueries.length - 1));
+  const endVec = timer.start("vec_legs");
   if (par > 1 && vecQueries.length > 1) {
     const pool = createWorkerLegPool(Math.min(par, vecQueries.length), {
       dbPath: getDefaultDbPath(),
@@ -1657,6 +1667,7 @@ async function cmdQuery(args: string[]) {
       1
     );
   }
+  endVec();
 
   // Original query BM25 + vec (weight 2x)
   allRanked.push({ results: ftsResults.map(toRanked), weight: 2 });
@@ -1669,7 +1680,9 @@ async function cmdQuery(args: string[]) {
   let vecIdx = 1;
   for (const eq of expandedQueries) {
     if (eq.type === "lex") {
+      const endLex = timer.start("lex_legs");
       const r = s.searchFTS(eq.query, POOL, undefined, scopeCols);
+      endLex();
       allRanked.push({ results: r.map(toRanked), weight: 1 });
       candidateResults.push(...r);
     } else {
@@ -1682,12 +1695,14 @@ async function cmdQuery(args: string[]) {
   // Steps 4-7: RRF fusion → top RERANK_CAP candidates (73tb.23) → rerank → position-aware
   // blend on the normalized RRF fusion score (master-harness-z7o4y). Shared with the REST
   // hybrid modes (master-harness-h06j); a reranker failure falls back to fusion order.
+  const endFuse = timer.start("fuse_rerank");
   const { blended } = await fuseAndRerank(
     query,
     allRanked,
-    (q, docs) => s.rerank(q, docs, DEFAULT_RERANK_MODEL),
+    (q, docs) => timer.time("rerank", () => s.rerank(q, docs, DEFAULT_RERANK_MODEL)),
     { rerankCap: RERANK_CAP }
   );
+  endFuse();
 
   // Step 8: Map back to full results and apply composite scoring. Build the map from
   // ALL legs (incl. typed expansions) so expansion-only candidates aren't dropped.
@@ -1699,10 +1714,14 @@ async function cmdQuery(args: string[]) {
     .filter((r): r is SearchResult => r !== undefined)
     .map(r => ({ ...r, score: blended.find(b => b.file === r.filepath)?.score ?? r.score }));
 
+  const endEnrich = timer.start("enrich");
   const enriched = enrichResults(s, fullResults, query);
+  endEnrich();
+  const endScore = timer.start("score");
   const scored = applyCompositeScoring(enriched, query)
     .filter(r => r.compositeScore >= minScore)
     .slice(0, limit);
+  endScore();
 
   if (values.json) {
     console.log(JSON.stringify(scored.map(r => ({
@@ -1718,7 +1737,8 @@ async function cmdQuery(args: string[]) {
   }
 
   signalEmptyResults(scored.length, !!values["fail-on-empty"]);
-  await disposeDefaultLlamaCpp();
+  await timer.time("dispose", () => disposeDefaultLlamaCpp());
+  timer.emit();
 }
 
 /**
