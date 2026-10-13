@@ -26,6 +26,7 @@ import {
   prepareScopedVecScan,
   prewarmScopedVecScan,
   enableVecScopeCache,
+  readScopedMmapBytes,
   type Store,
 } from "../../src/store.ts";
 import {
@@ -142,6 +143,24 @@ afterAll(() => {
 
 const QUERY = randomVec(rng(7), DIM);
 const qv = () => ({ embedding: QUERY, endpointModel: MODEL });
+
+describe("scoped query mmap budget (vn4rz.102)", () => {
+  it("defaults to 128 MiB and honors an explicit global override, including zero", () => {
+    expect(readScopedMmapBytes({})).toBe(128 * 1024 * 1024);
+    expect(readScopedMmapBytes({ CLAWMEM_SQLITE_MMAP_MB: "0" })).toBe(0);
+    expect(readScopedMmapBytes({ CLAWMEM_SQLITE_MMAP_MB: "256" })).toBe(256 * 1024 * 1024);
+  });
+
+  it("applies an explicit zero mmap budget to a read-only scoped store", () => {
+    const ro = createStore(dbPath, { readonly: true, mmapBytes: 0 });
+    try {
+      const row = ro.db.prepare("PRAGMA mmap_size").get() as { mmap_size: number };
+      expect(row.mmap_size).toBe(0);
+    } finally {
+      ro.close();
+    }
+  });
+});
 
 describe("scoped scan distances (vn4rz.100)", () => {
   it("are bit-identical to vec0 MATCH for 768-d cosine vectors", () => {

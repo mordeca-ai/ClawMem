@@ -21,6 +21,7 @@ import {
   prepareScopedVecScan,
   prewarmScopedVecScan,
   enableVecScopeCache,
+  readScopedMmapBytes,
   type Store,
   type SearchResult,
   type ExpandedQuery,
@@ -1586,7 +1587,7 @@ async function cmdVsearch(args: string[]) {
 function openScopedLegStore(collections: string[]): Store | null {
   let ro: Store | null = null;
   try {
-    ro = createStore(getDefaultDbPath(), { readonly: true });
+    ro = createStore(getDefaultDbPath(), { readonly: true, mmapBytes: readScopedMmapBytes() });
     if (enableVecScopeCache(ro.db) && prepareScopedVecScan(ro.db, { collections }, false)) return ro;
   } catch {
     // Fall through: the worker legs cover any failure to open or plan.
