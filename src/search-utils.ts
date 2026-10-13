@@ -304,6 +304,74 @@ export function ftsBypassEnabled(): boolean {
 }
 
 // =============================================================================
+// Vector-leg cap for hybrid query (master-harness-vn4rz.92)
+// =============================================================================
+
+/**
+ * Cap on the number of EXPANSION vector legs (vec + hyde) a hybrid query runs, read from
+ * CLAWMEM_QUERY_VEC_EXPANSION_LEGS. Returns `undefined` (no cap: the historical behaviour)
+ * when the variable is unset, empty, or not a non-negative integer. `0` keeps only the
+ * original-query vector leg.
+ *
+ * Why it exists: every vector leg pays a whole-table sqlite-vec vec0 flat scan (~1.0-1.4s on
+ * the 341k-fragment live vault, independent of collection scope — vn4rz.89), and the CLI and
+ * MCP `query` pipelines run 1 + N of them in sequence. Lex legs are cheap FTS and are never
+ * capped. Read at call time, like ftsBypassEnabled, so A/B harnesses can toggle per process.
+ */
+export function queryVecExpansionLegCap(): number | undefined {
+  const raw = process.env.CLAWMEM_QUERY_VEC_EXPANSION_LEGS?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return undefined;
+  return Number(raw);
+}
+
+/**
+ * Keep at most `cap` vector expansion legs (vec/hyde) from a typed expansion list; lex legs
+ * always pass. `cap === undefined` returns the input unchanged.
+ *
+ * Which legs survive: hyde first, then vec, each in generation order. A vec leg is a
+ * paraphrase of the original query, so its embedding sits close to the original leg's
+ * (which always runs at 2x weight) and its hits largely duplicate it; the hyde leg is a
+ * hypothetical answer passage, which lands in answer-shaped regions the query embedding
+ * misses. The hyde leg is also exempt from the anchor gate, so it is the one vector
+ * expansion that survives when the model does not know the query's jargon.
+ *
+ * The survivors keep their original relative order, so a capped run's fusion lists are
+ * a prefix-preserving subset of the uncapped run's.
+ */
+export function capVectorExpansions<T extends { type: "lex" | "vec" | "hyde" }>(
+  expanded: readonly T[],
+  cap: number | undefined,
+): T[] {
+  if (cap === undefined) return expanded.slice();
+  const vectorIdx = expanded
+    .map((e, i) => ({ e, i }))
+    .filter(({ e }) => e.type !== "lex");
+  if (vectorIdx.length <= cap) return expanded.slice();
+  const keep = new Set(
+    [...vectorIdx.filter(({ e }) => e.type === "hyde"), ...vectorIdx.filter(({ e }) => e.type === "vec")]
+      .slice(0, cap)
+      .map(({ i }) => i),
+  );
+  return expanded.filter((e, i) => e.type === "lex" || keep.has(i));
+}
+
+/**
+ * capVectorExpansions under the env cap, for the CLI and MCP `query` call sites. When the cap
+ * drops legs it says so on stderr (counts only, no query text — hook/MCP stdout stays clean),
+ * so a capped run is visible in logs.
+ */
+export function applyQueryVecLegCap<T extends { type: "lex" | "vec" | "hyde" }>(expanded: readonly T[]): T[] {
+  const cap = queryVecExpansionLegCap();
+  const kept = capVectorExpansions(expanded, cap);
+  if (kept.length < expanded.length) {
+    const before = expanded.filter(e => e.type !== "lex").length;
+    const after = kept.filter(e => e.type !== "lex").length;
+    console.error(`[query] vec-leg cap ${cap}: running ${after}/${before} expansion vector legs`);
+  }
+  return kept;
+}
+
+// =============================================================================
 // Fusion + Rerank Blending (master-harness-z7o4y)
 // =============================================================================
 

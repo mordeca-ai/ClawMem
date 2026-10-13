@@ -64,7 +64,7 @@ import type { Store as StoreType } from "./store.ts";
 import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, HALF_LIVES, type EnrichedResult } from "./memory.ts";
-import { enrichResults, toRanked, fuseAndRerank, hasStrongFtsSignal, ftsBypassEnabled, type RankedResult } from "./search-utils.ts";
+import { enrichResults, toRanked, fuseAndRerank, hasStrongFtsSignal, ftsBypassEnabled, applyQueryVecLegCap, type RankedResult } from "./search-utils.ts";
 import { splitDocument } from "./splitter.ts";
 import { buildEmbedFrontmatter } from "./embed-input.ts";
 import { getProfile, updateProfile, isProfileStale, type ProfileUpdateOutcome } from "./profile.ts";
@@ -1622,6 +1622,7 @@ async function cmdQuery(args: string[]) {
       // Fallback: no expansion
     }
   }
+  expandedQueries = applyQueryVecLegCap(expandedQueries);
 
   // Step 3: Parallel searches
   const allRanked: { results: RankedResult[]; weight: number }[] = [];

@@ -89,6 +89,16 @@ The LLM generates lex (keyword), vec (semantic), and hyde (hypothetical answer) 
 
 Routing by type matters because a keyword expansion ("auth token refresh") is useless to a dense vector model, and a hypothetical-answer passage (hyde) is mostly stopword noise to BM25. Searching every variant on both backends — the earlier behavior — fed each leg the input it handles worst, diluting RRF with low-quality lists.
 
+## Vector-leg cap
+
+Each vec or hyde expansion runs its own vector search. On sqlite every vector search scans the whole `vectors_vec` table, whatever the collection scope: about 0.7-1.4s per leg on a 341k-fragment vault. A query with two vec legs and one hyde leg pays that four times.
+
+`CLAWMEM_QUERY_VEC_EXPANSION_LEGS=<n>` caps the expansion vector legs at `n` in both the MCP pipeline and the CLI `query`. Lex legs and the original query's vector leg always run. The cap is off by default; an unset or empty value, or anything other than a non-negative integer, leaves it off.
+
+The cap keeps hyde legs first, then vec legs, each in generation order. A vec leg paraphrases the query, so its hits mostly repeat the original leg's. The hyde passage reaches answer-shaped text that the query embedding misses, and it is the one expansion the anchor gate never drops. On the 25-question library baseline (vn4rz.92), `n=1` matched the uncapped recall@10 and MRR. Keeping a vec leg instead lowered MRR by 0.023; `n=0` lowered it by 0.063.
+
+When the cap drops legs, stderr shows `[query] vec-leg cap <n>: running <kept>/<total> expansion vector legs`.
+
 ## Chunk selection
 
 For reranking, each document's content is windowed into overlapping chunks. Chunks are scored by overlap with query terms (1.0x weight) and intent terms (0.5x weight). The best chunk per document is sent to the cross-encoder.

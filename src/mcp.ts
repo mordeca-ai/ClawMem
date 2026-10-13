@@ -34,7 +34,7 @@ import {
   type EnrichedResult,
   type CoActivationFn,
 } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFtsSignal, ftsBypassEnabled, attachRrfScores, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFtsSignal, ftsBypassEnabled, applyQueryVecLegCap, attachRrfScores, type RankedResult } from "./search-utils.ts";
 import { selectScoringRegime, rankRawPrimary, VECTOR_SCORE_BASIS, FTS_SCORE_BASIS, COMPOSITE_SCORE_BASIS } from "./scoring-regime.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
@@ -712,9 +712,9 @@ This is the recommended entry point for ALL memory queries.`,
 
       // Step 2: Query expansion (skipped if strong signal). Typed routing —
       // original → BOTH FTS + vector (2× RRF anchor), lex → FTS only, vec/hyde → vector only.
-      const expanded = hasStrongSignal
+      const expanded = applyQueryVecLegCap(hasStrongSignal
         ? []
-        : await store.expandQuery(query, DEFAULT_QUERY_MODEL, intent);
+        : await store.expandQuery(query, DEFAULT_QUERY_MODEL, intent));
 
       // Original query — both backends, pushed FIRST so the positional 2× weight
       // below lands on exactly the original's lists.
