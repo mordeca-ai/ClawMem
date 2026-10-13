@@ -4,6 +4,20 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.51 — opt-in hybrid-query vector-leg cap (CLAWMEM_QUERY_VEC_EXPANSION_LEGS)
+
+Opt-in cap on hybrid-query vector legs (master-harness-vn4rz.92). A hybrid `query` runs one vector leg for the original query plus one per vec/hyde expansion, and each leg pays a full sqlite-vec scan of the whole table (about 0.85-1.4s). New knob `CLAWMEM_QUERY_VEC_EXPANSION_LEGS=<n>` caps the expansion vector legs in the CLI `query` and the MCP query tool. Hyde legs are kept first, then vec legs. Lex legs and the original-query vector leg always run. Unset or invalid means no cap, so default behaviour is unchanged. When the cap drops legs, stderr prints `[query] vec-leg cap <n>: running k/m expansion vector legs`.
+
+Measured live on `query -c docs` (n=30 per arm, alternating), with library-baseline-qa (25 questions):
+
+- base: p50 3.44s, recall@10 0.92, MRR 0.830
+- cap 1: p50 2.72s, recall@10 0.92, MRR 0.830 (parity)
+- cap 0: p50 1.95s, recall@10 0.96, MRR 0.767 (loses 0.063 MRR; not recommended)
+
+Keeping a vec leg instead of hyde under cap 1 lost 0.023 MRR, which is why hyde comes first. The remaining cost is the brute-force scan per leg. Running the legs in parallel on separate read-only connections measured ~4.3s to ~1.45s for four legs in a probe, with exact results. That is the follow-up.
+
+---
+
 ## v0.36.50 — vector-leg fixed overhead: W1 guard fast path + scoped path skips vec0 count(*)
 
 Vector-leg fixed overhead (master-harness-vn4rz.89). Every `vsearch` / `query` vector leg on the live vault paid two costs that did not depend on the collection searched:
