@@ -5584,6 +5584,17 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   const cachedResults: Map<string, number> = new Map();
   const uncachedDocs: RerankDocument[] = [];
+  // Rerank scores are written to llm_cache in ONE transaction per backend pass (vn4rz.97).
+  // One autocommit INSERT per document cost a WAL commit each: ~8ms apiece, ~0.25s for a
+  // 30-candidate hybrid query. Same rows, same values, same 1% LRU prune per insert.
+  const pendingCacheWrites: [string, string][] = [];
+  const flushCacheWrites = () => {
+    if (pendingCacheWrites.length === 0) return;
+    const rows = pendingCacheWrites.splice(0);
+    db.transaction(() => {
+      for (const [key, value] of rows) setCachedResult(db, key, value);
+    })();
+  };
 
   // Check cache for each unique document. noCache (health probes) skips the cache entirely so the
   // call always exercises the live endpoint — a cached probe would mask an endpoint silently
@@ -5672,7 +5683,7 @@ export async function rerank(query: string, documents: { file: string; text: str
               if (!doc || typeof r.relevance_score !== "number" || !Number.isFinite(r.relevance_score)) continue;
               if (!noCache) {
                 const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: doc.file, model, rerankUrl });
-                setCachedResult(db, cacheKey, r.relevance_score.toString());
+                pendingCacheWrites.push([cacheKey, r.relevance_score.toString()]);
               }
               // Apply score to all files sharing this text
               for (const file of textToFiles.get(doc.text)!) cachedResults.set(file, r.relevance_score);
@@ -5681,12 +5692,16 @@ export async function rerank(query: string, documents: { file: string; text: str
             break; // Remote failed mid-batch, fall through to local
           }
         }
+        flushCacheWrites();
         scored = cachedResults.size > 0;
       } catch (e) {
         // Network/transport failure → fall through to local. But a malformed-response error (only
         // raised under requireLiveCoverage) is a probe FINDING about the remote endpoint — propagate
         // it instead of masking it with the local fallback.
         if (e instanceof RerankMalformedResponseError) throw e;
+        // Keep the scores of the batches that did arrive before the transport failure, as the
+        // per-row writes did. A failing cache write must not mask the local fallback.
+        try { flushCacheWrites(); } catch { pendingCacheWrites.length = 0; }
       }
     }
 
@@ -5700,7 +5715,7 @@ export async function rerank(query: string, documents: { file: string; text: str
           const doc = remaining.find(d => d.file === result.file);
           if (!noCache) {
             const cacheKey = getCacheKey("rerank", { query: rerankQuery, file: result.file, model, rerankUrl });
-            setCachedResult(db, cacheKey, result.score.toString());
+            pendingCacheWrites.push([cacheKey, result.score.toString()]);
           }
           // Apply score to all files sharing this text
           if (doc) {
@@ -5709,6 +5724,7 @@ export async function rerank(query: string, documents: { file: string; text: str
             cachedResults.set(result.file, result.score);
           }
         }
+        flushCacheWrites();
       }
     }
   }
