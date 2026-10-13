@@ -41,19 +41,45 @@ export interface BlendRerankOptions {
  * satisfies the predicate's `active = 1` term by construction; collection is
  * available via the spread `collectionName`.
  */
+const ENRICH_COLUMNS = `content_type, observation_type, modified_at, authored_at, access_count, confidence, domain, workstream, tags,
+             quality_score, pinned, last_accessed_at, duplicate_count, revision_count, invalidated_at`;
+
+/**
+ * Look up one result's documents row by its display path (`<collection>/<path>`).
+ *
+ * The lookup used to match `(collection || '/' || path) = ?`. SQLite cannot use an index for
+ * that expression, so each result scanned the whole documents table: about 10-35ms per result
+ * on a 46k-document vault, 0.25-1.1s for a 30-candidate hybrid query (vn4rz.97). Collection
+ * names cannot contain '/' (isValidCollectionName), so splitting at the first '/' gives the
+ * same row through UNIQUE(collection, path). A miss falls back to the old expression, so a
+ * hand-edited collection name containing '/' still resolves exactly as before.
+ */
+export function lookupEnrichRow(db: Store["db"], displayPath: string): any | null {
+  const slash = displayPath.indexOf("/");
+  if (slash > 0) {
+    const row = db.prepare(`
+      SELECT ${ENRICH_COLUMNS}
+      FROM documents
+      WHERE active = 1 AND collection = ? AND path = ?
+      LIMIT 1
+    `).get(displayPath.slice(0, slash), displayPath.slice(slash + 1));
+    if (row) return row;
+  }
+  return db.prepare(`
+      SELECT ${ENRICH_COLUMNS}
+      FROM documents
+      WHERE active = 1 AND (collection || '/' || path) = ?
+      LIMIT 1
+    `).get(displayPath) ?? null;
+}
+
 export function enrichResults(
   store: Store,
   results: SearchResult[],
   _query: string
 ): EnrichedResult[] {
   return results.map(r => {
-    const row = store.db.prepare(`
-      SELECT content_type, observation_type, modified_at, authored_at, access_count, confidence, domain, workstream, tags,
-             quality_score, pinned, last_accessed_at, duplicate_count, revision_count, invalidated_at
-      FROM documents
-      WHERE active = 1 AND (collection || '/' || path) = ?
-      LIMIT 1
-    `).get(r.displayPath) as any | null;
+    const row = lookupEnrichRow(store.db, r.displayPath);
 
     return {
       ...r,

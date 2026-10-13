@@ -64,8 +64,9 @@ import type { Store as StoreType } from "./store.ts";
 import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, HALF_LIVES, type EnrichedResult } from "./memory.ts";
-import { enrichResults, toRanked, fuseAndRerank, hasStrongFtsSignal, ftsBypassEnabled, applyQueryVecLegCap, type RankedResult } from "./search-utils.ts";
-import { vecLegParallelism, runVecLegs, createWorkerLegPool } from "./vec-legs.ts";
+import { enrichResults, toRanked, fuseAndRerank, hasStrongFtsSignal, ftsBypassEnabled, applyQueryVecLegCap, queryVecExpansionLegCap, type RankedResult } from "./search-utils.ts";
+import { vecLegParallelism, runVecLegs, createWorkerLegPool, runVecLegsOverlapped, settlesImmediately } from "./vec-legs.ts";
+import { QueryTimer, queryTimingEnabled } from "./query-timing.ts";
 import { splitDocument } from "./splitter.ts";
 import { buildEmbedFrontmatter } from "./embed-input.ts";
 import { getProfile, updateProfile, isProfileStale, type ProfileUpdateOutcome } from "./profile.ts";
@@ -1591,7 +1592,11 @@ async function cmdQuery(args: string[]) {
   const query = positionals.join(" ");
   if (!query) die("Usage: clawmem query <query> [--fail-on-empty]");
 
+  // CLAWMEM_QUERY_TIMING=1 prints a per-stage breakdown to stderr (vn4rz.97); off by default.
+  const timer = new QueryTimer(queryTimingEnabled());
+  const endStore = timer.start("store_open");
   const s = getStore();
+  endStore();
   const limit = parseInt(values.num!, 10);
   const minScore = parseFloat(values["min-score"]!);
 
@@ -1609,21 +1614,22 @@ async function cmdQuery(args: string[]) {
   const POOL = RERANK_CAP * 2;
 
   // Step 1: BM25 for strong signal check
+  const endFts = timer.start("fts");
   const ftsResults = s.searchFTS(query, POOL, undefined, scopeCols);
+  endFts();
   const strongSignal = ftsBypassEnabled() && hasStrongFtsSignal(ftsResults);
 
   // Step 2: Query expansion (skip if strong BM25 signal). expandQuery now returns
   // typed ExpandedQuery[] (lex/vec/hyde) — no more brittle string re-parsing, and
   // the original query is no longer echoed back as a phantom "vec" expansion.
-  let expandedQueries: ExpandedQuery[] = [];
+  // A failed expansion means "no expansion"; the cap (vn4rz.92) applies to whatever lands.
+  let expansion: Promise<ExpandedQuery[]> | undefined;
   if (!strongSignal) {
-    try {
-      expandedQueries = await s.expandQuery(query, DEFAULT_QUERY_MODEL);
-    } catch {
-      // Fallback: no expansion
-    }
+    const endExpand = timer.start("expand");
+    expansion = s.expandQuery(query, DEFAULT_QUERY_MODEL)
+      .catch(() => [] as ExpandedQuery[])
+      .then(eqs => { endExpand(); return applyQueryVecLegCap(eqs); });
   }
-  expandedQueries = applyQueryVecLegCap(expandedQueries);
 
   // Step 3: Parallel searches
   const allRanked: { results: RankedResult[]; weight: number }[] = [];
@@ -1631,32 +1637,52 @@ async function cmdQuery(args: string[]) {
   // candidate found ONLY via an expansion leg survives Step 8's resultMap lookup.
   const candidateResults: SearchResult[] = [];
 
-  const vecQueries = [query, ...expandedQueries.filter(e => e.type !== "lex").map(e => e.query)];
+  const vecLegsOf = (eqs: ExpandedQuery[]) => eqs.filter(e => e.type !== "lex").map(e => e.query);
+  const inProcessLeg = (q: string) => s.searchVec(q, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols);
+  const poolOpts = { dbPath: getDefaultDbPath(), model: DEFAULT_EMBED_MODEL, limit: POOL, collections: scopeCols };
   const par = vecLegParallelism();
+  let expandedQueries: ExpandedQuery[];
   let vecLegResults: SearchResult[][];
-  if (par > 1 && vecQueries.length > 1) {
-    const pool = createWorkerLegPool(Math.min(par, vecQueries.length), {
-      dbPath: getDefaultDbPath(),
-      model: DEFAULT_EMBED_MODEL,
-      limit: POOL,
-      collections: scopeCols,
-    });
+  const endVec = timer.start("vec_legs");
+  if (expansion && par > 1 && !(await settlesImmediately(expansion))) {
+    // Live expansion in flight (vn4rz.97): start the original query's vector leg now and warm
+    // the workers for the expansion legs, instead of waiting ~1.5-2s for the LLM first. Same
+    // legs, same order, so the fused ranking is unchanged.
+    const cap = queryVecExpansionLegCap();
+    const pool = createWorkerLegPool(par, poolOpts);
     try {
-      vecLegResults = await runVecLegs(
-        vecQueries,
-        q => pool.runLeg(q).catch(() => s.searchVec(q, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols)),
-        pool.size
-      );
+      const overlapped = await runVecLegsOverlapped({
+        original: query,
+        expansion,
+        legsOf: vecLegsOf,
+        runLeg: q => pool.runLeg(q).catch(() => inProcessLeg(q)),
+        pool,
+        warm: Math.min(par - 1, cap ?? par - 1),
+      });
+      expandedQueries = overlapped.expansion;
+      vecLegResults = overlapped.results;
     } finally {
       pool.close();
     }
   } else {
-    vecLegResults = await runVecLegs(
-      vecQueries,
-      q => s.searchVec(q, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols),
-      1
-    );
+    // Strong BM25 signal, an llm_cache hit, or CLAWMEM_QUERY_VEC_PARALLEL=1: the leg list is
+    // already known, so run it as before (one leg in-process, several on a sized pool).
+    expandedQueries = expansion ? await expansion : [];
+    const vecQueries = [query, ...vecLegsOf(expandedQueries)];
+    if (par > 1 && vecQueries.length > 1) {
+      const pool = createWorkerLegPool(Math.min(par, vecQueries.length), poolOpts);
+      try {
+        vecLegResults = await runVecLegs(vecQueries, q => pool.runLeg(q).catch(() => inProcessLeg(q)), pool.size);
+      } finally {
+        pool.close();
+      }
+    } else {
+      vecLegResults = await runVecLegs(vecQueries, inProcessLeg, 1);
+    }
   }
+  timer.count("vec_legs", vecLegResults.length);
+  timer.count("lex_legs", expandedQueries.filter(e => e.type === "lex").length);
+  endVec();
 
   // Original query BM25 + vec (weight 2x)
   allRanked.push({ results: ftsResults.map(toRanked), weight: 2 });
@@ -1669,7 +1695,9 @@ async function cmdQuery(args: string[]) {
   let vecIdx = 1;
   for (const eq of expandedQueries) {
     if (eq.type === "lex") {
+      const endLex = timer.start("lex_legs");
       const r = s.searchFTS(eq.query, POOL, undefined, scopeCols);
+      endLex();
       allRanked.push({ results: r.map(toRanked), weight: 1 });
       candidateResults.push(...r);
     } else {
@@ -1682,12 +1710,14 @@ async function cmdQuery(args: string[]) {
   // Steps 4-7: RRF fusion → top RERANK_CAP candidates (73tb.23) → rerank → position-aware
   // blend on the normalized RRF fusion score (master-harness-z7o4y). Shared with the REST
   // hybrid modes (master-harness-h06j); a reranker failure falls back to fusion order.
+  const endFuse = timer.start("fuse_rerank");
   const { blended } = await fuseAndRerank(
     query,
     allRanked,
-    (q, docs) => s.rerank(q, docs, DEFAULT_RERANK_MODEL),
+    (q, docs) => timer.time("rerank", () => s.rerank(q, docs, DEFAULT_RERANK_MODEL)),
     { rerankCap: RERANK_CAP }
   );
+  endFuse();
 
   // Step 8: Map back to full results and apply composite scoring. Build the map from
   // ALL legs (incl. typed expansions) so expansion-only candidates aren't dropped.
@@ -1699,10 +1729,14 @@ async function cmdQuery(args: string[]) {
     .filter((r): r is SearchResult => r !== undefined)
     .map(r => ({ ...r, score: blended.find(b => b.file === r.filepath)?.score ?? r.score }));
 
+  const endEnrich = timer.start("enrich");
   const enriched = enrichResults(s, fullResults, query);
+  endEnrich();
+  const endScore = timer.start("score");
   const scored = applyCompositeScoring(enriched, query)
     .filter(r => r.compositeScore >= minScore)
     .slice(0, limit);
+  endScore();
 
   if (values.json) {
     console.log(JSON.stringify(scored.map(r => ({
@@ -1718,7 +1752,8 @@ async function cmdQuery(args: string[]) {
   }
 
   signalEmptyResults(scored.length, !!values["fail-on-empty"]);
-  await disposeDefaultLlamaCpp();
+  await timer.time("dispose", () => disposeDefaultLlamaCpp());
+  timer.emit();
 }
 
 /**

@@ -106,6 +106,27 @@ Both consumers run their vector legs (the original query plus each vec/hyde expa
 - **CLI `query`**: builds a pool per invocation (`createWorkerLegPool`) and closes it when the legs finish.
 - **MCP `query`** (vn4rz.96): the server owns one long-lived pool, created lazily on the first multi-leg query, kept warm across calls (no per-call worker spawn or sqlite-vec load) and closed with the stores on shutdown. Workers are spawned on demand, never more than `CLAWMEM_QUERY_VEC_PARALLEL`, and concurrent `query` calls share that bound. Each leg carries its own options (`collections`, `dateRange`, `excludeCollections`, limit) and returns the `searchVecDetailed` result, so the `degraded` markers on the response are unchanged. A single-leg query, an in-memory store, or a store whose file is missing runs in-process. A worker opens each vault path read-only at most once, so named vaults share the pool.
 
+## Expansion overlap (CLI `query`)
+
+The original query's vector leg does not depend on the expansion. When the expansion is a live LLM call, the CLI `query` (vn4rz.97) starts that leg on the worker pool at once and warms the remaining workers (`min(CLAWMEM_QUERY_VEC_PARALLEL - 1, CLAWMEM_QUERY_VEC_EXPANSION_LEGS)`). The expansion legs start on warm workers as soon as the expansion lands. Legs and their order are unchanged, so the fused ranking is identical.
+
+The old path still runs in three cases: a strong BM25 signal (no expansion), an `llm_cache` hit (the leg list is known at once), and `CLAWMEM_QUERY_VEC_PARALLEL=1`. The MCP `query` tool does not overlap yet.
+
+## Fixed per-query costs
+
+- **Enrich**: `enrichResults` looks each result up by `(collection, path)` through the documents unique index. The old `(collection || '/' || path) = ?` match scanned the documents table once per result, 0.25-1.1s for a 30-candidate query on a 46k-document vault. A miss falls back to the old expression, so a hand-edited collection name containing `/` still resolves.
+- **Rerank cache writes**: the scores from one rerank call are written to `llm_cache` in one transaction. Before, each score was its own autocommit insert, about 8ms each.
+
+## Stage timing
+
+`CLAWMEM_QUERY_TIMING=1` makes the CLI `query` print one line to stderr when it finishes:
+
+```
+[query-timing] {"startup_ms":422,"total_ms":3775,"stages":{"expand":{"start_ms":540,"ms":498},...},"counts":{"vec_legs":4,"lex_legs":0}}
+```
+
+`start_ms` is measured from process start, so overlapping stages show their real window and the durations need not sum to `total_ms`. Stages: `store_open`, `fts`, `expand`, `vec_legs`, `lex_legs`, `fuse_rerank`, `rerank`, `enrich`, `score`, `dispose`. Off by default.
+
 ## Chunk selection
 
 For reranking, each document's content is windowed into overlapping chunks. Chunks are scored by overlap with query terms (1.0x weight) and intent terms (0.5x weight). The best chunk per document is sent to the cross-encoder.

@@ -87,6 +87,11 @@ export interface WorkerLegPool {
   runLeg(query: string): Promise<SearchResult[]>;
   /** `searchVecDetailed` leg with per-call options (MCP `query`); carries the degraded marker. */
   runLegDetailed(query: string, opts: DetailedLegOpts): Promise<VecSearchDetailedResult>;
+  /**
+   * Spawn up to `n` more workers and have each open the pool's vault, so later legs skip the
+   * worker start and store open (vn4rz.97). Resolves when they are ready; never rejects.
+   */
+  warm(n: number): Promise<void>;
   close(): void;
 }
 
@@ -215,6 +220,13 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
       excludeCollections: o.excludeCollections,
     });
 
+  const warm = async (n: number): Promise<void> => {
+    const count = Math.max(0, Math.min(Math.floor(n), poolSize));
+    const reqs: Promise<unknown>[] = [];
+    for (let i = 0; i < count; i++) reqs.push(submit({ warm: true, dbPath: opts.dbPath }).catch(() => {}));
+    await Promise.all(reqs);
+  };
+
   const close = () => {
     closed = true;
     for (const slot of [...slots]) {
@@ -234,6 +246,55 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
     size: poolSize,
     runLeg,
     runLegDetailed,
+    warm,
     close,
   };
+}
+
+/**
+ * True when `p` has already settled by the next macrotask: an llm_cache hit or an immediate
+ * fallback, as opposed to a live LLM call still in flight.
+ */
+export async function settlesImmediately(p: Promise<unknown>): Promise<boolean> {
+  let settled = false;
+  p.then(() => { settled = true; }, () => { settled = true; });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  return settled;
+}
+
+export interface OverlappedVecLegsOpts<E, T> {
+  /** The original query: its vector leg starts at once, before the expansion lands. */
+  original: string;
+  /** Query expansion in flight. Must not reject (the caller maps failure to "no expansion"). */
+  expansion: Promise<E>;
+  /** The vector legs (vec/hyde, after any cap) an expansion contributes, in leg order. */
+  legsOf: (expansion: E) => string[];
+  /** Runs one leg; the CLI passes the worker leg with its in-process fallback. */
+  runLeg: (query: string) => Promise<T>;
+  /** Pool to pre-warm while the expansion is generated. */
+  pool: Pick<WorkerLegPool, "size" | "warm">;
+  /** Workers to warm beyond the one running the original leg. */
+  warm: number;
+}
+
+/**
+ * Run the hybrid query's vector legs alongside query expansion (vn4rz.97).
+ *
+ * The original query's leg does not depend on the expansion, so it starts immediately, and
+ * the remaining workers spawn and open the vault while the LLM generates. The expansion legs
+ * start as soon as the expansion lands, on workers that are already warm. Results come back
+ * in the same order as the sequential path: `[original, ...legsOf(expansion)]`. A leg error
+ * propagates to the caller, as it does from runVecLegs.
+ */
+export async function runVecLegsOverlapped<E, T>(
+  opts: OverlappedVecLegsOpts<E, T>
+): Promise<{ expansion: E; results: T[] }> {
+  const first = opts.runLeg(opts.original);
+  // Observed below; the noop handler only stops an early rejection being reported as
+  // unhandled while the expansion is still in flight.
+  first.catch(() => {});
+  if (opts.warm > 0) void opts.pool.warm(opts.warm);
+  const expansion = await opts.expansion;
+  const rest = await runVecLegs(opts.legsOf(expansion), opts.runLeg, opts.pool.size);
+  return { expansion, results: [await first, ...rest] };
 }

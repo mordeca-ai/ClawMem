@@ -16,9 +16,14 @@ function storeFor(dbPath: string): Store {
 }
 
 self.onmessage = async (ev: MessageEvent) => {
-  const { id, dbPath, model, query, limit, collections, detailed, dateRange, excludeCollections } = ev.data;
+  const { id, dbPath, model, query, limit, collections, detailed, dateRange, excludeCollections, warm } = ev.data;
   try {
     const st = storeFor(dbPath);
+    if (warm) {
+      // Pre-warm (vn4rz.97): the worker is up and the vault is open; no search runs.
+      self.postMessage({ id, ok: true, results: null });
+      return;
+    }
     const results = detailed
       ? await st.searchVecDetailed(query, model, limit, { collections, dateRange, excludeCollections })
       : await st.searchVec(query, model, limit, undefined, collections);

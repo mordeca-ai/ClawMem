@@ -4,6 +4,20 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.56 — CLI `query` overlaps expansion with the original vector leg; cheaper enrich and rerank writes
+
+The CLI hybrid `query` is faster with identical rankings (master-harness-vn4rz.97). Three changes:
+
+- When the expansion is a live LLM call, the original query's vector leg starts at once on the worker pool, and the other workers spawn and open the vault while the LLM generates. The expansion legs then run on warm workers. Strong-BM25 bypass, `llm_cache` hits and `CLAWMEM_QUERY_VEC_PARALLEL=1` keep the old path.
+- `enrichResults` looks results up through the `(collection, path)` unique index. The old expression match scanned the documents table once per result (0.25-1.1s per 30-candidate query). This applies to every caller, including MCP tools and the context-surfacing hook.
+- Rerank writes its scores to `llm_cache` in one transaction instead of one autocommit per document (~8ms each).
+
+`CLAWMEM_QUERY_TIMING=1` prints a per-stage breakdown of a CLI `query` to stderr. It is off by default.
+
+Measured on a snapshot of the live vault, `query -c docs`, cold `llm_cache`, 30 alternating base/change pairs at load 15-25: p50 4.55s to 3.90s, p90 6.21s to 4.97s. With the expansion and rerank scores held fixed, the top-10 matched on 30 of 30 pairs. On the 25-question library baseline, recall@10 stayed 1.00 and MRR went 0.886 to 0.915; the difference comes from expansion sampling, since all three changes keep the ranking exact.
+
+---
+
 ## v0.36.55 — MCP `query` runs its vector legs in parallel
 
 The MCP `query` tool now runs its vector legs (the original query plus each surviving vec/hyde expansion) through the same read-only worker pool the CLI `query` uses (master-harness-vn4rz.96, building on vn4rz.93). The MCP server keeps one long-lived, lazily created pool, so workers stay warm between calls; it is bounded by `CLAWMEM_QUERY_VEC_PARALLEL` (default 4, max 8) and closed on shutdown. Results merge in leg order and every per-leg option (`collections`, `dateRange`, `excludeCollections`, limit, degraded markers) is preserved, so rankings are unchanged. `CLAWMEM_QUERY_VEC_PARALLEL=1` restores the sequential in-process loop; a leg whose worker fails reruns in-process. On the live index, 25 library-baseline questions through the real `query` handler: p50 10.50 s to 4.90 s, p90 15.28 s to 6.77 s, identical ordered top-10 on 25/25.
