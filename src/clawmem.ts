@@ -18,6 +18,9 @@ import {
   enableProductionMode,
   getDefaultDbPath,
   canonicalDocId,
+  prepareScopedVecScan,
+  prewarmScopedVecScan,
+  enableVecScopeCache,
   type Store,
   type SearchResult,
   type ExpandedQuery,
@@ -66,6 +69,7 @@ import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, HALF_LIVES, type EnrichedResult } from "./memory.ts";
 import { enrichResults, toRanked, fuseAndRerank, hasStrongFtsSignal, ftsBypassEnabled, applyQueryVecLegCap, queryVecExpansionLegCap, type RankedResult } from "./search-utils.ts";
 import { vecLegParallelism, runVecLegs, createWorkerLegPool, runVecLegsOverlapped, settlesImmediately } from "./vec-legs.ts";
+import { scopedScanEnabled, vecScopeScanStats } from "./vec-scope-scan.ts";
 import { QueryTimer, queryTimingEnabled } from "./query-timing.ts";
 import { splitDocument } from "./splitter.ts";
 import { buildEmbedFrontmatter } from "./embed-input.ts";
@@ -1575,6 +1579,22 @@ async function cmdVsearch(args: string[]) {
   await disposeDefaultLlamaCpp();
 }
 
+/**
+ * vn4rz.100: a read-only store for CLI query legs when the chunk-targeted scoped scan serves
+ * `collections` (the scope fits and spans few enough vec0 chunks); null keeps the worker path.
+ */
+function openScopedLegStore(collections: string[]): Store | null {
+  let ro: Store | null = null;
+  try {
+    ro = createStore(getDefaultDbPath(), { readonly: true });
+    if (enableVecScopeCache(ro.db) && prepareScopedVecScan(ro.db, { collections }, false)) return ro;
+  } catch {
+    // Fall through: the worker legs cover any failure to open or plan.
+  }
+  try { ro?.close(); } catch {}
+  return null;
+}
+
 async function cmdQuery(args: string[]) {
   const { values, positionals } = parseArgs({
     args,
@@ -1644,7 +1664,55 @@ async function cmdQuery(args: string[]) {
   let expandedQueries: ExpandedQuery[];
   let vecLegResults: SearchResult[][];
   const endVec = timer.start("vec_legs");
-  if (expansion && par > 1 && !(await settlesImmediately(expansion))) {
+  const liveExpansion = !!expansion && !(await settlesImmediately(expansion));
+  // vn4rz.100: a collection scope the chunk-targeted scan serves runs every leg in this process
+  // on one read-only store, so the scope's vectors are read once per query (~0.5 GB for docs)
+  // instead of a full 1.4 GB vec0 scan per leg per worker. Embeds still overlap.
+  const endPlan = timer.start("scope_plan");
+  const scoped = scopeCols && scopedScanEnabled() ? openScopedLegStore(scopeCols) : null;
+  endPlan();
+  if (scoped) {
+    const scopedLeg = (q: string) =>
+      scoped.searchVec(q, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols).catch(() => inProcessLeg(q));
+    // Concurrency bounds the embeds in flight; the scans themselves are short and synchronous.
+    // CLAWMEM_QUERY_VEC_PARALLEL=1 keeps the sequential order here too.
+    const legConcurrency = par;
+    try {
+      if (liveExpansion) {
+        const overlapped = await runVecLegsOverlapped({
+          original: query,
+          expansion: expansion!,
+          legsOf: vecLegsOf,
+          runLeg: scopedLeg,
+          // "Warming" = reading the scope's vectors while the LLM generates. It yields first so
+          // the original leg's embed request is on the wire before the synchronous read.
+          pool: {
+            size: legConcurrency,
+            warm: async () => {
+              await new Promise(resolve => setTimeout(resolve, 0));
+              await timer.time("scope_load", () => prewarmScopedVecScan(scoped.db, scoped.dbPath, { collections: scopeCols }, par));
+            },
+          },
+          warm: 1,
+        });
+        expandedQueries = overlapped.expansion;
+        vecLegResults = overlapped.results;
+      } else {
+        expandedQueries = expansion ? await expansion : [];
+        const legs = runVecLegs([query, ...vecLegsOf(expandedQueries)], scopedLeg, legConcurrency);
+        // Same pre-warm as above: read the scope's vectors while the leg embeds are in flight.
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await timer.time("scope_load", () => prewarmScopedVecScan(scoped.db, scoped.dbPath, { collections: scopeCols }, par));
+        vecLegResults = await legs;
+      }
+    } finally {
+      scoped.close();
+    }
+    const st = vecScopeScanStats();
+    timer.count("scope_scans", st.scans);
+    timer.count("scope_chunks_read", st.chunksRead);
+    timer.count("scope_load_fallbacks", st.verifyFailures);
+  } else if (liveExpansion && par > 1) {
     // Live expansion in flight (vn4rz.97): start the original query's vector leg now and warm
     // the workers for the expansion legs, instead of waiting ~1.5-2s for the LLM first. Same
     // legs, same order, so the fused ranking is unchanged.
@@ -1653,7 +1721,7 @@ async function cmdQuery(args: string[]) {
     try {
       const overlapped = await runVecLegsOverlapped({
         original: query,
-        expansion,
+        expansion: expansion!,
         legsOf: vecLegsOf,
         runLeg: q => pool.runLeg(q).catch(() => inProcessLeg(q)),
         pool,

@@ -91,7 +91,7 @@ Routing by type matters because a keyword expansion ("auth token refresh") is us
 
 ## Vector-leg cap
 
-Each vec or hyde expansion runs its own vector search. On sqlite every vector search scans the whole `vectors_vec` table, whatever the collection scope: about 0.7-1.4s per leg on a 341k-fragment vault. A query with two vec legs and one hyde leg pays that four times.
+Each vec or hyde expansion runs its own vector search. On sqlite an unscoped vector search scans the whole `vectors_vec` table: about 0.7-1.4s per leg on a 341k-fragment vault. A query with two vec legs and one hyde leg pays that four times. A collection-scoped leg the scoped scan serves (below) costs far less, so the cap matters mainly for unscoped and large-scope queries.
 
 `CLAWMEM_QUERY_VEC_EXPANSION_LEGS=<n>` caps the expansion vector legs at `n` in both the MCP pipeline and the CLI `query`. Lex legs and the original query's vector leg always run. The cap is off by default; an unset or empty value, or anything other than a non-negative integer, leaves it off.
 
@@ -112,10 +112,23 @@ The original query's vector leg does not depend on the expansion. When the expan
 
 The old path still runs in three cases: a strong BM25 signal (no expansion), an `llm_cache` hit (the leg list is known at once), and `CLAWMEM_QUERY_VEC_PARALLEL=1`. The MCP `query` tool does not overlap yet.
 
+## Scoped vector scan (collection-scoped legs)
+
+sqlite-vec reads every vector chunk before it applies a `hash_seq IN (...)` filter, so a scoped vector leg cost a scan of the whole vault (1.4 GB for 350k x 768 vectors) whatever the collection. For an include scope (`-c`, `collections`, `dateRange`) small enough to pre-filter, the leg now reads only the vec0 chunks that hold the scope's fragments, straight from the shadow tables, and computes cosine distances in JS with sqlite-vec's float32 operation order (vn4rz.100). The distances are bit-identical to vec0's and cover every in-scope fragment, so the results equal the vec0 path's. On the live vault, `docs` (15.7k fragments) sits in 172 of 459 chunks: about 0.54 GB is read once, and each further leg is a ~25 ms scan.
+
+- **When it applies**: the table has clawmem's canonical `vec0(hash_seq TEXT PRIMARY KEY, embedding float[N] distance_metric=cosine)` shape and the scope spans at most half of the table's chunks. Otherwise the leg uses vec0 MATCH as before (`-c monchujo`, for example, is too large to pre-filter).
+- **Safety**: every slot is checked before its vector is used (blob sizes, the validity bit, and the chunk's rowid at that slot equal to the enumerated rowid). Any mismatch abandons the load and the leg uses vec0 MATCH. vec0 rowids are AUTOINCREMENT and clawmem never updates a vector in place, so a matching rowid is the same vector.
+- **CLI `query`**: when the scope qualifies, the legs run in-process on one read-only store instead of the worker pool. The scope's chunks are read once, on `CLAWMEM_QUERY_VEC_PARALLEL` threads, while the expansion is generated; the leg embeds still overlap. That store caches the scope (enumeration and vectors) until another connection commits (`PRAGMA data_version`) or the schema changes.
+- **Other callers** (MCP `query` workers, `vsearch`, writable stores) use the scan per call and keep nothing, so a long-lived process holds no scope vectors.
+- **Knob**: `CLAWMEM_QUERY_VEC_SCOPED_SCAN=0` (or `false`/`off`/`no`) turns it off; every scoped leg then uses vec0 MATCH.
+
+Read-only connections also map the vault into memory (`PRAGMA mmap_size`). Without it, a vec0 scan copied each 4 KiB page through a `pread` call, and system time was the larger part of a leg. `CLAWMEM_SQLITE_MMAP_MB` sets the size (default 2047; SQLite caps it at 2 GiB in Bun); `0` turns it off. Writable connections are unchanged.
+
 ## Fixed per-query costs
 
 - **Enrich**: `enrichResults` looks each result up by `(collection, path)` through the documents unique index. The old `(collection || '/' || path) = ?` match scanned the documents table once per result, 0.25-1.1s for a 30-candidate query on a 46k-document vault. A miss falls back to the old expression, so a hand-edited collection name containing `/` still resolves.
 - **Rerank cache writes**: the scores from one rerank call are written to `llm_cache` in one transaction. Before, each score was its own autocommit insert, about 8ms each.
+- **Vector hydrate**: the document body is read once per returned document (vn4rz.100). The hydrate query used to select `content.doc` on every fragment row of every requested hash, which for one 60-document `-c docs` leg was 2,399 rows and about 91 MB of text (200-380 ms).
 
 ## Stage timing
 
@@ -125,7 +138,7 @@ The old path still runs in three cases: a strong BM25 signal (no expansion), an 
 [query-timing] {"startup_ms":422,"total_ms":3775,"stages":{"expand":{"start_ms":540,"ms":498},...},"counts":{"vec_legs":4,"lex_legs":0}}
 ```
 
-`start_ms` is measured from process start, so overlapping stages show their real window and the durations need not sum to `total_ms`. Stages: `store_open`, `fts`, `expand`, `vec_legs`, `lex_legs`, `fuse_rerank`, `rerank`, `enrich`, `score`, `dispose`. Off by default.
+`start_ms` is measured from process start, so overlapping stages show their real window and the durations need not sum to `total_ms`. Stages: `store_open`, `fts`, `expand`, `vec_legs`, `lex_legs`, `fuse_rerank`, `rerank`, `enrich`, `score`, `dispose`; a scoped query on the scoped scan adds `scope_plan` (open the read-only store and enumerate the scope) and `scope_load` (read its chunks), with counts `scope_scans`, `scope_chunks_read` and `scope_load_fallbacks`. Off by default.
 
 ## Chunk selection
 
