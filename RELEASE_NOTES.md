@@ -4,6 +4,30 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.54 — Per-collection half-life overrides for decay-neutral memory topics
+
+ClawMem v0.36.53 adds per-collection half_lives overrides for recency and confidence scoring. The memory-topics collection can now disable decay while other collections retain global half-lives. Config rejects unknown types and non-positive or NaN values. The isolated r67 evaluation, after four explicit memory supersession rewrites, passed the predeclared R3 comparison: full-v2 vsearch recall improved 77/107 to 86/107; the revised 14-case forgetting set had no document-level leak increase. The per-collection override branch passed 15 focused and 189 adjacent unit tests in vn4rz.94.
+
+---
+
+## v0.36.53 — per-collection half-life override (`half_lives`)
+
+A collection can now override the content-type half-lives for its own documents (master-harness-vn4rz.94). Add a `half_lives` table to the collection entry in `index.yml` / `config.yaml`, mapping content_type to days. `.inf` or `none` means no decay:
+
+```yaml
+memory-topics:
+  path: ...
+  half_lives: { preference: 365 }      # slow-decay preference in this collection only
+```
+
+Documents in that collection rank with the override at query time (recency and computed confidence, in every path that goes through `applyCompositeScoring`, including the PG read path). The indexer also uses it for the stored confidence. Every other collection, and every type the table does not name, keeps the global `HALF_LIVES` exactly. A no-decay override also exempts the type from confidence attention decay, as every no-decay type in the global table already is.
+
+Validation is strict at config load: an unknown content_type, or days that are zero, negative, NaN or not a number, throws an error naming the collection and the entry.
+
+The stored confidence of unchanged files only picks up a new override on a forced re-parse of that collection, as with `frontmatter_map`.
+
+---
+
 ## v0.36.52 — hybrid query runs vector legs in parallel (CLAWMEM_QUERY_VEC_PARALLEL)
 
 The CLI `query` now runs its vector legs in parallel read-only Bun Workers (master-harness-vn4rz.93). Before this, the original-query leg and each vec/hyde expansion leg ran one after another, and each leg paid a full sqlite-vec table scan. New knob `CLAWMEM_QUERY_VEC_PARALLEL=<n>`: default 4, clamped to 1-8; `1` restores the sequential loop. Leg results merge in the original order, so the ranking is exact. A leg whose worker fails falls back to in-process. It composes with `CLAWMEM_QUERY_VEC_EXPANSION_LEGS`. The MCP query pipeline is unchanged.

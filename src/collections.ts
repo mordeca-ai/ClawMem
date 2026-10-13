@@ -10,6 +10,7 @@ import { join } from "path";
 import { homedir } from "os";
 import YAML from "yaml";
 import { validateFrontmatterMap, type FrontmatterMap } from "./frontmatter-map.ts";
+import { validateHalfLives, type HalfLifeTable } from "./memory.ts";
 
 // ============================================================================
 // Types
@@ -44,6 +45,12 @@ export interface Collection {
                           // collection's title / content_type live when the files use
                           // another spec's keys (e.g. `name:`, `metadata.type`). Absent =
                           // canonical keys only. Validated at config load; malformed = throw.
+  half_lives?: Record<string, number>; // OPT-IN per-collection half-life override
+                          // (master-harness-vn4rz.94, src/memory.ts HalfLifeTable):
+                          // content_type -> days, `.inf` / "none" = no decay. Docs in THIS
+                          // collection decay on it; every other collection reads the global
+                          // HALF_LIVES. Validated at config load; unknown type or
+                          // non-positive/NaN days = throw.
 }
 
 /**
@@ -54,9 +61,11 @@ export interface Collection {
  * configured-collection indexCollection() call goes through here.
  */
 export function collectionIndexOptions(
-  col: Pick<Collection, "content_type" | "frontmatter_map">,
-): { defaultContentType?: string; frontmatterMap?: FrontmatterMap } {
-  return { defaultContentType: col.content_type, frontmatterMap: col.frontmatter_map };
+  col: Pick<Collection, "content_type" | "frontmatter_map" | "half_lives">,
+): { defaultContentType?: string; frontmatterMap?: FrontmatterMap; halfLives?: HalfLifeTable } {
+  // vn4rz.94: halfLives feeds the stored confidence the indexer writes, so a
+  // half_lives override reaches the index-time score as well as query-time ranking.
+  return { defaultContentType: col.content_type, frontmatterMap: col.frontmatter_map, halfLives: col.half_lives };
 }
 
 /**
@@ -265,6 +274,17 @@ function parseConfigFile(configPath: string): CollectionConfig {
       }
     }
 
+    // master-harness-vn4rz.94: same fail-loud contract for a per-collection half_lives
+    // override — an unknown content_type or a non-positive/NaN day count throws.
+    for (const [name, col] of Object.entries(config.collections)) {
+      if (col && typeof col === "object" && "half_lives" in col) {
+        col.half_lives = validateHalfLives(
+          (col as { half_lives?: unknown }).half_lives,
+          `collection ${JSON.stringify(name)}`,
+        );
+      }
+    }
+
     // Parse lifecycle policy if present. (Historically this re-parsed `content` a second
     // time into `raw`; one parse is equivalent — the lifecycle fields are read off the
     // object before `config.lifecycle` is reassigned.)
@@ -291,6 +311,32 @@ function parseConfigFile(configPath: string): CollectionConfig {
   } catch (error) {
     throw new Error(`Failed to parse ${configPath}: ${error}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Per-collection half-life override lookup (master-harness-vn4rz.94)
+// ---------------------------------------------------------------------------
+//
+// applyCompositeScoring asks for one collection's table per scoring pass. loadConfig()
+// returns a deep copy of the whole config, so the lookup keeps a derived memo of just
+// the half_lives tables, keyed on configIdentityStamp() (same contract as the
+// store.ts context memo): any config edit or saveConfig() invalidates it, and the
+// CLAWMEM_DISABLE_CONFIG_CACHE bypass bypasses it too.
+
+let halfLivesMemo: { stamp: string; tables: Map<string, HalfLifeTable> } | null = null;
+
+/** The validated half_lives override for a collection, or undefined when it declares none. */
+export function getCollectionHalfLives(collectionName: string): HalfLifeTable | undefined {
+  const stamp = configIdentityStamp();
+  if (stamp === null) return loadConfig().collections[collectionName]?.half_lives;
+  if (halfLivesMemo === null || halfLivesMemo.stamp !== stamp) {
+    const tables = new Map<string, HalfLifeTable>();
+    for (const [name, col] of Object.entries(loadConfig().collections)) {
+      if (col?.half_lives) tables.set(name, Object.freeze({ ...col.half_lives }));
+    }
+    halfLivesMemo = { stamp, tables };
+  }
+  return halfLivesMemo.tables.get(collectionName);
 }
 
 /**
