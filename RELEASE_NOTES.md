@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.54 — Per-collection half-life overrides for decay-neutral memory topics
+
+ClawMem v0.36.53 adds per-collection half_lives overrides for recency and confidence scoring. The memory-topics collection can now disable decay while other collections retain global half-lives. Config rejects unknown types and non-positive or NaN values. The isolated r67 evaluation, after four explicit memory supersession rewrites, passed the predeclared R3 comparison: full-v2 vsearch recall improved 77/107 to 86/107; the revised 14-case forgetting set had no document-level leak increase. The per-collection override branch passed 15 focused and 189 adjacent unit tests in vn4rz.94.
+
+---
+
 ## v0.36.53 — per-collection half-life override (`half_lives`)
 
 A collection can now override the content-type half-lives for its own documents (master-harness-vn4rz.94). Add a `half_lives` table to the collection entry in `index.yml` / `config.yaml`, mapping content_type to days. `.inf` or `none` means no decay:
