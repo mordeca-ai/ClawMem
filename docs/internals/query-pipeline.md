@@ -99,9 +99,12 @@ The cap keeps hyde legs first, then vec legs, each in generation order. A vec le
 
 When the cap drops legs, stderr shows `[query] vec-leg cap <n>: running <kept>/<total> expansion vector legs`.
 
-## Parallel vector legs (CLI `query`)
+## Parallel vector legs (CLI `query` and MCP `query`)
 
-The CLI `query` runs its vector legs (the original query plus each vec/hyde expansion that survives the cap) in parallel Bun Workers. Each worker opens its own read-only connection to the vault. `CLAWMEM_QUERY_VEC_PARALLEL=<n>` sets the pool size: default 4, clamped to 1-8, and `1` restores the old sequential loop. Results are merged back in the original leg order, so the fused ranking is identical to the sequential run. A leg whose worker fails reruns in-process, so a fatal vector error still surfaces as before. The MCP query pipeline still runs its legs sequentially.
+Both consumers run their vector legs (the original query plus each vec/hyde expansion that survives the cap) in parallel read-only Bun Workers, each with its own connection to the vault. `CLAWMEM_QUERY_VEC_PARALLEL=<n>` sets the pool size: default 4, clamped to 1-8, and `1` restores the old sequential in-process loop. Results are merged back in the original leg order, so the fused ranking is identical to the sequential run. A leg whose worker fails reruns in-process, so a fatal vector error still surfaces as before. The cap above applies first; the pool only sees the legs that survive it.
+
+- **CLI `query`**: builds a pool per invocation (`createWorkerLegPool`) and closes it when the legs finish.
+- **MCP `query`** (vn4rz.96): the server owns one long-lived pool, created lazily on the first multi-leg query, kept warm across calls (no per-call worker spawn or sqlite-vec load) and closed with the stores on shutdown. Workers are spawned on demand, never more than `CLAWMEM_QUERY_VEC_PARALLEL`, and concurrent `query` calls share that bound. Each leg carries its own options (`collections`, `dateRange`, `excludeCollections`, limit) and returns the `searchVecDetailed` result, so the `degraded` markers on the response are unchanged. A single-leg query, an in-memory store, or a store whose file is missing runs in-process. A worker opens each vault path read-only at most once, so named vaults share the pool.
 
 ## Chunk selection
 

@@ -10,6 +10,7 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { existsSync } from "node:fs";
 import {
   createStore,
   resolveStore,
@@ -23,10 +24,12 @@ import {
   rethrowIfFatalVectorError,
   type Store,
   type SearchResult,
+  type VecSearchDetailedResult,
   type CausalEdgeRecord,
   type EvolutionEntry,
 } from "./store.ts";
 import { capCausalWire } from "./causal-reader.ts";
+import { vecLegParallelism, runVecLegs, createWorkerLegPool, type WorkerLegPool } from "./vec-legs.ts";
 import {
   applyCompositeScoring,
   hasRecencyIntent,
@@ -210,7 +213,51 @@ export function buildMcpServer(): { server: McpServer; store: Store; closeAllSto
     return s;
   }
 
+  // Long-lived read-only vector-leg worker pool (vn4rz.96). Created lazily on the first
+  // multi-leg `query`, kept warm across calls (no per-call worker spawn / sqlite-vec load),
+  // bounded by vecLegParallelism() workers, closed with the stores on shutdown. Workers are
+  // spawned on demand inside the pool, so a one-leg-at-a-time workload never grows past the
+  // legs it needs. Pool failures never fail a query: each leg falls back in-process.
+  let vecLegPool: WorkerLegPool | undefined;
+
+  function getVecLegPool(par: number): WorkerLegPool {
+    if (vecLegPool && vecLegPool.size === par) return vecLegPool;
+    vecLegPool?.close();
+    // Size is the only construction-time option the detailed path uses; every other
+    // option travels with each leg (runLegDetailed).
+    vecLegPool = createWorkerLegPool(par, { dbPath: "", model: DEFAULT_EMBED_MODEL, limit: 0 });
+    return vecLegPool;
+  }
+
+  /**
+   * Run the MCP `query` tool's vector legs (original + each vec/hyde expansion) with
+   * searchVecDetailed semantics, results in leg order. CLAWMEM_QUERY_VEC_PARALLEL=1, a
+   * single leg, or a store a worker cannot reopen (in-memory / missing file) runs the
+   * original sequential in-process loop.
+   */
+  async function runQueryVecLegs(
+    s: Store,
+    queries: string[],
+    limit: number,
+    scope: { collections?: string[]; dateRange?: { start: string; end: string }; excludeCollections?: string[] },
+  ): Promise<VecSearchDetailedResult[]> {
+    const inProcess = (q: string) => s.searchVecDetailed(q, DEFAULT_EMBED_MODEL, limit, scope);
+    const par = vecLegParallelism();
+    const dbPath = s.dbPath;
+    if (par <= 1 || queries.length <= 1 || !dbPath || dbPath === ":memory:" || !existsSync(dbPath)) {
+      return runVecLegs(queries, inProcess, 1);
+    }
+    const pool = getVecLegPool(par);
+    return runVecLegs(
+      queries,
+      q => pool.runLegDetailed(q, { dbPath, model: DEFAULT_EMBED_MODEL, limit, ...scope }).catch(() => inProcess(q)),
+      Math.min(par, pool.size),
+    );
+  }
+
   function closeAllStores(): void {
+    try { vecLegPool?.close(); } catch {}
+    vecLegPool = undefined;
     for (const [, s] of vaultStoreCache) {
       try { s.close(); } catch {}
     }
@@ -722,8 +769,18 @@ This is the recommended entry point for ALL memory queries.`,
         for (const r of initialFts) docidMap.set(r.filepath, r.docid);
         rankedLists.push(initialFts.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
       }
+      // Vector legs (original + each vec/hyde expansion) run through the shared leg runner:
+      // parallel read-only workers by default, sequential in-process when
+      // CLAWMEM_QUERY_VEC_PARALLEL=1. Results come back in leg order, so the fused
+      // ranking below is identical either way.
+      const vecScope = { collections, dateRange, excludeCollections: excl };
+      const vecQueries = hasVectors
+        ? [query, ...expanded.filter(e => e.type !== 'lex').map(e => e.query)]
+        : [];
+      const vecLegs = await runQueryVecLegs(store, vecQueries, 20, vecScope);
+
       if (hasVectors) {
-        const det = await store.searchVecDetailed(query, DEFAULT_EMBED_MODEL, 20, { collections, dateRange, excludeCollections: excl });
+        const det = vecLegs[0]!;
         if (det.degraded && det.degradedReason) degradedLegs.push({ leg: "vector:original", reason: det.degradedReason });
         if (det.results.length > 0) {
           for (const r of det.results) docidMap.set(r.filepath, r.docid);
@@ -735,6 +792,7 @@ This is the recommended entry point for ALL memory queries.`,
 
       // Typed expansions — route by type: lex → FTS, vec/hyde → vector.
       let expansionIdx = 0;
+      let vecLegIdx = 1;
       for (const eq of expanded) {
         if (eq.type === 'lex') {
           const ftsResults = store.searchFTS(eq.query, 20, undefined, collections, dateRange, excl);
@@ -743,7 +801,7 @@ This is the recommended entry point for ALL memory queries.`,
             rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
           }
         } else if (hasVectors) {
-          const det = await store.searchVecDetailed(eq.query, DEFAULT_EMBED_MODEL, 20, { collections, dateRange, excludeCollections: excl });
+          const det = vecLegs[vecLegIdx++]!;
           if (det.degraded && det.degradedReason) degradedLegs.push({ leg: `vector:expansion${expansionIdx}`, reason: det.degradedReason });
           if (det.results.length > 0) {
             for (const r of det.results) docidMap.set(r.filepath, r.docid);
