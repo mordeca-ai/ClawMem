@@ -91,7 +91,7 @@ export interface WorkerLegPool {
    * Spawn up to `n` more workers and have each open the pool's vault, so later legs skip the
    * worker start and store open (vn4rz.97). Resolves when they are ready; never rejects.
    */
-  warm(n: number): Promise<void>;
+  warm(n: number, dbPath?: string): Promise<void>;
   close(): void;
 }
 
@@ -220,10 +220,11 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
       excludeCollections: o.excludeCollections,
     });
 
-  const warm = async (n: number): Promise<void> => {
+  const warm = async (n: number, dbPath?: string): Promise<void> => {
     const count = Math.max(0, Math.min(Math.floor(n), poolSize));
+    const targetDbPath = dbPath ?? opts.dbPath;
     const reqs: Promise<unknown>[] = [];
-    for (let i = 0; i < count; i++) reqs.push(submit({ warm: true, dbPath: opts.dbPath }).catch(() => {}));
+    for (let i = 0; i < count; i++) reqs.push(submit({ warm: true, dbPath: targetDbPath }).catch(() => {}));
     await Promise.all(reqs);
   };
 

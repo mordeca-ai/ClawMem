@@ -29,7 +29,7 @@ import {
   type EvolutionEntry,
 } from "./store.ts";
 import { capCausalWire } from "./causal-reader.ts";
-import { vecLegParallelism, runVecLegs, createWorkerLegPool, type WorkerLegPool } from "./vec-legs.ts";
+import { vecLegParallelism, runVecLegs, createWorkerLegPool, runVecLegsOverlapped, settlesImmediately, type WorkerLegPool } from "./vec-legs.ts";
 import {
   applyCompositeScoring,
   hasRecencyIntent,
@@ -37,7 +37,7 @@ import {
   type EnrichedResult,
   type CoActivationFn,
 } from "./memory.ts";
-import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFtsSignal, ftsBypassEnabled, applyQueryVecLegCap, attachRrfScores, type RankedResult } from "./search-utils.ts";
+import { enrichResults, reciprocalRankFusion, toRanked, blendRerank, hasStrongFtsSignal, ftsBypassEnabled, applyQueryVecLegCap, queryVecExpansionLegCap, attachRrfScores, type RankedResult } from "./search-utils.ts";
 import { selectScoringRegime, rankRawPrimary, VECTOR_SCORE_BASIS, FTS_SCORE_BASIS, COMPOSITE_SCORE_BASIS } from "./scoring-regime.ts";
 import { applyMMRDiversity } from "./mmr.ts";
 import { indexCollection, type IndexStats } from "./indexer.ts";
@@ -759,9 +759,12 @@ This is the recommended entry point for ALL memory queries.`,
 
       // Step 2: Query expansion (skipped if strong signal). Typed routing —
       // original → BOTH FTS + vector (2× RRF anchor), lex → FTS only, vec/hyde → vector only.
-      const expanded = applyQueryVecLegCap(hasStrongSignal
-        ? []
-        : await store.expandQuery(query, DEFAULT_QUERY_MODEL, intent));
+      let expansion: Promise<ExpandedQuery[]> | undefined;
+      if (!hasStrongSignal) {
+        expansion = store.expandQuery(query, DEFAULT_QUERY_MODEL, intent)
+          .catch(() => [] as ExpandedQuery[])
+          .then(eqs => applyQueryVecLegCap(eqs));
+      }
 
       // Original query — both backends, pushed FIRST so the positional 2× weight
       // below lands on exactly the original's lists.
@@ -774,10 +777,40 @@ This is the recommended entry point for ALL memory queries.`,
       // CLAWMEM_QUERY_VEC_PARALLEL=1. Results come back in leg order, so the fused
       // ranking below is identical either way.
       const vecScope = { collections, dateRange, excludeCollections: excl };
-      const vecQueries = hasVectors
-        ? [query, ...expanded.filter(e => e.type !== 'lex').map(e => e.query)]
-        : [];
-      const vecLegs = await runQueryVecLegs(store, vecQueries, 20, vecScope);
+      const par = vecLegParallelism();
+      const dbPath = store.dbPath;
+      const canUseWorkers = par > 1 && !!dbPath && dbPath !== ":memory:" && existsSync(dbPath);
+
+      let expanded: ExpandedQuery[];
+      let vecLegs: VecSearchDetailedResult[];
+
+      if (hasVectors && expansion && canUseWorkers && !(await settlesImmediately(expansion))) {
+        // Live expansion in flight (master-harness-vn4rz.101): start the original query's
+        // vector leg now on the worker pool and warm the workers for the expansion legs,
+        // instead of waiting ~1.5-2s for the LLM first. Same legs, same order, so the fused
+        // ranking is unchanged.
+        const pool = getVecLegPool(par);
+        const inProcess = (q: string) => store.searchVecDetailed(q, DEFAULT_EMBED_MODEL, 20, vecScope);
+        const cap = queryVecExpansionLegCap();
+        const overlapped = await runVecLegsOverlapped({
+          original: query,
+          expansion,
+          legsOf: eqs => eqs.filter(e => e.type !== 'lex').map(e => e.query),
+          runLeg: q => pool.runLegDetailed(q, { dbPath, model: DEFAULT_EMBED_MODEL, limit: 20, ...vecScope }).catch(() => inProcess(q)),
+          pool: { size: pool.size, warm: (n: number) => pool.warm(n, dbPath) },
+          warm: Math.min(par - 1, cap ?? par - 1),
+        });
+        expanded = overlapped.expansion;
+        vecLegs = overlapped.results;
+      } else {
+        // Strong BM25 signal, no vectors, an llm_cache hit, or CLAWMEM_QUERY_VEC_PARALLEL=1:
+        // leg list is already known or ran sequentially.
+        expanded = expansion ? await expansion : [];
+        const vecQueries = hasVectors
+          ? [query, ...expanded.filter(e => e.type !== 'lex').map(e => e.query)]
+          : [];
+        vecLegs = await runQueryVecLegs(store, vecQueries, 20, vecScope);
+      }
 
       if (hasVectors) {
         const det = vecLegs[0]!;
