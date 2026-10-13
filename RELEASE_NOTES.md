@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.55 — MCP `query` runs its vector legs in parallel
+
+The MCP `query` tool now runs its vector legs (the original query plus each surviving vec/hyde expansion) through the same read-only worker pool the CLI `query` uses (master-harness-vn4rz.96, building on vn4rz.93). The MCP server keeps one long-lived, lazily created pool, so workers stay warm between calls; it is bounded by `CLAWMEM_QUERY_VEC_PARALLEL` (default 4, max 8) and closed on shutdown. Results merge in leg order and every per-leg option (`collections`, `dateRange`, `excludeCollections`, limit, degraded markers) is preserved, so rankings are unchanged. `CLAWMEM_QUERY_VEC_PARALLEL=1` restores the sequential in-process loop; a leg whose worker fails reruns in-process. On the live index, 25 library-baseline questions through the real `query` handler: p50 10.50 s to 4.90 s, p90 15.28 s to 6.77 s, identical ordered top-10 on 25/25.
+
+---
+
 ## v0.36.54 — Per-collection half-life overrides for decay-neutral memory topics
 
 ClawMem v0.36.53 adds per-collection half_lives overrides for recency and confidence scoring. The memory-topics collection can now disable decay while other collections retain global half-lives. Config rejects unknown types and non-positive or NaN values. The isolated r67 evaluation, after four explicit memory supersession rewrites, passed the predeclared R3 comparison: full-v2 vsearch recall improved 77/107 to 86/107; the revised 14-case forgetting set had no document-level leak increase. The per-collection override branch passed 15 focused and 189 adjacent unit tests in vn4rz.94.

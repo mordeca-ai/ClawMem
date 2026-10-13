@@ -1,4 +1,4 @@
-import type { SearchResult } from "./store.ts";
+import type { SearchResult, VecSearchDetailedResult } from "./store.ts";
 
 export function vecLegParallelism(env: Record<string, string | undefined> = process.env): number {
   const raw = env.CLAWMEM_QUERY_VEC_PARALLEL?.trim();
@@ -71,127 +71,157 @@ export interface WorkerLegPoolOpts {
   collections?: string[];
 }
 
+/** Full per-call configuration for a detailed leg (the MCP `query` path). */
+export interface DetailedLegOpts {
+  dbPath: string;
+  model: string;
+  limit: number;
+  collections?: string[];
+  dateRange?: { start: string; end: string };
+  excludeCollections?: string[];
+}
+
 export interface WorkerLegPool {
   size: number;
+  /** Plain `searchVec` leg with the pool's construction-time options (CLI `query`). */
   runLeg(query: string): Promise<SearchResult[]>;
+  /** `searchVecDetailed` leg with per-call options (MCP `query`); carries the degraded marker. */
+  runLegDetailed(query: string, opts: DetailedLegOpts): Promise<VecSearchDetailedResult>;
   close(): void;
+}
+
+interface Pending {
+  id: number;
+  resolve: (res: any) => void;
+  reject: (err: Error) => void;
 }
 
 interface WorkerSlot {
   worker: Worker;
-  busy: boolean;
-  currentPending?: {
-    id: number;
-    resolve: (res: SearchResult[]) => void;
-    reject: (err: Error) => void;
-  };
+  pending?: Pending;
 }
 
 interface QueuedRequest {
-  query: string;
-  resolve: (res: SearchResult[]) => void;
+  body: Record<string, unknown>;
+  resolve: (res: any) => void;
   reject: (err: Error) => void;
 }
 
+/**
+ * A bounded pool of read-only vector-leg workers. Workers are spawned lazily (never more
+ * than `size`), so a long-lived owner (the MCP server) keeps them warm across calls and a
+ * short-lived one (CLI) only pays for the legs it actually runs. A worker that errors is
+ * dropped and its request rejected; the next queued request lazily spawns a replacement.
+ */
 export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): WorkerLegPool {
-  const poolSize = Math.max(1, size);
-  const slots: WorkerSlot[] = [];
+  const poolSize = Math.max(1, Math.floor(size));
+  const slots = new Set<WorkerSlot>();
   const idleSlots: WorkerSlot[] = [];
   const queue: QueuedRequest[] = [];
   let nextId = 1;
+  let closed = false;
 
-  const processQueue = () => {
-    while (queue.length > 0 && idleSlots.length > 0) {
-      const req = queue.shift()!;
-      const slot = idleSlots.pop()!;
-      slot.busy = true;
-      const reqId = nextId++;
-      slot.currentPending = {
-        id: reqId,
-        resolve: req.resolve,
-        reject: req.reject,
-      };
-      slot.worker.postMessage({
-        id: reqId,
-        dbPath: opts.dbPath,
-        model: opts.model,
-        query: req.query,
-        limit: opts.limit,
-        collections: opts.collections,
-      });
-    }
+  const dropSlot = (slot: WorkerSlot) => {
+    slots.delete(slot);
+    const at = idleSlots.indexOf(slot);
+    if (at >= 0) idleSlots.splice(at, 1);
+    try { slot.worker.terminate(); } catch {}
   };
 
-  for (let i = 0; i < poolSize; i++) {
-    const worker = new Worker(new URL("./vec-leg-worker.ts", import.meta.url).href);
-    const slot: WorkerSlot = {
-      worker,
-      busy: false,
-    };
+  const spawn = (): WorkerSlot | undefined => {
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL("./vec-leg-worker.ts", import.meta.url).href);
+    } catch {
+      return undefined;
+    }
+    const slot: WorkerSlot = { worker };
 
     worker.onmessage = (ev: MessageEvent) => {
       const msg = ev.data;
-      if (slot.currentPending && slot.currentPending.id === msg.id) {
-        const { resolve, reject } = slot.currentPending;
-        slot.currentPending = undefined;
-        slot.busy = false;
-        idleSlots.push(slot);
-        if (msg.ok) {
-          resolve(msg.results);
-        } else {
-          reject(new Error(msg.error));
-        }
-        processQueue();
-      }
+      const pending = slot.pending;
+      if (!pending || pending.id !== msg.id) return;
+      slot.pending = undefined;
+      if (closed) return;
+      idleSlots.push(slot);
+      if (msg.ok) pending.resolve(msg.results);
+      else pending.reject(new Error(msg.error));
+      dispatch();
     };
 
     worker.onerror = (ev: ErrorEvent) => {
-      if (slot.currentPending) {
-        const { reject } = slot.currentPending;
-        slot.currentPending = undefined;
-        slot.busy = false;
-        const err = ev.error instanceof Error ? ev.error : new Error(ev.message || "Worker error");
-        reject(err);
-        processQueue();
+      const pending = slot.pending;
+      slot.pending = undefined;
+      dropSlot(slot);
+      if (pending) {
+        pending.reject(ev.error instanceof Error ? ev.error : new Error(ev.message || "Worker error"));
       }
+      if (!closed) dispatch();
     };
 
-    slots.push(slot);
-    idleSlots.push(slot);
-  }
-
-  const runLeg = (query: string): Promise<SearchResult[]> => {
-    return new Promise<SearchResult[]>((resolve, reject) => {
-      if (idleSlots.length > 0) {
-        const slot = idleSlots.pop()!;
-        slot.busy = true;
-        const reqId = nextId++;
-        slot.currentPending = {
-          id: reqId,
-          resolve,
-          reject,
-        };
-        slot.worker.postMessage({
-          id: reqId,
-          dbPath: opts.dbPath,
-          model: opts.model,
-          query,
-          limit: opts.limit,
-          collections: opts.collections,
-        });
-      } else {
-        queue.push({ query, resolve, reject });
-      }
-    });
+    slots.add(slot);
+    return slot;
   };
 
-  const close = () => {
-    for (const slot of slots) {
-      if (slot.currentPending) {
-        slot.currentPending.reject(new Error("Worker pool closed"));
-        slot.currentPending = undefined;
+  const dispatch = () => {
+    while (queue.length > 0 && !closed) {
+      let slot = idleSlots.pop();
+      if (!slot && slots.size < poolSize) slot = spawn();
+      if (!slot) {
+        // Nothing idle. Wait for a busy slot to free up, unless none exists at all
+        // (the spawn failed): then reject rather than hang the caller.
+        if (slots.size === 0) {
+          const req = queue.shift()!;
+          req.reject(new Error("Worker spawn failed"));
+          continue;
+        }
+        break;
       }
-      slot.worker.terminate();
+      const req = queue.shift()!;
+      const id = nextId++;
+      slot.pending = { id, resolve: req.resolve, reject: req.reject };
+      slot.worker.postMessage({ id, ...req.body });
+    }
+  };
+
+  const submit = <R>(body: Record<string, unknown>): Promise<R> =>
+    new Promise<R>((resolve, reject) => {
+      if (closed) {
+        reject(new Error("Worker pool closed"));
+        return;
+      }
+      queue.push({ body, resolve, reject });
+      dispatch();
+    });
+
+  const runLeg = (query: string): Promise<SearchResult[]> =>
+    submit<SearchResult[]>({
+      dbPath: opts.dbPath,
+      model: opts.model,
+      query,
+      limit: opts.limit,
+      collections: opts.collections,
+    });
+
+  const runLegDetailed = (query: string, o: DetailedLegOpts): Promise<VecSearchDetailedResult> =>
+    submit<VecSearchDetailedResult>({
+      detailed: true,
+      dbPath: o.dbPath,
+      model: o.model,
+      query,
+      limit: o.limit,
+      collections: o.collections,
+      dateRange: o.dateRange,
+      excludeCollections: o.excludeCollections,
+    });
+
+  const close = () => {
+    closed = true;
+    for (const slot of [...slots]) {
+      const pending = slot.pending;
+      slot.pending = undefined;
+      dropSlot(slot);
+      pending?.reject(new Error("Worker pool closed"));
     }
     for (const req of queue) {
       req.reject(new Error("Worker pool closed"));
@@ -203,6 +233,7 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
   return {
     size: poolSize,
     runLeg,
+    runLegDetailed,
     close,
   };
 }
