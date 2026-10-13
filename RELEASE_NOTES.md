@@ -14,6 +14,18 @@ The MCP `query` tool now starts the original query's vector leg while query expa
 
 ---
 
+## v0.36.57 — Chunk-targeted exact scan for collection-scoped vector legs
+
+Collection-scoped vector legs (`-c <collection>`, such as `query -c docs`) now perform an exact in-memory cosine distance scan across only the SQLite chunks containing the queried collection's fragment vectors, replacing the sqlite-vec `vectors_vec` MATCH brute force scan (master-harness-vn4rz.100).
+
+- Scoped vector scan loads chunk blobs for in-scope fragments only, computes exact dot products / cosine distances with bit-identical scores to vec0 MATCH, and caches the scoped vector buffer across multiple legs on read-only query connections.
+- When an include scope exceeds the maximum chunk fraction or falls back, the standard vec0 path serves it.
+- Kill switch: `CLAWMEM_QUERY_VEC_SCOPED_SCAN=0` disables the scoped exact scan and restores the full vec0 MATCH path.
+
+Measured against the live vault, `query -c docs`, 30 alternating pairs at load ~23: end-to-end wall p50 reduced from 4.59s to 2.45s (vec_legs stage p50 3.49s to 1.38s). Top-10 agreement with the base binary on identical cached expansions was 30/30 (100% exact). On the 25-question library baseline, recall@10 remained 1.00.
+
+---
+
 ## v0.36.56 — CLI `query` overlaps expansion with the original vector leg; cheaper enrich and rerank writes
 
 The CLI hybrid `query` is faster with identical rankings (master-harness-vn4rz.97). Three changes:
