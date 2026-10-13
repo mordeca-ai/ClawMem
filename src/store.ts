@@ -1940,9 +1940,14 @@ export function readMmapBytes(env: Record<string, string | undefined> = process.
   return Math.min(Number.parseInt(raw, 10), 1 << 20) * 1024 * 1024;
 }
 
-function applyReadMmap(db: Database): void {
-  const bytes = readMmapBytes();
-  if (bytes <= 0) return;
+/** The scoped scan reads only selected chunks; a large mmap mainly inflates per-query RSS.
+ * Keep the existing global knob as an explicit override for operators comparing profiles. */
+export function readScopedMmapBytes(env: Record<string, string | undefined> = process.env): number {
+  if (env.CLAWMEM_SQLITE_MMAP_MB !== undefined) return readMmapBytes(env);
+  return 128 * 1024 * 1024;
+}
+
+function applyReadMmap(db: Database, bytes = readMmapBytes()): void {
   try {
     db.exec(`PRAGMA mmap_size = ${bytes}`);
   } catch {
@@ -1957,7 +1962,7 @@ function applyReadMmap(db: Database): void {
  * @param dbPath - Path to the SQLite database file
  * @returns Store instance with all methods bound to the database
  */
-export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTimeout?: number }): Store {
+export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTimeout?: number; mmapBytes?: number }): Store {
   const resolvedPath = dbPath || getDefaultDbPath();
   const db = opts?.readonly
     ? new Database(resolvedPath, { readonly: true })
@@ -1975,7 +1980,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     loadVecExtension(db);
     setWalJournalMode(db, opts?.busyTimeout ?? 5000);
     db.exec("PRAGMA query_only = ON");
-    applyReadMmap(db);
+    applyReadMmap(db, opts?.mmapBytes);
   }
   // For the writable branch: initializeDatabase() set opts.busyTimeout (default 15000) during DDL —
   // reset to operational value here. For readonly: already set inside the
@@ -5108,7 +5113,7 @@ export async function prewarmScopedVecScan(
     const frags = scopeFragments(entry.rows);
     const plan = planScopedScan(db, frags, { maxChunkFraction: opts.scopedScanMaxChunkFraction });
     if (!plan) return false;
-    const pending: Promise<void> = loadScopedVectorsParallel(dbPath, frags, plan, workers, readMmapBytes())
+    const pending: Promise<void> = loadScopedVectorsParallel(dbPath, frags, plan, workers, readScopedMmapBytes())
       .then(sv => {
         if (sv && entry.vectors === undefined && vecScopeCache.get(db) === entry) entry.vectors = sv;
       })

@@ -122,7 +122,7 @@ sqlite-vec reads every vector chunk before it applies a `hash_seq IN (...)` filt
 - **Other callers** (MCP `query` workers, `vsearch`, writable stores) use the scan per call and keep nothing, so a long-lived process holds no scope vectors.
 - **Knob**: `CLAWMEM_QUERY_VEC_SCOPED_SCAN=0` (or `false`/`off`/`no`) turns it off; every scoped leg then uses vec0 MATCH.
 
-Read-only connections also map the vault into memory (`PRAGMA mmap_size`). Without it, a vec0 scan copied each 4 KiB page through a `pread` call, and system time was the larger part of a leg. `CLAWMEM_SQLITE_MMAP_MB` sets the size (default 2047; SQLite caps it at 2 GiB in Bun); `0` turns it off. Writable connections are unchanged.
+Read-only connections also map the vault into memory (`PRAGMA mmap_size`). Without it, a vec0 scan copied each 4 KiB page through a `pread` call, and system time was the larger part of a leg. The CLI scoped scan uses 128 MiB per read connection (vn4rz.102); its chunk-targeted reads do not need a whole-vault map. Other read-only paths retain the 2047 MiB default. `CLAWMEM_SQLITE_MMAP_MB` explicitly overrides either size, including `0` to disable mmap. Writable connections are unchanged. On the live `docs` scope, the 128 MiB setting measured 522 MiB maximum RSS over 30 queries and 1.819s p50 against 2.119s at the old setting (30 alternating pairs, shared cached expansion, host load recorded).
 
 ## Fixed per-query costs
 
