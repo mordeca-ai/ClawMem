@@ -61,6 +61,16 @@ import {
 import { parseLegacyEdgeWitness } from "./causal-reader.ts";
 import { uniquePhysicalResults } from "./search-utils.ts";
 import {
+  canonicalVecTableDim,
+  loadScopedVectors,
+  loadScopedVectorsParallel,
+  planScopedScan,
+  scanScopedVectors,
+  scopedScanEnabled,
+  type ScopedVectors,
+  type VecScopeFragment,
+} from "./vec-scope-scan.ts";
+import {
   enrichDocumentEntities,
   searchEntities,
   getEntityGraphNeighbors,
@@ -1916,6 +1926,31 @@ export type Store = {
 };
 
 /**
+ * vn4rz.100: memory-mapped reads for read-only connections. A vec0 scan copies every vector
+ * chunk through the pager; without mmap that is one pread per 4 KiB page (~350k syscalls for the
+ * live vault's 1.4 GB of vectors), which made system time the larger half of a leg. With mmap the
+ * pages are read from the shared page cache. Size from CLAWMEM_SQLITE_MMAP_MB (default 2047 MiB;
+ * SQLite clamps to its compile-time maximum, 2 GiB in Bun); 0 disables. Read-only handles only:
+ * writers keep the default I/O path.
+ */
+export function readMmapBytes(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.CLAWMEM_SQLITE_MMAP_MB?.trim();
+  if (!raw) return 2047 * 1024 * 1024;
+  if (!/^\d+$/.test(raw)) return 2047 * 1024 * 1024;
+  return Math.min(Number.parseInt(raw, 10), 1 << 20) * 1024 * 1024;
+}
+
+function applyReadMmap(db: Database): void {
+  const bytes = readMmapBytes();
+  if (bytes <= 0) return;
+  try {
+    db.exec(`PRAGMA mmap_size = ${bytes}`);
+  } catch {
+    // mmap is an optimisation; a build or platform that refuses it keeps the default reads.
+  }
+}
+
+/**
  * Create a new store instance with the given database path.
  * If no path is provided, uses the default path (~/.cache/qmd/index.sqlite).
  *
@@ -1940,6 +1975,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     loadVecExtension(db);
     setWalJournalMode(db, opts?.busyTimeout ?? 5000);
     db.exec("PRAGMA query_only = ON");
+    applyReadMmap(db);
   }
   // For the writable branch: initializeDatabase() set opts.busyTimeout (default 15000) during DDL —
   // reset to operational value here. For readonly: already set inside the
@@ -4624,8 +4660,7 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
       'clawmem://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      d.modified_at,
-      content.doc as body
+      d.modified_at
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL
     JOIN content ON content.hash = d.hash
@@ -4651,7 +4686,7 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
 
   const docRows = (db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string; modified_at: string;
+    display_path: string; title: string; modified_at: string;
     fragment_type: string | null; fragment_label: string | null;
   }[]).filter(row => requestedHashSeqs.has(row.hash_seq));
 
@@ -4674,9 +4709,13 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
   // on a tie boundary silently write-order dependent. `seen` is keyed by filepath, so filepath is
   // unique here and (bestDist, filepath) is a total order: the row order stops being observable
   // and the result is deterministic across query plans and across vault writes.
-  return Array.from(seen.values())
+  const top = Array.from(seen.values())
     .sort((a, b) => a.bestDist - b.bestDist || (a.row.filepath < b.row.filepath ? -1 : a.row.filepath > b.row.filepath ? 1 : 0))
-    .slice(0, limit)
+    .slice(0, limit);
+  // vn4rz.100: bodies for the returned docs only (see hydrateVecResultsClassified).
+  const bodies = readContentBodies(db, top.map(t => t.row.hash));
+  return top
+    .filter(({ row }) => bodies.has(row.hash))
     .map(({ row, bestDist }) => {
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
       return {
@@ -4687,8 +4726,8 @@ export function hydrateVecResults(db: Database, vecResults: { hash_seq: string; 
         docid: getDocid(row.hash),
         collectionName,
         modifiedAt: row.modified_at || "",
-        bodyLength: row.body.length,
-        body: row.body,
+        bodyLength: bodies.get(row.hash)!.length,
+        body: bodies.get(row.hash)!,
         context: getContextForFile(db, row.filepath),
         score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
@@ -4743,6 +4782,9 @@ export interface VecSearchDetailedOpts {
   /** Override the pre-filter scope-size threshold (vn4rz.69; default VEC_PREFILTER_MAX_SCOPE).
    * Primarily for tests — 0 forces the post-filter escalation fallback. */
   prefilterMaxScope?: number;
+  /** Override the chunk-share threshold of the chunk-targeted scoped scan (vn4rz.100; default
+   * VEC_SCOPED_SCAN_MAX_CHUNK_FRACTION). Primarily for tests — 1 serves any scope. */
+  scopedScanMaxChunkFraction?: number;
   /** WHY observation lane (v0.32.0): restrict candidates to `_clawmem` observation documents
    * (path 'observations/%' + observation_type set) inside the hydration SQL, so the escalation
    * loop fills `limit` with eligible observations by construction. */
@@ -4789,8 +4831,7 @@ export function buildClassifiedHydrateQuery(hashSeqs: string[], opts: VecSearchD
       'clawmem://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      d.modified_at,
-      content.doc as body
+      d.modified_at
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1 AND d.invalidated_at IS NULL
     JOIN content ON content.hash = d.hash
@@ -4833,6 +4874,17 @@ function hasVecIncludeScope(opts: Pick<VecSearchDetailedOpts, "collectionId" | "
   return (!!opts.collections && opts.collections.length > 0) || !!opts.collectionId || !!opts.dateRange;
 }
 
+/** content.doc by hash, for the given hashes only (one indexed lookup each). */
+function readContentBodies(db: Database, hashes: string[]): Map<string, string> {
+  const uniq = [...new Set(hashes)];
+  const out = new Map<string, string>();
+  if (uniq.length === 0) return out;
+  const rows = db.prepare(`SELECT hash, doc FROM content WHERE hash IN (${uniq.map(() => "?").join(",")})`)
+    .all(...uniq) as { hash: string; doc: string }[];
+  for (const r of rows) out.set(r.hash, r.doc);
+  return out;
+}
+
 // Hydration + visibility classification for one escalation round. Include-collections and
 // dateRange are SQL predicates (a row failing them was never a candidate); EXCLUSION is
 // classified in JS because the excluded-doc count is part of the degraded contract (T5-M2).
@@ -4855,7 +4907,7 @@ function hydrateVecResultsClassified(
   // exactly the docs it did under the old predicate.
   const docRows = (db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; collection: string; filepath: string;
-    display_path: string; title: string; body: string; modified_at: string;
+    display_path: string; title: string; modified_at: string;
     fragment_type: string | null; fragment_label: string | null;
   }[]).filter(row => requestedHashSeqs.has(row.hash_seq));
 
@@ -4877,9 +4929,15 @@ function hydrateVecResultsClassified(
   // distance-only comparator an exact-distance tie group crossing `limit` is resolved by SQL
   // row order, which is a query-plan artifact and changed with the predicate rewrite above.
   // filepath is unique after the per-filepath dedupe, so the result is plan-independent.
-  const results = Array.from(seen.values())
+  const top = Array.from(seen.values())
     .sort((a, b) => a.bestDist - b.bestDist || (a.row.filepath < b.row.filepath ? -1 : a.row.filepath > b.row.filepath ? 1 : 0))
-    .slice(0, limit)
+    .slice(0, limit);
+  // vn4rz.100: bodies are read for the returned docs only. Selecting content.doc on every
+  // fragment row materialised each body once per fragment of every requested hash (2,399
+  // rows / ~91 MB of text for one 60-doc `-c docs` leg, 200-380 ms).
+  const bodies = readContentBodies(db, top.map(t => t.row.hash));
+  const results = top
+    .filter(({ row }) => bodies.has(row.hash))
     .map(({ row, bestDist }) => ({
       filepath: row.filepath,
       displayPath: row.display_path,
@@ -4888,8 +4946,8 @@ function hydrateVecResultsClassified(
       docid: getDocid(row.hash),
       collectionName: row.collection,
       modifiedAt: row.modified_at || "",
-      bodyLength: row.body.length,
-      body: row.body,
+      bodyLength: bodies.get(row.hash)!.length,
+      body: bodies.get(row.hash)!,
       context: getContextForFile(db, row.filepath),
       score: 1 - bestDist,
       source: "vec" as const,
@@ -4917,6 +4975,173 @@ const VEC_PREFILTER_MAX_SCOPE = 50_000;
 // sqlite-vec's hard limit on `k` in a KNN query.
 const VEC_KNN_K_MAX = 4096;
 
+// vn4rz.100 — scope enumeration (+ the chunk-targeted vectors) for searchVecPrefiltered.
+//
+// On a connection opted in with enableVecScopeCache() (the CLI query's read-only leg store) the
+// enumeration and the loaded vectors are cached and reused while PRAGMA data_version (commits by
+// any other connection) and schema_version are unchanged and the scope key matches, so the legs
+// of one query read the scope's chunks once. Only query_only connections can opt in: a writer's
+// own commits do not move its data_version. Other connections (the long-lived MCP vector-leg
+// workers included) load per call and keep nothing, so no process retains up to ~150 MB of
+// scope vectors per worker.
+interface VecScopeRow {
+  hash_seq: string;
+  collection: string;
+  filepath: string;
+  rid: number | null;
+  cid: number | null;
+  off: number | null;
+}
+
+interface VecScopeEntry {
+  key: string;
+  token: string;
+  rows: VecScopeRow[];
+  overflow: boolean;
+  /** undefined = not loaded yet; null = the scoped scan declined this scope (use vec0 MATCH). */
+  vectors?: ScopedVectors | null;
+}
+
+const vecScopeCache = new WeakMap<Database, VecScopeEntry>();
+const vecScopeCacheOptIn = new WeakSet<Database>();
+
+function isQueryOnly(db: Database): boolean {
+  return ((db.prepare("PRAGMA query_only").get() as { query_only?: number } | null)?.query_only ?? 0) === 1;
+}
+
+/** vn4rz.100: let `db` cache one scope (enumeration + vectors) across calls. False (and no
+ * opt-in) unless the connection is query_only. */
+export function enableVecScopeCache(db: Database): boolean {
+  if (!isQueryOnly(db)) return false;
+  vecScopeCacheOptIn.add(db);
+  return true;
+}
+
+function vecScopeCacheable(db: Database): boolean {
+  return vecScopeCacheOptIn.has(db) && isQueryOnly(db);
+}
+
+function withReadSnapshot<T>(db: Database, fn: () => T): T {
+  if (db.inTransaction) return fn();
+  db.exec("BEGIN");
+  try {
+    const out = fn();
+    db.exec("COMMIT");
+    return out;
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* already closed */ }
+    throw e;
+  }
+}
+
+function scopeFragments(rows: VecScopeRow[]): VecScopeFragment[] {
+  const seen = new Set<string>();
+  const frags: VecScopeFragment[] = [];
+  for (const r of rows) {
+    if (r.rid === null || r.cid === null || r.off === null || seen.has(r.hash_seq)) continue;
+    seen.add(r.hash_seq);
+    frags.push({ hashSeq: r.hash_seq, rowid: r.rid, chunkId: r.cid, offset: r.off });
+  }
+  return frags;
+}
+
+function readVecScope(db: Database, opts: VecSearchDetailedOpts, maxScope: number, withVectors: boolean): VecScopeEntry {
+  const filter = buildVecDocFilterPredicates(opts);
+  const scanOn = scopedScanEnabled() && canonicalVecTableDim(db) !== null;
+  const fraction = opts.scopedScanMaxChunkFraction;
+  const key = JSON.stringify([filter.sql, filter.params, maxScope, scanOn, fraction ?? null]);
+  const cacheable = vecScopeCacheable(db);
+  return withReadSnapshot(db, () => {
+    const token = cacheable
+      ? `${(db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version}:` +
+        `${(db.prepare("PRAGMA schema_version").get() as { schema_version: number }).schema_version}`
+      : "";
+    let entry = cacheable ? vecScopeCache.get(db) : undefined;
+    if (!entry || entry.key !== key || entry.token !== token) {
+      // Enumerate the in-scope fragments (bounded: one row past the threshold is enough to
+      // decide the fallback). Same active/invalidated/filter predicates as the hydrate query.
+      // With the scoped scan on, also where vec0 stores each fragment (rowid, chunk, slot).
+      const rows = db.prepare(`
+        SELECT cv.hash || '_' || cv.seq AS hash_seq, d.collection,
+          'clawmem://' || d.collection || '/' || d.path AS filepath,
+          ${scanOn ? "r.rowid AS rid, r.chunk_id AS cid, r.chunk_offset AS off" : "NULL AS rid, NULL AS cid, NULL AS off"}
+        FROM documents d
+        JOIN content_vectors cv ON cv.hash = d.hash
+        ${scanOn ? "LEFT JOIN vectors_vec_rowids r ON r.id = cv.hash || '_' || cv.seq" : ""}
+        WHERE d.active = 1 AND d.invalidated_at IS NULL${filter.sql}
+        LIMIT ?
+      `).all(...filter.params, maxScope + 1) as VecScopeRow[];
+      entry = { key, token, rows, overflow: rows.length > maxScope, vectors: scanOn ? undefined : null };
+      if (cacheable) vecScopeCache.set(db, entry);
+    }
+    if (withVectors && entry.vectors === undefined && !entry.overflow) {
+      entry.vectors = loadScopedVectors(db, scopeFragments(entry.rows), { maxChunkFraction: fraction });
+    }
+    return entry;
+  });
+}
+
+// In-flight parallel scope loads per connection (prewarmScopedVecScan). searchVecDetailed awaits
+// one before its synchronous scan, so a leg whose embed returns early does not start a second,
+// in-thread read of the same chunks.
+const pendingScopeLoads = new WeakMap<Database, Promise<void>>();
+
+/**
+ * vn4rz.100: read a scope's vectors on `workers` threads ahead of the legs (the CLI calls this
+ * while query expansion is generated). It only loads for a connection with the scope cache
+ * enabled, since the legs reuse what it loads; with workers <= 1 it loads in-thread. Resolves
+ * true when the chunk-targeted scan will serve the scope. Never rejects; on a worker failure
+ * the legs load in-thread or fall back to vec0 MATCH.
+ */
+export async function prewarmScopedVecScan(
+  db: Database,
+  dbPath: string,
+  opts: VecSearchDetailedOpts,
+  workers: number
+): Promise<boolean> {
+  try {
+    if (!hasVecIncludeScope(opts)) return false;
+    if (workers <= 1 || !vecScopeCacheable(db)) return prepareScopedVecScan(db, opts, true);
+    const entry = readVecScope(db, opts, opts.prefilterMaxScope ?? VEC_PREFILTER_MAX_SCOPE, false);
+    if (entry.overflow || entry.vectors === null) return false;
+    if (entry.vectors) return true;
+    const frags = scopeFragments(entry.rows);
+    const plan = planScopedScan(db, frags, { maxChunkFraction: opts.scopedScanMaxChunkFraction });
+    if (!plan) return false;
+    const pending: Promise<void> = loadScopedVectorsParallel(dbPath, frags, plan, workers, readMmapBytes())
+      .then(sv => {
+        if (sv && entry.vectors === undefined && vecScopeCache.get(db) === entry) entry.vectors = sv;
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (pendingScopeLoads.get(db) === pending) pendingScopeLoads.delete(db);
+      });
+    pendingScopeLoads.set(db, pending);
+    await pending;
+    return !!entry.vectors;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * vn4rz.100: true when an include-scoped vector search on `db` will use the chunk-targeted
+ * scan. With `load`, also read the scope's vectors now (a pre-warm the following legs reuse;
+ * skipped unless the connection caches, since nothing would keep them). Never throws; false
+ * means vec0 MATCH serves the scope.
+ */
+export function prepareScopedVecScan(db: Database, opts: VecSearchDetailedOpts, load: boolean): boolean {
+  try {
+    if (!hasVecIncludeScope(opts)) return false;
+    const entry = readVecScope(db, opts, opts.prefilterMaxScope ?? VEC_PREFILTER_MAX_SCOPE, load && vecScopeCacheable(db));
+    if (entry.overflow || entry.vectors === null) return false;
+    if (entry.vectors) return true;
+    return planScopedScan(db, scopeFragments(entry.rows), { maxChunkFraction: opts.scopedScanMaxChunkFraction }) !== null;
+  } catch {
+    return false;
+  }
+}
+
 function searchVecPrefiltered(
   db: Database,
   embedding: Float32Array,
@@ -4926,18 +5151,9 @@ function searchVecPrefiltered(
   hardCap: number
 ): VecSearchDetailedResult | null {
   const maxScope = opts.prefilterMaxScope ?? VEC_PREFILTER_MAX_SCOPE;
-  const filter = buildVecDocFilterPredicates(opts);
-  // Enumerate the in-scope fragments (bounded: one row past the threshold is enough to
-  // decide the fallback). Same active/invalidated/filter predicates as the hydrate query.
-  const scopeRows = db.prepare(`
-    SELECT cv.hash || '_' || cv.seq AS hash_seq, d.collection,
-      'clawmem://' || d.collection || '/' || d.path AS filepath
-    FROM documents d
-    JOIN content_vectors cv ON cv.hash = d.hash
-    WHERE d.active = 1 AND d.invalidated_at IS NULL${filter.sql}
-    LIMIT ?
-  `).all(...filter.params, maxScope + 1) as { hash_seq: string; collection: string; filepath: string }[];
-  if (scopeRows.length > maxScope) return null;
+  const scope = readVecScope(db, opts, maxScope, true);
+  if (scope.overflow) return null;
+  const scopeRows = scope.rows;
 
   const docsByFragment = new Map<string, string[]>();
   const excludedDocs = new Set<string>();
@@ -4955,24 +5171,41 @@ function searchVecPrefiltered(
   if (allowedIds.length === 0) return empty;
   if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
 
-  // One scan. k covers every allowed fragment when the scope fits under the k limit (exact
-  // and exhaustive); otherwise the k nearest in-scope fragments, which still yields the exact
-  // top docs whenever they dedupe to >= limit docs (a doc absent from the window has its
-  // best fragment farther than every fragment in it).
-  const kCap = Math.min(hardCap, VEC_KNN_K_MAX);
-  const k = Math.min(allowedIds.length, kCap);
-  const raw = db.prepare(`
-    SELECT hash_seq, distance FROM vectors_vec
-    WHERE embedding MATCH ? AND k = ? AND hash_seq IN (SELECT value FROM json_each(?))
-  `).all(embedding, k, JSON.stringify(allowedIds)) as { hash_seq: string; distance: number }[];
+  let raw: { hash_seq: string; distance: number }[];
+  let capPreventedExhaustion: boolean;
+  if (scope.vectors) {
+    // vn4rz.100: the chunk-targeted scan read only this scope's chunks; distances are
+    // bit-identical to vec0's and cover EVERY allowed fragment, so the result is exhaustive.
+    raw = scanScopedVectors(scope.vectors, embedding, excludedDocs.size > 0 ? new Set(allowedIds) : undefined);
+    capPreventedExhaustion = false;
+  } else {
+    // One vec0 scan. k covers every allowed fragment when the scope fits under the k limit
+    // (exact and exhaustive); otherwise the k nearest in-scope fragments, which still yields
+    // the exact top docs whenever they dedupe to >= limit docs (a doc absent from the window
+    // has its best fragment farther than every fragment in it).
+    const kCap = Math.min(hardCap, VEC_KNN_K_MAX);
+    const k = Math.min(allowedIds.length, kCap);
+    raw = db.prepare(`
+      SELECT hash_seq, distance FROM vectors_vec
+      WHERE embedding MATCH ? AND k = ? AND hash_seq IN (SELECT value FROM json_each(?))
+    `).all(embedding, k, JSON.stringify(allowedIds)) as { hash_seq: string; distance: number }[];
+    capPreventedExhaustion = allowedIds.length > k;
+  }
 
   // Per-doc best fragment, total order (bestDist, filepath) — hxa17.
+  // The scoped scan returns `raw` nearest-first, so a doc's first hit is its best and the walk
+  // can stop once `limit` docs are in and the next hit is strictly farther than the limit-th
+  // (equal distances keep going, so the filepath tiebreak below still sees every tied doc).
   const best = new Map<string, { hash_seq: string; distance: number }>();
+  const sortedRaw = !!scope.vectors;
+  let limitDist = Infinity;
   for (const hit of raw) {
+    if (sortedRaw && best.size >= limit && hit.distance > limitDist) break;
     for (const filepath of docsByFragment.get(hit.hash_seq) ?? []) {
       const cur = best.get(filepath);
       if (!cur || hit.distance < cur.distance) best.set(filepath, hit);
     }
+    if (sortedRaw && limitDist === Infinity && best.size >= limit) limitDist = hit.distance;
   }
   const topDocs = [...best.entries()]
     .sort((a, b) => a[1].distance - b[1].distance || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
@@ -4984,7 +5217,6 @@ function searchVecPrefiltered(
   const classified = hydrateVecResultsClassified(db, winners, limit, opts, exclude);
 
   const underfilled = classified.allowedDocs < limit;
-  const capPreventedExhaustion = allowedIds.length > k;
   const degraded = underfilled && capPreventedExhaustion;
   return {
     results: classified.results,
@@ -5102,6 +5334,9 @@ export async function searchVecDetailed(
 
   const embedResult = await getEmbedding(query, model, true, opts.deadlineMs);
   if (!embedResult) return empty;
+  if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
+  const pendingLoad = pendingScopeLoads.get(db);
+  if (pendingLoad) await pendingLoad;
   if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
 
   return searchVecDetailedWithVector(
