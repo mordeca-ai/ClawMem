@@ -5336,7 +5336,12 @@ export async function searchVecDetailed(
   if (!embedResult) return empty;
   if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
   const pendingLoad = pendingScopeLoads.get(db);
-  if (pendingLoad) await pendingLoad;
+  if (pendingLoad) {
+    // Run the (memoized) model guard while the scope's chunks are still being read on worker
+    // threads, then wait for them; searchVecDetailedWithVector's own guard call is then a hit.
+    assertQueryVectorCompatible(db, embedResult.model, embedResult.embedding.length);
+    await pendingLoad;
+  }
   if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
 
   return searchVecDetailedWithVector(
