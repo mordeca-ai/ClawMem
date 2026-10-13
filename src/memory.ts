@@ -7,6 +7,10 @@
 
 import { MAX_FRAGMENT_CHARS } from "./splitter.ts";
 import { getUnpromotedObservationWeight } from "./config.ts";
+// Cycle note (vn4rz.94): collections.ts imports this module (validateHalfLives, and via
+// frontmatter-map.ts). Safe in any load order: neither side touches the other's
+// bindings at module evaluation, only inside function bodies.
+import { getCollectionHalfLives } from "./collections.ts";
 
 // Collections that are, by their nature, agent-generated observation streams.
 // Part of the is_agent_generated_observation provenance proxy (ADR-0112 inv.3 /
@@ -37,6 +41,66 @@ export const HALF_LIVES: Record<string, number> = {
   hub: Infinity,
   antipattern: Infinity,
 };
+
+// =============================================================================
+// Per-collection half-life override (master-harness-vn4rz.94)
+// =============================================================================
+//
+// A collection may declare `half_lives: { <content_type>: <days> }` in its config
+// entry. A doc in that collection decays on the overridden half-life; every other
+// collection (and every type the table does not name) reads HALF_LIVES exactly as
+// before. `.inf` (YAML) or the string "none" means "no decay". A no-decay override
+// also exempts the type from confidence attention decay, matching the global table,
+// where every Infinity half-life type is attention-exempt.
+
+/** Validated per-collection override: content_type -> half-life days (Infinity = no decay). */
+export type HalfLifeTable = Readonly<Record<string, number>>;
+
+/** The string spelling of "no decay" in a `half_lives` table (YAML `.inf` also works). */
+export const NO_DECAY_TOKEN = "none";
+
+/**
+ * Validate a raw `half_lives` value from the config file. Throws an actionable
+ * Error naming the collection and the offending entry; returns a normalized copy
+ * otherwise. Unknown content types and non-positive / NaN / non-numeric days are
+ * config errors: silently ignoring them would leave the operator believing an
+ * override is live that is not.
+ */
+export function validateHalfLives(raw: unknown, where: string): Record<string, number> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(
+      `${where}: half_lives must be a mapping of content_type -> days; got ${JSON.stringify(raw)}. ` +
+        `Remove the key to use the global half-lives.`,
+    );
+  }
+  const out: Record<string, number> = {};
+  for (const [type, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Object.hasOwn(HALF_LIVES, type)) {
+      throw new Error(
+        `${where}: half_lives has unknown content_type ${JSON.stringify(type)} ` +
+          `(known: ${Object.keys(HALF_LIVES).join(", ")})`,
+      );
+    }
+    if (value === NO_DECAY_TOKEN) {
+      out[type] = Infinity;
+      continue;
+    }
+    if (typeof value !== "number" || Number.isNaN(value) || value <= 0) {
+      throw new Error(
+        `${where}: half_lives.${type} = ${JSON.stringify(value)} is not a positive number of days ` +
+          `(use ${JSON.stringify(NO_DECAY_TOKEN)} or .inf for no decay)`,
+      );
+    }
+    out[type] = value;
+  }
+  return out;
+}
+
+/** The base half-life for a type: the collection override when it names the type, else HALF_LIVES. */
+export function baseHalfLife(contentType: string, halfLives?: HalfLifeTable): number {
+  if (halfLives && Object.hasOwn(halfLives, contentType)) return halfLives[contentType]!;
+  return HALF_LIVES[contentType] ?? 60;
+}
 
 // =============================================================================
 // Confidence Baselines by Content Type
@@ -147,12 +211,13 @@ export function recencyScore(
   contentType: string,
   now: Date = new Date(),
   accessCount: number = 0,
-  lastAccessedAt?: Date | string | null
+  lastAccessedAt?: Date | string | null,
+  halfLives?: HalfLifeTable
 ): number {
-  const baseHalfLife = HALF_LIVES[contentType] ?? 60;
-  if (!isFinite(baseHalfLife)) return 1.0;
+  const base = baseHalfLife(contentType, halfLives);
+  if (!isFinite(base)) return 1.0;
 
-  const halfLife = effectiveHalfLife(baseHalfLife, accessCount, lastAccessedAt, now);
+  const halfLife = effectiveHalfLife(base, accessCount, lastAccessedAt, now);
 
   const modified = typeof modifiedAt === "string" ? new Date(modifiedAt) : modifiedAt;
   if (isNaN(modified.getTime())) return 0.5;
@@ -172,7 +237,8 @@ export function confidenceScore(
   accessCount: number,
   now: Date = new Date(),
   lastAccessedAt?: Date | string | null,
-  modifiedAtForBackfill?: Date | string
+  modifiedAtForBackfill?: Date | string,
+  halfLives?: HalfLifeTable
 ): number {
   // §51.1 D8 — three time inputs with distinct roles:
   //   decayAt              — content/effective time (authoredAt ?? modifiedAt); drives ONLY the
@@ -184,7 +250,7 @@ export function confidenceScore(
   //                          so the sentinel must compare against filing time, never decayAt).
   //                          Defaults to decayAt for callers with no separate axis.
   const baseline = TYPE_BASELINES[contentType] ?? 0.5;
-  const recency = recencyScore(decayAt, contentType, now);
+  const recency = recencyScore(decayAt, contentType, now, 0, undefined, halfLives);
   const safeAccess = Number.isFinite(accessCount) && accessCount >= 0 ? accessCount : 0;
   const accessBoost = Math.min(1.5, 1 + Math.log2(1 + safeAccess) * 0.1);
 
@@ -192,8 +258,11 @@ export function confidenceScore(
   // Only apply to episodic/progress content — skip for durable types (decision, hub, research)
   // Also skip if last_accessed_at was backfilled from modified_at (no real access yet)
   const DECAY_EXEMPT_TYPES = new Set(["decision", "deductive", "hub", "research", "antipattern", "preference"]);
+  // vn4rz.94: a no-decay collection override exempts the type too (see HalfLifeTable).
+  const noDecayOverride = halfLives !== undefined && Object.hasOwn(halfLives, contentType)
+    && !isFinite(halfLives[contentType]!);
   let attentionDecay = 1.0;
-  if (lastAccessedAt && !DECAY_EXEMPT_TYPES.has(contentType)) {
+  if (lastAccessedAt && !DECAY_EXEMPT_TYPES.has(contentType) && !noDecayOverride) {
     const lastAccess = typeof lastAccessedAt === "string" ? new Date(lastAccessedAt) : lastAccessedAt;
     const backfillRef = modifiedAtForBackfill ?? decayAt;
     const modified = typeof backfillRef === "string" ? new Date(backfillRef) : backfillRef;
@@ -390,6 +459,9 @@ export type CompositeScoringOptions = {
    *  _clawmem observations — burying them there contradicts the surface's own contract
    *  (and upstream v0.32's guarantee that causal retrieval reaches observation docs). */
   suppressUnpromotedObservationPenalty?: boolean;
+  /** vn4rz.94: per-collection half-life override lookup. Defaults to the collection
+   *  config (`half_lives`); injected by tests. Resolved once per collection per pass. */
+  halfLivesFor?: (collectionName: string) => HalfLifeTable | undefined;
 };
 
 export function applyCompositeScoring(
@@ -410,12 +482,25 @@ export function applyCompositeScoring(
   // down-weight once per scoring pass (env-driven; default 0.5). 1.0 = disabled.
   const unpromotedObsWeight = getUnpromotedObservationWeight();
 
+  // vn4rz.94: one config lookup per distinct collection per pass, not per row.
+  const halfLivesFor = options?.halfLivesFor ?? getCollectionHalfLives;
+  const halfLivesByCollection = new Map<string, HalfLifeTable | undefined>();
+  const halfLivesOf = (collection: string): HalfLifeTable | undefined => {
+    if (!halfLivesByCollection.has(collection)) {
+      halfLivesByCollection.set(collection, halfLivesFor(collection));
+    }
+    return halfLivesByCollection.get(collection);
+  };
+
   const scored = results.map(r => {
     // §51.1: rank recency by content time — authorship when known, filing time
     // otherwise. modifiedAt still rides along for the backfill sentinel.
     const effectiveAt = r.authoredAt ?? r.modifiedAt;
-    const recency = recencyScore(effectiveAt, r.contentType, now, r.accessCount, r.lastAccessedAt);
-    const computed = confidenceScore(r.contentType, effectiveAt, r.accessCount, now, r.lastAccessedAt, r.modifiedAt);
+    const halfLives = r.collectionName ? halfLivesOf(r.collectionName) : undefined;
+    const recency = recencyScore(effectiveAt, r.contentType, now, r.accessCount, r.lastAccessedAt, halfLives);
+    const computed = confidenceScore(
+      r.contentType, effectiveAt, r.accessCount, now, r.lastAccessedAt, r.modifiedAt, halfLives,
+    );
     // Blend stored confidence (from contradiction lowering, feedback boosts) with computed.
     // Default stored=0.5 → 100% computed. Stored deviations shift the result proportionally.
     const storedConf = r.confidence ?? 0.5;

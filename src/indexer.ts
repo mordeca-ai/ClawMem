@@ -11,7 +11,7 @@ import { basename, relative } from "path";
 import matter from "gray-matter";
 import { createHash } from "crypto";
 import type { Store } from "./store.ts";
-import { inferContentType, confidenceScore, type ContentType } from "./memory.ts";
+import { inferContentType, confidenceScore, type ContentType, type HalfLifeTable } from "./memory.ts";
 import { getDefaultLlamaCpp } from "./llm.ts";
 import {
   applyFrontmatterMap, frontmatterInstant, readFrontmatterInvalidation, supersededByPathCandidate,
@@ -605,6 +605,8 @@ export async function indexCollection(
     forceEnrich?: boolean; force?: boolean; importMode?: boolean; defaultContentType?: string;
     /** master-harness-wzwh8.1: the collection's frontmatter_map; pass via collectionIndexOptions(). */
     frontmatterMap?: FrontmatterMap;
+    /** master-harness-vn4rz.94: the collection's half_lives override (stored confidence); via collectionIndexOptions(). */
+    halfLives?: HalfLifeTable;
   }
 ): Promise<IndexStats> {
   if (RESERVED_COLLECTIONS.has(collectionName)) {
@@ -799,7 +801,7 @@ export async function indexCollection(
           tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
           content_type: contentType,
           review_by: meta.review_by,
-          confidence: confidenceScore(contentType, mtime, 0),
+          confidence: confidenceScore(contentType, mtime, 0, undefined, undefined, undefined, options?.halfLives),
           quality_score: computeQualityScore(body, meta),
           // §51.1: authoritative on the changed path — string sets, null clears,
           // undefined (frontmatter parse failure) leaves the stored value.
@@ -865,7 +867,7 @@ export async function indexCollection(
             tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
             content_type: contentType,
             review_by: meta.review_by,
-            confidence: confidenceScore(contentType, mtime, 0),
+            confidence: confidenceScore(contentType, mtime, 0, undefined, undefined, undefined, options?.halfLives),
             quality_score: computeQualityScore(body, meta),
             authored_at: meta.authored_at,
           });
@@ -883,7 +885,7 @@ export async function indexCollection(
               tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
               content_type: contentType,
               review_by: meta.review_by,
-              confidence: confidenceScore(contentType, mtime, 0),
+              confidence: confidenceScore(contentType, mtime, 0, undefined, undefined, undefined, options?.halfLives),
               quality_score: computeQualityScore(body, meta),
               authored_at: meta.authored_at,
             });
