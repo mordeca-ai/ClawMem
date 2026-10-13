@@ -106,11 +106,11 @@ Both consumers run their vector legs (the original query plus each vec/hyde expa
 - **CLI `query`**: builds a pool per invocation (`createWorkerLegPool`) and closes it when the legs finish.
 - **MCP `query`** (vn4rz.96): the server owns one long-lived pool, created lazily on the first multi-leg query, kept warm across calls (no per-call worker spawn or sqlite-vec load) and closed with the stores on shutdown. Workers are spawned on demand, never more than `CLAWMEM_QUERY_VEC_PARALLEL`, and concurrent `query` calls share that bound. Each leg carries its own options (`collections`, `dateRange`, `excludeCollections`, limit) and returns the `searchVecDetailed` result, so the `degraded` markers on the response are unchanged. A single-leg query, an in-memory store, or a store whose file is missing runs in-process. A worker opens each vault path read-only at most once, so named vaults share the pool.
 
-## Expansion overlap (CLI `query`)
+## Expansion overlap (CLI and MCP `query`)
 
-The original query's vector leg does not depend on the expansion. When the expansion is a live LLM call, the CLI `query` (vn4rz.97) starts that leg on the worker pool at once and warms the remaining workers (`min(CLAWMEM_QUERY_VEC_PARALLEL - 1, CLAWMEM_QUERY_VEC_EXPANSION_LEGS)`). The expansion legs start on warm workers as soon as the expansion lands. Legs and their order are unchanged, so the fused ranking is identical.
+The original query's vector leg does not depend on the expansion. When the expansion is a live LLM call, the CLI `query` (vn4rz.97) and MCP `query` tool (vn4rz.101) start that leg on the worker pool at once and warm the remaining workers (`min(CLAWMEM_QUERY_VEC_PARALLEL - 1, CLAWMEM_QUERY_VEC_EXPANSION_LEGS)`). The expansion legs start on warm workers as soon as the expansion lands. Legs and their order are unchanged, so the fused ranking is identical.
 
-The old path still runs in three cases: a strong BM25 signal (no expansion), an `llm_cache` hit (the leg list is known at once), and `CLAWMEM_QUERY_VEC_PARALLEL=1`. The MCP `query` tool does not overlap yet.
+The old path still runs in three cases: a strong BM25 signal (no expansion), an `llm_cache` hit (the leg list is known at once), and `CLAWMEM_QUERY_VEC_PARALLEL=1`.
 
 ## Scoped vector scan (collection-scoped legs)
 

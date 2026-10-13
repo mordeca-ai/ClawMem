@@ -4,6 +4,16 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.58 — MCP `query` overlaps expansion with the original vector leg
+
+The MCP `query` tool now starts the original query's vector leg while query expansion runs, matching CLI `query` (master-harness-vn4rz.101, building on vn4rz.96 and vn4rz.97).
+
+- When query expansion is in flight on the live LLM, the original query's vector leg starts immediately on the shared worker pool, and the pool warms workers for subsequent expansion legs.
+- Results assemble in the same leg order `[original, ...expansions]` so fused reciprocal-rank ranking is byte-identical to the sequential path.
+- Strong-BM25 bypass, `llm_cache` hits, vectorless vaults, and `CLAWMEM_QUERY_VEC_PARALLEL=1` remain unchanged.
+
+---
+
 ## v0.36.57 — Chunk-targeted exact scan for collection-scoped vector legs
 
 Collection-scoped vector legs (`-c <collection>`, such as `query -c docs`) now perform an exact in-memory cosine distance scan across only the SQLite chunks containing the queried collection's fragment vectors, replacing the sqlite-vec `vectors_vec` MATCH brute force scan (master-harness-vn4rz.100).
