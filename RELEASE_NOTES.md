@@ -4,6 +4,18 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.52 — hybrid query runs vector legs in parallel (CLAWMEM_QUERY_VEC_PARALLEL)
+
+The CLI `query` now runs its vector legs in parallel read-only Bun Workers (master-harness-vn4rz.93). Before this, the original-query leg and each vec/hyde expansion leg ran one after another, and each leg paid a full sqlite-vec table scan. New knob `CLAWMEM_QUERY_VEC_PARALLEL=<n>`: default 4, clamped to 1-8; `1` restores the sequential loop. Leg results merge in the original order, so the ranking is exact. A leg whose worker fails falls back to in-process. It composes with `CLAWMEM_QUERY_VEC_EXPANSION_LEGS`. The MCP query pipeline is unchanged.
+
+Measured live on `query -c docs` (n=30 per arm, alternating, 6 queries x 5 rounds, host load ~30-50):
+
+- base: p50 8.44s, p90 13.57s
+- parallel: p50 5.83s, p90 8.81s
+- result lists identical on 30/30 pairs
+
+---
+
 ## v0.36.51 — opt-in hybrid-query vector-leg cap (CLAWMEM_QUERY_VEC_EXPANSION_LEGS)
 
 Opt-in cap on hybrid-query vector legs (master-harness-vn4rz.92). A hybrid `query` runs one vector leg for the original query plus one per vec/hyde expansion, and each leg pays a full sqlite-vec scan of the whole table (about 0.85-1.4s). New knob `CLAWMEM_QUERY_VEC_EXPANSION_LEGS=<n>` caps the expansion vector legs in the CLI `query` and the MCP query tool. Hyde legs are kept first, then vec legs. Lex legs and the original-query vector leg always run. Unset or invalid means no cap, so default behaviour is unchanged. When the cap drops legs, stderr prints `[query] vec-leg cap <n>: running k/m expansion vector legs`.

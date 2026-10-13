@@ -65,6 +65,7 @@ import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, HALF_LIVES, type EnrichedResult } from "./memory.ts";
 import { enrichResults, toRanked, fuseAndRerank, hasStrongFtsSignal, ftsBypassEnabled, applyQueryVecLegCap, type RankedResult } from "./search-utils.ts";
+import { vecLegParallelism, runVecLegs, createWorkerLegPool } from "./vec-legs.ts";
 import { splitDocument } from "./splitter.ts";
 import { buildEmbedFrontmatter } from "./embed-input.ts";
 import { getProfile, updateProfile, isProfileStale, type ProfileUpdateOutcome } from "./profile.ts";
@@ -1630,21 +1631,49 @@ async function cmdQuery(args: string[]) {
   // candidate found ONLY via an expansion leg survives Step 8's resultMap lookup.
   const candidateResults: SearchResult[] = [];
 
+  const vecQueries = [query, ...expandedQueries.filter(e => e.type !== "lex").map(e => e.query)];
+  const par = vecLegParallelism();
+  let vecLegResults: SearchResult[][];
+  if (par > 1 && vecQueries.length > 1) {
+    const pool = createWorkerLegPool(Math.min(par, vecQueries.length), {
+      dbPath: getDefaultDbPath(),
+      model: DEFAULT_EMBED_MODEL,
+      limit: POOL,
+      collections: scopeCols,
+    });
+    try {
+      vecLegResults = await runVecLegs(
+        vecQueries,
+        q => pool.runLeg(q).catch(() => s.searchVec(q, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols)),
+        pool.size
+      );
+    } finally {
+      pool.close();
+    }
+  } else {
+    vecLegResults = await runVecLegs(
+      vecQueries,
+      q => s.searchVec(q, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols),
+      1
+    );
+  }
+
   // Original query BM25 + vec (weight 2x)
   allRanked.push({ results: ftsResults.map(toRanked), weight: 2 });
   candidateResults.push(...ftsResults);
-  const vecResults = await s.searchVec(query, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols);
+  const vecResults = vecLegResults[0] ?? [];
   allRanked.push({ results: vecResults.map(toRanked), weight: 2 });
   candidateResults.push(...vecResults);
 
   // Expanded queries (weight 1x): lex → FTS, vec/hyde → vector
+  let vecIdx = 1;
   for (const eq of expandedQueries) {
     if (eq.type === "lex") {
       const r = s.searchFTS(eq.query, POOL, undefined, scopeCols);
       allRanked.push({ results: r.map(toRanked), weight: 1 });
       candidateResults.push(...r);
     } else {
-      const r = await s.searchVec(eq.query, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols);
+      const r = vecLegResults[vecIdx++] ?? [];
       allRanked.push({ results: r.map(toRanked), weight: 1 });
       candidateResults.push(...r);
     }

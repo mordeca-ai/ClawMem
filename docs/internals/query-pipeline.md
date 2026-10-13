@@ -99,6 +99,10 @@ The cap keeps hyde legs first, then vec legs, each in generation order. A vec le
 
 When the cap drops legs, stderr shows `[query] vec-leg cap <n>: running <kept>/<total> expansion vector legs`.
 
+## Parallel vector legs (CLI `query`)
+
+The CLI `query` runs its vector legs (the original query plus each vec/hyde expansion that survives the cap) in parallel Bun Workers. Each worker opens its own read-only connection to the vault. `CLAWMEM_QUERY_VEC_PARALLEL=<n>` sets the pool size: default 4, clamped to 1-8, and `1` restores the old sequential loop. Results are merged back in the original leg order, so the fused ranking is identical to the sequential run. A leg whose worker fails reruns in-process, so a fatal vector error still surfaces as before. The MCP query pipeline still runs its legs sequentially.
+
 ## Chunk selection
 
 For reranking, each document's content is windowed into overlapping chunks. Chunks are scored by overlap with query terms (1.0x weight) and intent terms (0.5x weight). The best chunk per document is sent to the cross-encoder.
