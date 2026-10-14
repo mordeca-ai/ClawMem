@@ -4,6 +4,13 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.60 — collection add keeps half_lives; no-decay saved as none
+
+- `clawmem collection add` on an existing collection now keeps its `half_lives` override. Before this, the nightly memory-topics refresh re-added the collection and silently put it back on global decay (full-sweep RED: clawmem-collections, 2026-10-14).
+- Saving the config writes a no-decay half-life back as `none` instead of `.inf`, so the file still matches what was declared.
+
+---
+
 ## v0.36.59 — clawmem scoped vector scan: cut the ~1.9 GB RSS peak and the remaining 2.0s floor (startup 0.57s + scope_load 1.05s) — carries the vn4rz.100 miss
 
 Bound CLI collection-scoped vector scans to a 128 MiB SQLite mmap budget per read connection. This keeps the exact chunk-targeted retrieval path while reducing peak memory use and query latency on the live docs collection. The existing CLAWMEM_SQLITE_MMAP_MB setting remains an explicit override; unscoped read paths retain their prior default.
