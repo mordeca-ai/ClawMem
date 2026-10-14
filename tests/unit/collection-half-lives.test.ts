@@ -13,7 +13,7 @@
  *       confidence, and the stored confidence the indexer writes.
  */
 import { describe, it, expect, beforeEach, afterEach, afterAll } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, utimesSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, utimesSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
@@ -28,6 +28,7 @@ import {
   type HalfLifeTable,
 } from "../../src/memory.ts";
 import {
+  addCollection,
   clearConfigCache,
   collectionIndexOptions,
   getCollectionHalfLives,
@@ -253,6 +254,21 @@ describe("H1/H3: from the collection config", () => {
       },
     );
     expect(other!.recencyScore).toBe(Math.pow(0.5, 200 / 120));
+  });
+
+  it("survives an idempotent addCollection, written back as the none token (83qk0.209)", () => {
+    write([...BASE, "    half_lives: { preference: 365, project: none, note: .inf }"]);
+    addCollection("topics", "/tmp/nowhere", "**/*.md"); // safe: writes only the temp config dir
+    clearConfigCache();
+    expect(getCollectionHalfLives("topics")).toEqual({
+      preference: 365,
+      project: Infinity,
+      note: Infinity,
+    });
+    const raw = readFileSync(join(DIR, "config.yaml"), "utf-8");
+    expect(raw).toContain("project: none");
+    expect(raw).toContain("note: none");
+    expect(raw).not.toContain(".inf");
   });
 
   it("an edited config invalidates the lookup", () => {

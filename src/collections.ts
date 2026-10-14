@@ -10,7 +10,7 @@ import { join } from "path";
 import { homedir } from "os";
 import YAML from "yaml";
 import { validateFrontmatterMap, type FrontmatterMap } from "./frontmatter-map.ts";
-import { validateHalfLives, type HalfLifeTable } from "./memory.ts";
+import { NO_DECAY_TOKEN, validateHalfLives, type HalfLifeTable } from "./memory.ts";
 
 // ============================================================================
 // Types
@@ -347,7 +347,24 @@ export function saveConfig(config: CollectionConfig): void {
   const configPath = getConfigFilePath();
 
   try {
-    const yaml = YAML.stringify(config, {
+    // master-harness-83qk0.209: loadConfig() validated half_lives "none" into
+    // Infinity; write it back as the token so a read-modify-write round-trip
+    // stays byte-equivalent to what the operator (or the manifest) declared.
+    const collections: CollectionConfig["collections"] = {};
+    for (const [name, col] of Object.entries(config.collections ?? {})) {
+      collections[name] = col?.half_lives
+        ? {
+            ...col,
+            half_lives: Object.fromEntries(
+              Object.entries(col.half_lives).map(([kind, days]) => [
+                kind,
+                days === Infinity ? NO_DECAY_TOKEN : days,
+              ]),
+            ) as Record<string, number>,
+          }
+        : col;
+    }
+    const yaml = YAML.stringify(config.collections ? { ...config, collections } : config, {
       indent: 2,
       lineWidth: 0,  // Don't wrap lines
     });
@@ -409,6 +426,10 @@ export function addCollection(
     // Preserve the frontmatter key map (master-harness-wzwh8.1) — dropping it would
     // silently turn mapping off on the next `clawmem collection add`.
     frontmatter_map: config.collections[name]?.frontmatter_map,
+    // Preserve the per-collection half-life override (master-harness-83qk0.209) —
+    // dropping it here reverted memory-topics to the global decay on every nightly
+    // idempotent `clawmem collection add` (tools/memory-collection-refresh).
+    half_lives: config.collections[name]?.half_lives,
   };
 
   saveConfig(config);
