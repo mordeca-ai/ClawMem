@@ -44,6 +44,9 @@ clawmem mine <dir> -c convos --backfill-dates --apply     # Execute the backfill
 clawmem reindex                                # Re-scan all collections
 clawmem reindex --force                        # Re-read every file, bypassing the content-hash skip
 clawmem reindex --enrich                       # Full A-MEM pipeline on all documents
+clawmem backfill-meta                          # Fill description/keywords for older rows from source
+                                               # frontmatter — dry-run report by default (read-only)
+clawmem backfill-meta --apply [-c name] [--limit N]   # Write them and queue those docs for re-embed
 clawmem embed                   # Embed all un-embedded fragments (geometry-canary preflight runs first)
 clawmem embed --force           # Re-embed everything (clears existing vectors; aborts BEFORE clearing if the canary preflight fails)
 clawmem embed --force --force-geometry        # v0.21.0: proceed despite a failed/unavailable canary — vault is tainted until a verified rebuild
@@ -78,6 +81,45 @@ Adds a post-import LLM fact extraction pass. After `indexCollection` commits the
 - **Idempotent reruns** — synthesized fact paths are hash-stable, so rerunning over the same collection updates facts in place rather than creating parallel rows. Relation weights are monotone (`MAX(weight, excluded.weight)`).
 - **Non-fatal failures** — any LLM failure, JSON parse error, or relation insert error is counted and logged. Synthesis failure never rolls back the mine import.
 - See [post-import conversation synthesis](../concepts/architecture.md#post-import-conversation-synthesis-v072) for the full architectural walkthrough.
+
+### Backfilling description and keywords (`backfill-meta`)
+
+The `title`, `description` and `keywords` frontmatter fields are embedded as their own
+`frontmatter` fragments, labeled with the field name. `description` has been stored since
+v0.10.13. `keywords` is stored in `documents.keywords` as one string: a YAML list is
+joined with `", "`, a string is trimmed, and any other type is ignored. Rows indexed before
+those columns existed have them empty. The next index pass does not fill them in, because
+the content hash covers only the body below the frontmatter, so the row looks unchanged.
+
+`clawmem backfill-meta` fills those rows from their source files:
+
+- It scans active documents that come from files (it skips `api` rows such as hooks or
+  saved memories, which have no source file). It re-reads each file's frontmatter the same
+  way the indexer does.
+- It writes a field only when the source has a non-empty value that differs from the
+  stored one. It never clears a stored value.
+- It skips rows whose source file is missing, unreadable or has broken frontmatter. It also
+  skips rows whose body changed since the last index pass, which the next `update` handles.
+  Each skip is counted, and none of them stop the run.
+- Without `--apply` it is a dry run: it opens the index read-only and prints what it would
+  change. `--apply` writes the fields and deletes every stored vector for each affected
+  content hash, so the next `clawmem embed` re-embeds the whole document. Adding a
+  frontmatter fragment shifts the fragment numbering, so all of the old vectors have to go.
+- `--apply` takes the same lease as `clawmem embed`. If an embed is running, it refuses with
+  exit 1 and writes nothing.
+- `-c/--collection <name>` limits the scan to one collection. `--limit N` checks at most N
+  rows, in collection then path order.
+- When several paths share one content hash, each row gets its own fields. The hash is
+  re-embedded only when the change is on the alias whose fields the embedder uses: the
+  first `collection/path` in sort order. A change on any other alias is counted as
+  `noncanonical_only_hashes`.
+
+The last line of output is a `key=value` summary, for example
+`backfill-meta: mode=dry-run scanned=… missing_source=… would_update_description=…
+would_update_keywords=… rows_to_update=… hashes_to_invalidate=… vectors_to_delete=… … exit=0`.
+After an `--apply` run, run `clawmem embed`. The Postgres reindex needs no backfill: it
+re-reads frontmatter from the source on every run, and re-embeds a hash whenever its
+fragment count changes.
 
 ## Search (CLI)
 

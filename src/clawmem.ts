@@ -555,17 +555,20 @@ export async function finalizeCanaryWithoutPreflight(
  * title/description-shaping fix class on exactly this basis).
  *
  * Fix: synthesize the frontmatter object fed to `splitDocument` from data
- * already durable on the `documents` row (title, description) instead of
- * trying to recover it from the stripped body. As of master-harness-s1lli,
- * `description` IS persisted (nullable `documents.description` column,
- * populated by `DocumentMeta`/`parseDocument` at index time) and is passed
- * in here as `docDescription`, so it is embeddable the same way `title` is.
- * `keywords` remains NOT persisted anywhere in the schema — that still needs
- * its own column + is out of scope here (tracked as a follow-up). Existing
- * rows populate `description` on their next natural re-index (source-file
- * touch → content-hash change); no dedicated backfill command ships with
- * this fix. Extracted (not inlined in `cmdEmbed`) so the fix is directly
- * unit-testable without a DB/network round trip.
+ * already durable on the `documents` row (title, description, keywords)
+ * instead of trying to recover it from the stripped body. As of
+ * master-harness-s1lli, `description` IS persisted (nullable
+ * `documents.description` column) and is passed in as `docDescription`; as of
+ * master-harness-65amk, `keywords` IS persisted too (nullable
+ * `documents.keywords`, normalized to one comma-joined string by
+ * `normalizeKeywords`) and is passed in as `docKeywords`. Both are populated by
+ * `DocumentMeta`/`parseDocument` at index time and embed the same way `title`
+ * does; absent/empty values add no fragment, so the output for a document
+ * without them is unchanged. Rows indexed before those columns existed are
+ * populated by `clawmem backfill-meta --apply`, which also invalidates the
+ * affected hashes' vectors so the next `clawmem embed` re-embeds them.
+ * Extracted (not inlined in `cmdEmbed`) so the fix is directly unit-testable
+ * without a DB/network round trip.
  */
 export function buildDocEmbedTask(
   hash: string,
@@ -573,9 +576,10 @@ export function buildDocEmbedTask(
   path: string,
   docTitle: string | null | undefined,
   docDescription: string | null | undefined,
-  collection: string
+  collection: string,
+  docKeywords?: string | null
 ): DocEmbedTask {
-  const frontmatter = buildEmbedFrontmatter(docTitle, path, docDescription);
+  const frontmatter = buildEmbedFrontmatter(docTitle, path, docDescription, docKeywords);
   const fragments = splitDocument(body, frontmatter);
   return { hash, path, title: frontmatter.title, collection, fragments };
 }
@@ -1157,13 +1161,13 @@ export async function cmdEmbed(args: string[]) {
 
     // Parse + split every document up front (fork z7o4y/s1lli: synthesize the
     // frontmatter fed to splitDocument from durable documents-row data — title +
-    // description — because content.doc is stored frontmatter-STRIPPED, so
+    // description + keywords (65amk) — because content.doc is stored frontmatter-STRIPPED, so
     // re-parsing it for frontmatter is a structural no-op). This also yields the
     // fragment-count ETA, replacing the old separate count pass.
     const docTasks: DocEmbedTask[] = [];
     let totalFragEstimate = 0;
-    for (const { hash, body, path, title: docTitle, description: docDescription, collection } of hashes) {
-      const docTask = buildDocEmbedTask(hash, body, path, docTitle, docDescription, collection);
+    for (const { hash, body, path, title: docTitle, description: docDescription, keywords: docKeywords, collection } of hashes) {
+      const docTask = buildDocEmbedTask(hash, body, path, docTitle, docDescription, collection, docKeywords);
       docTasks.push(docTask);
       totalFragEstimate += docTask.fragments.length;
     }
@@ -2983,6 +2987,60 @@ async function cmdReindex(args: string[]) {
 }
 
 /**
+ * `clawmem backfill-meta [--apply] [-c <collection>] [--limit N]` (master-harness-65amk):
+ * populate documents.description/keywords for rows indexed before those columns existed
+ * and invalidate the affected hashes' vectors so the next `clawmem embed` re-embeds them.
+ * Logic lives in backfill-meta.ts (importing THIS module runs the CLI). The dry run opens
+ * the index READ-ONLY (query_only, no schema migration), so it cannot write.
+ */
+async function cmdBackfillMeta(args: string[]) {
+  const usage = "Usage: clawmem backfill-meta [--apply] [-c/--collection <name>] [--limit N]";
+  const { values } = parseArgs({
+    args,
+    options: {
+      apply: { type: "boolean", default: false },
+      collection: { type: "string", short: "c" },
+      limit: { type: "string" },
+    },
+    allowPositionals: false,
+  });
+  let limit: number | undefined;
+  if (values.limit !== undefined) {
+    const n = Number(values.limit);
+    if (!Number.isInteger(n) || n <= 0) die(`--limit must be a positive integer (got "${values.limit}"). ${usage}`);
+    limit = n;
+  }
+  const collections = collectionsList();
+  if (values.collection && !collections.some(col => col.name === values.collection)) {
+    die(`Unknown collection: ${values.collection}. ${usage}`);
+  }
+  const { runBackfillMeta, formatBackfillMetaSummary } = await import("./backfill-meta.ts");
+  const apply = !!values.apply;
+  const s = apply ? getStore() : createStore(undefined, { readonly: true });
+  try {
+    const outcome = runBackfillMeta(s, { apply, collection: values.collection, limit, collections });
+    const k = outcome.counts;
+    const scope = `${values.collection ? `collection '${values.collection}'` : "all collections"}${limit ? `, limit ${limit}` : ""}`;
+    console.log(`${c.bold}Backfill description/keywords${c.reset} (${scope}${apply ? "" : ", DRY RUN"}):`);
+    console.log(`  ${k.scanned} scanned — ${c.green}${k.would_update_description} description${c.reset}, ${c.green}${k.would_update_keywords} keywords${c.reset} to write on ${k.rows_to_update} row(s); ${k.hashes_to_invalidate} hash(es) / ${k.vectors_to_delete} vector(s) to invalidate for re-embed`);
+    console.log(`  ${c.dim}skipped: ${k.missing_source} missing source, ${k.unconfigured_collection} unconfigured collection, ${k.read_error} read error, ${k.parse_failed} frontmatter parse failure, ${k.source_changed} source changed since index, ${k.skipped_api} DB-born (no source file), ${k.noncanonical_only_hashes} shared hash(es) with only a non-canonical alias changed${c.reset}`);
+    if (outcome.refused) {
+      console.error(`${c.red}--apply refused: ${outcome.refused}${c.reset}`);
+    } else if (outcome.applied) {
+      const a = outcome.applied;
+      console.log(`  ${c.green}✓${c.reset} ${a.applied} row(s) written, ${a.invalidated_hashes} hash(es) invalidated (${a.deleted_vectors} vector(s) deleted) — run ${c.cyan}clawmem embed${c.reset} to re-embed them`);
+      if (a.raced > 0) console.log(`  ${c.yellow}⚠${c.reset} ${a.raced} row(s) changed concurrently and were skipped — re-run to reconcile`);
+    } else if (k.rows_to_update > 0) {
+      console.log(`  Run again with ${c.cyan}--apply${c.reset} to write.`);
+    }
+    console.log(formatBackfillMetaSummary(outcome));
+    if (outcome.exitCode !== 0) process.exitCode = outcome.exitCode;
+  } finally {
+    if (!apply) s.close();
+  }
+}
+
+/**
  * master-harness-wzwh8: per-collection count of parsed frontmatter blocks that
  * declared no title / content_type. Covers only the files this pass PARSED —
  * unchanged files skip parsing — so `reindex --force` gives the full count.
@@ -3877,6 +3935,9 @@ async function main() {
         break;
       case "reindex":
         await cmdReindex(subArgs);
+        break;
+      case "backfill-meta":
+        await cmdBackfillMeta(subArgs);
         break;
       case "doctor":
         await cmdDoctor(subArgs);
@@ -4826,6 +4887,7 @@ ${c.bold}Indexing:${c.reset}
   clawmem mine <dir> -c name --backfill-dates [--apply]  Derive authored_at for already-mined docs from source transcripts (metadata-only; dry-run without --apply)
   clawmem embed [-f] [--lenient]       Generate fragment embeddings (exits 1 on failed fragments; --lenient exits 0)
   clawmem reindex [--force] [--enrich]  Full re-index (--enrich: run entity extraction + links on all docs)
+  clawmem backfill-meta [--apply] [-c name] [--limit N]  Fill description/keywords from source frontmatter for older rows and queue them for re-embed (dry-run without --apply)
   clawmem watch                        File watcher daemon
   clawmem status                       Show index status
 

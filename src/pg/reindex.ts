@@ -324,6 +324,26 @@ export function parseForReindex(
 }
 
 /**
+ * The frontmatter object the pg reindex feeds splitDocument (master-harness-z7o4y,
+ * s1lli, 65amk). Mirrors src/embed-input.ts buildEmbedFrontmatter key-for-key —
+ * title, then description, then keywords, each only when non-empty — so the sqlite
+ * and pg paths cut the same fragments. `meta` is re-parsed from the source file on
+ * every reindex, so no pg column is needed for keywords to be embedded; a hash
+ * embedded before keywords existed is re-embedded on its next reindex because its
+ * fragment count changes (hashFullyEmbedded). Pure and exported for unit tests
+ * (this module is otherwise only reachable with a Postgres).
+ */
+export function reindexEmbedFrontmatter(
+  title: string,
+  meta: Pick<DocumentMeta, "description" | "keywords">,
+): Record<string, unknown> {
+  const frontmatter: Record<string, unknown> = { title };
+  if (meta.description) frontmatter.description = meta.description;
+  if (meta.keywords) frontmatter.keywords = meta.keywords;
+  return frontmatter;
+}
+
+/**
  * The per-collection summary line `pg reindex` prints.
  *
  * THE PREFIX IS A CONTRACT: master-harness's tools/clawmem-pg-reindex parses
@@ -675,11 +695,9 @@ export async function reindexCollection(
       //
       // `body` is the frontmatter-STRIPPED text, matching what the sqlite path
       // stores in content.doc — so the frontmatter fragment is SYNTHESIZED from
-      // title/description (the master-harness-z7o4y fix) rather than re-parsed out
-      // of a body that no longer has any frontmatter to find.
-      const frontmatter: Record<string, unknown> = { title };
-      if (meta.description) frontmatter.description = meta.description;
-      const fragments = splitDocument(body, frontmatter);
+      // title/description/keywords (the master-harness-z7o4y fix, + 65amk keywords)
+      // rather than re-parsed out of a body that no longer has any frontmatter to find.
+      const fragments = splitDocument(body, reindexEmbedFrontmatter(title, meta));
       const canonicalId = canonicalDocId(name, rel);
       const queued: PendingFragment[] = [];
       for (let seq = 0; seq < fragments.length; seq++) {
