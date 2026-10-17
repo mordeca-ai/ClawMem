@@ -227,9 +227,45 @@ function frontmatterVocabGap(
   return { titleMissing: title === undefined, contentTypeMissing: contentType === undefined, declaredKeys };
 }
 
+/**
+ * Normalize a frontmatter `keywords` value to the single string persisted in
+ * `documents.keywords` (master-harness-65amk).
+ *
+ * - YAML list → elements joined with ", " (the same separator splitDocument's
+ *   extractFrontmatter uses for arrays, so the embedded text is identical
+ *   whichever form the author wrote). String/number/boolean elements are
+ *   stringified and trimmed; empty, null and object elements are dropped.
+ * - string → trimmed, otherwise stored verbatim (not re-split).
+ * - anything else (number, boolean, Date, object, null) → undefined, the same
+ *   runtime type guard `title`/`description` get against gray-matter coercion.
+ * An empty result is undefined, so "no keywords" never writes or embeds anything.
+ */
+export function normalizeKeywords(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  }
+  if (Array.isArray(value)) {
+    const parts: string[] = [];
+    for (const item of value) {
+      if (typeof item !== "string" && typeof item !== "number" && typeof item !== "boolean") continue;
+      const part = String(item).trim();
+      if (part) parts.push(part);
+    }
+    return parts.length > 0 ? parts.join(", ") : undefined;
+  }
+  return undefined;
+}
+
 export interface DocumentMeta {
   title?: string;
   description?: string;
+  /**
+   * master-harness-65amk: frontmatter `keywords`, normalized to ONE string
+   * (see normalizeKeywords) — persisted to documents.keywords and embedded as a
+   * `frontmatter` fragment labeled `keywords`.
+   */
+  keywords?: string;
   tags?: string[];
   domain?: string;
   workstream?: string;
@@ -409,6 +445,7 @@ export function parseDocument(
       meta: {
         title,
         description: str(data.description),
+        keywords: normalizeKeywords(data.keywords),
         tags: Array.isArray(data.tags) ? data.tags.map(String) : undefined,
         domain: str(data.domain),
         workstream: str(data.workstream),
@@ -798,6 +835,7 @@ export async function indexCollection(
           domain: meta.domain,
           workstream: meta.workstream,
           description: meta.description,
+          keywords: meta.keywords,
           tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
           content_type: contentType,
           review_by: meta.review_by,
@@ -864,6 +902,7 @@ export async function indexCollection(
             domain: meta.domain,
             workstream: meta.workstream,
             description: meta.description,
+            keywords: meta.keywords,
             tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
             content_type: contentType,
             review_by: meta.review_by,
@@ -875,13 +914,14 @@ export async function indexCollection(
           enrichQueue.push({ docId: inactive.id, isNew: false });
         } else {
           // Truly new document
-          store.insertDocument(collectionName, relativePath, title, docHash, now, mtime.toISOString(), meta.description ?? null, rowOrigin);
+          store.insertDocument(collectionName, relativePath, title, docHash, now, mtime.toISOString(), meta.description ?? null, rowOrigin, meta.keywords ?? null);
           const newDoc = store.findActiveDocument(collectionName, relativePath);
           if (newDoc) {
             store.updateDocumentMeta(newDoc.id, {
               domain: meta.domain,
               workstream: meta.workstream,
               description: meta.description,
+              keywords: meta.keywords,
               tags: meta.tags ? JSON.stringify(meta.tags) : undefined,
               content_type: contentType,
               review_by: meta.review_by,

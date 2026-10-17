@@ -504,6 +504,7 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
       domain TEXT,
       workstream TEXT,
       description TEXT,
+      keywords TEXT,
       tags TEXT,
       content_type TEXT NOT NULL DEFAULT 'note',
       review_by TEXT,
@@ -543,6 +544,11 @@ function initializeDatabase(db: Database, busyTimeoutMs: number = 15000): void {
     // master-harness-s1lli: persist description frontmatter so it can be
     // recovered + embedded at embed time (mirrors the z7o4y title fix).
     ["description", "ALTER TABLE documents ADD COLUMN description TEXT"],
+    // master-harness-65amk: persist `keywords` frontmatter (normalized to one
+    // comma-joined string by indexer.ts normalizeKeywords) so it is embeddable the
+    // same way description is. Nullable, no forced re-index; existing rows stay NULL
+    // until a re-index or `clawmem backfill-meta --apply` populates them.
+    ["keywords", "ALTER TABLE documents ADD COLUMN keywords TEXT"],
     ["authored_at", "ALTER TABLE documents ADD COLUMN authored_at TEXT"],
     // §55.6 D9: WHY a row was deactivated. `active` is written by three unrelated owners —
     // absence reconciliation, forget, and archival — and the indexer used to reactivate all
@@ -1813,7 +1819,7 @@ export type Store = {
 
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null, origin?: DocumentOrigin) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null, origin?: DocumentOrigin, keywords?: string | null) => void;
   findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; pinned: number; snoozed_until: string | null; confidence: number } | null;
   findAnyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; active: number } | null;
   reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => boolean;
@@ -1825,7 +1831,7 @@ export type Store = {
 
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
-  getHashesNeedingFragments: () => { hash: string; body: string; path: string; title: string; collection: string; description: string | null }[];
+  getHashesNeedingFragments: () => { hash: string; body: string; path: string; title: string; collection: string; description: string | null; keywords: string | null }[];
   clearAllEmbeddings: (leaseGuard?: LeaseGuard) => void;
   getVectorConsistency: () => { cvCount: number; vvCount: number; cvMissingVv: number; vvOrphan: number; pending: number };
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, fragmentType?: string, fragmentLabel?: string, canonicalId?: string, leaseGuard?: LeaseGuard, embedInputFp?: string, endpoint?: string) => void;
@@ -1852,7 +1858,7 @@ export type Store = {
   markUsageReferenced: (id: number) => void;
 
   // SAME: Document metadata operations
-  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number; authored_at?: string | null }) => void;
+  updateDocumentMeta: (docId: number, meta: { domain?: string; workstream?: string; description?: string; keywords?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number; authored_at?: string | null }) => void;
   incrementAccessCount: (paths: string[]) => void;
   getDocumentsByType: (contentType: string, limit?: number, opts?: { orderBy?: "operational" | "effective" }) => DocumentRow[];
   getStaleDocuments: (beforeDate: string) => DocumentRow[];
@@ -2046,7 +2052,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
 
     // Document indexing operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null, origin?: DocumentOrigin) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, description, origin),
+    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, description?: string | null, origin?: DocumentOrigin, keywords?: string | null) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, description, origin, keywords),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
     findAnyDocument: (collectionName: string, path: string) => findAnyDocument(db, collectionName, path),
     reactivateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => reactivateDocument(db, documentId, title, hash, modifiedAt),
@@ -3051,16 +3057,17 @@ export function insertDocument(
   createdAt: string,
   modifiedAt: string,
   description?: string | null,
-  origin: DocumentOrigin = "api"
+  origin: DocumentOrigin = "api",
+  keywords?: string | null
 ): void {
   // Guard: gray-matter can coerce YAML values to Date/boolean/null — SQLite rejects these
   const safeTitle = (typeof title === "string") ? title : String(title ?? "Untitled");
   // origin defaults to 'api': a caller this parameter has not reached yet becomes exempt
   // from filesystem reconciliation — stale-active at worst, never a destroyed DB-born row.
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, description, origin)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
-  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt, description ?? null, origin);
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, description, origin, keywords)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+  `).run(collectionName, path, safeTitle, hash, createdAt, modifiedAt, description ?? null, origin, keywords ?? null);
 }
 
 // =============================================================================
@@ -3090,6 +3097,8 @@ export type SaveMemoryParams = {
   title: string;
   /** Optional short summary, persisted to documents.description (master-harness-s1lli). */
   description?: string;
+  /** Optional normalized keywords string, persisted to documents.keywords (master-harness-65amk). */
+  keywords?: string;
   body: string;
   contentType: string;
   confidence?: number;
@@ -3253,8 +3262,8 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
         INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active,
                                content_type, confidence, quality_score, normalized_hash,
                                duplicate_count, revision_count, last_seen_at, topic_key, description, authored_at,
-                               origin)
-        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, 'api')
+                               origin, keywords)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, 'api', ?)
       `).run(
         params.collection,
         params.path,
@@ -3270,6 +3279,7 @@ export function saveMemory(db: Database, params: SaveMemoryParams): SaveMemoryRe
         params.topicKey ?? null,
         params.description ?? null,
         authoredAt,
+        params.keywords ?? null,
       );
     } catch (err: any) {
       // UNIQUE(collection, path) conflict — update existing row
@@ -5395,7 +5405,7 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
  * Get all unique content hashes that need fragment-level embeddings.
  * Returns hashes that have no content_vectors row with fragment_type set.
  */
-export function getHashesNeedingFragments(db: Database): { hash: string; body: string; path: string; title: string; collection: string; description: string | null }[] {
+export function getHashesNeedingFragments(db: Database): { hash: string; body: string; path: string; title: string; collection: string; description: string | null; keywords: string | null }[] {
   // Select docs that either have no fragments at all OR are missing the primary (seq=0) fragment.
   // The seq=0 embedding is critical — surprisal scoring, semantic graph, and health checks depend on it.
   // Also retry docs left 'pending' (crash mid-doc) or 'failed' (partial fragment failure) so partial
@@ -5407,7 +5417,7 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
   // deterministic real alias; the correlated join recovers that row's actual columns.
   return db.prepare(`
     SELECT g.hash, c.doc as body, d.path as path, d.title as title, d.collection as collection,
-           d.description as description
+           d.description as description, d.keywords as keywords
     FROM (
       SELECT dd.hash, MIN(dd.collection || '/' || dd.path) as canon_key
       FROM documents dd
@@ -5420,7 +5430,7 @@ export function getHashesNeedingFragments(db: Database): { hash: string; body: s
     ) g
     JOIN documents d ON d.hash = g.hash AND d.active = 1 AND (d.collection || '/' || d.path) = g.canon_key
     JOIN content c ON g.hash = c.hash
-  `).all() as { hash: string; body: string; path: string; title: string; collection: string; description: string | null }[];
+  `).all() as { hash: string; body: string; path: string; title: string; collection: string; description: string | null; keywords: string | null }[];
 }
 
 /**
@@ -5441,6 +5451,106 @@ export function clearAllEmbeddings(db: Database, leaseGuard?: LeaseGuard): void 
     // Reset embed state so failed docs get retried after force re-embed
     try { db.exec(`UPDATE documents SET embed_state = 'pending', embed_error = NULL, embed_attempts = 0 WHERE active = 1`); } catch { /* column may not exist yet */ }
   }).immediate(); // immediate write lock: assert ownership under the lock before this destructive op
+}
+
+/**
+ * The alias whose metadata the embed pipeline actually uses for a content hash:
+ * getHashesNeedingFragments picks MIN(collection || '/' || path) over the hash's active
+ * rows, so that row's description/keywords decide the hash's frontmatter fragments.
+ * Shared by the backfill planner (dry run) and its writer so both apply ONE rule.
+ */
+export function canonicalActiveDocIdForHash(db: Database, hash: string): number | null {
+  const row = db.prepare(
+    `SELECT id FROM documents WHERE hash = ? AND active = 1 ORDER BY collection || '/' || path LIMIT 1`
+  ).get(hash) as { id: number } | null;
+  return row?.id ?? null;
+}
+
+/** One planned documents-row metadata write for `clawmem backfill-meta --apply`. */
+export type DocMetaBackfillUpdate = {
+  id: number;
+  /** The content hash the plan validated; the write is skipped if the row moved off it. */
+  hash: string;
+  description?: string;
+  keywords?: string;
+};
+
+export type DocMetaBackfillResult = {
+  /** Rows whose metadata was written. */
+  applied: number;
+  /** Rows skipped because they changed (hash / active) between plan and write. */
+  raced: number;
+  /** Hashes whose fragment rows were deleted so the next `clawmem embed` re-embeds them. */
+  invalidatedHashes: string[];
+  /** content_vectors rows deleted (each with its vectors_vec entry when the table exists). */
+  deletedVectors: number;
+};
+
+/**
+ * Apply backfilled description/keywords and invalidate the affected hashes' embeddings
+ * (master-harness-65amk), in ONE immediate transaction fenced by the embedding lease.
+ *
+ * Why invalidate ALL of a hash's fragment rows: adding a description/keywords
+ * frontmatter fragment changes the hash's fragment count, and the worklist
+ * (getHashesNeedingFragments) only re-selects a hash with no fragments, a missing seq 0,
+ * or embed_state pending/failed — a metadata write alone would never re-embed it, and a
+ * pending-only requeue would leave rows at seqs the new layout no longer has. Deleting
+ * every content_vectors row (and its vectors_vec entry) plus resetting embed_state /
+ * embed_attempts makes the next embed rebuild the whole document.
+ *
+ * Shared hashes: every planned row gets its own metadata, but a hash is invalidated only
+ * when its CANONICAL alias (canonicalActiveDocIdForHash) was written — that alias is the
+ * only one whose metadata reaches the embedded fragments, so re-embedding for a
+ * non-canonical alias would rebuild identical vectors.
+ *
+ * leaseGuard: pass the held `embedding` lease. assertLeaseHeld runs first inside the
+ * transaction, so a backfill cannot delete vectors under a running embed (the embed
+ * holds that lease for its whole run) and a backfill that lost its lease writes nothing.
+ */
+export function applyDocMetaBackfill(
+  db: Database,
+  updates: DocMetaBackfillUpdate[],
+  leaseGuard?: LeaseGuard,
+): DocMetaBackfillResult {
+  return db.transaction((): DocMetaBackfillResult => {
+    assertLeaseHeld(db, leaseGuard);
+    const rowStmt = db.prepare(`SELECT hash, active FROM documents WHERE id = ?`);
+    let applied = 0;
+    let raced = 0;
+    const appliedIds = new Set<number>();
+    const touchedHashes = new Set<string>();
+    for (const u of updates) {
+      const row = rowStmt.get(u.id) as { hash: string; active: number } | null;
+      if (!row || row.active !== 1 || row.hash !== u.hash) { raced++; continue; }
+      updateDocumentMetaFn(db, u.id, { description: u.description, keywords: u.keywords });
+      applied++;
+      appliedIds.add(u.id);
+      touchedHashes.add(u.hash);
+    }
+
+    const invalidatedHashes: string[] = [];
+    let deletedVectors = 0;
+    const hasVecTable = !!db.prepare(
+      `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vectors_vec'`
+    ).get();
+    const seqStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ?`);
+    const delVec = hasVecTable ? db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`) : null;
+    const delCv = db.prepare(`DELETE FROM content_vectors WHERE hash = ?`);
+    const requeue = db.prepare(
+      `UPDATE documents SET embed_state = 'pending', embed_attempts = 0, embed_error = NULL WHERE hash = ? AND active = 1`
+    );
+    for (const hash of [...touchedHashes].sort()) {
+      const canonicalId = canonicalActiveDocIdForHash(db, hash);
+      if (canonicalId === null || !appliedIds.has(canonicalId)) continue;
+      const seqs = seqStmt.all(hash) as { seq: number }[];
+      if (delVec) for (const { seq } of seqs) delVec.run(`${hash}_${seq}`);
+      delCv.run(hash);
+      requeue.run(hash);
+      deletedVectors += seqs.length;
+      invalidatedHashes.push(hash);
+    }
+    return { applied, raced, invalidatedHashes, deletedVectors };
+  }).immediate(); // immediate write lock: assert lease ownership before any mutation
 }
 
 /**
@@ -6543,12 +6653,13 @@ function markUsageReferencedFn(db: Database, id: number): void {
 // SAME: Document Metadata Operations
 // =============================================================================
 
-function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; description?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number; authored_at?: string | null }): void {
+function updateDocumentMetaFn(db: Database, docId: number, meta: { domain?: string; workstream?: string; description?: string; keywords?: string; tags?: string; content_type?: string; review_by?: string; confidence?: number; quality_score?: number; authored_at?: string | null }): void {
   const sets: string[] = [];
   const vals: (string | number | null)[] = [];
   if (meta.domain !== undefined) { sets.push("domain = ?"); vals.push(meta.domain); }
   if (meta.workstream !== undefined) { sets.push("workstream = ?"); vals.push(meta.workstream); }
   if (meta.description !== undefined) { sets.push("description = ?"); vals.push(meta.description); }
+  if (meta.keywords !== undefined) { sets.push("keywords = ?"); vals.push(meta.keywords); }
   if (meta.tags !== undefined) { sets.push("tags = ?"); vals.push(meta.tags); }
   if (meta.content_type !== undefined) { sets.push("content_type = ?"); vals.push(meta.content_type); }
   if (meta.review_by !== undefined) { sets.push("review_by = ?"); vals.push(meta.review_by); }

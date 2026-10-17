@@ -478,7 +478,7 @@ export async function runSampledVectorValidation(
   // stored canonical identity may name a since-deactivated alias while an active twin
   // keeps the row eligible; condemning it as unreconstructable would be false. The
   // active-document EXISTS guard above still gates ELIGIBILITY.
-  const aliasStmt = s.db.prepare(`SELECT collection, path, title, description, active FROM documents WHERE hash = ? ORDER BY active DESC, collection, path`);
+  const aliasStmt = s.db.prepare(`SELECT collection, path, title, description, keywords, active FROM documents WHERE hash = ? ORDER BY active DESC, collection, path`);
   const fragCountStmt = s.db.prepare(`SELECT count(*) as c FROM content_vectors WHERE hash = ?`);
   const vecStmt = s.db.prepare(`SELECT embedding FROM vectors_vec WHERE hash_seq = ?`);
 
@@ -490,7 +490,7 @@ export async function runSampledVectorValidation(
     // Canonical resolution (T8-H3 / T9-M1): the document whose canonicalDocId matches the
     // stored id — searched across ALL aliases (active first). Null-canonical legacy rows
     // fall back to a single ACTIVE alias; ambiguity → unreconstructable, never condemned.
-    const aliases = aliasStmt.all(row.hash) as { collection: string; path: string; title: string; description: string | null; active: number }[];
+    const aliases = aliasStmt.all(row.hash) as { collection: string; path: string; title: string; description: string | null; keywords: string | null; active: number }[];
     let canonical = row.canonical_id
       ? aliases.find(a => canonicalDocId(a.collection, a.path) === row.canonical_id)
       : undefined;
@@ -505,7 +505,7 @@ export async function runSampledVectorValidation(
     try {
       const bodyRow = bodyStmt.get(row.hash) as { doc: string } | undefined;
       if (!bodyRow) { markUnreconstructable("body_missing"); continue; }
-      const frontmatter = buildEmbedFrontmatter(canonical.title, canonical.path, canonical.description);
+      const frontmatter = buildEmbedFrontmatter(canonical.title, canonical.path, canonical.description, canonical.keywords);
       const frags = splitDocument(bodyRow.doc, frontmatter);
       // Per-hash fragment-count contract (T8-M4): splitter output must match what was persisted.
       const persistedCount = (fragCountStmt.get(row.hash) as { c: number }).c;
