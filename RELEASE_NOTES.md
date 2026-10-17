@@ -4,6 +4,15 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.62 — keywords frontmatter persisted + embedded; backfill-meta verb
+
+- `keywords` frontmatter is now persisted (nullable `documents.keywords` column, migrated in place) and embedded as its own frontmatter fragment after title and description, the same way v0.10.13 handled description. A document with no description or keywords cuts exactly the fragments it did before, so nothing re-embeds for those.
+- `pg reindex` feeds the same title → description → keywords frontmatter through a shared `reindexEmbedFrontmatter` helper, so the sqlite and Postgres paths cut identical fragments. No Postgres column is needed: metadata is re-parsed from source on every reindex.
+- New verb `clawmem backfill-meta`: fills description/keywords on rows indexed before those columns existed, without a forced full re-index. Dry run by default; `--apply` writes the columns and drops the affected hashes' vectors under the embedding lease, so run `clawmem embed` right after. Flags: `--collection`, `--limit`.
+- Known gap: on sqlite, an edit that touches only description/keywords frontmatter updates the columns but does not re-embed (the content hash covers the body only). Use `clawmem embed --requeue-hashes`. Postgres reindex is not affected.
+
+---
+
 ## v0.36.61 — PRIVATE_COLLECTIONS tripwire adds openclaw-workspace
 
 `PRIVATE_COLLECTIONS` in `src/pg/vaults.ts` now names `openclaw-workspace` beside `bj-corpus` (operator ruling, Review Hub a7981735). The collection already routes to the nsfw vault by data (`vault: nsfw`, master-harness-vn4rz.65); the code tripwire now also throws `PrivateContentRoutingError` if it ever resolves sfw, so a config re-add that drops the vault key fails the write instead of routing the next reindex into the general database. Mirrored in master-harness `tools/clawmem-vault-isolation-check`. Routing tests updated, with a new case covering the dropped-key, explicit-sfw and nsfw paths.
