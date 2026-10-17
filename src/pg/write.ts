@@ -169,6 +169,13 @@ export interface EmbeddingWrite {
   embedInputFp?: string | null;
   /** Producing embed arm (EmbeddingResult.endpoint) — named by the write fence on refusal. */
   endpoint?: string;
+  /**
+   * Index-time content verdict for the fragment's document (master-harness-vn4rz.66),
+   * passed to resolveVault as its ESCALATION-ONLY hint so a classified document's
+   * vectors land in the same vault as its row. "nsfw" escalates; "sfw" or absent
+   * changes nothing — the collection (+ path) still decides.
+   */
+  vault?: Vault;
 }
 
 function assertDimension(w: EmbeddingWrite, expected: number): void {
@@ -201,7 +208,7 @@ export async function insertEmbeddingsBatch(writes: EmbeddingWrite[]): Promise<v
   // for the same reason as the intra-batch model-mismatch check below.
   const vaults = new Map<Vault, string[]>();
   for (const w of writes) {
-    const v = resolveVault(w.collection, w.path ?? undefined);
+    const v = resolveVault(w.collection, w.path ?? undefined, w.vault);
     const seen = vaults.get(v);
     if (seen) seen.push(w.collection);
     else vaults.set(v, [w.collection]);
@@ -843,7 +850,12 @@ export interface ContentGcResult {
   capped: boolean;
 }
 
-const ORPHAN_PREDICATE = `
+/**
+ * "No documents or origin_documents row references c.hash" — the one definition
+ * of an orphaned content row, shared by content GC and the origin loader's sfw
+ * residue removal (master-harness-vn4rz.66). Expects the content table aliased `c`.
+ */
+export const ORPHAN_PREDICATE = `
   NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = c.hash)
   AND NOT EXISTS (SELECT 1 FROM origin_documents o WHERE o.hash = c.hash)`;
 
