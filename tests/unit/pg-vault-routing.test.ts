@@ -57,16 +57,17 @@ afterAll(() => {
 });
 
 describe("PRIVATE_ROOTS is exactly the ADR-0162 §1 / clawmem-recall.toml surface", () => {
-  it("names bj-corpus and nothing else", () => {
-    // Widening this set is a POLICY decision (openclaw-workspace, monchujo and
-    // friends were deliberately left out at 0ynkd). This assertion is what makes
-    // a quiet widening show up as a failing test rather than as a diff nobody read.
-    expect([...PRIVATE_COLLECTIONS]).toEqual(["bj-corpus"]);
+  it("names bj-corpus and openclaw-workspace and nothing else", () => {
+    // Widening this set is a POLICY decision. bj-corpus is the 0ynkd surface;
+    // openclaw-workspace was added by operator ruling (Review Hub a7981735,
+    // master-harness-vn4rz.106). This assertion is what makes a quiet widening
+    // show up as a failing test rather than as a diff nobody read.
+    expect([...PRIVATE_COLLECTIONS]).toEqual(["bj-corpus", "openclaw-workspace"]);
     expect([...PRIVATE_PATH_PREFIXES]).toEqual(["intelligence/personal/bj/"]);
   });
 
-  it("does NOT treat openclaw-workspace or monchujo as private", () => {
-    expect(collectionIsPrivate("openclaw-workspace")).toBe(false);
+  it("treats openclaw-workspace as private and monchujo as NOT private", () => {
+    expect(collectionIsPrivate("openclaw-workspace")).toBe(true);
     expect(collectionIsPrivate("monchujo")).toBe(false);
   });
 });
@@ -105,6 +106,17 @@ describe("resolveVault — the hard-coded tripwire (the guarantee half)", () => 
     useConfig(`collections:\n  bj-corpus:\n    path: ${REPO}\n    pattern: "intelligence/personal/bj/approved/**/*.md"\n    vault: sfw\n`);
     expect(() => resolveVault("bj-corpus", "intelligence/personal/bj/approved/x.md"))
       .toThrow(PrivateContentRoutingError);
+  });
+
+  it("THROWS when openclaw-workspace resolves sfw (vault key dropped by a config re-add)", () => {
+    // vn4rz.106: an openclaw-side remove+re-add that loses `vault: nsfw` must
+    // fail the write, not route the next reindex into the general database.
+    useConfig(`collections:\n  openclaw-workspace:\n    path: /home/bj/.openclaw/workspace\n    pattern: "memory/**/*.md"\n`);
+    expect(() => resolveVault("openclaw-workspace", "memory/x.md")).toThrow(PrivateContentRoutingError);
+    useConfig(`collections:\n  openclaw-workspace:\n    path: /home/bj/.openclaw/workspace\n    pattern: "memory/**/*.md"\n    vault: sfw\n`);
+    expect(() => resolveVault("openclaw-workspace", "memory/x.md")).toThrow(PrivateContentRoutingError);
+    useConfig(`collections:\n  openclaw-workspace:\n    path: /home/bj/.openclaw/workspace\n    pattern: "memory/**/*.md"\n    vault: nsfw\n`);
+    expect(resolveVault("openclaw-workspace", "memory/x.md")).toBe("nsfw");
   });
 
   it("THROWS when a private collection is left UNDECLARED (defaulting to sfw)", () => {

@@ -31,11 +31,13 @@
  * private set in code means a mis-declaration is impossible rather than merely
  * detectable, and changing the private set is a reviewed code change.
  *
- * PRIVATE_ROOTS is seeded with EXACTLY what ADR-0162 §1 and
- * infra/clawmem/clawmem-recall.toml's `excluded_collections` declare today —
- * the bj-corpus surface, nothing more. Widening the private set (openclaw
- * workspaces, monchujo, …) is a policy decision that belongs to whoever makes
- * it, not to this module.
+ * PRIVATE_ROOTS was seeded with EXACTLY what ADR-0162 §1 and
+ * infra/clawmem/clawmem-recall.toml's `excluded_collections` declared at
+ * master-harness-0ynkd — the bj-corpus surface. Widening it is a policy
+ * decision that belongs to whoever makes it, not to this module. One widening
+ * has been made: openclaw-workspace, routed nsfw by operator ruling (Review
+ * Hub a7981735, 2026-09-02; master-harness-vn4rz.65 / vn4rz.106). monchujo and
+ * the rest stay out until someone rules otherwise.
  * ---------------------------------------------------------------------------
  */
 
@@ -53,10 +55,14 @@ export function isVault(v: unknown): v is Vault {
 
 /**
  * Collection names that MUST route to the nsfw vault. Hard-coded on purpose —
- * see the header. Set-equal to `excluded_collections` in
- * infra/clawmem/clawmem-recall.toml as of master-harness-0ynkd.
+ * see the header. bj-corpus is the ADR-0162 §1 surface (set-equal to
+ * `excluded_collections` in infra/clawmem/clawmem-recall.toml as of
+ * master-harness-0ynkd); openclaw-workspace is the Review Hub a7981735 ruling
+ * (master-harness-vn4rz.106). Mirrored by PRIVATE_COLLECTIONS in master-harness
+ * tools/clawmem-vault-isolation-check, whose pg-no-private-in-sfw probe fails
+ * on drift between the two.
  */
-export const PRIVATE_COLLECTIONS: readonly string[] = ["bj-corpus"] as const;
+export const PRIVATE_COLLECTIONS: readonly string[] = ["bj-corpus", "openclaw-workspace"] as const;
 
 /**
  * Source-path prefixes that MUST route to the nsfw vault. Matched

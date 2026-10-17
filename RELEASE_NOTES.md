@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.61 — PRIVATE_COLLECTIONS tripwire adds openclaw-workspace
+
+`PRIVATE_COLLECTIONS` in `src/pg/vaults.ts` now names `openclaw-workspace` beside `bj-corpus` (operator ruling, Review Hub a7981735). The collection already routes to the nsfw vault by data (`vault: nsfw`, master-harness-vn4rz.65); the code tripwire now also throws `PrivateContentRoutingError` if it ever resolves sfw, so a config re-add that drops the vault key fails the write instead of routing the next reindex into the general database. Mirrored in master-harness `tools/clawmem-vault-isolation-check`. Routing tests updated, with a new case covering the dropped-key, explicit-sfw and nsfw paths.
+
+---
+
 ## v0.36.60 — collection add keeps half_lives; no-decay saved as none
 
 - `clawmem collection add` on an existing collection now keeps its `half_lives` override. Before this, the nightly memory-topics refresh re-added the collection and silently put it back on global decay (full-sweep RED: clawmem-collections, 2026-10-14).
