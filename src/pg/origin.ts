@@ -31,7 +31,7 @@
 
 import { Glob } from "bun";
 import { readFileSync } from "fs";
-import { basename, join } from "path";
+import { join } from "path";
 import matter from "gray-matter";
 import {
   extractTitle, hashContent, parseDocument, type DocumentMeta,
@@ -41,13 +41,8 @@ import { getDefaultLlamaCpp, formatDocForEmbedding } from "../llm.ts";
 import { splitDocument } from "../splitter.ts";
 import { canonicalDocId } from "../store.ts";
 import { withClient, withTransaction } from "./client.ts";
-import {
-  assertVaultDatabase, insertEmbeddingsBatch, ORPHAN_PREDICATE, type EmbeddingWrite,
-} from "./write.ts";
-import { resolveVault, type Vault } from "./vaults.ts";
-import {
-  classifyText, isContentClassified, SessionClassifier, sessionKeyFor, type SessionVerdict,
-} from "./classify.ts";
+import { insertEmbeddingsBatch, type EmbeddingWrite } from "./write.ts";
+import type { Vault } from "./vaults.ts";
 import { embedInputFingerprint } from "../embed-fingerprint.ts";
 
 /** How `authored_at` was obtained. Mirrors the CHECK in migration 004. */
@@ -199,191 +194,12 @@ export interface OriginLoadStats {
   hashesAlreadyEmbedded: number;
   fragmentsEmbedded: number;
   embedFailures: number;
-  // Index-time content classification (master-harness-vn4rz.66). All zero unless
-  // the collection is in CONTENT_CLASSIFIED_COLLECTIONS and the requested vault
-  // is sfw. Counted over the documents THIS run wrote (the `--month` / `--limit`
-  // filters apply), while each session's verdict is taken over every file the
-  // pattern matches.
-  /** Documents written to the nsfw vault because their session was classified nsfw. */
-  classifiedNsfwDocs: number;
-  /** Distinct nsfw-classified sessions among the documents written. */
-  classifiedNsfwSessions: number;
-  /** Distinct sfw sessions with at least one AMBIGUOUS signal (reported, never routed). */
-  ambiguousSessions: number;
-  /** What the sfw residue removal deleted for nsfw-routed documents. */
-  sfwResidueRemoved: SfwResidueRemoved;
   wallClockMs: number;
-}
-
-export interface SfwResidueRemoved {
-  originRows: number;
-  contentRows: number;
-  vectorRows: number;
 }
 
 function expandBraces(pattern: string): string[] {
   const m = pattern.match(/^\{(.+)\}$/);
   return m ? m[1]!.split(",").map(s => s.trim()) : [pattern];
-}
-
-/** Every file the collection pattern matches under `root`, sorted. */
-export function listOriginFiles(root: string, pattern: string): string[] {
-  const files: string[] = [];
-  for (const p of expandBraces(pattern)) {
-    for (const f of new Glob(p).scanSync({ cwd: root, onlyFiles: true })) files.push(f);
-  }
-  return files.sort();
-}
-
-/** A record's frontmatter `session_id` as a string, or null when absent. */
-export function frontmatterSessionId(m: Record<string, unknown>): string | null {
-  const v = m.session_id;
-  if (typeof v === "string") return v;
-  if (typeof v === "number") return String(v);
-  return null;
-}
-
-/**
- * The classification PRE-PASS (master-harness-vn4rz.66): one verdict per session
- * over EVERY file the pattern matches, plus each file's session key. Streams the
- * files through SessionClassifier so no transcript text is retained.
- */
-export function classifyOriginFiles(
-  root: string,
-  files: string[],
-): { sessionOf: Map<string, string>; verdicts: Map<string, SessionVerdict> } {
-  const sc = new SessionClassifier();
-  const sessionOf = new Map<string, string>();
-  for (const rel of files) {
-    let raw: string;
-    try { raw = readFileSync(join(root, rel), "utf-8"); } catch { continue; }
-    sessionOf.set(rel, sc.add({ rel, raw, sessionId: frontmatterSessionId(rawFrontmatter(raw)) }));
-  }
-  return { sessionOf, verdicts: sc.verdicts() };
-}
-
-/** One session in the `origin-classify` report. Content-free by construction. */
-export interface OriginClassifySession {
-  session: string;
-  vault: Vault;
-  docs: number;
-  private: string[];
-  ambiguous: string[];
-  /** Chunk basenames, aligned with `hashes`. */
-  chunks: string[];
-  /** hashContent of each chunk's raw file — the same key the loader writes. */
-  hashes: string[];
-}
-
-export interface OriginClassifyReport {
-  collection: string;
-  sessions: OriginClassifySession[];
-  totals: {
-    files: number;
-    sessions: number;
-    nsfwSessions: number;
-    sfwSessions: number;
-    ambiguousSessions: number;
-    nsfwDocs: number;
-    sfwDocs: number;
-  };
-}
-
-/**
- * The `origin-classify` dry run: what the loader WOULD route, per session,
- * touching no database. Output carries session keys, chunk basenames, signal ids,
- * counts and content hashes — never text, titles or directory paths.
- */
-export function classifyOriginCollection(opts: {
-  collection: string;
-  root: string;
-  pattern: string;
-}): OriginClassifyReport {
-  const files = listOriginFiles(opts.root, opts.pattern);
-  const { verdicts } = classifyOriginFiles(opts.root, files);
-  const bySession = new Map<string, { chunks: string[]; hashes: string[] }>();
-  for (const rel of files) {
-    let raw: string;
-    try { raw = readFileSync(join(opts.root, rel), "utf-8"); } catch { continue; }
-    const key = sessionKeyFor(rel, frontmatterSessionId(rawFrontmatter(raw)));
-    let e = bySession.get(key);
-    if (!e) { e = { chunks: [], hashes: [] }; bySession.set(key, e); }
-    e.chunks.push(basename(rel));
-    e.hashes.push(hashContent(raw));
-  }
-  const sessions: OriginClassifySession[] = [];
-  for (const key of [...bySession.keys()].sort()) {
-    const v = verdicts.get(key)!;
-    const e = bySession.get(key)!;
-    sessions.push({
-      session: key, vault: v.vault, docs: e.chunks.length,
-      private: v.private, ambiguous: v.ambiguous, chunks: e.chunks, hashes: e.hashes,
-    });
-  }
-  const nsfw = sessions.filter(s => s.vault === "nsfw");
-  const sfw = sessions.filter(s => s.vault === "sfw");
-  return {
-    collection: opts.collection,
-    sessions,
-    totals: {
-      files: files.length,
-      sessions: sessions.length,
-      nsfwSessions: nsfw.length,
-      sfwSessions: sfw.length,
-      ambiguousSessions: sfw.filter(s => s.ambiguous.length > 0).length,
-      nsfwDocs: nsfw.reduce((n, s) => n + s.docs, 0),
-      sfwDocs: sfw.reduce((n, s) => n + s.docs, 0),
-    },
-  };
-}
-
-/**
- * SFW RESIDUE REMOVAL (master-harness-vn4rz.66) — what makes a later-flagged
- * session self-heal. For documents this run has just written to the nsfw vault,
- * in ONE sfw transaction:
- *
- *   1. delete the sfw origin_documents rows for (collection, path);
- *   2. take as candidates both the hashes those rows pointed at (an earlier
- *      revision of the chunk may have hashed differently) and the current ones;
- *   3. lock the candidates that NO remaining sfw documents / origin_documents
- *      row references (FOR UPDATE: a concurrent writer's FK check now waits
- *      rather than racing the delete), then delete their content_vectors and
- *      content rows. A hash still referenced by any sfw row is kept.
- *
- * Only ever called for documents already committed to nsfw, so the delete can
- * never be the only copy.
- */
-export async function removeSfwResidue(
-  collection: string,
-  docs: { rel: string; hash: string }[],
-): Promise<SfwResidueRemoved> {
-  const out: SfwResidueRemoved = { originRows: 0, contentRows: 0, vectorRows: 0 };
-  if (docs.length === 0) return out;
-  return withTransaction("sfw", async c => {
-    await assertVaultDatabase(c, "sfw");
-    const del = await c.query<{ hash: string }>(
-      `DELETE FROM origin_documents WHERE collection = $1 AND path = ANY($2::text[]) RETURNING hash`,
-      [collection, docs.map(d => d.rel)],
-    );
-    out.originRows = del.rowCount ?? del.rows.length;
-    const candidates = [...new Set([...del.rows.map(r => r.hash), ...docs.map(d => d.hash)])].sort();
-    const locked = await c.query<{ hash: string }>(
-      `SELECT c.hash FROM content c
-        WHERE c.hash = ANY($1::text[])
-          AND ${ORPHAN_PREDICATE}
-        ORDER BY c.hash
-        FOR UPDATE OF c`,
-      [candidates],
-    );
-    const orphans = locked.rows.map(r => r.hash);
-    if (orphans.length === 0) return out;
-    const vec = await c.query(`DELETE FROM content_vectors WHERE hash = ANY($1::text[])`, [orphans]);
-    out.vectorRows = vec.rowCount ?? 0;
-    const con = await c.query(
-      `DELETE FROM content c WHERE c.hash = ANY($1::text[]) AND ${ORPHAN_PREDICATE}`, [orphans]);
-    out.contentRows = con.rowCount ?? 0;
-    return out;
-  });
 }
 
 /**
@@ -405,51 +221,29 @@ export async function loadOriginCollection(
     unassigned: 0, unassignedPaths: [],
     recordTypeBacklog: {},
     hashesAlreadyEmbedded: 0, fragmentsEmbedded: 0, embedFailures: 0,
-    classifiedNsfwDocs: 0, classifiedNsfwSessions: 0, ambiguousSessions: 0,
-    sfwResidueRemoved: { originRows: 0, contentRows: 0, vectorRows: 0 },
     wallClockMs: 0,
   };
 
-  const files = listOriginFiles(opts.root, opts.pattern);
+  const files: string[] = [];
+  for (const p of expandBraces(opts.pattern)) {
+    for (const f of new Glob(p).scanSync({ cwd: opts.root, onlyFiles: true })) files.push(f);
+  }
+  files.sort();
   stats.filesSeen = files.length;
 
-  // INDEX-TIME CLASSIFICATION (master-harness-vn4rz.66; Review Hub a7981735).
-  // Only for a content-classified collection loaded into the sfw vault: an
-  // explicit `--vault nsfw`, or any other collection, takes the unchanged path.
-  // The pre-pass walks EVERY matched file, ignoring --month/--limit, so a
-  // session's verdict never depends on which of its chunks this run selected.
-  const classified = isContentClassified(opts.collection) && vault === "sfw";
-  const pre = classified
-    ? classifyOriginFiles(opts.root, files)
-    : { sessionOf: new Map<string, string>(), verdicts: new Map<string, SessionVerdict>() };
-  const nsfwSessionsWritten = new Set<string>();
-  const ambiguousSessionsWritten = new Set<string>();
-  const residue: { rel: string; hash: string }[] = [];
-  const RESIDUE_BATCH = 200;
-  const flushResidue = async () => {
-    if (residue.length === 0) return;
-    const r = await removeSfwResidue(opts.collection, residue.splice(0, residue.length));
-    stats.sfwResidueRemoved.originRows += r.originRows;
-    stats.sfwResidueRemoved.contentRows += r.contentRows;
-    stats.sfwResidueRemoved.vectorRows += r.vectorRows;
-  };
-
-  // Which (vault, month) pairs already have a partition, so the ensure call is
-  // made once per month per vault rather than once per record.
+  // Which months already have a partition, so the ensure call is made once per
+  // month rather than once per record.
   const ensured = new Set<string>();
-  const ensureMonth = async (v: Vault, monthKey: string) => {
-    const key = `${v}|${monthKey}`;
-    if (ensured.has(key)) return;
-    await withClient(v, c =>
+  const ensureMonth = async (monthKey: string) => {
+    if (ensured.has(monthKey)) return;
+    await withClient(vault, c =>
       c.query("SELECT origin_documents_ensure_partition($1::date)", [monthKey]));
-    ensured.add(key);
+    ensured.add(monthKey);
   };
 
   interface PendingFragment {
     hash: string; seq: number; pos: number; text: string;
-    fragmentType: string; fragmentLabel: string | null; canonicalId: string; relPath: string;
-    /** Content-routing hint for the vectors; set only for nsfw-classified documents. */
-    vault?: Vault;
+    fragmentType: string; fragmentLabel: string; canonicalId: string; relPath: string;
   }
   const pending: PendingFragment[] = [];
   const hashesDone = new Set<string>();
@@ -461,27 +255,19 @@ export async function loadOriginCollection(
     while (pending.length >= batchSize || (force && pending.length > 0)) {
       const chunk = pending.splice(0, Math.min(batchSize, pending.length));
       const results = await llm.embedBatch(chunk.map(p => p.text));
-      // Grouped by routing hint: one embed batch can hold fragments of an
-      // nsfw-classified document and of an sfw one, and insertEmbeddingsBatch
-      // (rightly) refuses a batch that spans two vaults. Without classification
-      // there is exactly one group, so the write is unchanged.
-      const groups = new Map<string, EmbeddingWrite[]>();
+      const writes: EmbeddingWrite[] = [];
       for (let i = 0; i < chunk.length; i++) {
         const r = results[i]; const frag = chunk[i]!;
         if (!r?.embedding) { stats.embedFailures++; continue; }
-        const w: EmbeddingWrite = {
+        writes.push({
           collection: opts.collection, path: frag.relPath,
           hash: frag.hash, seq: frag.seq, pos: frag.pos,
           embedding: r.embedding, model: r.model, endpoint: r.endpoint,
           fragmentType: frag.fragmentType, fragmentLabel: frag.fragmentLabel,
           canonicalId: frag.canonicalId, embedInputFp: embedInputFingerprint(frag.text, r),
-        };
-        if (frag.vault) w.vault = frag.vault;
-        const gk = frag.vault ?? "";
-        const g = groups.get(gk);
-        if (g) g.push(w); else groups.set(gk, [w]);
+        });
       }
-      for (const writes of groups.values()) {
+      if (writes.length) {
         // Dimension, model-consistency and vault checks all live inside
         // insertEmbeddingsBatch's transaction. Not re-checked here: one home.
         await insertEmbeddingsBatch(writes);
@@ -511,31 +297,13 @@ export async function loadOriginCollection(
 
     const hash = hashContent(raw);
     const title = meta.title ?? extractTitle(raw, rel);
-
-    // Where THIS document goes. Unclassified: the requested vault, as before.
-    // Classified: the session verdict, through resolveVault's escalation-only
-    // hint — the same function that routes the document's vectors, so row and
-    // vectors cannot disagree, and the tripwire still runs.
-    let docVault: Vault = vault;
-    let verdict: SessionVerdict | undefined;
-    let sessionKey = "";
-    if (classified) {
-      sessionKey = pre.sessionOf.get(rel) ?? sessionKeyFor(rel, frontmatterSessionId(m));
-      verdict = pre.verdicts.get(sessionKey);
-      if (!verdict) {
-        // The file appeared between the pre-pass and now: judge it alone.
-        const c = classifyText(raw);
-        verdict = { vault: c.private.length ? "nsfw" : "sfw", private: c.private, ambiguous: c.ambiguous };
-      }
-      docVault = resolveVault(opts.collection, rel, verdict.vault);
-    }
     const { recordType, raw: rtRaw } = narrowRecordType(m.content_type as string | undefined);
     if (recordType === "unknown" && rtRaw) {
       stats.recordTypeBacklog[rtRaw] = (stats.recordTypeBacklog[rtRaw] ?? 0) + 1;
     }
 
     if (authoredAt) {
-      await ensureMonth(docVault, utcMonthKey(authoredAt));
+      await ensureMonth(utcMonthKey(authoredAt));
       const pname = `origin_documents_${utcMonthKey(authoredAt).slice(0, 7).replace("-", "_")}`;
       stats.perMonth[pname] = (stats.perMonth[pname] ?? 0) + 1;
     } else {
@@ -543,10 +311,7 @@ export async function loadOriginCollection(
       if (stats.unassignedPaths.length < 50) stats.unassignedPaths.push(rel);
     }
 
-    await withTransaction(docVault, async c => {
-      // Belt for the new route: a classified document headed for nsfw verifies
-      // the connection really is the nsfw database before anything is written.
-      if (classified && docVault === "nsfw") await assertVaultDatabase(c, "nsfw");
+    await withTransaction(vault, async c => {
       await c.query(
         `INSERT INTO content (hash, doc) VALUES ($1, $2)
          ON CONFLICT ON CONSTRAINT content_pkey DO UPDATE SET doc = EXCLUDED.doc`,
@@ -600,15 +365,6 @@ export async function loadOriginCollection(
               "origin vocabulary (NOT the ADR-0058 enum); authored_at from " + source +
               "; partition = UTC month of authored_at, DEFAULT when unresolved",
             authored_at_source: source,
-            // Signal ids only — never the matched text.
-            ...(verdict ? {
-              content_classification: {
-                rule: "per-session boundary signals (master-harness-vn4rz.66, Review Hub a7981735)",
-                vault: docVault,
-                private: verdict.private,
-                ambiguous: verdict.ambiguous,
-              },
-            } : {}),
           }),
           "private",
         ],
@@ -617,30 +373,13 @@ export async function loadOriginCollection(
     stats.recordsWritten++;
     n++;
 
-    if (classified && verdict) {
-      if (docVault === "nsfw") {
-        if (verdict.vault === "nsfw") {
-          stats.classifiedNsfwDocs++;
-          nsfwSessionsWritten.add(sessionKey);
-        }
-        residue.push({ rel, hash });
-        if (residue.length >= RESIDUE_BATCH) await flushResidue();
-      } else if (verdict.ambiguous.length > 0) {
-        ambiguousSessionsWritten.add(sessionKey);
-      }
-    }
-
-    // Keyed by vault as well as hash: a hash the sfw vault already covers says
-    // nothing about the nsfw vault a classified document now routes to.
-    const doneKey = `${docVault}|${hash}`;
-    if (!hashesDone.has(doneKey)) {
-      hashesDone.add(doneKey);
+    if (!hashesDone.has(hash)) {
+      hashesDone.add(hash);
       // EMBED-INCREMENTAL. The vectors key on the content hash, so a hash the
       // vault already holds vectors for needs nothing. This is what makes the
       // 13,723-row migration cost ZERO embed calls -- and it is checked against
-      // the database rather than assumed from "we reindexed it earlier". The
-      // coverage read goes to the vault THIS document routes to.
-      const { rows } = await withClient(docVault, c =>
+      // the database rather than assumed from "we reindexed it earlier".
+      const { rows } = await withClient(vault, c =>
         c.query<{ n: string }>(
           "SELECT count(*)::text AS n FROM content_vectors WHERE hash = $1", [hash]));
       if (Number(rows[0]!.n) > 0) { stats.hashesAlreadyEmbedded++; continue; }
@@ -654,7 +393,6 @@ export async function loadOriginCollection(
           hash, seq, pos: frag.startLine,
           text: formatDocForEmbedding(frag.content, frag.label || title),
           fragmentType: frag.type, fragmentLabel: frag.label, canonicalId, relPath: rel,
-          ...(classified && docVault === "nsfw" ? { vault: "nsfw" as const } : {}),
         });
       }
       if (pending.length >= batchSize) {
@@ -663,12 +401,7 @@ export async function loadOriginCollection(
       }
     }
   }
-  // Residue first: the nsfw rows are already committed, so the sfw copies can go
-  // even if the final embed flush below fails.
-  await flushResidue();
   await flush(true);
-  stats.classifiedNsfwSessions = nsfwSessionsWritten.size;
-  stats.ambiguousSessions = ambiguousSessionsWritten.size;
   stats.wallClockMs = Date.now() - t0;
   return stats;
 }

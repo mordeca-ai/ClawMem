@@ -4,19 +4,6 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
-## v0.36.63 — monchujo per-session NSFW routing at index time; origin-classify verb
-
-- `pg origin-load` now classifies monchujo transcripts per session before writing (operator ruling, Review Hub a7981735). If any chunk of a session references a private root (the NSFW, persona or personal crypt roots listed in the new `src/pg/classify.ts`), every chunk of that session goes to the nsfw vault: rows, content, partitions and vectors. Other sessions stay in sfw.
-- The session verdict is taken over every file the collection pattern matches, so `--month` and `--limit` never split a session across vaults.
-- A session flagged after an earlier clean load heals on the next load. Its sfw `origin_documents` rows are deleted, and its sfw content and vectors are deleted too unless another sfw row still references the same hash.
-- References to the PII and business crypt roots (job search, financial, household, customer data, eval transcripts) are counted and never routed. The operator rules on those separately.
-- `resolveVault` takes an optional content hint that can only escalate sfw to nsfw. A declared nsfw collection and the private-root tripwire are unaffected by a hint of sfw. `EmbeddingWrite` carries the hint so a classified document's vectors land in the same vault as its row.
-- `origin-load` always prints two new lines, zeros included: documents and sessions routed nsfw with the ambiguous-session count, and the sfw residue removed (origin, content and vector rows). Counts only.
-- New verb `bun src/pg/cli.ts origin-classify --collection <name> [--json]`: a dry run of the routing that opens no database. It prints per-session vault, signal ids, chunk basenames and content hashes, plus totals. It never prints text, titles or directory paths.
-- Unchanged: `--vault nsfw` loads and every collection other than monchujo. Changing either signal list is a reviewed code change, mirrored in master-harness `tools/clawmem-vault-isolation-check`.
-
----
-
 ## v0.36.62 — keywords frontmatter persisted + embedded; backfill-meta verb
 
 - `keywords` frontmatter is now persisted (nullable `documents.keywords` column, migrated in place) and embedded as its own frontmatter fragment after title and description, the same way v0.10.13 handled description. A document with no description or keywords cuts exactly the fragments it did before, so nothing re-embeds for those.
