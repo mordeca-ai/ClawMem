@@ -148,7 +148,7 @@ d("PG origin write read-back guard", () => {
     );
     writeFileSync(
       join(fixtureDir, "session_003.md"),
-      `---\nts: "2026-04-01T12:00:00Z"\nsession_id: "sess-003"\ncontent_type: "session-transcript"\ntitle: "Third session record"\n---\nThird transcript content body here.\n`,
+      `---\nts: "2026-04-01T12:00:00Z"\nsession_id: 30003\ncontent_type: "session-transcript"\ntitle: "Third session record"\n---\nThird transcript content body here.\n`,
       "utf-8",
     );
   }, PG_TEST_SETUP_TIMEOUT_MS);

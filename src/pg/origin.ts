@@ -515,7 +515,12 @@ export async function loadOriginCollection(
       const contentRow = contentRows[0];
       const originRow = originRows[0];
       const mismatches = checkOriginWriteReadBack(
-        { path: rel, title, hash, authoredAt: authoredAt ?? null, sessionId: (m.session_id as string) ?? null },
+        // session_id goes over the wire as text whatever YAML typed it (a bare
+        // number parses as one), so compare its text form, not the raw value.
+        {
+          path: rel, title, hash, authoredAt: authoredAt ?? null,
+          sessionId: m.session_id == null ? null : String(m.session_id),
+        },
         contentRow,
         originRow,
       );
