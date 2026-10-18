@@ -36,6 +36,8 @@
  * duration of the run and the JSON is written with process.stdout.write.
  */
 
+import { resolvePgCollectionScope } from "./focus-scope.ts";
+import { listCollections } from "../collections.ts";
 import type { SearchResult } from "../store.ts";
 import { applyCompositeScoring, type EnrichedResult } from "../memory.ts";
 import type { PgQueryable, PgVecEmbedder } from "./search.ts";
@@ -180,6 +182,12 @@ export interface RetrieveDeps {
   searchReranked: typeof pgSearchRerankedDetailed;
   /** PG metadata enrichment + the same composite ranking used by sqlite CLI. */
   rankResults?(c: PgQueryable, results: SearchResult[], query: string, limit: number): Promise<SearchResult[]>;
+  /**
+   * Configured collection names, for ADR-0085 session-focus auto-scope
+   * (master-harness-vn4rz.111). Absent => focus is not consulted (unscoped),
+   * so injected-deps unit tests stay hermetic.
+   */
+  knownCollections?(): string[];
   /** Release anything the deps opened (pools, the rerank cache store, the LLM). */
   dispose(): Promise<void>;
 }
@@ -312,7 +320,10 @@ export async function runRetrieve(
   };
 
   try {
-    const collections = args.collections;
+    // explicit --collection > session focus > unscoped (same resolver as sqlite).
+    const collections = deps.knownCollections
+      ? resolvePgCollectionScope(args.collections, deps.knownCollections())
+      : args.collections;
     switch (args.mode) {
       case "search": {
         const { r, ranked } = await deps.withClient(args.vault, async c => {
@@ -402,6 +413,10 @@ export function productionRetrieveDeps(): RetrieveDeps {
   let closeStore: (() => void) | undefined;
   let embedderLoaded = false;
   return {
+    knownCollections() {
+      // Fail-open: an unreadable collections config means unscoped, not an error.
+      try { return listCollections().map(c => c.name); } catch { return []; }
+    },
     async withClient(vault, fn) {
       const { withClient } = await import("./client.ts");
       return withClient(vault, fn);
