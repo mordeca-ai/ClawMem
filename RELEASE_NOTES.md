@@ -4,7 +4,7 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
-## v0.36.64 — monchujo per-session NSFW routing re-landed on the read-back guard
+## v0.36.65 — monchujo per-session NSFW routing re-landed on the read-back guard
 
 - Re-lands the v0.36.63 classifier (master-harness-vn4rz.66), which was reverted after a live `origin-load` wrote rows with stale parameters (master-harness-vn4rz.109). Every `content` and `origin_documents` write in the classified loop now passes the v0.36.63 read-back guard, in both vaults and on both insert and conflict update. A mismatch throws `OriginWriteReadBackError` and rolls the document's transaction back.
 - `pg origin-load` now classifies monchujo transcripts per session before writing (operator ruling, Review Hub a7981735). If any chunk of a session references a private root (the NSFW, persona or personal crypt roots listed in the new `src/pg/classify.ts`), every chunk of that session goes to the nsfw vault: rows, content, partitions and vectors. Other sessions stay in sfw.
@@ -15,6 +15,14 @@ For upgrade instructions (migration steps, opt-in features, verification command
 - `origin-load` always prints two new lines, zeros included: documents and sessions routed nsfw with the ambiguous-session count, and the sfw residue removed (origin, content and vector rows). Counts only.
 - New verb `bun src/pg/cli.ts origin-classify --collection <name> [--json]`: a dry run of the routing that opens no database. It prints per-session vault, signal ids, chunk basenames and content hashes, plus totals. It never prints text, titles or directory paths.
 - Unchanged: `--vault nsfw` loads and every collection other than monchujo. Changing either signal list is a reviewed code change, mirrored in master-harness `tools/clawmem-vault-isolation-check`.
+
+---
+
+## v0.36.64 — clawmem vec-compact: collection-clustered vec0 rebuild
+
+- New `clawmem vec-compact [--dry-run] [--json] [-c <collection>]...` rebuilds `vectors_vec` with rows inserted in collection-clustered order (MIN active owning collection, then hash, then seq; unowned vectors last), so a collection-scoped vector leg reads a few vec0 chunks instead of hundreds (master-harness-vn4rz.110).
+- Live vault dry run: `openclaw-workspace` 123 -> 3 chunks, `docs` 163 -> 21, `agents-skills` 159 -> 18; 511 -> 374 chunks total. On a live-size copy, warm `vsearch -c openclaw-workspace` fell from 2.2-3.8 s to 1.4-2.0 s with identical hits; the vector leg itself ~1.7 s -> ~0.7 s. Collections that were declined by the vn4rz.100 scoped scan (span > 50% of chunks) become eligible after compaction.
+- One `BEGIN IMMEDIATE` transaction; bit-identical verification of every (hash_seq, embedding) pair before COMMIT; any error rolls back. Copy and verify read each chunk blob once (per-row vec0 reads cost ~1 ms each). Holds the write lock ~10 min on the live vault (381,953 vectors) — run it when no embed/reindex is active. `--dry-run` is read-only.
 
 ---
 
