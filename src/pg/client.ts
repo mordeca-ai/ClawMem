@@ -109,6 +109,76 @@ export async function withTransaction<T>(
   });
 }
 
+/**
+ * Which pool a checked-out client belongs to, plus its backend identity
+ * (master-harness-vn4rz.114). For diagnostics only, and content-free: pool
+ * counts, the backend pid the client recorded at connect time, the database
+ * name, and whether the client is currently mid-query.
+ *
+ * Reads node-postgres internals (`_clients`, `_queryQueue`, `_activeQuery`,
+ * `readyForQuery`) defensively: if a future pg release renames them, the fields
+ * read `null` rather than throwing inside an error path. The private names are
+ * read on purpose: pg 8.23's public `activeQuery`/`queryQueue` getters emit a
+ * DeprecationWarning on every access.
+ */
+export interface PoolClientIdentity {
+  vault: Vault;
+  /** Backend pid from the connection's BackendKeyData. */
+  processID: number | null;
+  database: string | null;
+  applicationName: string | null;
+  /** The client is in `vault`'s own pool's client list. */
+  inOwnPool: boolean | null;
+  /** Other vault pools that ALSO list this client. Must be empty. */
+  inOtherPools: Vault[];
+  poolTotal: number | null;
+  poolIdle: number | null;
+  poolWaiting: number | null;
+  /** A query is still running on this client (should be false between awaits). */
+  activeQuery: boolean | null;
+  queueDepth: number | null;
+  /** pg's own "idle, may send" flag; false between awaits means a query is in flight. */
+  readyForQuery: boolean | null;
+}
+
+function poolHas(pool: pg.Pool, c: unknown): boolean | null {
+  const list = (pool as unknown as { _clients?: unknown[] })._clients;
+  return Array.isArray(list) ? list.includes(c) : null;
+}
+
+export function describePoolClient(vault: Vault, c: pg.PoolClient): PoolClientIdentity {
+  const own = pools.get(vault);
+  const raw = c as unknown as {
+    processID?: unknown;
+    database?: unknown;
+    connectionParameters?: { application_name?: unknown };
+    _activeQuery?: unknown;
+    _queryQueue?: unknown[];
+    readyForQuery?: unknown;
+  };
+  const inOtherPools: Vault[] = [];
+  for (const [v, p] of pools) {
+    if (v !== vault && poolHas(p, c)) inOtherPools.push(v);
+  }
+  return {
+    vault,
+    processID: typeof raw.processID === "number" ? raw.processID : null,
+    database: typeof raw.database === "string" ? raw.database : null,
+    applicationName:
+      typeof raw.connectionParameters?.application_name === "string"
+        ? raw.connectionParameters.application_name
+        : null,
+    inOwnPool: own ? poolHas(own, c) : null,
+    inOtherPools,
+    poolTotal: own?.totalCount ?? null,
+    poolIdle: own?.idleCount ?? null,
+    poolWaiting: own?.waitingCount ?? null,
+    activeQuery: "_activeQuery" in raw ? raw._activeQuery != null : null,
+    queueDepth: Array.isArray(raw._queryQueue) ? raw._queryQueue.length : null,
+    readyForQuery: typeof raw.readyForQuery === "boolean" ? raw.readyForQuery : null,
+  };
+}
+
 /** Close EVERY vault pool. Called from the CLI teardown and test afterAll hooks. */
 export async function closePool(): Promise<void> {
   const open = [...pools.values()];

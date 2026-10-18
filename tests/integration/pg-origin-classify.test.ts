@@ -409,6 +409,15 @@ d("PG origin classification (vn4rz.66)", () => {
       // Privacy: the message names columns and the path, never the session id.
       expect(e.message).not.toContain("sid-guard-7");
       expect(e.message).not.toContain("stale-session");
+      // vn4rz.114: the diagnostics say which pool and database the client came
+      // from (the nsfw one, listed by no other pool), and the in-transaction
+      // re-read agrees the STORED session_id is the wrong one.
+      expect(e.diagnostics!.client).toMatchObject({
+        vault: "nsfw", inOwnPool: true, inOtherPools: [], database: NSFW_DB,
+      });
+      expect(e.diagnostics!.stored).toMatchObject({
+        pathRows: 1, exactRows: 0, sessionRows: 0, hashRows: 1, titleRows: 1, database: NSFW_DB,
+      });
 
       // Rolled back: no origin row and no content row in nsfw, nothing leaked to sfw.
       for (const db of [NSFW_DB, SFW_DB]) {
