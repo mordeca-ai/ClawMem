@@ -7,9 +7,8 @@ import { parseArgs } from "util";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { resolve as pathResolve, basename, relative as pathRelative } from "path";
 import { embedInputFingerprint } from "./embed-fingerprint.ts";
-import { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, runSampledVectorValidation, canaryGate, persistCanaryBaselineIfFirst, type CanaryCheckResult } from "./canary.ts";
+import type { CanaryCheckResult } from "./canary.ts";
 import { retryOnBusyAsync, isSqliteBusyError } from "./busy-retry.ts";
-import { clearGeometryTaint, describeLastTaintClear, DEFAULT_CLEAR_TAINT_SAMPLE, TAINT_CLEARED_FLAG } from "./taint-clear.ts";
 import {
   createStore,
   prewarmVectors,
@@ -35,7 +34,7 @@ import {
   VecModelMismatchError,
   EmbedLeaseLostError,
 } from "./store.ts";
-import { startVectorDaemon, type VectorDaemonHandle } from "./vector-daemon.ts";
+import type { VectorDaemonHandle } from "./vector-daemon.ts";
 import {
   getDefaultLlamaCpp,
   setDefaultLlamaCpp,
@@ -61,9 +60,8 @@ import {
   collectionIndexOptions,
 } from "./collections.ts";
 import { formatSearchResults, type OutputFormat } from "./formatter.ts";
-import { runEval, IMPLEMENTED_PROFILES, EvalIntegrityError, type EvalProfile, type RunEvalResult } from "./eval/run.ts";
-import { GoldFileError } from "./eval/gold.ts";
-import { indexCollection, parseDocument, hashContent, formatFrontmatterVocab, type IndexStats } from "./indexer.ts";
+import type { EvalProfile, RunEvalResult } from "./eval/run.ts";
+import type { IndexStats } from "./indexer.ts";
 import type { Store as StoreType } from "./store.ts";
 import type { ConversationChunk } from "./normalize.ts";
 import { detectBeadsProject } from "./beads.ts";
@@ -74,30 +72,8 @@ import { scopedScanEnabled, vecScopeScanStats } from "./vec-scope-scan.ts";
 import { QueryTimer, queryTimingEnabled } from "./query-timing.ts";
 import { splitDocument } from "./splitter.ts";
 import { buildEmbedFrontmatter } from "./embed-input.ts";
-import { getProfile, updateProfile, isProfileStale, type ProfileUpdateOutcome } from "./profile.ts";
-import { regenerateAllDirectoryContexts } from "./directory-context.ts";
-import {
-  startConsolidationWorker,
-  stopConsolidationWorker,
-} from "./consolidation.ts";
-import {
-  parseHeavyLaneConfigFromEnv,
-  startHeavyMaintenanceWorker,
-} from "./maintenance.ts";
+import type { ProfileUpdateOutcome } from "./profile.ts";
 import { readHookInput, writeHookOutput, makeEmptyOutput, type HookOutput } from "./hooks.ts";
-import { contextSurfacing } from "./hooks/context-surfacing.ts";
-import { sessionBootstrap } from "./hooks/session-bootstrap.ts";
-import { decisionExtractor, unwrapContradictionArray, admitContradictionEntries } from "./hooks/decision-extractor.ts";
-import { resolveJudge, buildContradictionPrompt, extractJudgeJson, JUDGE_VERDICT_SCHEMA } from "./judge.ts";
-import { evaluateMergeContradiction, isActionableContradiction, resolveContradictionPolicy } from "./merge-guards.ts";
-import { judgeAuditCounts } from "./judge-audit.ts";
-import { handoffGenerator } from "./hooks/handoff-generator.ts";
-import { feedbackLoop } from "./hooks/feedback-loop.ts";
-import { stalenessCheck } from "./hooks/staleness-check.ts";
-import { precompactExtract } from "./hooks/precompact-extract.ts";
-import { postcompactInject } from "./hooks/postcompact-inject.ts";
-import { pretoolInject } from "./hooks/pretool-inject.ts";
-import { curatorNudge } from "./hooks/curator-nudge.ts";
 import {
   readSessionFocus,
   writeSessionFocus,
@@ -107,7 +83,6 @@ import {
   resolveEnvSessionId,
 } from "./session-focus.ts";
 import { computeCollectionScope, type CollectionScope } from "./collection-scope.ts";
-import { createBackup } from "./backup.ts";
 import {
   resolveExtensionsDirNoOpenClaw,
   printSetupOpenClawHelp,
@@ -256,6 +231,8 @@ async function cmdCollectionRemove(args: string[]) {
 }
 
 async function cmdUpdate(args: string[]) {
+  const { indexCollection } = await import("./indexer.ts");
+  const { isProfileStale, updateProfile } = await import("./profile.ts");
   const { values } = parseArgs({
     args,
     options: {
@@ -283,7 +260,7 @@ async function cmdUpdate(args: string[]) {
     console.log(`${c.cyan}Indexing ${col.name}${c.reset} (${col.path})`);
     const stats = await indexCollection(s, col.name, col.path, col.pattern, { ...collectionIndexOptions(col) });
     console.log(`  ${c.green}+${stats.added}${c.reset} added, ${c.yellow}~${stats.updated}${c.reset} updated, ${c.dim}=${stats.unchanged}${c.reset} unchanged, ${c.red}-${stats.removed}${c.reset} removed`);
-    printFrontmatterVocab(stats);
+    await printFrontmatterVocab(stats);
   }
 
   // Auto-embed if --embed flag is set
@@ -395,6 +372,7 @@ function deriveMineIdentity(
 }
 
 async function cmdMine(args: string[]) {
+  const { indexCollection } = await import("./indexer.ts");
   const { values, positionals } = parseArgs({
     args,
     options: {
@@ -455,7 +433,7 @@ async function cmdMine(args: string[]) {
     if (values.embed || values.synthesize || values["dry-run"] || values["synthesis-max-docs"]) {
       die("--backfill-dates is an exclusive mode (dry-run by default; --apply executes) — it cannot combine with --embed, --synthesize, --dry-run, or --synthesis-max-docs");
     }
-    runBackfillDates(allChunks, collectionName, values.apply as boolean);
+    await runBackfillDates(allChunks, collectionName, values.apply as boolean);
     return;
   }
   if (values.apply) die("--apply only applies to --backfill-dates");
@@ -800,7 +778,8 @@ export async function runBatchedEmbed(
  * collection+path match; idempotence. Never touches hash/content/modified_at/
  * stored confidence/embeddings. Dry-run by default; one transaction on --apply.
  */
-function runBackfillDates(allChunks: ConversationChunk[], collectionName: string, apply: boolean): void {
+async function runBackfillDates(allChunks: ConversationChunk[], collectionName: string, apply: boolean): Promise<void> {
+  const { parseDocument, hashContent } = await import("./indexer.ts");
   const s = getStore();
   const identity = deriveMineIdentity(allChunks.map(ch => ch.sourcePath), s, collectionName);
 
@@ -886,6 +865,7 @@ export function parseRequeueHashesFile(text: string): string[] {
 }
 
 export async function cmdEmbed(args: string[]) {
+  const { runCanaryBattery, canaryProbeInputs, cosineSim, CANARY_DRIFT_FLOOR, canaryGate, persistCanaryBaselineIfFirst } = await import("./canary.ts");
   const { values } = parseArgs({
     args,
     options: {
@@ -1551,7 +1531,6 @@ async function cmdVsearch(args: string[]) {
   const query = positionals.join(" ");
   if (!query) die("Usage: clawmem vsearch <query> [--fail-on-empty]");
 
-  const s = getStore();
   const limit = parseInt(values.num!, 10);
   const minScore = parseFloat(values["min-score"]!);
 
@@ -1559,6 +1538,17 @@ async function cmdVsearch(args: string[]) {
   if (scope && !values.json) {
     console.log(`${c.dim}[scope: ${scope.collections.join(", ")}${scope.source === "focus" ? " — session focus" : ""}]${c.reset}`);
   }
+
+  // vn4rz.116: vsearch writes nothing (searchVec embeds the query and reads; enrichResults and
+  // applyCompositeScoring without a co-activation fn only SELECT), so it opens the index
+  // READ-ONLY (~4ms) instead of the writable store (~90ms: initializeDatabase DDL + migration
+  // probes). Deliberately NOT openScopedLegStore: that also plans a chunk-targeted scan whose
+  // cost grows with the scope (measured 27ms / 271ms / 690ms for a small / mid / large
+  // collection) and only pays back across the several legs `query` runs; vsearch has one leg.
+  // Any failure to open read-only falls back to the writable store exactly as before.
+  let ro: Store | null = null;
+  try { ro = createStore(getDefaultDbPath(), { readonly: true }); } catch { ro = null; }
+  const s = ro ?? getStore();
 
   const results = await s.searchVec(query, DEFAULT_EMBED_MODEL, limit * 2, undefined, scope?.collections);
   const enriched = enrichResults(s, results, query);
@@ -1877,6 +1867,8 @@ function printResults(results: Array<{ displayPath: string; title: string; compo
 // =============================================================================
 
 async function cmdEval(args: string[]) {
+  const { runEval, IMPLEMENTED_PROFILES, EvalIntegrityError } = await import("./eval/run.ts");
+  const { GoldFileError } = await import("./eval/gold.ts");
   const usage = "Usage: clawmem eval run --gold <file.jsonl> [--profile query] [--limit N] [--min-examples N] [--audited] [--out <dir>] [--db <path>] [--json]";
   const sub = args[0];
   if (sub !== "run") die(usage);
@@ -2005,34 +1997,34 @@ async function cmdHook(args: string[]) {
         // (decision-extractor / handoff-generator / feedback-loop, 30s budget)
         // run in separate processes and keep the store default (5000ms).
         try { s.db.exec(`PRAGMA busy_timeout = ${CONTEXT_SURFACING_WRITE_BUSY_TIMEOUT_MS}`); } catch { /* non-fatal */ }
-        output = await contextSurfacing(s, input);
+        output = await (await import("./hooks/context-surfacing.ts")).contextSurfacing(s, input);
         break;
       case "session-bootstrap":
-        output = await sessionBootstrap(s, input);
+        output = await (await import("./hooks/session-bootstrap.ts")).sessionBootstrap(s, input);
         break;
       case "decision-extractor":
-        output = await decisionExtractor(s, input);
+        output = await (await import("./hooks/decision-extractor.ts")).decisionExtractor(s, input);
         break;
       case "handoff-generator":
-        output = await handoffGenerator(s, input);
+        output = await (await import("./hooks/handoff-generator.ts")).handoffGenerator(s, input);
         break;
       case "feedback-loop":
-        output = await feedbackLoop(s, input);
+        output = await (await import("./hooks/feedback-loop.ts")).feedbackLoop(s, input);
         break;
       case "staleness-check":
-        output = await stalenessCheck(s, input);
+        output = await (await import("./hooks/staleness-check.ts")).stalenessCheck(s, input);
         break;
       case "precompact-extract":
-        output = await precompactExtract(s, input);
+        output = await (await import("./hooks/precompact-extract.ts")).precompactExtract(s, input);
         break;
       case "postcompact-inject":
-        output = await postcompactInject(s, input);
+        output = await (await import("./hooks/postcompact-inject.ts")).postcompactInject(s, input);
         break;
       case "pretool-inject":
-        output = await pretoolInject(s, input);
+        output = await (await import("./hooks/pretool-inject.ts")).pretoolInject(s, input);
         break;
       case "curator-nudge":
-        output = await curatorNudge(s, input);
+        output = await (await import("./hooks/curator-nudge.ts")).curatorNudge(s, input);
         break;
       default:
         die(`Unknown hook: ${hookName}. Available: context-surfacing, session-bootstrap, decision-extractor, handoff-generator, feedback-loop, staleness-check, precompact-extract, postcompact-inject, pretool-inject, curator-nudge`);
@@ -2060,6 +2052,9 @@ async function readStdinRaw(): Promise<string> {
 }
 
 async function cmdSurface(args: string[]) {
+  const { sessionBootstrap } = await import("./hooks/session-bootstrap.ts");
+  const { stalenessCheck } = await import("./hooks/staleness-check.ts");
+  const { contextSurfacing } = await import("./hooks/context-surfacing.ts");
   const isBootstrap = args.includes("--bootstrap");
   const isContext = args.includes("--context");
   const useStdin = args.includes("--stdin");
@@ -2732,6 +2727,10 @@ function findClawmemBinary(): string {
 // =============================================================================
 
 async function cmdWatch() {
+  const { indexCollection } = await import("./indexer.ts");
+  const { startVectorDaemon } = await import("./vector-daemon.ts");
+  const { startConsolidationWorker, stopConsolidationWorker } = await import("./consolidation.ts");
+  const { parseHeavyLaneConfigFromEnv, startHeavyMaintenanceWorker } = await import("./maintenance.ts");
   const { startWatcher } = await import("./watcher.ts");
   const collections = collectionsList()
     .sort((a, b) => b.path.length - a.path.length); // Most specific path first for prefix matching
@@ -2955,6 +2954,7 @@ function profileOutcomeMessage(outcome: ProfileUpdateOutcome, auto: boolean): st
 }
 
 async function cmdReindex(args: string[]) {
+  const { indexCollection } = await import("./indexer.ts");
   const force = args.includes("--force") || args.includes("-f");
   const enrich = args.includes("--enrich");
   const collections = collectionsList();
@@ -2982,7 +2982,7 @@ async function cmdReindex(args: string[]) {
     console.log(`Indexing ${c.bold}${col.name}${c.reset} (${col.path})...`);
     const stats = await indexCollection(s, col.name, col.path, col.pattern, { forceEnrich: enrich, force, ...collectionIndexOptions(col) });
     console.log(`  +${stats.added} added, ~${stats.updated} updated, =${stats.unchanged} unchanged, -${stats.removed} removed`);
-    printFrontmatterVocab(stats);
+    await printFrontmatterVocab(stats);
   }
 }
 
@@ -3081,7 +3081,8 @@ async function cmdBackfillMeta(args: string[]) {
  * declared no title / content_type. Covers only the files this pass PARSED —
  * unchanged files skip parsing — so `reindex --force` gives the full count.
  */
-function printFrontmatterVocab(stats: IndexStats): void {
+async function printFrontmatterVocab(stats: IndexStats): Promise<void> {
+  const { formatFrontmatterVocab } = await import("./indexer.ts");
   const line = stats.frontmatterVocab ? formatFrontmatterVocab(stats.frontmatterVocab) : null;
   if (line) console.log(`  ${c.yellow}${line}${c.reset} [new/changed files only]`);
 }
@@ -3096,6 +3097,7 @@ function printFrontmatterVocab(stats: IndexStats): void {
  * mechanism for the ClawMem SQLite index at all — see master-harness-t5i0.
  */
 async function cmdBackup(args: string[]) {
+  const { createBackup } = await import("./backup.ts");
   const { values } = parseArgs({
     args,
     options: {
@@ -3132,6 +3134,7 @@ async function cmdBackup(args: string[]) {
  * baseline, sampled vectors reach N with no definitive failure. See src/taint-clear.ts.
  */
 async function cmdDoctorClearTaint(sampleArg: string | undefined) {
+  const { clearGeometryTaint, DEFAULT_CLEAR_TAINT_SAMPLE, TAINT_CLEARED_FLAG } = await import("./taint-clear.ts");
   const sample = sampleArg === undefined ? DEFAULT_CLEAR_TAINT_SAMPLE : Number(sampleArg);
   if (!Number.isInteger(sample) || sample < 1) {
     console.error(`${c.red}--sample must be a positive integer (got ${JSON.stringify(sampleArg)})${c.reset}`);
@@ -3153,6 +3156,12 @@ async function cmdDoctorClearTaint(sampleArg: string | undefined) {
 }
 
 async function cmdDoctor(args: string[] = []) {
+  const { describeLastTaintClear, TAINT_CLEARED_FLAG } = await import("./taint-clear.ts");
+  const { runCanaryBattery, runSampledVectorValidation } = await import("./canary.ts");
+  const { resolveJudge, buildContradictionPrompt, extractJudgeJson, JUDGE_VERDICT_SCHEMA } = await import("./judge.ts");
+  const { evaluateMergeContradiction, isActionableContradiction, resolveContradictionPolicy } = await import("./merge-guards.ts");
+  const { unwrapContradictionArray, admitContradictionEntries } = await import("./hooks/decision-extractor.ts");
+  const { judgeAuditCounts } = await import("./judge-audit.ts");
   const { values } = parseArgs({
     args,
     options: {
@@ -3775,6 +3784,7 @@ WantedBy=default.target
 // =============================================================================
 
 async function cmdUpdateContext() {
+  const { regenerateAllDirectoryContexts } = await import("./directory-context.ts");
   const s = getStore();
   const count = regenerateAllDirectoryContexts(s);
   console.log(`${c.green}Updated CLAUDE.md in ${count} directories${c.reset}`);
@@ -3785,6 +3795,7 @@ async function cmdUpdateContext() {
 // =============================================================================
 
 async function cmdProfile(args: string[]) {
+  const { getProfile, updateProfile } = await import("./profile.ts");
   const s = getStore();
 
   if (args[0] === "rebuild") {
