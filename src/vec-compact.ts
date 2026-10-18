@@ -14,7 +14,7 @@
  * collections is placed with the lexicographically first one; every collection's span is still
  * reported (a shared vector counts for each owner).
  *
- * The rebuild is ONE `BEGIN IMMEDIATE` transaction and is streamed SQL-side: the pairs are copied
+ * The rebuild is ONE `BEGIN IMMEDIATE` transaction. The pairs are copied chunk by chunk
  * into a TEMP table (disk-backed, SQLite spills it to its temp dir), the vec0 table is dropped
  * and re-created with the SAME DDL (same dimension, cosine metric, chunk_size), and refilled with
  * `INSERT ... SELECT ... ORDER BY plan position`. Before COMMIT every (hash_seq, embedding) pair
@@ -25,6 +25,9 @@ import type { Database } from "bun:sqlite";
 
 /** vec0's default chunk_size when the DDL does not name one. */
 export const VEC0_DEFAULT_CHUNK_SIZE = 1024;
+
+/** Temp-schema page cache for the rebuild (KiB). */
+const TEMP_CACHE_KIB = 256 * 1024;
 
 /** A refusal to compact (missing / non-canonical table). Nothing was written. */
 export class VecCompactRefusal extends Error {
@@ -63,7 +66,7 @@ export function readCanonicalVecShape(db: Database): VecTableShape {
   const chunkSize = m[2] ? parseInt(m[2], 10) : VEC0_DEFAULT_CHUNK_SIZE;
   if (!(dim > 0) || !(chunkSize > 0))
     throw new VecCompactRefusal(`vectors_vec has an invalid dimension/chunk_size: ${row.sql}`);
-  for (const t of ["vectors_vec_rowids", "vectors_vec_chunks"]) {
+  for (const t of ["vectors_vec_rowids", "vectors_vec_chunks", "vectors_vec_vector_chunks00"]) {
     const has = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(t);
     if (!has) throw new VecCompactRefusal(`vec0 shadow table ${t} is missing; refusing to compact`);
   }
@@ -88,6 +91,51 @@ const ORDERED_VECTORS_SQL = `
   SELECT ids.hash_seq AS hash_seq, ids.chunk AS chunk, owner.placed AS placed, ids.h AS h, ids.q AS q
   FROM ids LEFT JOIN owner ON owner.hash = ids.h
   ORDER BY (owner.placed IS NULL), owner.placed, ids.h, ids.q, ids.hash_seq`;
+
+/**
+ * Visit every vector as (plan position, embedding bytes), reading each chunk's vector blob once.
+ * A per-row `SELECT embedding FROM vectors_vec` walks the chunk blob's overflow chain for every
+ * vector (~1 ms each, mostly system time; minutes for the live vault). Every slot is checked
+ * against the chunk's validity bit and rowid; a mismatch throws and the transaction rolls back.
+ * Needs temp.vc_plan. Returns the number of vectors visited.
+ */
+function forEachVector(db: Database, dim: number, onVector: (pos: number, vec: Uint8Array) => void): number {
+  const slots = db.prepare(
+    `SELECT r.rowid AS rid, r.chunk_id AS cid, r.chunk_offset AS off, p.pos AS pos
+     FROM main.vectors_vec_rowids r JOIN temp.vc_plan p ON p.hash_seq = r.id
+     ORDER BY r.chunk_id, r.chunk_offset`,
+  );
+  const chunkMeta = db.prepare(`SELECT validity, rowids FROM main.vectors_vec_chunks WHERE chunk_id = ?`);
+  const chunkVectors = db.prepare(`SELECT vectors FROM main.vectors_vec_vector_chunks00 WHERE rowid = ?`);
+  const width = dim * 4;
+  let cur = -1;
+  let validity: Uint8Array | null = null;
+  let rowids: DataView | null = null;
+  let vectors: Uint8Array | null = null;
+  let n = 0;
+  for (const s of slots.iterate() as Iterable<{ rid: number; cid: number; off: number; pos: number }>) {
+    if (s.cid !== cur) {
+      const meta = chunkMeta.get(s.cid) as { validity: Uint8Array; rowids: Uint8Array } | null;
+      const vrow = chunkVectors.get(s.cid) as { vectors: Uint8Array } | null;
+      if (!meta || !vrow) throw new Error(`vec-compact: chunk ${s.cid} is missing`);
+      validity = meta.validity;
+      rowids = new DataView(meta.rowids.buffer, meta.rowids.byteOffset, meta.rowids.byteLength);
+      vectors = vrow.vectors;
+      cur = s.cid;
+    }
+    const at = s.off * width;
+    if (
+      !((validity![s.off >> 3]! >> (s.off & 7)) & 1) ||
+      rowids!.getBigInt64(s.off * 8, true) !== BigInt(s.rid) ||
+      at + width > vectors!.byteLength
+    ) {
+      throw new Error(`vec-compact: chunk ${s.cid} slot ${s.off} does not hold rowid ${s.rid}`);
+    }
+    onVector(s.pos, vectors!.slice(at, at + width));
+    n++;
+  }
+  return n;
+}
 
 export interface CollectionSpan {
   name: string;
@@ -243,10 +291,11 @@ export function compactVectors(db: Database, opts: VecCompactOptions = {}): VecC
     );
     db.exec(`INSERT INTO temp.vc_plan(hash_seq) SELECT hash_seq FROM (${ORDERED_VECTORS_SQL})`);
     stage("planned");
-    db.exec(`CREATE TEMP TABLE vc_copy(hash_seq TEXT PRIMARY KEY, embedding BLOB NOT NULL)`);
-    db.exec(
-      `INSERT INTO temp.vc_copy(hash_seq, embedding) SELECT hash_seq, embedding FROM main.vectors_vec`,
-    );
+    // Keyed by plan position so the refill and the verify walk it in rowid order. Per-row vec0
+    // reads took 9.5 min to copy and 10+ min to verify on the live-size vault.
+    db.exec(`CREATE TEMP TABLE vc_copy(pos INTEGER PRIMARY KEY, embedding BLOB NOT NULL)`);
+    const insertCopy = db.prepare(`INSERT INTO temp.vc_copy(pos, embedding) VALUES (?, ?)`);
+    forEachVector(db, shape.dim, (pos, vec) => insertCopy.run(pos, vec));
     const copied = (db.prepare(`SELECT count(*) AS c FROM temp.vc_copy`).get() as { c: number }).c;
     if (copied !== before.totalVectors) {
       throw new Error(
@@ -260,21 +309,20 @@ export function compactVectors(db: Database, opts: VecCompactOptions = {}): VecC
     stage("recreated");
     db.exec(
       `INSERT INTO main.vectors_vec(hash_seq, embedding)
-       SELECT c.hash_seq, c.embedding FROM temp.vc_plan p JOIN temp.vc_copy c ON c.hash_seq = p.hash_seq
-       ORDER BY p.pos`,
+       SELECT p.hash_seq, c.embedding FROM temp.vc_copy c JOIN temp.vc_plan p ON p.pos = c.pos
+       ORDER BY c.pos`,
     );
     stage("inserted");
     const newCount = (
       db.prepare(`SELECT count(*) AS c FROM main.vectors_vec_rowids`).get() as { c: number }
     ).c;
-    const matching = (
-      db
-        .prepare(
-          `SELECT count(*) AS c FROM main.vectors_vec v JOIN temp.vc_copy c ON c.hash_seq = v.hash_seq
-           WHERE v.embedding = c.embedding`,
-        )
-        .get() as { c: number }
-    ).c;
+    // The refill inserted in pos order, so the copy lookups here are sequential too.
+    const copyOf = db.prepare(`SELECT embedding FROM temp.vc_copy WHERE pos = ?`);
+    let matching = 0;
+    forEachVector(db, shape.dim, (pos, vec) => {
+      const orig = (copyOf.get(pos) as { embedding: Uint8Array } | null)?.embedding;
+      if (orig && Buffer.compare(Buffer.from(orig), Buffer.from(vec)) === 0) matching++;
+    });
     if (newCount !== copied || matching !== copied) {
       throw new Error(
         `vec-compact: verification failed (rows ${newCount}, bit-identical ${matching}, expected ${copied})`,
@@ -300,7 +348,14 @@ export function compactVectors(db: Database, opts: VecCompactOptions = {}): VecC
       elapsedMs: 0,
     };
   });
-  run.immediate();
+  // The plan's hash_seq index and the sorter's pages stay cached instead of spilling per page.
+  const tempCache = (db.prepare(`PRAGMA temp.cache_size`).get() as { cache_size: number }).cache_size;
+  db.exec(`PRAGMA temp.cache_size = -${TEMP_CACHE_KIB}`);
+  try {
+    run.immediate();
+  } finally {
+    db.exec(`PRAGMA temp.cache_size = ${tempCache}`);
+  }
   report.elapsedMs = Math.round(performance.now() - t0);
   return report;
 }
