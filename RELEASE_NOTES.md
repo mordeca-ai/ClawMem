@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.66 — PG read path honours ADR-0085 session focus
+
+- PG read path (`retrieve` search/vsearch/query and the `search` verb) now honours ADR-0085 session focus, matching sqlite: explicit `-c` wins, then a per-session focus that names a collection, else unscoped. Free-text focus stays unscoped. The new helper `src/pg/focus-scope.ts` reuses `computeCollectionScope`; no precedence logic is duplicated. (master-harness-vn4rz.111)
+
+---
+
 ## v0.36.65 — monchujo per-session NSFW routing re-landed on the read-back guard
 
 - Re-lands the v0.36.63 classifier (master-harness-vn4rz.66), which was reverted after a live `origin-load` wrote rows with stale parameters (master-harness-vn4rz.109). Every `content` and `origin_documents` write in the classified loop now passes the v0.36.63 read-back guard, in both vaults and on both insert and conflict update. A mismatch throws `OriginWriteReadBackError` and rolls the document's transaction back.

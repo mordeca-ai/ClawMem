@@ -23,6 +23,7 @@ import {
   classifyOriginCollection, dropLegacyDocumentRows, dropPartitionsBefore, listPartitions,
   loadOriginCollection,
 } from "./origin.ts";
+import { resolvePgCollectionScope } from "./focus-scope.ts";
 import { listCollections } from "../collections.ts";
 import { formatFrontmatterVocab } from "../indexer.ts";
 
@@ -169,7 +170,10 @@ async function main() {
       const timeoutRaw = flagValue(argv, "--timeout-ms");
       await withClient(vault, async c => {
         const results = await pgSearchVec(c, q, {
-          collections: cols ? cols.split(",").map(s => s.trim()) : undefined,
+          collections: resolvePgCollectionScope(
+            cols ? cols.split(",").map(s => s.trim()) : undefined,
+            listCollections().map(x => x.name),
+          ),
           limit: limitRaw ? Number(limitRaw) : undefined,
           timeoutMs: timeoutRaw ? Number(timeoutRaw) : undefined,
         });
