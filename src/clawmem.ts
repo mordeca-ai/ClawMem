@@ -2987,6 +2987,42 @@ async function cmdReindex(args: string[]) {
 }
 
 /**
+ * `clawmem vec-compact [--dry-run] [--json] [-c <collection>]...` (master-harness-vn4rz.110):
+ * rewrite vectors_vec in collection-clustered order so a collection-scoped search reads
+ * ~ceil(n/chunk_size) chunks instead of a scattered subset of the whole table. Logic lives in
+ * vec-compact.ts. --dry-run opens the index READ-ONLY (query_only) and writes nothing; the real
+ * run is one BEGIN IMMEDIATE transaction and rolls back on any error.
+ */
+async function cmdVecCompact(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      "dry-run": { type: "boolean", default: false },
+      json: { type: "boolean", default: false },
+      collection: { type: "string", short: "c", multiple: true },
+    },
+    allowPositionals: false,
+  });
+  const { compactVectors, formatVecCompactReport, VecCompactRefusal } = await import("./vec-compact.ts");
+  const dryRun = !!values["dry-run"];
+  const s = dryRun ? createStore(undefined, { readonly: true }) : createStore(undefined, { busyTimeout: 15000 });
+  try {
+    const report = compactVectors(s.db, { dryRun, collections: values.collection ?? [] });
+    if (values.json) console.log(JSON.stringify(report, null, 2));
+    else console.log(formatVecCompactReport(report));
+  } catch (err) {
+    if (err instanceof VecCompactRefusal) {
+      console.error(`${c.red}vec-compact refused: ${err.message}${c.reset}`);
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  } finally {
+    s.close();
+  }
+}
+
+/**
  * `clawmem backfill-meta [--apply] [-c <collection>] [--limit N]` (master-harness-65amk):
  * populate documents.description/keywords for rows indexed before those columns existed
  * and invalidate the affected hashes' vectors so the next `clawmem embed` re-embeds them.
@@ -3938,6 +3974,9 @@ async function main() {
         break;
       case "backfill-meta":
         await cmdBackfillMeta(subArgs);
+        break;
+      case "vec-compact":
+        await cmdVecCompact(subArgs);
         break;
       case "doctor":
         await cmdDoctor(subArgs);
@@ -4941,6 +4980,8 @@ ${c.bold}Integration:${c.reset}
                                        Clear embed geometry taint on evidence (lease + canary + N sampled vectors, default 200)
   clawmem backup [--dest <dir>] [--keep <n>]  Snapshot the index (VACUUM INTO), prune to <n> (default 7)
   clawmem rerank-health [--json]       Probe reranker discrimination (exit 1 if degenerate)
+  clawmem vec-compact [--dry-run] [--json] [-c col]...
+                                       Rewrite vectors_vec in collection-clustered order (fewer chunks per scoped search); --dry-run is read-only
   clawmem migrate causal-witnesses --preflight [--out <manifest.json>]
                                        Census unresolved pre-cut causal edges (run before CLAWMEM_CAUSAL_WRITER=on)
   clawmem migrate causal-witnesses --resolve-unmaterializable keep-weight|retire-edge

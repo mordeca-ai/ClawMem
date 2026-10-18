@@ -121,6 +121,40 @@ After an `--apply` run, run `clawmem embed`. The Postgres reindex needs no backf
 re-reads frontmatter from the source on every run, and re-embeds a hash whenever its
 fragment count changes.
 
+## Vector compaction (`vec-compact`)
+
+```bash
+clawmem vec-compact --dry-run                  # Read-only: current vs projected chunk span per collection
+clawmem vec-compact --dry-run --json -c docs   # Machine-readable; always include collection "docs"
+clawmem vec-compact                            # Rewrite vectors_vec in collection-clustered order
+```
+
+The sqlite-vec table `vectors_vec` stores rows in chunks in insert order. After many
+incremental re-embeds a small collection's vectors are scattered over most chunks, so a
+collection-scoped `vsearch` reads far more chunk data than the collection owns.
+`vec-compact` rebuilds the table with rows inserted in (collection, hash, seq) order, so
+each collection spans about `ceil(n / chunk_size)` chunks.
+
+- Ordering key per vector: the lexicographically first collection among active documents
+  that own its content hash, then hash, then seq numerically. A vector shared by several
+  collections is placed with the first one. Vectors with no active document go last.
+- Every `(hash_seq, embedding)` pair is kept bit-identically (verified inside the
+  transaction before commit). The dimension, `distance_metric=cosine` and any explicit
+  `chunk_size` are preserved, and the table keeps its name.
+- The rewrite is one `BEGIN IMMEDIATE` transaction (busy timeout at least 15 s). Any error
+  rolls back and leaves the original table intact. Rows are copied SQL-side through a TEMP
+  table, so SQLite spills about one table's worth of data to its temp directory (set
+  `SQLITE_TMPDIR` if `/tmp` is small); the vectors are never loaded into process memory.
+  Run it while no embed is running, because the write lock blocks writers for the duration.
+- It refuses (exit 1, nothing written) when `vectors_vec` is missing or its schema is not
+  the canonical clawmem shape.
+- `--dry-run` opens the index read-only. It prints total vectors, total chunks, and for the
+  20 largest collections plus any named with repeatable `-c`: the current chunk span and the
+  span after compaction. A real run prints the same table with the measured span and the
+  elapsed time. `--json` emits the same fields as one object.
+- Vector rowids change, so long-lived read-only processes re-read their scoped caches on the
+  next query (the data version changes); no restart is needed.
+
 ## Search (CLI)
 
 ```bash

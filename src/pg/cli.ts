@@ -20,7 +20,8 @@ import {
   type DocTierReconcileResult,
 } from "./write.ts";
 import {
-  dropLegacyDocumentRows, dropPartitionsBefore, listPartitions, loadOriginCollection,
+  classifyOriginCollection, dropLegacyDocumentRows, dropPartitionsBefore, listPartitions,
+  loadOriginCollection,
 } from "./origin.ts";
 import { resolvePgCollectionScope } from "./focus-scope.ts";
 import { listCollections } from "../collections.ts";
@@ -99,6 +100,34 @@ async function main() {
     });
     printContentGc(r);
     await closePool();
+    return;
+  }
+  // `origin-classify` (master-harness-vn4rz.66) touches NO database, so it is
+  // dispatched before any PG config is resolved: it must run (and prove its
+  // routing) on a host with no vault connection configured at all.
+  if (cmd === "origin-classify") {
+    const name = flagValue(argv, "--collection");
+    if (!name) throw new Error("origin-classify requires --collection <name>");
+    const c = listCollections().find(x => x.name === name);
+    if (!c) throw new Error(`no collection ${name} in the clawmem index config`);
+    const r = classifyOriginCollection({ collection: c.name, root: c.path, pattern: c.pattern });
+    // CONTENT-FREE: session keys, chunk basenames, signal ids, counts, hashes.
+    // Never a title, a body line or a directory path.
+    if (argv.includes("--json")) {
+      console.log(JSON.stringify(r, null, 2));
+    } else {
+      for (const s of r.sessions) {
+        console.log(
+          `${s.session}  vault=${s.vault} docs=${s.docs} ` +
+          `private=${s.private.join(",") || "-"} ambiguous=${s.ambiguous.join(",") || "-"}`);
+        for (let i = 0; i < s.chunks.length; i++) console.log(`    ${s.chunks[i]}  ${s.hashes[i]}`);
+      }
+      const t = r.totals;
+      console.log(
+        `${r.collection}: ${t.files} file(s), ${t.sessions} session(s) -- nsfw ${t.nsfwSessions} ` +
+        `session(s) / ${t.nsfwDocs} doc(s), sfw ${t.sfwSessions} session(s) / ${t.sfwDocs} doc(s), ` +
+        `${t.ambiguousSessions} sfw session(s) with ambiguous signals (reported, not routed)`);
+    }
     return;
   }
   const vault = vaultFlag(argv);
@@ -296,6 +325,17 @@ async function main() {
         `  record_type outside the closed origin vocabulary: ` +
         (backlog.length ? backlog.map(([k, v]) => `${k}=${v}`).join(", ") : "(none)") +
         ` -- stored as 'unknown' with the raw value in record_type_raw`);
+      // ALWAYS printed, zeros included (master-harness-vn4rz.66): counts only,
+      // never a path or a matched string. All zero means the collection is not
+      // content-classified or the vault was given explicitly as nsfw.
+      const rr = s.sfwResidueRemoved;
+      console.log(
+        `  content classification: ${s.classifiedNsfwDocs} doc(s) in ${s.classifiedNsfwSessions} ` +
+        `session(s) routed nsfw; ${s.ambiguousSessions} sfw session(s) with ambiguous signals ` +
+        `(reported, not routed)`);
+      console.log(
+        `  sfw residue removed: ${rr.originRows} origin row(s), ${rr.contentRows} content row(s), ` +
+        `${rr.vectorRows} vector row(s)`);
       break;
     }
     case "origin-partitions": {
@@ -333,10 +373,10 @@ async function main() {
     }
     default:
       console.error(
-        "usage: bun src/pg/cli.ts <migrate|status|reindex|search|retrieve|origin-load|origin-partitions|" +
+        "usage: bun src/pg/cli.ts <migrate|status|reindex|search|retrieve|origin-load|origin-classify|origin-partitions|" +
         "origin-drop-legacy|origin-retention|gc> [--vault sfw|nsfw] " +
         "[--collection a,b] [--limit N] [--no-embed] [--reembed] [--no-sweep] [--month YYYY-MM] " +
-        "[--before DATE] [--apply] [--query TEXT] [--timeout-ms N] [--no-gc] " +
+        "[--before DATE] [--apply] [--query TEXT] [--timeout-ms N] [--no-gc] [origin-classify: --json] " +
         `[gc: --dry-run --batch-size N (${CONTENT_GC_DEFAULTS.batchSize}) ` +
         `--max-batches N (${CONTENT_GC_DEFAULTS.maxBatches}) --grace-seconds N (${CONTENT_GC_DEFAULTS.graceSeconds})]`,
       );

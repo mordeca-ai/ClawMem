@@ -38,6 +38,17 @@
  * has been made: openclaw-workspace, routed nsfw by operator ruling (Review
  * Hub a7981735, 2026-09-02; master-harness-vn4rz.65 / vn4rz.106). monchujo and
  * the rest stay out until someone rules otherwise.
+ *
+ * ---------------------------------------------------------------------------
+ * THE CONTENT HINT ESCALATES, IT NEVER DOWNGRADES
+ *
+ * The same ruling classifies monchujo transcripts per session at index time
+ * (src/pg/classify.ts, master-harness-vn4rz.66). Its verdict reaches routing as
+ * resolveVault's optional `contentVault` argument, and it is ONE-WAY: "nsfw"
+ * escalates an sfw collection's document to the nsfw vault; "sfw" changes
+ * nothing. A collection declared nsfw stays nsfw, and a tripwire hit still
+ * throws, whatever the hint says. Content evidence can add privacy; it can
+ * never remove what data or code already decided.
  * ---------------------------------------------------------------------------
  */
 
@@ -159,8 +170,17 @@ function resolvedSourcePath(collection: string, relPath?: string): string | null
  *   is a programming/configuration defect, never a runtime condition to handle:
  *   the correct response is to declare the collection `vault: nsfw`, not to
  *   catch this.
+ *
+ * @param contentVault optional index-time content verdict (master-harness-vn4rz.66).
+ *   ESCALATION ONLY: "nsfw" routes nsfw; "sfw" or absent leaves the decision to
+ *   the declared vault and the tripwire, unchanged.
  */
-export function resolveVault(collection: string, relPath?: string): Vault {
+export function resolveVault(collection: string, relPath?: string, contentVault?: Vault): Vault {
+  if (contentVault !== undefined && !isVault(contentVault)) {
+    throw new Error(
+      `resolveVault: content hint must be "sfw" or "nsfw", got ${JSON.stringify(contentVault)}`,
+    );
+  }
   const declared = lookupCollection(collection)?.vault;
   let vault: Vault = "sfw";
   if (declared !== undefined) {
@@ -174,6 +194,10 @@ export function resolveVault(collection: string, relPath?: string): Vault {
     }
     vault = declared;
   }
+
+  // The content hint, AFTER the declared-vault validation: a malformed config is
+  // refused whether or not a hint is present. Escalate only — never downgrade.
+  if (contentVault === "nsfw") return "nsfw";
 
   if (vault === "sfw") {
     const abs = resolvedSourcePath(collection, relPath);
