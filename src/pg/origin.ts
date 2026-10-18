@@ -30,7 +30,8 @@
  */
 
 import { Glob } from "bun";
-import { readFileSync } from "fs";
+import { closeSync, fstatSync, openSync, readFileSync, readSync } from "fs";
+import { createRequire } from "module";
 import { basename, join } from "path";
 import matter from "gray-matter";
 import {
@@ -40,7 +41,10 @@ import type { FrontmatterMap } from "../frontmatter-map.ts";
 import { getDefaultLlamaCpp, formatDocForEmbedding } from "../llm.ts";
 import { splitDocument } from "../splitter.ts";
 import { canonicalDocId } from "../store.ts";
-import { withClient, withTransaction } from "./client.ts";
+import type pg from "pg";
+import {
+  describePoolClient, withClient, withTransaction, type PoolClientIdentity,
+} from "./client.ts";
 import {
   assertVaultDatabase, insertEmbeddingsBatch, ORPHAN_PREDICATE, type EmbeddingWrite,
 } from "./write.ts";
@@ -169,6 +173,14 @@ export interface OriginLoadOptions {
    * ADR-0058 content_type the map targets.
    */
   frontmatterMap?: FrontmatterMap;
+  /**
+   * TEST SEAM (master-harness-vn4rz.114): how the write loop reads a record's
+   * text. Production never sets it (default: readFileSync utf-8). The read-back
+   * guard's regression test passes a reader that returns ANOTHER file's text,
+   * the 2026-10-18T08:53Z live failure shape, to prove the independent source
+   * re-read catches it. The classification pre-pass always reads the real file.
+   */
+  readRaw?: (absPath: string) => string;
 }
 
 /**
@@ -232,6 +244,14 @@ export interface ExpectedOriginWrite {
   hash: string;
   authoredAt: Date | null;
   sessionId: string | null;
+  /**
+   * hashContent of an INDEPENDENT second read of the source file
+   * (master-harness-vn4rz.114), or null when that read failed. Absent = not
+   * checked. Every other expected value derives from the one `raw` string, so
+   * without this a `raw` carrying another file's text passes every RETURNING
+   * comparison: the 2026-10-18T08:53Z live run wrote 265 rows that way.
+   */
+  sourceHash?: string | null;
 }
 
 export interface ContentWriteReadBack {
@@ -249,9 +269,14 @@ export interface OriginWriteReadBack {
 
 export interface OriginWriteReadBackDetails {
   expectedHash?: string | null;
-  contentHash?: string | null;
-  originHash?: string | null;
-  docSha?: string | null;
+  contentHash?: unknown;
+  originHash?: unknown;
+  docSha?: unknown;
+  /**
+   * The full content-free picture (master-harness-vn4rz.114). When present the
+   * message is built from it; the four hash fields above are the legacy shape.
+   */
+  diagnostics?: OriginReadBackDiagnostics;
 }
 
 function authoredAtMatches(
@@ -308,18 +333,503 @@ export function checkOriginWriteReadBack(
     mismatches.push("doc_sha");
   }
 
+  if (expected.sourceHash !== undefined && expected.sourceHash !== expected.hash) {
+    mismatches.push("source");
+  }
+
   return mismatches;
+}
+
+// ---------------------------------------------------------------------------
+// READ-BACK DIAGNOSTICS (master-harness-vn4rz.114)
+//
+// The vn4rz.109 message printed one 8-char prefix per hash and fell back to a
+// combined "hash expected X got Y" whose `got` was `origin ?? content`. On the
+// 2026-10-18 recurrence that printed "expected 0458e203 got 0458e203" for both
+// hash and doc_sha. That line cannot tell stale values from missing keys from a
+// value of the wrong type. These diagnostics can, and they stay content-free:
+//
+//   - every guarded column, mismatched or not, with: is the key on the row,
+//     typeof, constructor name, length, and the guard's own equality verdict;
+//   - hash and doc_sha also get both 8-char prefixes (or "missing"/"null"/
+//     "non-hex") and the first index where the text differs;
+//   - authored_at gets the signed difference in milliseconds;
+//   - each RETURNING result's row count, command, key names, and the
+//     RowDescription names and type OIDs (names that are not plain SQL
+//     identifiers print as their length only);
+//   - the client: backend pid, database, which vault pool lists it, whether a
+//     query is still in flight on it;
+//   - an in-transaction re-read whose answers come back as COUNTS computed in
+//     SQL, so "the DB holds the right row but RETURNING came back wrong" and
+//     "the DB holds the wrong row" read differently;
+//   - process.versions.bun and the pg package version.
+//
+// Title, session id and document text never appear: those fields report only
+// type, length and equality.
+// ---------------------------------------------------------------------------
+
+/** One guarded column, described without its value. */
+export interface ReadBackFieldDiagnostic {
+  /** `content.hash`, `origin.title`, ... */
+  field: string;
+  /** Object.hasOwn(row, key). False when the row itself is missing. */
+  present: boolean;
+  /** typeof the value; "null" for null. */
+  type: string;
+  /** Constructor name of an object value (Date, Buffer, String, ...), else null. */
+  ctor: string | null;
+  /** Length of a string-like value (string, String, Uint8Array byteLength), else null. */
+  len: number | null;
+  /** Length of the expected value when it is a string, else null. */
+  expLen: number | null;
+  /** The guard's own equality verdict for this column. */
+  equal: boolean;
+  /** hash/doc_sha only: 8-char prefixes, or "missing" | "null" | "undefined" | "non-string" | "non-hex". */
+  exp8?: string;
+  got8?: string;
+  /**
+   * hash/doc_sha/path only: first index where the text differs; -1 when the text
+   * is identical (so `equal: false` then means a type difference); null when the
+   * value is not string-like.
+   */
+  firstDiff?: number | null;
+  /** authored_at only: got minus expected in ms; null when either side has no instant. */
+  deltaMs?: number | null;
+}
+
+/** The shape of one RETURNING result. Key and field names only, never values. */
+export interface ReadBackResultShape {
+  rows: number;
+  rowCount: number | null;
+  command: string | null;
+  /** Object.keys(rows[0]), sanitised. */
+  keys: string[];
+  /** RowDescription as `name:typeOid`, sanitised. */
+  fields: string[];
+}
+
+/**
+ * An in-transaction re-read of what the database now holds for this write.
+ * Every value is a count or an id computed server-side; no column text comes back.
+ */
+export interface StoredRowCheck {
+  /** origin_documents rows for (collection, path), any authored_at. */
+  pathRows: number;
+  /** ... of which every guarded column equals the expected value. */
+  exactRows: number;
+  hashRows: number;
+  titleRows: number;
+  authoredRows: number;
+  sessionRows: number;
+  /** content rows whose hash and sha256(doc) both equal the expected hash. */
+  contentOkRows: number;
+  /** pg_backend_pid() as seen by the server on this client's connection. */
+  backendPid: number | null;
+  database: string | null;
+}
+
+export interface SourceReadFacts {
+  /** 0-based position of this file among the records this run has written. */
+  index: number;
+  /** Bytes the independent re-read returned; null when it failed. */
+  fileBytes: number | null;
+  /** UTF-8 byte length of the `raw` string the loader derived everything from. */
+  rawBytes: number;
+  readError: string | null;
+  /**
+   * `raw` hashes the same as the FIRST record this run wrote, for a different
+   * path: the exact vn4rz.109 / 2026-10-18T08:53Z signature. Null for record 0.
+   */
+  matchesRunFirst: boolean | null;
+}
+
+export interface OriginReadBackDiagnostics {
+  fields: ReadBackFieldDiagnostic[];
+  content: ReadBackResultShape | null;
+  origin: ReadBackResultShape | null;
+  client: PoolClientIdentity | null;
+  /** The re-read, or the error class name when it could not run. */
+  stored: StoredRowCheck | { error: string } | null;
+  /** The source file: loop index, byte counts of both reads, re-read error class. */
+  source: SourceReadFacts | null;
+  runtime: { bun: string | null; node: string | null; pg: string | null };
+}
+
+const IDENT = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
+const HEX8 = /^[0-9a-f]{8}$/;
+
+/** A key or field name that is a plain identifier prints as itself, anything else as its length. */
+function safeName(n: string): string {
+  return IDENT.test(n) ? n : `<non-ident len ${n.length}>`;
+}
+
+function stringLike(v: unknown): string | null {
+  if (typeof v === "string") return v;
+  if (v instanceof String) return v.valueOf();
+  if (v instanceof Uint8Array) return Buffer.from(v.buffer, v.byteOffset, v.byteLength).toString("utf8");
+  return null;
+}
+
+function lengthOf(v: unknown): number | null {
+  if (typeof v === "string") return v.length;
+  if (v instanceof String) return v.length;
+  if (v instanceof Uint8Array) return v.byteLength;
+  return null;
+}
+
+function typeName(v: unknown): string {
+  return v === null ? "null" : typeof v;
+}
+
+function ctorName(v: unknown): string | null {
+  if (v === null || typeof v !== "object") return null;
+  const c = (v as { constructor?: { name?: unknown } }).constructor;
+  return typeof c?.name === "string" ? c.name : "<none>";
+}
+
+/** 8-char hex prefix, or a word saying why there is none. Never prints non-hex text. */
+function hex8(v: unknown, present: boolean): string {
+  if (!present) return "missing";
+  if (v === undefined) return "undefined";
+  if (v === null) return "null";
+  const s = stringLike(v);
+  if (s === null) return "non-string";
+  const p = s.slice(0, 8);
+  return HEX8.test(p) ? p : "non-hex";
+}
+
+function firstDiffIndex(expected: string, got: unknown): number | null {
+  const s = stringLike(got);
+  if (s === null) return null;
+  const n = Math.min(expected.length, s.length);
+  for (let i = 0; i < n; i++) if (expected.charCodeAt(i) !== s.charCodeAt(i)) return i;
+  return expected.length === s.length ? -1 : n;
+}
+
+function instantMs(v: unknown): number | null {
+  if (v instanceof Date) return Number.isNaN(v.getTime()) ? null : v.getTime();
+  if (typeof v === "string" || typeof v === "number") {
+    const ms = new Date(v).getTime();
+    return Number.isNaN(ms) ? null : ms;
+  }
+  return null;
+}
+
+function describeField(
+  field: string,
+  row: object | null | undefined,
+  key: string,
+  expected: unknown,
+  equal: boolean,
+  kind: "hex" | "path" | "text" | "instant",
+): ReadBackFieldDiagnostic {
+  const present = row != null && Object.hasOwn(row, key);
+  const got = present ? (row as Record<string, unknown>)[key] : undefined;
+  const d: ReadBackFieldDiagnostic = {
+    field,
+    present,
+    type: typeName(got),
+    ctor: ctorName(got),
+    len: lengthOf(got),
+    expLen: typeof expected === "string" ? expected.length : null,
+    equal,
+  };
+  if (kind === "hex") {
+    d.exp8 = hex8(expected, true);
+    d.got8 = hex8(got, present);
+  }
+  if ((kind === "hex" || kind === "path") && typeof expected === "string") {
+    d.firstDiff = present ? firstDiffIndex(expected, got) : null;
+  }
+  if (kind === "instant") {
+    const e = instantMs(expected);
+    const g = present ? instantMs(got) : null;
+    d.deltaMs = e === null || g === null ? null : g - e;
+  }
+  return d;
+}
+
+/** Row count, command, key names and RowDescription of one pg result. Values never read. */
+export function summarizeReadBackResult(res: unknown): ReadBackResultShape | null {
+  if (res == null || typeof res !== "object") return null;
+  const r = res as {
+    rows?: unknown[];
+    rowCount?: unknown;
+    command?: unknown;
+    fields?: { name?: unknown; dataTypeID?: unknown }[];
+  };
+  const rows = Array.isArray(r.rows) ? r.rows : [];
+  const first = rows[0];
+  return {
+    rows: rows.length,
+    rowCount: typeof r.rowCount === "number" ? r.rowCount : null,
+    command: typeof r.command === "string" ? safeName(r.command) : null,
+    keys: first != null && typeof first === "object" ? Object.keys(first).map(safeName) : [],
+    fields: Array.isArray(r.fields)
+      ? r.fields.map(f => `${safeName(String(f?.name ?? ""))}:${String(f?.dataTypeID ?? "?")}`)
+      : [],
+  };
+}
+
+let pgVersionMemo: string | null | undefined;
+function pgPackageVersion(): string | null {
+  if (pgVersionMemo !== undefined) return pgVersionMemo;
+  try {
+    const v = createRequire(import.meta.url)("pg/package.json") as { version?: unknown };
+    pgVersionMemo = typeof v.version === "string" ? v.version : null;
+  } catch {
+    pgVersionMemo = null;
+  }
+  return pgVersionMemo;
+}
+
+/** The runtime facts a driver/runtime defect would depend on. */
+export function readBackRuntime(): OriginReadBackDiagnostics["runtime"] {
+  const versions = process.versions as Record<string, string | undefined>;
+  return { bun: versions.bun ?? null, node: versions.node ?? null, pg: pgPackageVersion() };
+}
+
+/**
+ * Describe every guarded column of one origin write against what was expected.
+ * Pure; the caller supplies the result shapes, client identity and re-read.
+ */
+export function describeOriginWriteReadBack(
+  expected: ExpectedOriginWrite,
+  contentRow: ContentWriteReadBack | null | undefined,
+  originRow: OriginWriteReadBack | null | undefined,
+  extra: Partial<Omit<OriginReadBackDiagnostics, "fields" | "runtime">> = {},
+): OriginReadBackDiagnostics {
+  const expSession = expected.sessionId ?? null;
+  const gotSession = originRow ? (originRow.session_id ?? null) : null;
+  const fields: ReadBackFieldDiagnostic[] = [
+    describeField("origin.path", originRow, "path", expected.path,
+      originRow?.path === expected.path, "path"),
+    describeField("origin.title", originRow, "title", expected.title,
+      originRow?.title === expected.title, "text"),
+    describeField("content.hash", contentRow, "hash", expected.hash,
+      contentRow?.hash === expected.hash, "hex"),
+    describeField("origin.hash", originRow, "hash", expected.hash,
+      originRow?.hash === expected.hash, "hex"),
+    describeField("origin.authored_at", originRow, "authored_at", expected.authoredAt,
+      authoredAtMatches(expected.authoredAt, originRow?.authored_at), "instant"),
+    describeField("origin.session_id", originRow, "session_id", expSession,
+      !!originRow && expSession === gotSession, "text"),
+    describeField("content.doc_sha", contentRow, "doc_sha", expected.hash,
+      contentRow?.doc_sha === expected.hash, "hex"),
+  ];
+  if (expected.sourceHash !== undefined) {
+    fields.push(describeField("source.sha", { sha: expected.sourceHash }, "sha", expected.hash,
+      expected.sourceHash === expected.hash, "hex"));
+  }
+  return {
+    fields,
+    content: extra.content ?? null,
+    origin: extra.origin ?? null,
+    client: extra.client ?? null,
+    stored: extra.stored ?? null,
+    source: extra.source ?? null,
+    runtime: readBackRuntime(),
+  };
+}
+
+function fmtField(f: ReadBackFieldDiagnostic): string {
+  const parts = [
+    `has=${f.present ? 1 : 0}`,
+    `type=${f.type}`,
+    ...(f.ctor ? [`ctor=${f.ctor}`] : []),
+    `len=${f.len ?? "-"}/${f.expLen ?? "-"}`,
+    `eq=${f.equal ? 1 : 0}`,
+  ];
+  if (f.exp8 !== undefined) parts.push(`exp8=${f.exp8}`, `got8=${f.got8}`);
+  if (f.firstDiff !== undefined) {
+    parts.push(`diff=${f.firstDiff === null ? "n/a" : f.firstDiff === -1 ? "same-text" : f.firstDiff}`);
+  }
+  if (f.deltaMs !== undefined) parts.push(`dms=${f.deltaMs ?? "n/a"}`);
+  return `${f.field}[${parts.join(" ")}]`;
+}
+
+function fmtShape(name: string, s: ReadBackResultShape | null): string {
+  if (!s) return `${name}{none}`;
+  return `${name}{rows=${s.rows} rowCount=${s.rowCount ?? "-"} cmd=${s.command ?? "-"} ` +
+    `keys=[${s.keys.join(",")}] desc=[${s.fields.join(",")}]}`;
+}
+
+/** One compact, content-free line. Every field is printed, mismatched or not. */
+export function formatOriginReadBackDiagnostics(d: OriginReadBackDiagnostics): string {
+  const out = [
+    d.fields.map(fmtField).join(" "),
+    fmtShape("content", d.content),
+    fmtShape("origin", d.origin),
+  ];
+  const c = d.client;
+  if (c) {
+    out.push(
+      `client{vault=${c.vault} pid=${c.processID ?? "-"} db=${c.database ?? "-"} ` +
+        `app=${c.applicationName ?? "-"} ownPool=${c.inOwnPool ?? "-"} ` +
+        `otherPools=[${c.inOtherPools.join(",")}] total=${c.poolTotal ?? "-"} ` +
+        `idle=${c.poolIdle ?? "-"} waiting=${c.poolWaiting ?? "-"} ` +
+        `active=${c.activeQuery ?? "-"} queue=${c.queueDepth ?? "-"} ` +
+        `ready=${c.readyForQuery ?? "-"}}`,
+    );
+  }
+  const s = d.stored;
+  if (s && "error" in s) out.push(`stored{error=${s.error}}`);
+  else if (s) {
+    out.push(
+      `stored{pathRows=${s.pathRows} exact=${s.exactRows} hash=${s.hashRows} ` +
+        `title=${s.titleRows} authored=${s.authoredRows} session=${s.sessionRows} ` +
+        `contentOk=${s.contentOkRows} serverPid=${s.backendPid ?? "-"} db=${s.database ?? "-"}}`,
+    );
+  }
+  const src = d.source;
+  if (src) {
+    out.push(
+      `source{index=${src.index} fileBytes=${src.fileBytes ?? "-"} rawBytes=${src.rawBytes}` +
+        `${src.readError ? ` readError=${src.readError}` : ""} ` +
+        `matchesRunFirst=${src.matchesRunFirst ?? "-"}}`,
+    );
+  }
+  out.push(`bun=${d.runtime.bun ?? "-"} node=${d.runtime.node ?? "-"} pg=${d.runtime.pg ?? "-"}`);
+  return out.join(" | ");
+}
+
+/** Legacy details (four hashes) as diagnostics, so the message never prints a lossy fallback. */
+function diagnosticsFromLegacy(d: OriginWriteReadBackDetails): OriginReadBackDiagnostics {
+  const exp = d.expectedHash ?? "";
+  const hexField = (field: string, v: unknown): ReadBackFieldDiagnostic => {
+    const present = v !== undefined;
+    return {
+      field,
+      present,
+      type: typeName(v),
+      ctor: ctorName(v),
+      len: lengthOf(v),
+      expLen: exp ? exp.length : null,
+      equal: v === exp,
+      exp8: exp ? hex8(exp, true) : "missing",
+      got8: hex8(v, present),
+      firstDiff: present && exp ? firstDiffIndex(exp, v) : null,
+    };
+  };
+  return {
+    fields: [
+      hexField("content.hash", d.contentHash),
+      hexField("origin.hash", d.originHash),
+      hexField("content.doc_sha", d.docSha),
+    ],
+    content: null,
+    origin: null,
+    client: null,
+    stored: null,
+    source: null,
+    runtime: readBackRuntime(),
+  };
+}
+
+/**
+ * An INDEPENDENT second read of a source file (master-harness-vn4rz.114): fd +
+ * fstat + readSync into a fresh zero-filled Buffer, then the same UTF-8 decode
+ * and hashContent the loader applies to `raw`, so a correct read always agrees
+ * with it. It deliberately avoids readFileSync, the call that produced the
+ * `raw` being checked. Never throws: a failed read is `hash: null` plus the
+ * error class name, which the guard treats as a mismatch.
+ */
+export function rereadSource(path: string): { hash: string | null; bytes: number | null; error: string | null } {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    const buf = Buffer.alloc(size);
+    let off = 0;
+    while (off < size) {
+      const got = readSync(fd, buf, off, size - off, off);
+      if (got <= 0) break;
+      off += got;
+    }
+    return { hash: hashContent(buf.subarray(0, off).toString("utf-8")), bytes: off, error: null };
+  } catch (e) {
+    return { hash: null, bytes: null, error: e instanceof Error ? safeName(e.name) : "unknown" };
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+/**
+ * Re-read, inside the still-open transaction, what the database now holds for
+ * this write. Every answer is a count computed server-side, so no column text
+ * comes back over the wire. Never throws: a failure is reported by class name.
+ */
+export async function probeStoredOriginWrite(
+  c: pg.PoolClient,
+  collection: string,
+  expected: ExpectedOriginWrite,
+  timeoutMs = 5_000,
+): Promise<StoredRowCheck | { error: string }> {
+  try {
+    const { rows } = await c.query<{
+      path_rows: number; exact_rows: number; hash_rows: number; title_rows: number;
+      authored_rows: number; session_rows: number; content_ok_rows: number;
+      backend_pid: number; db: string;
+    }>({
+      text: `
+        WITH o AS (
+          SELECT hash, title, authored_at, session_id FROM origin_documents
+           WHERE collection = $1 AND path = $2
+        )
+        SELECT
+          (SELECT count(*)::int FROM o) AS path_rows,
+          (SELECT count(*)::int FROM o WHERE hash = $3 AND title = $4
+              AND authored_at IS NOT DISTINCT FROM $5::timestamptz
+              AND session_id IS NOT DISTINCT FROM $6::text) AS exact_rows,
+          (SELECT count(*)::int FROM o WHERE hash = $3) AS hash_rows,
+          (SELECT count(*)::int FROM o WHERE title = $4) AS title_rows,
+          (SELECT count(*)::int FROM o
+              WHERE authored_at IS NOT DISTINCT FROM $5::timestamptz) AS authored_rows,
+          (SELECT count(*)::int FROM o
+              WHERE session_id IS NOT DISTINCT FROM $6::text) AS session_rows,
+          (SELECT count(*)::int FROM content WHERE hash = $3
+              AND encode(sha256(convert_to(doc, 'UTF8')), 'hex') = $3) AS content_ok_rows,
+          pg_backend_pid() AS backend_pid,
+          current_database() AS db`,
+      values: [
+        collection, expected.path, expected.hash, expected.title,
+        expected.authoredAt ?? null, expected.sessionId ?? null,
+      ],
+      query_timeout: timeoutMs,
+    } as pg.QueryConfig);
+    const r = rows[0];
+    if (!r) return { error: "no-row" };
+    const num = (v: unknown) => (typeof v === "number" ? v : Number(v));
+    return {
+      pathRows: num(r.path_rows),
+      exactRows: num(r.exact_rows),
+      hashRows: num(r.hash_rows),
+      titleRows: num(r.title_rows),
+      authoredRows: num(r.authored_rows),
+      sessionRows: num(r.session_rows),
+      contentOkRows: num(r.content_ok_rows),
+      backendPid: typeof r.backend_pid === "number" ? r.backend_pid : null,
+      database: typeof r.db === "string" ? safeName(r.db) : null,
+    };
+  } catch (e) {
+    return { error: e instanceof Error ? safeName(e.name) : "unknown" };
+  }
 }
 
 /**
  * Thrown when PostgreSQL RETURNING verification detects stale or corrupted parameters
  * (master-harness-vn4rz.109). Rolling back prevents unverified writes from committing.
  * To preserve privacy, title text, session IDs, and doc bodies are NEVER included.
+ *
+ * vn4rz.114: the message carries the full content-free diagnostics line (see
+ * formatOriginReadBackDiagnostics), and `diagnostics` holds the same data
+ * structured.
  */
 export class OriginWriteReadBackError extends Error {
   readonly collection: string;
   readonly path: string;
   readonly mismatches: readonly string[];
+  readonly diagnostics: OriginReadBackDiagnostics | null;
 
   constructor(
     collection: string,
@@ -327,35 +837,37 @@ export class OriginWriteReadBackError extends Error {
     mismatches: string[],
     details?: OriginWriteReadBackDetails,
   ) {
-    const hexDetails: string[] = [];
-    const exp8 = details?.expectedHash ? details.expectedHash.slice(0, 8) : undefined;
-    if (mismatches.includes("hash")) {
-      if (details?.contentHash && exp8 && details.contentHash.slice(0, 8) !== exp8) {
-        hexDetails.push(`content.hash expected ${exp8} got ${details.contentHash.slice(0, 8)}`);
-      }
-      if (details?.originHash && exp8 && details.originHash.slice(0, 8) !== exp8) {
-        hexDetails.push(`origin.hash expected ${exp8} got ${details.originHash.slice(0, 8)}`);
-      }
-      if (hexDetails.length === 0 && (exp8 || details?.originHash || details?.contentHash)) {
-        const got8 = (details?.originHash ?? details?.contentHash)?.slice(0, 8) ?? "none";
-        hexDetails.push(`hash expected ${exp8 ?? "none"} got ${got8}`);
-      }
-    }
-    if (mismatches.includes("doc_sha")) {
-      const gotDocSha8 = details?.docSha ? details.docSha.slice(0, 8) : "none";
-      hexDetails.push(`doc_sha expected ${exp8 ?? "none"} got ${gotDocSha8}`);
-    }
-
-    const detailSuffix = hexDetails.length > 0 ? ` (${hexDetails.join(", ")})` : "";
+    const diagnostics = details?.diagnostics
+      ?? (details ? diagnosticsFromLegacy(details) : null);
+    const suffix = diagnostics ? ` :: ${formatOriginReadBackDiagnostics(diagnostics)}` : "";
     super(
       `Origin write read-back mismatch for collection "${collection}", path "${path}": ` +
-        `columns [${mismatches.join(", ")}]${detailSuffix}`,
+        `columns [${mismatches.join(", ")}]${suffix}`,
     );
     this.name = "OriginWriteReadBackError";
     this.collection = collection;
     this.path = path;
     this.mismatches = mismatches;
+    this.diagnostics = diagnostics;
   }
+}
+
+/** The structured stderr line for a read-back mismatch. Same data as the message. */
+export function originReadBackLogLine(
+  collection: string,
+  path: string,
+  mismatches: readonly string[],
+  diagnostics: OriginReadBackDiagnostics,
+): string {
+  return JSON.stringify({
+    event: "origin_write_readback_mismatch",
+    bead: "master-harness-vn4rz.114",
+    ts: new Date().toISOString(),
+    collection,
+    path,
+    mismatches,
+    ...diagnostics,
+  });
 }
 
 /** Every file the collection pattern matches under `root`, sorted. */
@@ -623,10 +1135,14 @@ export async function loadOriginCollection(
   };
 
   let n = 0;
+  // The first record written, for the read-back diagnostics' matchesRunFirst.
+  let runFirst: { rel: string; hash: string } | null = null;
   for (const rel of files) {
     if (opts.limit !== undefined && n >= opts.limit) break;
     let raw: string;
-    try { raw = readFileSync(join(opts.root, rel), "utf-8"); } catch { continue; }
+    try {
+      raw = opts.readRaw ? opts.readRaw(join(opts.root, rel)) : readFileSync(join(opts.root, rel), "utf-8");
+    } catch { continue; }
 
     const { body, meta } = parseOriginDocument(raw, rel, opts.frontmatterMap);
     // Two reads of the same frontmatter, on purpose: `meta` for the narrowed
@@ -642,6 +1158,12 @@ export async function loadOriginCollection(
     }
 
     const hash = hashContent(raw);
+    // vn4rz.114: an independent second read, through a different fs path
+    // (fd + readSync into a fresh zero-filled Buffer), checked against `hash`
+    // inside the transaction below. Taken now, next to the first read, so a
+    // file the capture rewrites mid-run is the only expected disagreement (and
+    // that fails closed too: the next run retries it).
+    const reread = rereadSource(join(opts.root, rel));
     const title = meta.title ?? extractTitle(raw, rel);
 
     // Where THIS document goes. Unclassified: the requested vault, as before.
@@ -679,13 +1201,13 @@ export async function loadOriginCollection(
       // Belt for the new route: a classified document headed for nsfw verifies
       // the connection really is the nsfw database before anything is written.
       if (classified && docVault === "nsfw") await assertVaultDatabase(c, "nsfw");
-      const { rows: contentRows } = await c.query<{ hash: string; doc_sha: string }>(
+      const contentRes = await c.query<{ hash: string; doc_sha: string }>(
         `INSERT INTO content (hash, doc) VALUES ($1, $2)
          ON CONFLICT ON CONSTRAINT content_pkey DO UPDATE SET doc = EXCLUDED.doc
          RETURNING hash, encode(sha256(convert_to(doc, 'UTF8')), 'hex') AS doc_sha`,
         [hash, raw],
       );
-      const { rows: originRows } = await c.query<{
+      const originRes = await c.query<{
         path: string;
         title: string;
         hash: string;
@@ -756,34 +1278,37 @@ export async function loadOriginCollection(
 
       // master-harness-vn4rz.109: read-back guard against stale params observed below
       // the JS layer (driver/wire/runtime). Fail-closed so stale writes never commit.
-      const contentRow = contentRows[0];
-      const originRow = originRows[0];
-      const mismatches = checkOriginWriteReadBack(
-        // session_id goes over the wire as text whatever YAML typed it (a bare
-        // number parses as one), so compare its text form, not the raw value.
-        {
-          path: rel, title, hash, authoredAt: authoredAt ?? null,
-          sessionId: m.session_id == null ? null : String(m.session_id),
-        },
-        contentRow,
-        originRow,
-      );
+      const contentRow = contentRes.rows[0];
+      const originRow = originRes.rows[0];
+      // session_id goes over the wire as text whatever YAML typed it (a bare
+      // number parses as one), so compare its text form, not the raw value.
+      const expected: ExpectedOriginWrite = {
+        path: rel, title, hash, authoredAt: authoredAt ?? null,
+        sessionId: m.session_id == null ? null : String(m.session_id),
+        sourceHash: reread.hash,
+      };
+      const mismatches = checkOriginWriteReadBack(expected, contentRow, originRow);
       if (mismatches.length > 0) {
-        throw new OriginWriteReadBackError(
-          opts.collection,
-          rel,
-          mismatches,
-          {
-            expectedHash: hash,
-            contentHash: contentRow?.hash,
-            originHash: originRow?.hash,
-            docSha: contentRow?.doc_sha,
+        // vn4rz.114: capture the client state BEFORE the re-read query runs on it.
+        const client = describePoolClient(docVault, c);
+        const diagnostics = describeOriginWriteReadBack(expected, contentRow, originRow, {
+          content: summarizeReadBackResult(contentRes),
+          origin: summarizeReadBackResult(originRes),
+          client,
+          stored: await probeStoredOriginWrite(c, opts.collection, expected),
+          source: {
+            index: n, fileBytes: reread.bytes, rawBytes: Buffer.byteLength(raw, "utf-8"),
+            readError: reread.error,
+            matchesRunFirst: runFirst && runFirst.rel !== rel ? runFirst.hash === hash : null,
           },
-        );
+        });
+        console.error(originReadBackLogLine(opts.collection, rel, mismatches, diagnostics));
+        throw new OriginWriteReadBackError(opts.collection, rel, mismatches, { diagnostics });
       }
     });
     stats.recordsWritten++;
     n++;
+    runFirst ??= { rel, hash };
 
     if (classified && verdict) {
       if (docVault === "nsfw") {

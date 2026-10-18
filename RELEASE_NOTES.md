@@ -4,6 +4,13 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.67 — Origin read-back guard: decisive diagnostics + source re-read closes the stale-raw hole
+
+- Origin read-back guard: decisive, content-free mismatch diagnostics (per-column presence/type/length/===, exp8+got8 per field, first differing index, RETURNING row keys, pool/client identity, runtime versions) plus a structured stderr JSON line (master-harness-vn4rz.114).
+- Close the stale-raw hole: an independent source re-read must hash equal to the loaded raw text, else a `source` mismatch fails the write closed and rolls back. The 2026-10-18T08:48Z live run wrote 265 rows carrying file #0's text under fresh paths that the old guard could not see.
+
+---
+
 ## v0.36.66 — PG read path honours ADR-0085 session focus
 
 - PG read path (`retrieve` search/vsearch/query and the `search` verb) now honours ADR-0085 session focus, matching sqlite: explicit `-c` wins, then a per-session focus that names a collection, else unscoped. Free-text focus stays unscoped. The new helper `src/pg/focus-scope.ts` reuses `computeCollectionScope`; no precedence logic is duplicated. (master-harness-vn4rz.111)

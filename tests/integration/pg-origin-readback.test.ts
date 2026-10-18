@@ -120,7 +120,8 @@ d("PG origin write read-back guard", () => {
       join(configDir, "index.yml"),
       `collections:\n` +
         `  origin-rb-test:\n    path: ${fixtureDir}\n    pattern: "**/*.md"\n` +
-        `  origin-rb-fresh:\n    path: ${fixtureDir}\n    pattern: "**/*.md"\n`,
+        `  origin-rb-fresh:\n    path: ${fixtureDir}\n    pattern: "**/*.md"\n` +
+        `  origin-rb-stale:\n    path: ${fixtureDir}\n    pattern: "**/*.md"\n`,
       "utf-8",
     );
     setEnv("CLAWMEM_CONFIG_DIR", configDir);
@@ -195,6 +196,46 @@ d("PG origin write read-back guard", () => {
     }
   });
 
+  it("REGRESSION (vn4rz.114, live 2026-10-18T08:53Z): raw carrying ANOTHER file's text is caught by the source re-read; the bad write rolls back", async () => {
+    // Every expected value AND the server's sha256(doc) derive from `raw`, so
+    // before vn4rz.114 this shape passed the read-back guard and committed
+    // rows with a fresh path but the first file's title/hash/ts/session.
+    const first = readFileSync(join(fixtureDir, "session_001.md"), "utf-8");
+    let thrown: unknown = null;
+    try {
+      await loadOriginCollection({
+        collection: "origin-rb-stale",
+        root: fixtureDir,
+        pattern: "**/*.md",
+        skipEmbed: true,
+        readRaw: () => first,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(OriginWriteReadBackError);
+    const e = thrown as OriginWriteReadBackError;
+    expect(e.path).toBe("session_002.md");
+    expect(e.mismatches).toEqual(["source"]);
+    const src = e.diagnostics!.fields.find(f => f.field === "source.sha")!;
+    expect(src).toMatchObject({ equal: false, exp8: hashContent(first).slice(0, 8) });
+    expect(e.diagnostics!.source).toMatchObject({ index: 1, readError: null, matchesRunFirst: true });
+    expect(e.message).not.toContain("First session record");
+
+    const pool = new pg.Pool({ connectionString: dbUrl(SCRATCH_DB) });
+    try {
+      const { rows } = await pool.query<{ path: string }>(
+        "SELECT path FROM origin_documents WHERE collection = $1 ORDER BY path",
+        ["origin-rb-stale"],
+      );
+      // session_001 is genuinely file #0's text, so it committed; session_002
+      // (the first stale one) rolled back, and the run stopped there.
+      expect(rows.map(r => r.path)).toEqual(["session_001.md"]);
+    } finally {
+      await pool.end();
+    }
+  });
+
   it("NEGATIVE / positive control: tamper trigger forces read-back rejection and roll back", async () => {
     const pool = new pg.Pool({ connectionString: dbUrl(SCRATCH_DB) });
     try {
@@ -254,6 +295,29 @@ d("PG origin write read-back guard", () => {
       const readBackErr = thrown as OriginWriteReadBackError;
       expect(readBackErr.message).toContain("title");
       expect(readBackErr.mismatches).toContain("title");
+
+      // master-harness-vn4rz.114: the diagnostics name the real client and the
+      // in-transaction re-read agrees the STORED title is wrong (the trigger
+      // wrote it), while every other column and the row count are right.
+      const diag = readBackErr.diagnostics!;
+      expect(diag).not.toBeNull();
+      const title = diag.fields.find(f => f.field === "origin.title")!;
+      expect(title).toMatchObject({ present: true, type: "string", equal: false });
+      expect(diag.origin).toMatchObject({ rows: 1, command: "INSERT" });
+      expect(diag.origin!.keys).toEqual(["path", "title", "hash", "authored_at", "session_id"]);
+      expect(diag.content!.keys).toEqual(["hash", "doc_sha"]);
+      expect(diag.client).toMatchObject({ vault: "sfw", inOwnPool: true, inOtherPools: [], activeQuery: false, readyForQuery: true });
+      expect(diag.client!.processID).toBeGreaterThan(0);
+      expect(diag.stored).toMatchObject({
+        pathRows: 1, exactRows: 0, titleRows: 0, hashRows: 1, authoredRows: 1, sessionRows: 1,
+        contentOkRows: 1, database: SCRATCH_DB,
+      });
+      expect((diag.stored as { backendPid: number }).backendPid).toBe(diag.client!.processID!);
+      expect(diag.runtime.pg).toMatch(/^\d+\.\d+\.\d+/);
+      // Privacy: neither the expected nor the stored title text is printed.
+      expect(readBackErr.message).not.toContain("tampered");
+      expect(readBackErr.message).not.toContain("session record");
+      expect(readBackErr.message).not.toContain("sess-00");
 
       // origin_documents must hold ZERO rows for that collection (rolled back)
       const { rows: countRows } = await pool.query<{ n: string }>(
