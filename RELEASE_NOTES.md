@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.68 — CLI startup floor: lazy-load heavy modules for read-only verbs
+
+CLI startup floor cut: heavy modules (eval, indexer, consolidation, maintenance, hooks, judge, merge-guards, canary, taint-clear, backup, profile) load lazily per verb, `--version` 450ms -> 140ms, scoped vsearch ~1.15s -> ~0.88s; vsearch opens the index read-only (writable fallback). Regression test tests/unit/cli-startup-import-graph.test.ts pins the read-only verbs' import graph. (master-harness-vn4rz.116)
+
+---
+
 ## v0.36.67 — Origin read-back guard: decisive diagnostics + source re-read closes the stale-raw hole
 
 - Origin read-back guard: decisive, content-free mismatch diagnostics (per-column presence/type/length/===, exp8+got8 per field, first differing index, RETURNING row keys, pool/client identity, runtime versions) plus a structured stderr JSON line (master-harness-vn4rz.114).
