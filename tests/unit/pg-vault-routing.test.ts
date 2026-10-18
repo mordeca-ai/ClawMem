@@ -184,3 +184,42 @@ describe("pathIsPrivate", () => {
     expect(pathIsPrivate("/some/checkout/intelligence/personal/bj/approved/a.md")).toBe(true);
   });
 });
+
+describe("resolveVault — content hint escalates, never downgrades (master-harness-vn4rz.66)", () => {
+  it("escalates an sfw collection's document to nsfw on hint nsfw", () => {
+    useConfig(`collections:\n  monchujo:\n    path: /tmp/monchujo-fixture\n    pattern: "**/*.md"\n`);
+    expect(resolveVault("monchujo", "2026/09/s__c00.md")).toBe("sfw");
+    expect(resolveVault("monchujo", "2026/09/s__c00.md", "nsfw")).toBe("nsfw");
+  });
+
+  it("hint sfw changes nothing for an sfw collection", () => {
+    useConfig(`collections:\n  monchujo:\n    path: /tmp/monchujo-fixture\n    pattern: "**/*.md"\n`);
+    expect(resolveVault("monchujo", "2026/09/s__c00.md", "sfw")).toBe("sfw");
+  });
+
+  it("a DECLARED nsfw collection stays nsfw under hint sfw", () => {
+    useConfig(`collections:\n  bj-corpus:\n    path: ${REPO}\n    pattern: "intelligence/personal/bj/approved/**/*.md"\n    vault: nsfw\n`);
+    expect(resolveVault("bj-corpus", "intelligence/personal/bj/approved/x.md", "sfw")).toBe("nsfw");
+    useConfig(`collections:\n  someday-private:\n    path: ${REPO}\n    pattern: "**/*.md"\n    vault: nsfw\n`);
+    expect(resolveVault("someday-private", "library/x.md", "sfw")).toBe("nsfw");
+  });
+
+  it("a private collection under hint sfw STILL throws PrivateContentRoutingError", () => {
+    useConfig(`collections:\n  bj-corpus:\n    path: ${REPO}\n    pattern: "**/*.md"\n    vault: sfw\n`);
+    expect(() => resolveVault("bj-corpus", "intelligence/personal/bj/approved/x.md", "sfw"))
+      .toThrow(PrivateContentRoutingError);
+    useConfig(`collections:\n  synthesis:\n    path: ${REPO}\n    pattern: "**/*.md"\n`);
+    expect(() => resolveVault("synthesis", "intelligence/personal/bj/approved/x.md", "sfw"))
+      .toThrow(PrivateContentRoutingError);
+  });
+
+  it("an invalid declared vault is refused even with a hint", () => {
+    useConfig(`collections:\n  weird:\n    path: ${REPO}\n    pattern: "**/*.md"\n    vault: private\n`);
+    expect(() => resolveVault("weird", "a.md", "nsfw")).toThrow(/only valid values are "sfw" and "nsfw"/);
+  });
+
+  it("an invalid hint value is refused rather than ignored", () => {
+    useConfig("collections: {}\n");
+    expect(() => resolveVault("x", "a.md", "public" as never)).toThrow(/content hint/);
+  });
+});
