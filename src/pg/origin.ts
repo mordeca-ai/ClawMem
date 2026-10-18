@@ -202,6 +202,138 @@ function expandBraces(pattern: string): string[] {
   return m ? m[1]!.split(",").map(s => s.trim()) : [pattern];
 }
 
+export interface ExpectedOriginWrite {
+  path: string;
+  title: string;
+  hash: string;
+  authoredAt: Date | null;
+  sessionId: string | null;
+}
+
+export interface ContentWriteReadBack {
+  hash?: string | null;
+  doc_sha?: string | null;
+}
+
+export interface OriginWriteReadBack {
+  path?: string | null;
+  title?: string | null;
+  hash?: string | null;
+  authored_at?: Date | string | null;
+  session_id?: string | null;
+}
+
+export interface OriginWriteReadBackDetails {
+  expectedHash?: string | null;
+  contentHash?: string | null;
+  originHash?: string | null;
+  docSha?: string | null;
+}
+
+function authoredAtMatches(
+  expected: Date | null,
+  got: Date | string | null | undefined,
+): boolean {
+  if (expected === null) {
+    return got == null;
+  }
+  if (got == null) {
+    return false;
+  }
+  const expMs = expected.getTime();
+  const gotMs = got instanceof Date ? got.getTime() : new Date(got).getTime();
+  if (Number.isNaN(expMs) || Number.isNaN(gotMs)) return false;
+  return expMs === gotMs;
+}
+
+/**
+ * Pure read-back check comparing expected write parameters against rows returned
+ * from PostgreSQL RETURNING clauses (master-harness-vn4rz.109). Returns an empty array
+ * if all columns match, or the list of mismatching column names.
+ */
+export function checkOriginWriteReadBack(
+  expected: ExpectedOriginWrite,
+  contentRow?: ContentWriteReadBack | null,
+  originRow?: OriginWriteReadBack | null,
+): string[] {
+  const mismatches: string[] = [];
+
+  if (originRow?.path !== expected.path) {
+    mismatches.push("path");
+  }
+
+  if (originRow?.title !== expected.title) {
+    mismatches.push("title");
+  }
+
+  if (contentRow?.hash !== expected.hash || originRow?.hash !== expected.hash) {
+    mismatches.push("hash");
+  }
+
+  if (!authoredAtMatches(expected.authoredAt, originRow?.authored_at)) {
+    mismatches.push("authored_at");
+  }
+
+  const expSession = expected.sessionId ?? null;
+  const gotSession = originRow ? (originRow.session_id ?? null) : null;
+  if (!originRow || expSession !== gotSession) {
+    mismatches.push("session_id");
+  }
+
+  if (contentRow?.doc_sha !== expected.hash) {
+    mismatches.push("doc_sha");
+  }
+
+  return mismatches;
+}
+
+/**
+ * Thrown when PostgreSQL RETURNING verification detects stale or corrupted parameters
+ * (master-harness-vn4rz.109). Rolling back prevents unverified writes from committing.
+ * To preserve privacy, title text, session IDs, and doc bodies are NEVER included.
+ */
+export class OriginWriteReadBackError extends Error {
+  readonly collection: string;
+  readonly path: string;
+  readonly mismatches: readonly string[];
+
+  constructor(
+    collection: string,
+    path: string,
+    mismatches: string[],
+    details?: OriginWriteReadBackDetails,
+  ) {
+    const hexDetails: string[] = [];
+    const exp8 = details?.expectedHash ? details.expectedHash.slice(0, 8) : undefined;
+    if (mismatches.includes("hash")) {
+      if (details?.contentHash && exp8 && details.contentHash.slice(0, 8) !== exp8) {
+        hexDetails.push(`content.hash expected ${exp8} got ${details.contentHash.slice(0, 8)}`);
+      }
+      if (details?.originHash && exp8 && details.originHash.slice(0, 8) !== exp8) {
+        hexDetails.push(`origin.hash expected ${exp8} got ${details.originHash.slice(0, 8)}`);
+      }
+      if (hexDetails.length === 0 && (exp8 || details?.originHash || details?.contentHash)) {
+        const got8 = (details?.originHash ?? details?.contentHash)?.slice(0, 8) ?? "none";
+        hexDetails.push(`hash expected ${exp8 ?? "none"} got ${got8}`);
+      }
+    }
+    if (mismatches.includes("doc_sha")) {
+      const gotDocSha8 = details?.docSha ? details.docSha.slice(0, 8) : "none";
+      hexDetails.push(`doc_sha expected ${exp8 ?? "none"} got ${gotDocSha8}`);
+    }
+
+    const detailSuffix = hexDetails.length > 0 ? ` (${hexDetails.join(", ")})` : "";
+    super(
+      `Origin write read-back mismatch for collection "${collection}", path "${path}": ` +
+        `columns [${mismatches.join(", ")}]${detailSuffix}`,
+    );
+    this.name = "OriginWriteReadBackError";
+    this.collection = collection;
+    this.path = path;
+    this.mismatches = mismatches;
+  }
+}
+
 /**
  * Load one origin collection from its record files into `origin_documents`.
  *
@@ -243,7 +375,7 @@ export async function loadOriginCollection(
 
   interface PendingFragment {
     hash: string; seq: number; pos: number; text: string;
-    fragmentType: string; fragmentLabel: string; canonicalId: string; relPath: string;
+    fragmentType: string; fragmentLabel: string | null; canonicalId: string; relPath: string;
   }
   const pending: PendingFragment[] = [];
   const hashesDone = new Set<string>();
@@ -312,12 +444,19 @@ export async function loadOriginCollection(
     }
 
     await withTransaction(vault, async c => {
-      await c.query(
+      const { rows: contentRows } = await c.query<{ hash: string; doc_sha: string }>(
         `INSERT INTO content (hash, doc) VALUES ($1, $2)
-         ON CONFLICT ON CONSTRAINT content_pkey DO UPDATE SET doc = EXCLUDED.doc`,
+         ON CONFLICT ON CONSTRAINT content_pkey DO UPDATE SET doc = EXCLUDED.doc
+         RETURNING hash, encode(sha256(convert_to(doc, 'UTF8')), 'hex') AS doc_sha`,
         [hash, raw],
       );
-      await c.query(
+      const { rows: originRows } = await c.query<{
+        path: string;
+        title: string;
+        hash: string;
+        authored_at: Date | string | null;
+        session_id: string | null;
+      }>(
         `INSERT INTO origin_documents (
            collection, path, title, hash, authored_at, authored_at_source,
            record_type, record_type_raw,
@@ -343,7 +482,8 @@ export async function loadOriginCollection(
            git_branch         = EXCLUDED.git_branch,
            agent_version      = EXCLUDED.agent_version,
            provenance         = EXCLUDED.provenance,
-           active             = true`,
+           active             = true
+         RETURNING path, title, hash, authored_at, session_id`,
         [
           opts.collection, rel, title, hash, authoredAt ?? null, source,
           recordType, rtRaw,
@@ -369,6 +509,29 @@ export async function loadOriginCollection(
           "private",
         ],
       );
+
+      // master-harness-vn4rz.109: read-back guard against stale params observed below
+      // the JS layer (driver/wire/runtime). Fail-closed so stale writes never commit.
+      const contentRow = contentRows[0];
+      const originRow = originRows[0];
+      const mismatches = checkOriginWriteReadBack(
+        { path: rel, title, hash, authoredAt: authoredAt ?? null, sessionId: (m.session_id as string) ?? null },
+        contentRow,
+        originRow,
+      );
+      if (mismatches.length > 0) {
+        throw new OriginWriteReadBackError(
+          opts.collection,
+          rel,
+          mismatches,
+          {
+            expectedHash: hash,
+            contentHash: contentRow?.hash,
+            originHash: originRow?.hash,
+            docSha: contentRow?.doc_sha,
+          },
+        );
+      }
     });
     stats.recordsWritten++;
     n++;

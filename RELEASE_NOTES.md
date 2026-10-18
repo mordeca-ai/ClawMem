@@ -4,6 +4,14 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.63 — fail-closed origin-load write read-back guard
+
+- `origin-load` now guards writes into `content` and `origin_documents` within `withTransaction` using `RETURNING` clauses and `checkOriginWriteReadBack` (master-harness-vn4rz.109).
+- Protects against stale parameters occurring below the JS layer (driver/wire/runtime): verifies written `path`, `title`, `hash`, `authored_at`, `session_id`, and `doc_sha` (Postgres sha256 of inserted `doc`).
+- Throws `OriginWriteReadBackError` on any mismatch, rolling back the transaction. Privacy-safe error message logs collection, relative path, mismatched columns, and truncated (8-char) hash/doc_sha prefixes without exposing title, session, or document content.
+
+---
+
 ## v0.36.62 — keywords frontmatter persisted + embedded; backfill-meta verb
 
 - `keywords` frontmatter is now persisted (nullable `documents.keywords` column, migrated in place) and embedded as its own frontmatter fragment after title and description, the same way v0.10.13 handled description. A document with no description or keywords cuts exactly the fragments it did before, so nothing re-embeds for those.
