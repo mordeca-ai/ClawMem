@@ -561,7 +561,8 @@ describe("CLI", () => {
     const refused = run(empty.dbPath, empty.dir, []);
     expect(refused.code).toBe(1);
     expect(refused.err).toContain("vec-compact refused");
-  });
+    // Three CLI subprocesses: bun's 5 s default timed out under host load.
+  }, 60_000);
 });
 
 beforeAll(() => {
