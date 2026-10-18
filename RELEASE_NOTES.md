@@ -4,6 +4,14 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.64 — clawmem vec-compact: collection-clustered vec0 rebuild
+
+- New `clawmem vec-compact [--dry-run] [--json] [-c <collection>]...` rebuilds `vectors_vec` with rows inserted in collection-clustered order (MIN active owning collection, then hash, then seq; unowned vectors last), so a collection-scoped vector leg reads a few vec0 chunks instead of hundreds (master-harness-vn4rz.110).
+- Live vault dry run: `openclaw-workspace` 123 -> 3 chunks, `docs` 163 -> 21, `agents-skills` 159 -> 18; 511 -> 374 chunks total. On a live-size copy, warm `vsearch -c openclaw-workspace` fell from 2.2-3.8 s to 1.4-2.0 s with identical hits; the vector leg itself ~1.7 s -> ~0.7 s. Collections that were declined by the vn4rz.100 scoped scan (span > 50% of chunks) become eligible after compaction.
+- One `BEGIN IMMEDIATE` transaction; bit-identical verification of every (hash_seq, embedding) pair before COMMIT; any error rolls back. Copy and verify read each chunk blob once (per-row vec0 reads cost ~1 ms each). Holds the write lock ~10 min on the live vault (381,953 vectors) — run it when no embed/reindex is active. `--dry-run` is read-only.
+
+---
+
 ## v0.36.63 — fail-closed origin-load write read-back guard
 
 - `origin-load` now guards writes into `content` and `origin_documents` within `withTransaction` using `RETURNING` clauses and `checkOriginWriteReadBack` (master-harness-vn4rz.109).
