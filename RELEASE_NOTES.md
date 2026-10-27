@@ -4,6 +4,14 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.69 — clawmem query arm ~5s per openclaw turn is mostly per-spawn cost (bun startup + store_open + scope_load re-read); persistent clawmem serve for the recall plugin
+
+Add a persistent POST /query endpoint to ClawMem serve. It runs the full CLI query pipeline, including expansion, scoped vector legs, fusion, and scoring, and returns the CLI JSON hit array. Requests serialize around the shared store and model lifecycle. The endpoint requires a collection and bounded limit; other REST routes are unchanged.
+
+Eval: library baseline query Recall@3 0.92 and MRR@3 0.87 before and after, with identical outcomes on 25 questions; 24/25 exact ordered top-three. Five OpenClaw default-vault CLI/HTTP probes matched ordered top-three exactly. Focused server tests passed. Live 24-hour OpenClaw acceptance remains to be measured after service and plugin deployment.
+
+---
+
 ## v0.36.68 — CLI startup floor: lazy-load heavy modules for read-only verbs
 
 CLI startup floor cut: heavy modules (eval, indexer, consolidation, maintenance, hooks, judge, merge-guards, canary, taint-clear, backup, profile) load lazily per verb, `--version` 450ms -> 140ms, scoped vsearch ~1.15s -> ~0.88s; vsearch opens the index read-only (writable fallback). Regression test tests/unit/cli-startup-import-graph.test.ts pins the read-only verbs' import graph. (master-harness-vn4rz.116)
