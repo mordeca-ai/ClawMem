@@ -1590,7 +1590,16 @@ function openScopedLegStore(collections: string[]): Store | null {
   return null;
 }
 
-async function cmdQuery(args: string[]) {
+type QueryJsonHit = {
+  file: string;
+  title: string;
+  score: number;
+  searchScore: number;
+  recencyScore: number;
+  contentType: string;
+};
+
+async function cmdQuery(args: string[], emit: boolean = true): Promise<QueryJsonHit[]> {
   const { values, positionals } = parseArgs({
     args,
     options: {
@@ -1801,22 +1810,24 @@ async function cmdQuery(args: string[]) {
     .slice(0, limit);
   endScore();
 
-  if (values.json) {
-    console.log(JSON.stringify(scored.map(r => ({
+  const jsonHits = scored.map(r => ({
       file: r.displayPath,
       title: r.title,
       score: r.compositeScore,
       searchScore: r.score,
       recencyScore: r.recencyScore,
       contentType: r.contentType,
-    })), null, 2));
-  } else {
+    }));
+  if (emit && values.json) {
+    console.log(JSON.stringify(jsonHits, null, 2));
+  } else if (emit) {
     printResults(scored, query);
   }
 
   signalEmptyResults(scored.length, !!values["fail-on-empty"]);
   await timer.time("dispose", () => disposeDefaultLlamaCpp());
   timer.emit();
+  return jsonHits;
 }
 
 /**
@@ -2194,7 +2205,17 @@ async function cmdServe(args: string[]) {
   const host = args.find((_, i, a) => a[i - 1] === "--host") || "127.0.0.1";
   const s = getStore();
   const { startServer } = await import("./server.ts");
-  const server = startServer(s, port, host);
+  // Keep the exact CLI query pipeline (expansion, scoped vector legs, fusion and scoring)
+  // resident behind the HTTP API. Serial execution protects the process-global store and
+  // local-model disposer from overlapping requests; failed requests never poison the queue.
+  let queryQueue: Promise<unknown> = Promise.resolve();
+  const queryHandler = (query: string, collection: string, limit: number) => {
+    const run = queryQueue.then(() =>
+      cmdQuery([query, "-c", collection, "-n", String(limit), "--json"], false));
+    queryQueue = run.then(() => undefined, () => undefined);
+    return run;
+  };
+  const server = startServer(s, port, host, queryHandler);
   console.log(`ClawMem HTTP server listening on http://${host}:${port}`);
   console.log(`Token auth: ${process.env.CLAWMEM_API_TOKEN ? "enabled" : "disabled (set CLAWMEM_API_TOKEN)"}`);
   console.log(`Press Ctrl+C to stop.`);

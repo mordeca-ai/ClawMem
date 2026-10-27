@@ -33,6 +33,17 @@ import {
 
 type RouteHandler = (req: Request, url: URL, store: Store) => Promise<Response> | Response;
 
+/** The CLI query JSON shape, returned unchanged by the persistent endpoint. */
+export type QueryJsonHit = {
+  file: string;
+  title: string;
+  score: number;
+  searchScore: number;
+  recencyScore: number;
+  contentType: string;
+};
+export type QueryHandler = (query: string, collection: string, limit: number) => Promise<QueryJsonHit[]>;
+
 // =============================================================================
 // Auth
 // =============================================================================
@@ -828,7 +839,7 @@ function matchRoute(method: string, pathname: string): RouteHandler | null {
 // Server
 // =============================================================================
 
-export function startServer(store: Store, port: number = 7438, host: string = "127.0.0.1") {
+export function startServer(store: Store, port: number = 7438, host: string = "127.0.0.1", queryHandler?: QueryHandler) {
   return Bun.serve({
     port,
     hostname: host,
@@ -851,6 +862,23 @@ export function startServer(store: Store, port: number = 7438, host: string = "1
       // Auth check
       const authError = checkAuth(req);
       if (authError) return authError;
+
+      // The full CLI query pipeline is supplied only by `clawmem serve`. Direct users of
+      // startServer retain the existing REST surface without a misleading hybrid alias.
+      if (req.method === "POST" && url.pathname === "/query" && queryHandler) {
+        const body = await parseBody<{ query?: unknown; collection?: unknown; limit?: unknown }>(req);
+        if (!body || typeof body.query !== "string" || !body.query.trim() || body.query.length > 2000 ||
+            typeof body.collection !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(body.collection) ||
+            (body.limit !== undefined && (!Number.isInteger(body.limit) || (body.limit as number) < 1 || (body.limit as number) > 20))) {
+          return jsonError("query, collection, or limit is invalid");
+        }
+        try {
+          return jsonResponse(await queryHandler(body.query, body.collection, body.limit as number | undefined ?? 3));
+        } catch (err: any) {
+          console.error("[clawmem-server] POST /query error:", err);
+          return jsonError(`Internal error: ${err.message}`, 500);
+        }
+      }
 
       // Route matching
       const handler = matchRoute(req.method, url.pathname);
