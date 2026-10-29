@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { QueryRequestError, startServer, type QueryJsonHit } from "../../src/server.ts";
+import { QUERY_MAX_CHARS, QueryRequestError, startServer, type QueryJsonHit } from "../../src/server.ts";
 import type { Store } from "../../src/store.ts";
 
 const hit: QueryJsonHit = {
@@ -46,6 +46,14 @@ describe("POST /query", () => {
     const response = await post({ query: "relay policy", session_id: "0f2c4d6e-a1b2" });
     expect(response.status).toBe(200);
     expect(calls.at(-1)).toEqual(["relay policy", undefined, 3, "0f2c4d6e-a1b2"]);
+  });
+
+  test("a whole long prompt (past the old 2000-char cap) is accepted up to QUERY_MAX_CHARS", async () => {
+    const long = "relay policy ".repeat(1200).slice(0, 15_000);
+    expect((await post({ query: long })).status).toBe(200);
+    expect(calls.at(-1)?.[0]).toBe(long);
+    expect((await post({ query: "x".repeat(QUERY_MAX_CHARS) })).status).toBe(200);
+    expect((await post({ query: "x".repeat(QUERY_MAX_CHARS + 1) })).status).toBe(400);
   });
 
   test("a handler QueryRequestError answers its 4xx JSON, not a 500", async () => {

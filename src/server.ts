@@ -72,6 +72,13 @@ export class QueryRequestError extends Error {
 /** Collection names and session ids accepted on POST /query (no paths, no separators). */
 const QUERY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const QUERY_SESSION_ID_MAX = 128;
+/**
+ * Longest query text POST /query accepts. Was 2000 (sized for OpenClaw turns); the master-harness
+ * recall hook sends the whole user prompt, exactly as it passes it to `clawmem query` argv, and
+ * 41% of its last 1479 live prompts were longer than 2000 chars (p95 15241, p99 18548). A cap
+ * below that silently forced those prompts back onto the per-spawn path (vn4rz.123).
+ */
+export const QUERY_MAX_CHARS = 32_000;
 
 // =============================================================================
 // Auth
@@ -898,7 +905,7 @@ export function startServer(store: Store, port: number = 7438, host: string = "1
         const body = await parseBody<{ query?: unknown; collection?: unknown; limit?: unknown; session_id?: unknown }>(req);
         // `collection` and `session_id` are OPTIONAL (absent => unscoped / no session), but
         // when present they must be a bare name: the same charset guard for both.
-        if (!body || typeof body.query !== "string" || !body.query.trim() || body.query.length > 2000 ||
+        if (!body || typeof body.query !== "string" || !body.query.trim() || body.query.length > QUERY_MAX_CHARS ||
             (body.collection !== undefined &&
               (typeof body.collection !== "string" || !QUERY_NAME_RE.test(body.collection))) ||
             (body.session_id !== undefined &&
