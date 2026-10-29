@@ -42,7 +42,36 @@ export type QueryJsonHit = {
   recencyScore: number;
   contentType: string;
 };
-export type QueryHandler = (query: string, collection: string, limit: number) => Promise<QueryJsonHit[]>;
+/**
+ * `collection` undefined => unscoped (exactly `clawmem query` with no `-c`). `sessionId` is the
+ * caller's session, applied for that one request so session-focus precedence matches the CLI
+ * path (master-harness-vn4rz.123).
+ */
+export type QueryHandler = (
+  query: string,
+  collection: string | undefined,
+  limit: number,
+  sessionId?: string,
+) => Promise<QueryJsonHit[]>;
+
+/**
+ * A request the query pipeline refuses as the CALLER's fault (unknown collection, ...). A
+ * QueryHandler throws this instead of exiting; the server answers `status` with a JSON error and
+ * keeps serving. master-harness-vn4rz.123: one probe naming an unknown collection used to reach
+ * cmdQuery's die() -> process.exit(1) and took the whole persistent endpoint down.
+ */
+export class QueryRequestError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number = 400) {
+    super(message);
+    this.name = "QueryRequestError";
+    this.status = status;
+  }
+}
+
+/** Collection names and session ids accepted on POST /query (no paths, no separators). */
+const QUERY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+const QUERY_SESSION_ID_MAX = 128;
 
 // =============================================================================
 // Auth
@@ -866,15 +895,30 @@ export function startServer(store: Store, port: number = 7438, host: string = "1
       // The full CLI query pipeline is supplied only by `clawmem serve`. Direct users of
       // startServer retain the existing REST surface without a misleading hybrid alias.
       if (req.method === "POST" && url.pathname === "/query" && queryHandler) {
-        const body = await parseBody<{ query?: unknown; collection?: unknown; limit?: unknown }>(req);
+        const body = await parseBody<{ query?: unknown; collection?: unknown; limit?: unknown; session_id?: unknown }>(req);
+        // `collection` and `session_id` are OPTIONAL (absent => unscoped / no session), but
+        // when present they must be a bare name: the same charset guard for both.
         if (!body || typeof body.query !== "string" || !body.query.trim() || body.query.length > 2000 ||
-            typeof body.collection !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(body.collection) ||
+            (body.collection !== undefined &&
+              (typeof body.collection !== "string" || !QUERY_NAME_RE.test(body.collection))) ||
+            (body.session_id !== undefined &&
+              (typeof body.session_id !== "string" || body.session_id.length > QUERY_SESSION_ID_MAX ||
+                !QUERY_NAME_RE.test(body.session_id))) ||
             (body.limit !== undefined && (!Number.isInteger(body.limit) || (body.limit as number) < 1 || (body.limit as number) > 20))) {
-          return jsonError("query, collection, or limit is invalid");
+          return jsonError("query, collection, session_id, or limit is invalid");
         }
         try {
-          return jsonResponse(await queryHandler(body.query, body.collection, body.limit as number | undefined ?? 3));
+          return jsonResponse(await queryHandler(
+            body.query,
+            body.collection as string | undefined,
+            body.limit as number | undefined ?? 3,
+            body.session_id as string | undefined,
+          ));
         } catch (err: any) {
+          if (err instanceof QueryRequestError) {
+            console.error(`[clawmem-server] POST /query refused (${err.status}): ${err.message}`);
+            return jsonError(err.message, err.status);
+          }
           console.error("[clawmem-server] POST /query error:", err);
           return jsonError(`Internal error: ${err.message}`, 500);
         }

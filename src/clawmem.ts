@@ -2204,19 +2204,57 @@ async function cmdServe(args: string[]) {
   const port = parseInt(args.find((_, i, a) => a[i - 1] === "--port") || "7438", 10);
   const host = args.find((_, i, a) => a[i - 1] === "--host") || "127.0.0.1";
   const s = getStore();
-  const { startServer } = await import("./server.ts");
+  const { startServer, QueryRequestError } = await import("./server.ts");
+  const { SESSION_ID_ENV_VARS } = await import("./session-focus.ts");
   // Keep the exact CLI query pipeline (expansion, scoped vector legs, fusion and scoring)
   // resident behind the HTTP API. Serial execution protects the process-global store and
   // local-model disposer from overlapping requests; failed requests never poison the queue.
+  // The queue also serialises the per-request session env below, so no two requests ever
+  // observe each other's session id.
   let queryQueue: Promise<unknown> = Promise.resolve();
-  const queryHandler = (query: string, collection: string, limit: number) => {
-    const run = queryQueue.then(() =>
-      cmdQuery([query, "-c", collection, "-n", String(limit), "--json"], false));
+  const runQuery = async (
+    query: string, collection: string | undefined, limit: number, sessionId: string | undefined,
+  ) => {
+    // master-harness-vn4rz.123: validate the scope HERE. cmdQuery reports an unknown
+    // collection through die() -> process.exit(1), which is right for the CLI and fatal for
+    // a persistent server (one bad probe took the live endpoint down). Same check, same
+    // message, but thrown as a request error the server answers 400 and survives.
+    if (collection !== undefined) {
+      const checked = computeCollectionScope(collection, undefined, collectionsList().map(c => c.name));
+      if (checked && "error" in checked) throw new QueryRequestError(checked.error, 400);
+    }
+    // session_id: apply it for THIS request exactly as the CLI path sees it (the recall hook
+    // sets CLAUDE_SESSION_ID on the subprocess). Higher-precedence ambient ids are masked so the
+    // caller's session wins; every prior value is restored afterwards.
+    // This is a WRITE of the env contract cmdQuery then reads through resolveEnvSessionId(),
+    // so the var is named via SESSION_ID_ENV_VARS rather than a literal process.env read.
+    const saved = new Map(SESSION_ID_ENV_VARS.map(k => [k, process.env[k]] as const));
+    if (sessionId !== undefined) {
+      for (const k of SESSION_ID_ENV_VARS) delete process.env[k];
+      const hookSessionVar: (typeof SESSION_ID_ENV_VARS)[number] = "CLAUDE_SESSION_ID";
+      process.env[hookSessionVar] = sessionId;
+    }
+    try {
+      // Options first and `--` before the text: a prompt that starts with "-" is query text,
+      // never a cmdQuery option.
+      const args = ["-n", String(limit), "--json"];
+      if (collection !== undefined) args.push("-c", collection);
+      return await cmdQuery([...args, "--", query], false);
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  };
+  const queryHandler = (query: string, collection: string | undefined, limit: number, sessionId?: string) => {
+    const run = queryQueue.then(() => runQuery(query, collection, limit, sessionId));
     queryQueue = run.then(() => undefined, () => undefined);
     return run;
   };
   const server = startServer(s, port, host, queryHandler);
-  console.log(`ClawMem HTTP server listening on http://${host}:${port}`);
+  // server.port, not the flag: `--port 0` binds an ephemeral port and this line names it.
+  console.log(`ClawMem HTTP server listening on http://${host}:${server.port}`);
   console.log(`Token auth: ${process.env.CLAWMEM_API_TOKEN ? "enabled" : "disabled (set CLAWMEM_API_TOKEN)"}`);
   console.log(`Press Ctrl+C to stop.`);
   // Keep alive
