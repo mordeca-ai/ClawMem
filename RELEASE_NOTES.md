@@ -4,6 +4,14 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.70 — serve POST /query survives bad input; optional collection and session_id (recall-hook route)
+
+POST /query no longer takes the server down on an unknown collection: cmdQuery's die() path is checked at the serve boundary and answered as a 400 JSON error (one bad probe had killed the live endpoint). `collection` is now optional (absent = unscoped, as `clawmem query` with no -c), an optional `session_id` is applied as CLAUDE_SESSION_ID for that one request and restored afterwards, and the query text cap rises from 2000 to 32000 characters. Query text is passed after `--`, so a prompt starting with "-" is never read as an option. Other REST routes and the CLI query path are unchanged.
+
+Eval: transport-only change; the served hits match `clawmem query --json` on files, titles, contentType and searchScore, scoped and unscoped (tests/unit/serve-query-cli-parity.test.ts). Server tests 128 pass. Live measurement of the master-harness recall hook over this route is recorded in master-harness r77 (master-harness-vn4rz.123).
+
+---
+
 ## v0.36.69 — clawmem query arm ~5s per openclaw turn is mostly per-spawn cost (bun startup + store_open + scope_load re-read); persistent clawmem serve for the recall plugin
 
 Add a persistent POST /query endpoint to ClawMem serve. It runs the full CLI query pipeline, including expansion, scoped vector legs, fusion, and scoring, and returns the CLI JSON hit array. Requests serialize around the shared store and model lifecycle. The endpoint requires a collection and bounded limit; other REST routes are unchanged.
