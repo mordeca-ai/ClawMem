@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.71 — hook-level test seeds stop pinning a calendar date
+
+Two hook-level integration tests seeded documents at a literal 2026-01-01. Composite recency decays against the real clock, so on 2026-11-01 those documents fell below the activation floor and the tests failed with no code change. They now seed relative to Date.now(), computed once per file, and tests/unit/hook-seed-date-guard.test.ts rejects a literal timestamp in any test that calls contextSurfacing. Test-only change: no src/ file changed, so there is no retrieval eval.
+
+---
+
 ## v0.36.70 — serve POST /query survives bad input; optional collection and session_id (recall-hook route)
 
 POST /query no longer takes the server down on an unknown collection: cmdQuery's die() path is checked at the serve boundary and answered as a 400 JSON error (one bad probe had killed the live endpoint). `collection` is now optional (absent = unscoped, as `clawmem query` with no -c), an optional `session_id` is applied as CLAUDE_SESSION_ID for that one request and restored afterwards, and the query text cap rises from 2000 to 32000 characters. Query text is passed after `--`, so a prompt starting with "-" is never read as an option. Other REST routes and the CLI query path are unchanged.

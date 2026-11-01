@@ -122,7 +122,9 @@ afterEach(() => {
 // infinitesimally different ages).
 // =============================================================================
 
-const SEED_TS = "2026-01-01T00:00:00.000Z";
+// Relative to the wall clock, computed once: a pinned date decays against the real
+// now until the docs fall below the activation floor (master-harness-83qk0.309).
+const SEED_TS = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
 function seedDoc(
   store: Store,
