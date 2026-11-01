@@ -85,9 +85,12 @@ afterEach(() => {
   }
 });
 
-// Fixed timestamp so seeded stores are deterministic in every
-// score-affecting field (recency derives from modified_at).
-const SEED_TS = "2026-01-01T00:00:00.000Z";
+// One timestamp for every seeded row, so no seeded store outranks another on
+// recency. Relative to the wall clock, never a fixed date: composite recency
+// decays from modified_at against the real now, so a pinned date slowly pushed
+// these docs below the activation floor and the hook-level tests started failing
+// on 2026-11-01 with no code change (master-harness-83qk0.309).
+const SEED_TS = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
 function seedDoc(store: Store, path: string, title: string, body: string): void {
   const hash = `hash_${path}`;
