@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.72 — llm_cache keeps a day of writes, not 38 minutes
+
+Fixed: rerank scores could evict every other llm_cache row within about 38 minutes, so a repeating query lost its cached expansion. The cap is now 50,000 rows and a purge fires on 0.1% of writes. (master-harness-uvnhf.17)
+
+---
+
 ## v0.36.71 — hook-level test seeds stop pinning a calendar date
 
 Two hook-level integration tests seeded documents at a literal 2026-01-01. Composite recency decays against the real clock, so on 2026-11-01 those documents fell below the activation floor and the tests failed with no code change. They now seed relative to Date.now(), computed once per file, and tests/unit/hook-seed-date-guard.test.ts rejects a literal timestamp in any test that calls contextSurfacing. Test-only change: no src/ file changed, so there is no retrieval eval.
