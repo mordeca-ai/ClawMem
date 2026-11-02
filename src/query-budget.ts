@@ -20,23 +20,30 @@
  * 1.3.13 that panics the whole process (SIGILL, exit 132, in the worker's module transpile), so a
  * cut worker that is still booting is terminated only once it has posted its loaded signal.
  *
- * What it still does not bound: every other synchronous main-thread step. Named: opening the store
- * and resolving the collection scope, the expansion and rerank cache lookups, RRF fusion, result
- * enrichment (one SQLite read per row on the main handle), composite scoring and JSON building,
- * disposing the local models, the HTTP body parse, reply deserialization from the FTS worker, and
- * a main-thread FTS fallback after a worker failure. Neither this budget's timer nor the next
- * request's arrival clock can run while one is going, so a request stuck in one answers only when
- * it returns. The other REST routes, which do their own FTS on the main thread, are outside this
- * budget altogether.
+ * Cache writes (vn4rz.140): the rerank cache flush (store.ts flushCacheWrites) and the expansion
+ * cache write are best-effort, so under a budget each waits QUERY_BUDGET_CACHE_WRITE_BUSY_MS for
+ * the vault's write lock and is dropped past it (store.ts guardedCacheWrite), then the handle's
+ * 5 s busy_timeout is put back. Before, a write lock held by another connection froze the main
+ * thread for 5 s per write: a measured run answered at 5040 ms and 9093 ms under a 2000 ms budget,
+ * bare arrays with the budget count at 0. A dropped write is counted in the timing row
+ * (cache_write_dropped, cache_write_stalled, cache_write_ms) and logged ("cache write dropped"). It
+ * does not degrade the reply: the answer is complete and on time, and only a later recompute is
+ * lost. A write that carries the request past its budget does flag query_budget_expired. The
+ * cache LOOKUPS never wait on that lock (the vault is WAL: a reader is not blocked by a writer).
  *
- * The unbounded case is the cache WRITES on the main handle: the rerank cache flush
- * (store.ts flushCacheWrites) and the expansion cache write. A write that waits on a write lock
- * held by another connection blocks the main thread for up to busy_timeout (5 s). A measured run
- * answered at 6233 ms and 10965 ms under a 2000 ms budget, with the budget count at 0. Moving
- * those writes off the main thread is not part of this change. The other main-thread stages, over
- * the 533 live timing rows (95.5 h), peaked at 415 ms; the "50 of 200 rows at 1000 ms or more"
- * figure sometimes quoted for this change is the FTS rows that this change moved to the worker,
- * not a remainder.
+ * What it still does not bound: every other synchronous main-thread step. Named: opening the store
+ * and resolving the collection scope, the expansion and rerank cache lookups (reads; unblocked by
+ * a held write lock, but still synchronous), RRF fusion, result enrichment (one SQLite read per
+ * row on the main handle), composite scoring and JSON building, disposing the local models, the
+ * HTTP body parse, reply deserialization from the FTS worker, and a main-thread FTS fallback after
+ * a worker failure. Each cache write can still hold the thread for up to the short wait above, and
+ * a purge of the cache table at its row cap (about 200 ms, one write in a thousand) runs inside
+ * the guarded write's transaction. Neither this budget's timer nor the next request's arrival clock
+ * can run while one is going, so a request stuck in one answers only when it returns. The other
+ * REST routes, which do their own FTS on the main thread, are outside this budget altogether. The
+ * main-thread stages, over the 533 live timing rows (95.5 h), peaked at 415 ms; the "50 of 200 rows
+ * at 1000 ms or more" figure sometimes quoted for this change is the FTS rows that this change moved
+ * to the worker, not a remainder.
  *
  * Expiry is never an error: the response carries the best results so far, flagged degraded with
  * reason `query_budget_expired`. The pipeline checks the budget around the synchronous stages and
@@ -51,6 +58,13 @@ export const QUERY_BUDGET_REASON = "query_budget_expired" as const;
  * anyway. The pipeline normally ends on its own at the budget; this covers a stage that ignores it.
  */
 export const QUERY_BUDGET_GRACE_MS = 1000;
+
+/**
+ * How long a cache write under the budget waits for the vault's write lock before it is dropped
+ * (vn4rz.140). A request makes at most two such writes (expansion, rerank scores), so a held lock
+ * freezes the main thread for at most about twice this per request, against 5 s per write before.
+ */
+export const QUERY_BUDGET_CACHE_WRITE_BUSY_MS = 50;
 
 /** setTimeout stores its delay in 32 bits: from 2^31 ms it fires at once instead of that late. */
 export const QUERY_BUDGET_MAX_MS = 2 ** 31 - 1;
@@ -156,6 +170,18 @@ export function queryBudgetTestStall(
   const match = env.CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MATCH;
   if (match && !query.includes(match)) return;
   Bun.sleepSync(ms);
+}
+
+/**
+ * Test seam, a no-op unless CLAWMEM_QUERY_BUDGET_TEST_CACHE_WRITE_STALL_MS is set: block this long
+ * inside each guarded cache write (store.ts guardedCacheWrite), as a write that is slow in SQLite
+ * itself would. Lets a test carry a request past its budget through a cache write, deterministically.
+ */
+export function queryBudgetTestCacheWriteStall(
+  env: Record<string, string | undefined> = process.env,
+): void {
+  const ms = Number(env.CLAWMEM_QUERY_BUDGET_TEST_CACHE_WRITE_STALL_MS);
+  if (ms > 0) Bun.sleepSync(ms);
 }
 
 /**

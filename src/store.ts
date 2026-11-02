@@ -1805,7 +1805,7 @@ export type Store = {
   searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => Promise<VecSearchDetailedResult>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
+  expandQuery: (query: string, model?: string, intent?: string, cacheWrites?: CacheWriteGuard) => Promise<ExpandedQuery[]>;
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, options?: RerankProbeOptions) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
@@ -2038,7 +2038,7 @@ export function createStore(dbPath?: string, opts?: { readonly?: boolean; busyTi
     searchVecDetailed: (query: string, model: string, limit?: number, opts?: VecSearchDetailedOpts) => searchVecDetailed(db, query, model, limit, opts),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent),
+    expandQuery: (query: string, model?: string, intent?: string, cacheWrites?: CacheWriteGuard) => expandQuery(query, model, db, intent, cacheWrites),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string, options?: RerankProbeOptions) => rerank(query, documents, model, db, intent, options),
 
     // Document retrieval
@@ -2888,6 +2888,79 @@ export function setCachedResult(db: Database, cacheKey: string, result: string):
   if (Math.random() < LLM_CACHE_PURGE_PROBABILITY) {
     db.exec(`DELETE FROM llm_cache WHERE hash NOT IN (SELECT hash FROM llm_cache ORDER BY created_at DESC LIMIT ${LLM_CACHE_MAX_ROWS})`);
   }
+}
+
+/**
+ * Best-effort cache writes under a request budget (master-harness-vn4rz.140).
+ *
+ * The rerank flush and the expansion write run synchronously on the caller's handle, whose
+ * busy_timeout is 5 s. Another connection holding the vault's write lock froze the whole thread for
+ * that long, so the request budget's timer and the next request's arrival stamp could not run. A
+ * lost cache row costs a later recompute and nothing else, so a guarded write waits `busyMs` for
+ * the lock and is dropped past it. The guard also carries what the request reports: drops and slow
+ * writes, the time spent writing, and whether a write itself carried the request past its budget.
+ * Without a guard the write is the unguarded one it always was.
+ */
+export type CacheWriteGuard = {
+  /** How long a write may wait for the write lock before it is dropped. */
+  readonly busyMs: number;
+  /** True once the request budget is spent; lets a write that crossed it be flagged. */
+  readonly expired?: () => boolean;
+  /** Runs inside each guarded write, before it: the test seam that makes a write slow. */
+  readonly before?: () => void;
+  /** Writes dropped because the write lock stayed held. */
+  dropped: number;
+  /** Writes that waited at least half the window and still succeeded. */
+  stalled: number;
+  /** Time spent inside guarded writes, in ms. */
+  ms: number;
+  /** A guarded write ended after the budget did, having started before it. */
+  crossedBudget: boolean;
+};
+
+export function createCacheWriteGuard(busyMs: number, expired?: () => boolean, before?: () => void): CacheWriteGuard {
+  return { busyMs, expired, before, dropped: 0, stalled: 0, ms: 0, crossedBudget: false };
+}
+
+function isSqliteBusy(e: unknown): boolean {
+  const code = (e as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? /^SQLITE_(BUSY|LOCKED)/.test(code) : /database is locked/i.test(String((e as Error)?.message));
+}
+
+/**
+ * Run `write` with the connection's busy_timeout narrowed to `guard.busyMs`, then put the prior
+ * value back, also when `write` throws. A busy or locked error is swallowed and counted (the write
+ * is dropped); any other error propagates as it always did. Returns whether the write landed.
+ * The connection is used by this thread alone, so no other statement sees the narrowed value.
+ */
+export function guardedCacheWrite(db: Database, guard: CacheWriteGuard, what: string, write: () => void): boolean {
+  const prior = (db.query("PRAGMA busy_timeout").get() as { timeout?: number } | null)?.timeout ?? 5000;
+  const liveAtStart = !guard.expired?.();
+  const t0 = performance.now();
+  let wrote = false;
+  let busy = false;
+  db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(guard.busyMs))}`);
+  try {
+    guard.before?.();
+    write();
+    wrote = true;
+  } catch (e) {
+    if (!isSqliteBusy(e)) throw e;
+    busy = true;
+  } finally {
+    db.exec(`PRAGMA busy_timeout = ${prior}`);
+    const ms = performance.now() - t0;
+    guard.ms += ms;
+    if (liveAtStart && guard.expired?.()) guard.crossedBudget = true;
+    if (busy) {
+      guard.dropped++;
+      console.error(`[clawmem] cache write dropped (database is locked): ${what}, waited ${Math.round(ms)} ms of ${guard.busyMs} ms`);
+    } else if (wrote && ms >= guard.busyMs / 2) {
+      guard.stalled++;
+      console.error(`[clawmem] cache write stalled: ${what}, took ${Math.round(ms)} ms of ${guard.busyMs} ms`);
+    }
+  }
+  return wrote;
 }
 
 export function clearCache(db: Database): void {
@@ -5805,7 +5878,7 @@ export function expandQueryCacheKey(query: string, model: string = DEFAULT_QUERY
   });
 }
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, cacheWrites?: CacheWriteGuard): Promise<ExpandedQuery[]> {
   // Typed-JSON cache. Versioned key (include intent + provider fingerprint).
   const cacheKey = expandQueryCacheKey(query, model, intent);
   const cached = getCachedResult(db, cacheKey);
@@ -5870,7 +5943,9 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   }
 
   const expanded: ExpandedQuery[] = anchored.map(r => ({ type: r.type, query: r.text }));
-  setCachedResult(db, cacheKey, JSON.stringify(expanded));
+  const payload = JSON.stringify(expanded);
+  if (cacheWrites) guardedCacheWrite(db, cacheWrites, "expansion cache", () => setCachedResult(db, cacheKey, payload));
+  else setCachedResult(db, cacheKey, payload);
   return expanded;
 }
 
@@ -5893,6 +5968,11 @@ export type RerankProbeOptions = {
    * reranker (vn4rz.134: the request budget is spent; a model load would only run past it).
    */
   failOnAbort?: boolean;
+  /**
+   * Under a request budget (vn4rz.140): the cache flush waits only this guard's window for the
+   * write lock and is dropped past it, instead of freezing the thread for the handle's busy_timeout.
+   */
+  cacheWrites?: CacheWriteGuard;
 };
 
 /** Thrown by rerank() when requireLiveCoverage is set and the reranker did not score every input doc. */
@@ -5958,9 +6038,11 @@ export async function rerank(query: string, documents: { file: string; text: str
   const flushCacheWrites = () => {
     if (pendingCacheWrites.length === 0) return;
     const rows = pendingCacheWrites.splice(0);
-    db.transaction(() => {
+    const write = () => db.transaction(() => {
       for (const [key, value] of rows) setCachedResult(db, key, value);
     })();
+    if (options?.cacheWrites) guardedCacheWrite(db, options.cacheWrites, `rerank cache, ${rows.length} rows`, write);
+    else write();
   };
 
   // Check cache for each unique document. noCache (health probes) skips the cache entirely so the

@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createStore, expandQueryCacheKey } from "../../src/store.ts";
+import { createCacheWriteGuard, createStore, expandQueryCacheKey, guardedCacheWrite } from "../../src/store.ts";
 import { hashContent } from "../../src/indexer.ts";
 import {
   QueryBudget,
@@ -198,6 +199,13 @@ const Q_RERANK = "orbital ferry cutoffprobe";
 const Q_LEG = "orbital ferry zzlegfail";
 // Cached expansion with one lex leg whose text carries the FTS stall match (vn4rz.135 F5).
 const Q_LEX = "orbital ferry lexroute";
+// Queries whose rerank is not cached and whose expansion is cached empty: each one writes rerank
+// scores to llm_cache, so a held write lock bites on the cache write and on nothing else (vn4rz.140).
+const Q_WARM = "orbital ferry writewarm";
+const Q_W1 = "orbital ferry writeprobe alpha";
+const Q_W2 = "orbital ferry writeprobe beta";
+const Q_W3 = "orbital ferry writeprobe gamma";
+const Q_W4 = "orbital ferry writeprobe delta";
 const LEX_LEG = "ferry cargo lexstall";
 
 let fake: ReturnType<typeof Bun.serve>;
@@ -246,7 +254,7 @@ function seedVault(): void {
     store.db
       .prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`)
       .run(expandQueryCacheKey(Q_LEX), JSON.stringify([{ type: "lex", query: LEX_LEG }]), now);
-    for (const q of [Q_OK, Q_BLOCK, Q_RERANK, Q_LEG]) {
+    for (const q of [Q_OK, Q_BLOCK, Q_RERANK, Q_LEG, Q_WARM, Q_W1, Q_W2, Q_W3, Q_W4]) {
       store.db
         .prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`)
         .run(expandQueryCacheKey(q), "[]", now);
@@ -471,6 +479,75 @@ describe("store.rerank with failOnAbort (the budget's abort must not fall throug
       st.close();
     }
   }, 30_000);
+});
+
+describe("guardedCacheWrite (vn4rz.140)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawmem-cache-write-guard-"));
+  const path = join(dir, "g.sqlite");
+  const open = () => {
+    const db = new Database(path);
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA busy_timeout = 5000");
+    db.exec("CREATE TABLE IF NOT EXISTS t (x INTEGER)");
+    return db;
+  };
+  const timeout = (db: Database) => (db.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout;
+  const insert = (db: Database) => () => db.transaction(() => db.prepare("INSERT INTO t VALUES (1)").run())();
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("waits only its window under a held write lock, drops and counts the write, and puts the 5 s timeout back", () => {
+    const db = open();
+    const holder = open();
+    holder.exec("PRAGMA busy_timeout = 0");
+    holder.exec("BEGIN IMMEDIATE");
+    try {
+      const guard = createCacheWriteGuard(50);
+      const t0 = performance.now();
+      expect(guardedCacheWrite(db, guard, "unit", insert(db))).toBe(false);
+      const ms = performance.now() - t0;
+      expect(ms).toBeGreaterThanOrEqual(40);
+      expect(ms).toBeLessThan(2000); // the 5000 ms default is what it replaces
+      expect(guard.dropped).toBe(1);
+      expect(timeout(db)).toBe(5000);
+    } finally {
+      holder.exec("ROLLBACK");
+      holder.close();
+    }
+    // Lock gone: the write lands, nothing is counted as dropped, and a fast one is not "stalled".
+    const guard = createCacheWriteGuard(50);
+    expect(guardedCacheWrite(db, guard, "unit", insert(db))).toBe(true);
+    expect(guard.dropped).toBe(0);
+    expect(guard.stalled).toBe(0);
+    expect((db.prepare("SELECT count(*) AS n FROM t").get() as { n: number }).n).toBe(1);
+    db.close();
+  });
+
+  it("restores the timeout when the write throws, and rethrows an error that is not lock contention", () => {
+    const db = open();
+    const guard = createCacheWriteGuard(50);
+    expect(() =>
+      guardedCacheWrite(db, guard, "unit", () => {
+        db.prepare("INSERT INTO no_such_table VALUES (1)").run();
+      }),
+    ).toThrow(/no_such_table/);
+    expect(timeout(db)).toBe(5000);
+    expect(guard.dropped).toBe(0);
+    db.close();
+  });
+
+  it("flags a write that starts inside the budget and ends past it, and not one that starts past it", () => {
+    const db = open();
+    let spent = false;
+    const guard = createCacheWriteGuard(50, () => spent);
+    guardedCacheWrite(db, guard, "unit", () => {
+      spent = true;
+    });
+    expect(guard.crossedBudget).toBe(true);
+    const late = createCacheWriteGuard(50, () => spent);
+    guardedCacheWrite(db, late, "unit", () => {});
+    expect(late.crossedBudget).toBe(false);
+    db.close();
+  });
 });
 
 describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
@@ -790,6 +867,139 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
         const [t] = await s.timings();
         expect(t!.counts.fts_worker_failed).toBe(1);
         expect(t!.counts.fts_cut).toBe(0);
+      },
+    );
+  }, 90_000);
+
+  // vn4rz.140: the rerank cache flush and the expansion cache write ran on the main handle with a
+  // 5 s busy_timeout. Another connection holding the write lock froze the main thread for all of
+  // it: the budget timer and the next request's arrival stamp could not run. They are best-effort
+  // writes, so with a budget they wait briefly and are dropped, and the drop is counted.
+  const cacheRows = () => {
+    const db = new Database(DB, { readonly: true });
+    try {
+      return (db.prepare("SELECT count(*) AS n FROM llm_cache").get() as { n: number }).n;
+    } finally {
+      db.close();
+    }
+  };
+  /** A second connection takes the vault's write lock, as a long ingest or a backup would. */
+  const holdWriteLock = () => {
+    const db = new Database(DB);
+    db.exec("PRAGMA busy_timeout = 0");
+    db.exec("BEGIN IMMEDIATE");
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false;
+      db.exec("ROLLBACK");
+      db.close();
+    };
+  };
+
+  test("W: the vault's write lock held past the budget: A (t=0) and B (t=1000) answer within budget + grace, the dropped cache writes are counted, neither reply is degraded", async () => {
+    const D = 2000;
+    // Held longer than the 5 s busy_timeout A and B used to wait out one after the other.
+    let release = () => {};
+    try {
+      await withServe({ CLAWMEM_QUERY_BUDGET_MS: BUDGET(D) }, async (s) => {
+        await s.post(Q_WARM); // cold start (store, workers) is not what this test times
+        release = holdWriteLock();
+        const rowsBefore = cacheRows();
+        const t0 = performance.now();
+        const a = s.post(Q_W1);
+        await sleep(1000);
+        const bSentAt = performance.now() - t0;
+        const b = await s.post(Q_W2);
+        const ra = await a;
+        release();
+        console.error(`[W] A ${Math.round(ra.ms)} ms, B ${Math.round(b.ms)} ms (sent at ${Math.round(bSentAt)} ms); A body ${Array.isArray(ra.body) ? "array" : JSON.stringify(ra.body.degraded_reason)}, B body ${Array.isArray(b.body) ? "array" : JSON.stringify(b.body.degraded_reason)}`);
+        const bound = D + QUERY_BUDGET_GRACE_MS + 500;
+        expect(bSentAt).toBeGreaterThanOrEqual(900);
+        expect(ra.status).toBe(200);
+        expect(ra.ms).toBeLessThan(bound);
+        expect(b.status).toBe(200);
+        expect(b.ms).toBeLessThan(bound);
+        // The writes were dropped, not made: the held lock was still there when they tried.
+        expect(cacheRows()).toBe(rowsBefore);
+        // A complete, on-time answer that only skipped a cache write is not a degraded one.
+        for (const r of [ra, b]) {
+          expect(Array.isArray(r.body)).toBe(true);
+          expect(hitsOf(r.body).length).toBeGreaterThan(0);
+        }
+        const timings = await s.timings();
+        const [, tA, tB] = timings; // [0] is the warm-up
+        expect(timings.length).toBe(3);
+        for (const t of [tA!, tB!]) {
+          expect(t.counts.cache_write_dropped).toBe(1);
+          expect(t.counts.query_budget_expired).toBe(0);
+        }
+        // B's clock started at its arrival (t=1000), not after a write that blocked the main thread.
+        expect(tB!.counts.budget_elapsed_at_start_ms).toBeLessThan(D);
+        expect(await s.log()).toContain("cache write dropped");
+      });
+    } finally {
+      release();
+    }
+  }, 90_000);
+
+  test("W2: a dropped write leaves the result identical to a landed one; the counter is 0 without contention; the next uncontended query writes the cache", async () => {
+    let release = () => {};
+    try {
+      await withServe({ CLAWMEM_QUERY_BUDGET_MS: BUDGET(20_000) }, async (s) => {
+        await s.post(Q_WARM);
+        const shape = (r: Reply) => hitsOf(r.body).map((h) => `${h.file}:${h.searchScore}`);
+        // Contended: the rerank scores are computed, returned, and not stored.
+        release = holdWriteLock();
+        const rows0 = cacheRows();
+        const dropped = await s.post(Q_W3);
+        expect(cacheRows()).toBe(rows0);
+        release();
+        // Uncontended, the same query: the cache is still cold for it, so the rerank is live again.
+        const landed = await s.post(Q_W3);
+        const rows1 = cacheRows();
+        expect(rows1).toBeGreaterThan(rows0);
+        // The same ranking and the same scores, whether or not the write landed.
+        expect(shape(dropped).length).toBeGreaterThan(0);
+        expect(shape(landed)).toEqual(shape(dropped));
+        expect(Array.isArray(dropped.body)).toBe(true);
+        expect(Array.isArray(landed.body)).toBe(true);
+        // And now the stored scores replay: a third run reads them and writes nothing more.
+        const replay = await s.post(Q_W3);
+        expect(shape(replay)).toEqual(shape(dropped));
+        expect(cacheRows()).toBe(rows1);
+        const [, tDropped, tLanded, tReplay] = await s.timings();
+        expect(tDropped!.counts.cache_write_dropped).toBe(1);
+        expect(tLanded!.counts.cache_write_dropped).toBe(0);
+        expect(tReplay!.counts.cache_write_dropped).toBe(0);
+        for (const t of [tDropped!, tLanded!, tReplay!]) expect(t.counts.query_budget_expired).toBe(0);
+        expect(await s.log()).toContain("cache write dropped");
+      });
+    } finally {
+      release();
+    }
+  }, 90_000);
+
+  test("W3: a cache write that carries the request past its budget flags query_budget_expired and counts the stalled write", async () => {
+    // The seam blocks inside the guarded write alone, so only that write can end the budget.
+    await withServe(
+      {
+        CLAWMEM_QUERY_BUDGET_MS: BUDGET(1500),
+        CLAWMEM_QUERY_BUDGET_TEST_CACHE_WRITE_STALL_MS: "2500",
+      },
+      async (s) => {
+        await s.post(Q_WARM);
+        const r = await s.post(Q_W4);
+        expect(r.status).toBe(200);
+        expect(r.body.degraded).toBe(true);
+        expect(r.body.degraded_reason).toBe("query_budget_expired");
+        expect(hitsOf(r.body).length).toBeGreaterThan(0); // complete answer, only late
+        const t = (await s.timings()).at(-1)!;
+        expect(t.counts.query_budget_expired).toBe(1);
+        expect(t.counts.cache_write_stalled).toBe(1);
+        expect(t.counts.cache_write_dropped).toBe(0);
+        expect(t.counts.cache_write_ms).toBeGreaterThanOrEqual(2400);
+        expect(await s.log()).toContain("cache write stalled");
       },
     );
   }, 90_000);
