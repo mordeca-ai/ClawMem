@@ -1,5 +1,6 @@
 import type { SearchResult, VecSearchDetailedResult } from "./store.ts";
 import type { VecScopeScanStats } from "./vec-scope-scan.ts";
+import { WorkerLoadGuard } from "./worker-load-guard.ts";
 
 export function vecLegParallelism(env: Record<string, string | undefined> = process.env): number {
   const raw = env.CLAWMEM_QUERY_VEC_PARALLEL?.trim();
@@ -137,6 +138,8 @@ interface WorkerSlot {
   worker: Worker;
   pending?: Pending;
   exited: Promise<void>;
+  /** Holds a terminate until the worker has loaded (src/worker-load-guard.ts). */
+  guard: WorkerLoadGuard;
 }
 
 interface QueuedRequest {
@@ -163,7 +166,7 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
     slots.delete(slot);
     const at = idleSlots.indexOf(slot);
     if (at >= 0) idleSlots.splice(at, 1);
-    try { slot.worker.terminate(); } catch {}
+    slot.guard.terminate(); // never during module load: that panics Bun 1.3.13
   };
 
   const spawn = (): WorkerSlot | undefined => {
@@ -176,10 +179,11 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
     const exited = new Promise<void>(resolve => {
       worker.addEventListener("close", () => resolve());
     });
-    const slot: WorkerSlot = { worker, exited };
+    const slot: WorkerSlot = { worker, exited, guard: new WorkerLoadGuard(worker) };
 
     worker.onmessage = (ev: MessageEvent) => {
       const msg = ev.data;
+      if (slot.guard.observe(msg)) return; // the loaded signal is never a reply
       const pending = slot.pending;
       if (!pending || pending.id !== msg.id) return;
       slot.pending = undefined;
@@ -195,6 +199,7 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
     };
 
     worker.onerror = (ev: ErrorEvent) => {
+      slot.guard.failed();
       const pending = slot.pending;
       slot.pending = undefined;
       dropSlot(slot);
@@ -308,7 +313,11 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
   };
 
   const closeTracked = (): Promise<void>[] => {
-    const busy = [...slots].filter(slot => slot.pending);
+    // A worker still loading is not counted: it starts no scan before the loaded signal, and counting
+    // it would shed the next query's vector stage for the length of a cold start. Its terminate is
+    // held until then and unrefs it (src/worker-load-guard.ts). A leg queued on it can still start in
+    // the gap before that terminate lands, so this count can be low by one per slot cut during load.
+    const busy = [...slots].filter(slot => slot.pending && slot.guard.isSettled);
     // A thread still inside a native scan must not hold a CLI process open after its answer.
     for (const slot of busy) slot.worker.unref();
     const exits = busy.map(slot => slot.exited);

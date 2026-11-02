@@ -4,6 +4,22 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.76 — FTS runs in a worker under the query budget
+
+With CLAWMEM_QUERY_BUDGET_MS set, POST /query runs its FTS (the original query and any expansion lex leg) in a read-only worker and waits for it against the budget left. A slow FTS is now cut at the budget instead of holding the whole server: the request goes on at once with no FTS hits, is flagged `query_budget_expired`, and skips the vector stage and rerank. A request that arrives meanwhile is stamped on arrival. Measured on a 5000 ms FTS stall at a 2000 ms budget: the first request answered at 5045 ms and the second, sent at t=1000, started its clock at about t=5000 and was not counted; both now answer within budget + 1000 ms and are counted. With the budget unset nothing changes: FTS is the same synchronous main-thread call and no worker is started.
+
+A cut worker is not freed. `Worker.terminate()` returns in about 3 ms, but a thread inside a SQLite call keeps running it to the end, and its `close` event fires only then (measured on Bun 1.3.13: a 12.6 s statement closed at 13.5 s after a terminate at 0.3 s). Cut workers are counted until they exit, and live plus cut FTS workers are capped at 3 (so up to 3 cut workers can be running with none live). At the cap a request is answered degraded (`query_budget_expired`, counted as `fts_shed`) without starting FTS; a shed with budget left still runs the vector stage and returns whatever it finds, and only a cut or a spent budget skips it. A worker that exits without an error event frees its slot and fails its request, so a silent exit cannot pin the count.
+
+A worker is never terminated while it is still loading its modules. On Bun 1.3.13 that panics the whole process (SIGILL, exit 132, in the worker's module transpile): terminating during load gave at least 27 panics, terminating after a warm reply gave 0 of 45. Each worker script (FTS, vector leg, scope read) posts a loaded signal as the last statement of its module, and a terminate that arrives earlier is held until then (`src/worker-load-guard.ts`). There is no timed force. A cut worker that was still booting stays in the abandoned count until it has loaded, been terminated and closed. Terminating also unrefs the worker, so a vector leg that started in the gap before the held terminate landed cannot hold a CLI process open after its answer. A worker that fails or cannot open the vault falls back to the main-thread FTS (counted as `fts_worker_failed`) while budget remains. The worker is started with the serve when a budget is set.
+
+The timing row keeps the `fts` stage and gains `fts_cut` and `fts_shed` (0 or 1) and, when it happens, `fts_worker_failed`.
+
+Still on the main thread, so still not bounded by the budget: store open and collection scope, the expansion and rerank cache lookups, RRF fusion, result enrichment (one SQLite read per row), composite scoring and JSON building, local-model disposal, the HTTP body parse, the deserialization of a worker's reply, and the main-thread FTS fallback after a worker failure. Over the 533 live timing rows (95.5 h) these stages peaked at 415 ms. The "50 of the newest 200 rows over 1000 ms" seen earlier is the FTS this change moved, not what remains. The unbounded case is the cache WRITES on the main handle (the rerank cache flush, `flushCacheWrites` in `store.ts`, and the expansion cache write): behind a write lock another connection holds they wait up to `busy_timeout` (5 s). A measured run under a 2000 ms budget answered at 6233 ms and 10965 ms with the budget count at 0. A request held by one of these answers only when it returns, and a request arriving meanwhile is stamped late. The other REST routes (/search and the like) keep their own main-thread FTS and are outside this budget.
+
+The timing row also gains `budget_elapsed_at_start_ms`: arrival to pipeline start, which shows a late arrival stamp or a queue wait.
+
+---
+
 ## v0.36.75 — Recall deadline bounds only the vector stage; health is blind to a permanent degraded run
 
 Whole-request budget for POST /query (CLAWMEM_QUERY_BUDGET_MS, off when unset): from arrival it bounds the queue, vector stage and rerank, keeps a finished leg, and answers degraded rather than error. FTS and other main-thread work are not bounded. Do not set the env before vn4rz.131 lands.
@@ -16,7 +32,7 @@ CLAWMEM_QUERY_BUDGET_MS sets one budget for `clawmem serve` POST /query, counted
 
 The budget bounds the queue wait, the vector stage and rerank. When it runs out the request returns the best results so far with {degraded, degraded_reason: "query_budget_expired", hits}, never an error: a request still queued answers at once with no hits, the vector stage ends at the smaller of its own deadline and what is left, and rerank's fetch is aborted at the remaining budget and falls back to the fused order. If a vector leg failed and the budget also cut the request, the reply keeps `vec_leg_failed` and the timing row counts both.
 
-What it does not bound: FTS and every other main-thread step. They are synchronous, so neither the budget's timer nor the next request's arrival clock can run while one is going. A request whose FTS outlasts the budget answers only when FTS returns, with the FTS hits and without the vector stage. A request that arrives during such a stall is stamped after it, so its budget starts late, and that overrun is not counted in its timing row. Moving FTS off the main thread is separate work.
+v0.36.76 moves FTS off the main thread; see above for what is bounded now. (v0.36.74 itself left FTS synchronous, so a slow FTS outlasted the budget.)
 
 The timing row gains a `query_budget_expired` count. Also fixed: with CLAWMEM_QUERY_VEC_DEADLINE_MS, a vector leg that had finished was dropped when the query expansion was still in flight at the deadline.
 

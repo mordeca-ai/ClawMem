@@ -7,6 +7,7 @@ import { hashContent } from "../../src/indexer.ts";
 import {
   QueryBudget,
   QueryBudgetExpired,
+  QUERY_BUDGET_GRACE_MS,
   QUERY_BUDGET_MAX_MS,
   queryBudgetMs,
   submitWithBudget,
@@ -195,6 +196,9 @@ const Q_OK = "orbital ferry schedule";
 const Q_BLOCK = `orbital ferry schedule ${BLOCKED}`;
 const Q_RERANK = "orbital ferry cutoffprobe";
 const Q_LEG = "orbital ferry zzlegfail";
+// Cached expansion with one lex leg whose text carries the FTS stall match (vn4rz.135 F5).
+const Q_LEX = "orbital ferry lexroute";
+const LEX_LEG = "ferry cargo lexstall";
 
 let fake: ReturnType<typeof Bun.serve>;
 let rerankDelayMs = 0;
@@ -239,6 +243,9 @@ function seedVault(): void {
       );
     }
     // Known at once (llm_cache hit, no expansion), so no test waits on a live LLM call.
+    store.db
+      .prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`)
+      .run(expandQueryCacheKey(Q_LEX), JSON.stringify([{ type: "lex", query: LEX_LEG }]), now);
     for (const q of [Q_OK, Q_BLOCK, Q_RERANK, Q_LEG]) {
       store.db
         .prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`)
@@ -285,6 +292,8 @@ type Serve = {
   /** Headers go out now and the body `bodyDelayMs` later: the request has arrived but is unread. */
   postSlowBody: (query: string, bodyDelayMs: number) => Promise<Reply>;
   timings: () => Promise<Timing[]>;
+  /** The serve's stderr, once it has been stopped. */
+  log: () => Promise<string>;
 };
 
 async function withServe(
@@ -299,6 +308,7 @@ async function withServe(
     { cwd: REPO_ROOT, env: serveEnv(extra), stdout: "ignore", stderr: "pipe" },
   );
   const stderr = new Response(proc.stderr).text();
+  let stoppedByUs = false;
   const base = `http://127.0.0.1:${port}`;
   try {
     const up = Date.now() + 30_000;
@@ -312,6 +322,11 @@ async function withServe(
       await sleep(100);
     }
     let finished: string | undefined;
+    const stop = async () => {
+      stoppedByUs = true;
+      proc.kill(9);
+      await proc.exited;
+    };
     await fn({
       post: async (query) => {
         const t0 = performance.now();
@@ -342,9 +357,13 @@ async function withServe(
         const body = await res.json();
         return { status: res.status, body, ms: performance.now() - t0 };
       },
+      log: async () => {
+        await stop();
+        finished ??= await stderr;
+        return finished;
+      },
       timings: async () => {
-        proc.kill(9);
-        await proc.exited;
+        await stop();
         finished ??= await stderr;
         return finished
           .split("\n")
@@ -352,6 +371,15 @@ async function withServe(
           .map((l) => JSON.parse(l.slice(l.indexOf("{"))) as Timing);
       },
     });
+  } catch (e) {
+    // A serve that died on its own (a crash, not our kill below) says how: the exit signal and its
+    // stderr go on the error, instead of a bare ConnectionRefused or a timeout.
+    if (!stoppedByUs && (proc.exitCode !== null || proc.signalCode !== null)) {
+      const err = await Promise.race([stderr, sleep(2000).then(() => "(stderr not drained)")]);
+      const why = `serve died before the test finished: exit ${proc.exitCode}, signal ${proc.signalCode}`;
+      throw new Error(`${e instanceof Error ? e.message : String(e)}\n${why}\n--- serve stderr (tail) ---\n${err.slice(-3000)}`);
+    }
+    throw e;
   } finally {
     proc.kill(9);
     await proc.exited;
@@ -580,26 +608,128 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
     });
   }, 90_000);
 
-  test("B7: a budget spent during FTS skips the vector stage and rerank, and still answers with the FTS hits", async () => {
-    // FTS cannot be cut, so the stall runs its course; what the budget decides is what happens next.
+  test("B7: a budget spent during FTS is cut there: no FTS hits, vector stage and rerank skipped, still a 200", async () => {
+    // FTS runs in a worker (vn4rz.135), so the budget cuts the stall instead of waiting it out.
     rerankCalls = 0;
     await withServe(
       {
         CLAWMEM_QUERY_BUDGET_MS: "600",
-        CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MS: "1500",
+        CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MS: "4000",
         CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MATCH: "cutoffprobe",
       },
       async (s) => {
         const r = await s.post(Q_RERANK);
         expect(r.status).toBe(200);
+        expect(r.ms).toBeLessThan(600 + TOLERANCE_MS); // far short of the 4000 ms stall
         expect(r.body.degraded).toBe(true);
         expect(r.body.degraded_reason).toBe("query_budget_expired");
-        expect(hitsOf(r.body).map((h) => h.file)).toContain("alpha/ferry.md");
+        expect(hitsOf(r.body)).toEqual([]);
         expect(rerankCalls).toBe(0);
         const [t] = await s.timings();
         expect(t!.counts.query_budget_expired).toBe(1);
+        expect(t!.counts.fts_cut).toBe(1);
         expect(t!.counts.vec_legs).toBe(0);
         expect(t!.counts.query_budget_unstarted).toBeUndefined();
+        expect(t!.stages.fts).toBeDefined();
+        expect(await s.log()).toContain("fts worker started");
+      },
+    );
+  }, 90_000);
+
+  test("A: FTS stalled 5000 ms inside the worker: A answers within budget + grace, B (sent at t=1000) is stamped on arrival and answers within its own budget + grace; both counted", async () => {
+    const D = 2000;
+    await withServe(
+      {
+        CLAWMEM_QUERY_BUDGET_MS: String(D),
+        CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MS: "5000",
+        CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MATCH: "cutoffprobe",
+      },
+      async (s) => {
+        const t0 = performance.now();
+        const a = s.post(Q_RERANK);
+        await sleep(1000);
+        const bSentAt = performance.now() - t0;
+        const b = await s.post(Q_RERANK);
+        const ra = await a;
+        const [, bTiming] = await s.timings();
+        // The serve's own reading: B's pipeline started (right after A's) this long after B arrived.
+        // That is about A's end minus B's send time. A stamp made late by 1300 ms (or by a blocked
+        // main thread) would read 1300 ms less, so it cannot pass this.
+        const expectedElapsed = ra.ms - bSentAt;
+        expect(bTiming!.counts.budget_elapsed_at_start_ms).toBeGreaterThanOrEqual(expectedElapsed - 450);
+        expect(bSentAt).toBeGreaterThanOrEqual(900); // B really was sent while A's stall was on
+        // The bug: A answers at ~5045 ms, and B, read only after the stall, starts its clock at ~5000 ms.
+        const bound = D + QUERY_BUDGET_GRACE_MS + 500;
+        expect(ra.status).toBe(200);
+        expect(ra.ms).toBeLessThan(bound);
+        expect(b.status).toBe(200);
+        expect(b.ms).toBeLessThan(bound);
+        // B's budget counts from its arrival at t=1000: it ends near t=3000, not near t=7000.
+        for (const r of [ra, b]) {
+          expect(r.body.degraded).toBe(true);
+          expect(r.body.degraded_reason).toBe("query_budget_expired");
+        }
+        const timings = await s.timings();
+        expect(timings.length).toBe(2);
+        for (const t of timings) {
+          expect(t.counts.query_budget_expired).toBe(1);
+          expect(t.counts.fts_cut).toBe(1);
+        }
+      },
+    );
+  }, 90_000);
+
+  test("L: an expansion lex leg runs in the FTS worker under the budget: a stalled lex leg is cut, counted, and the reply keeps the vector hits", async () => {
+    // Only the lex leg's text carries the stall match, so the original query's FTS is fast. The
+    // seam stalls inside the worker alone: a lex leg on the main thread would never stall, and
+    // fts_cut would stay 0.
+    await withServe(
+      {
+        CLAWMEM_QUERY_BUDGET_MS: "3000",
+        CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MS: "9000",
+        CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MATCH: "lexstall",
+      },
+      async (s) => {
+        const r = await s.post(Q_LEX);
+        expect(r.status).toBe(200);
+        expect(r.ms).toBeLessThan(3000 + QUERY_BUDGET_GRACE_MS + 500); // far short of the 9000 ms stall
+        expect(r.body.degraded).toBe(true);
+        expect(r.body.degraded_reason).toBe("query_budget_expired");
+        expect(hitsOf(r.body).length).toBeGreaterThan(0); // the original query's legs answered
+        const [t] = await s.timings();
+        expect(t!.counts.lex_legs).toBe(1);
+        expect(t!.counts.fts_cut).toBe(1);
+        expect(t!.counts.query_budget_expired).toBe(1);
+      },
+    );
+  }, 90_000);
+
+  test("S: FTS shed at the worker cap with budget left is degraded and counted, and the vector stage still answers", async () => {
+    // Three cut statements stay running in abandoned threads (the cap), so the next request is shed.
+    await withServe(
+      {
+        CLAWMEM_QUERY_BUDGET_MS: "2500",
+        CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MS: "30000",
+        CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MATCH: "cutoffprobe",
+      },
+      async (s) => {
+        await s.post(Q_OK); // warm: store, vector worker
+        for (let i = 0; i < 3; i++) {
+          const cut = await s.post(Q_RERANK);
+          expect(cut.body.degraded_reason).toBe("query_budget_expired");
+        }
+        const r = await s.post(Q_OK);
+        expect(r.status).toBe(200);
+        expect(r.body.degraded).toBe(true);
+        expect(r.body.degraded_reason).toBe("query_budget_expired");
+        // Shed, not cut: the vector stage ran and found the vault's documents.
+        expect(hitsOf(r.body).length).toBeGreaterThan(0);
+        const t = (await s.timings()).at(-1)!;
+        expect(t.counts.fts_shed).toBe(1);
+        expect(t.counts.fts_cut).toBe(0);
+        expect(t.counts.vec_legs).toBeGreaterThanOrEqual(1);
+        expect(t.counts.query_budget_expired).toBe(1);
+        expect(await s.log()).toContain("fts shed: 3 abandoned");
       },
     );
   }, 90_000);
@@ -608,15 +738,17 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
     // A directory as the seam's log path makes every worker leg throw a plain (non-fatal) error.
     // Rerank then outlasts the budget. The hook counts vec_leg_failed toward its DOWN streak, so
     // the reply must keep it; the timing row counts both reasons.
-    rerankDelayMs = 4500;
+    // A cold vector worker can take seconds on a loaded host and ate a 2000 ms budget before the leg
+    // could fail (vn4rz.135 F9), so the budget is 4000 ms and the rerank outlasts it by far.
+    rerankDelayMs = 9000;
     try {
       await withServe(
-        { CLAWMEM_QUERY_BUDGET_MS: "2000", CLAWMEM_VEC_SCAN_TEST_LOG: ROOT },
+        { CLAWMEM_QUERY_BUDGET_MS: "4000", CLAWMEM_VEC_SCAN_TEST_LOG: ROOT },
         async (s) => {
           // Cold start must not eat the budget before the vector stage runs: warm with a fast rerank.
           rerankDelayMs = 0;
           await s.post(Q_OK);
-          rerankDelayMs = 4500;
+          rerankDelayMs = 9000;
           const r = await s.post(Q_LEG);
           expect(r.status).toBe(200);
           expect(r.body.degraded).toBe(true);
@@ -645,6 +777,23 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
     );
   }, 90_000);
 
+  test("B10: an FTS worker that fails falls back to the main thread: a 200 with the FTS hits, not an error, counted", async () => {
+    await withServe(
+      {
+        CLAWMEM_QUERY_BUDGET_MS: "60000",
+        CLAWMEM_QUERY_BUDGET_TEST_FTS_FAIL_MATCH: "cutoffprobe",
+      },
+      async (s) => {
+        const r = await s.post(Q_RERANK);
+        expect(r.status).toBe(200);
+        expect(hitsOf(r.body).map((h) => h.file)).toContain("alpha/ferry.md");
+        const [t] = await s.timings();
+        expect(t!.counts.fts_worker_failed).toBe(1);
+        expect(t!.counts.fts_cut).toBe(0);
+      },
+    );
+  }, 90_000);
+
   test("C: env unset is today's behaviour: bare array, no budget count, requests serialize", async () => {
     await withServe({ CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "1500" }, async (s) => {
       const t0 = performance.now();
@@ -658,6 +807,8 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
       const timings = await s.timings();
       for (const t of timings)
         expect(Object.keys(t.counts).sort()).toEqual(["lex_legs", "vec_legs"]);
+      // No budget: FTS stayed on the main thread and no FTS worker was ever started (vn4rz.135).
+      expect(await s.log()).not.toContain("fts worker started");
     });
   }, 90_000);
 });

@@ -16,6 +16,7 @@
  * future sqlite-vec degrades to the old speed, never to a wrong answer.
  */
 import type { Database } from "bun:sqlite";
+import { WorkerLoadGuard } from "./worker-load-guard.ts";
 
 /** One in-scope fragment and where vec0 stores its vector. */
 export interface VecScopeFragment {
@@ -327,7 +328,7 @@ export async function loadScopedVectorsParallel(
   chunkIds.forEach((id, k) => groups[k % n]!.push(id));
   const vectors = new Float32Array(frags.length * dim);
   const mags = new Float32Array(frags.length);
-  const spawned: Worker[] = [];
+  const spawned: WorkerLoadGuard[] = [];
   try {
     const parts = await Promise.all(
       groups.map((group) => {
@@ -353,11 +354,16 @@ export async function loadScopedVectorsParallel(
             resolve({ res: { ok: false, error: String(e) }, globalRows });
             return;
           }
-          spawned.push(w);
-          w.onmessage = (ev: MessageEvent) =>
+          const guard = new WorkerLoadGuard(w);
+          spawned.push(guard);
+          w.onmessage = (ev: MessageEvent) => {
+            if (guard.observe(ev.data)) return; // the loaded signal is not the chunk reply
             resolve({ res: ev.data as ChunkReadResponse, globalRows });
-          w.onerror = (ev: ErrorEvent) =>
+          };
+          w.onerror = (ev: ErrorEvent) => {
+            guard.failed();
             resolve({ res: { ok: false, error: ev.message || "worker error" }, globalRows });
+          };
           w.postMessage(req);
         });
       }),
@@ -385,13 +391,8 @@ export async function loadScopedVectorsParallel(
     countLoad(sv, true);
     return sv;
   } finally {
-    for (const w of spawned) {
-      try {
-        w.terminate();
-      } catch {
-        /* already gone */
-      }
-    }
+    // A reader still loading is terminated when it has loaded, never before (src/worker-load-guard.ts).
+    for (const g of spawned) g.terminate();
   }
 }
 

@@ -71,7 +71,8 @@ import { vecLegParallelism, runVecLegs, createWorkerLegPool, runVecLegsOverlappe
 import { scopedScanEnabled, vecScopeScanStats } from "./vec-scope-scan.ts";
 import { QueryTimer, queryTimingEnabled } from "./query-timing.ts";
 import { runVecStageWithDeadline, VecDeadlineLegs, vecDeadlineMs, type VecDegradedReason } from "./vec-deadline.ts";
-import { QUERY_BUDGET_REASON, QueryBudget, QueryBudgetExpired, queryBudgetMs, queryBudgetTestStall, submitWithBudget, withinBudget } from "./query-budget.ts";
+import { QUERY_BUDGET_REASON, QueryBudget, QueryBudgetExpired, queryBudgetMs, submitWithBudget, withinBudget } from "./query-budget.ts";
+import { FtsLegs } from "./fts-legs.ts";
 import type { ScopedLegResult } from "./vec-legs.ts";
 import { splitDocument } from "./splitter.ts";
 import { buildEmbedFrontmatter } from "./embed-input.ts";
@@ -1614,6 +1615,15 @@ function getVecDeadlineLegs(): VecDeadlineLegs {
   return vecDeadlineLegs;
 }
 
+// FTS worker owner (vn4rz.135): created only when a request budget is on, so an unset budget never
+// starts a worker. `clawmem serve` warms it at start.
+let ftsLegs: FtsLegs | undefined;
+
+function getFtsLegs(): FtsLegs {
+  ftsLegs ??= new FtsLegs({ onSpawn: () => console.error("[clawmem] fts worker started") });
+  return ftsLegs;
+}
+
 /** What cmdQuery reports beside its hits; `clawmem serve` turns it into the /query response. */
 type QueryOutcome = { degraded?: VecDegradedReason | typeof QUERY_BUDGET_REASON };
 
@@ -1640,6 +1650,8 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
 
   // CLAWMEM_QUERY_TIMING=1 prints a per-stage breakdown to stderr (vn4rz.97); off by default.
   const timer = new QueryTimer(queryTimingEnabled());
+  // Arrival to pipeline start (the stamp plus the queue wait), so a test can see a late arrival stamp.
+  if (budget) timer.count("budget_elapsed_at_start_ms", Math.round(budget.elapsedMs()));
   const endStore = timer.start("store_open");
   const s = getStore();
   endStore();
@@ -1660,15 +1672,48 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   const POOL = RERANK_CAP * 2;
 
   // Step 1: BM25 for strong signal check
-  if (budget) queryBudgetTestStall(query);
+  // With a budget, FTS runs in a worker and is awaited against what the budget has left, so it is
+  // cut at the budget and the main thread stays free to stamp the next request (vn4rz.135). Without
+  // one it is the synchronous main-thread call it always was.
+  let ftsCut = false;
+  // A shed started no FTS but spent no budget either: the reply is degraded and the vector stage
+  // still runs (vn4rz.135 F6). Only a cut, or a budget that is spent, skips later stages.
+  let ftsShed = false;
+  const budgetedFts = async (q: string): Promise<SearchResult[]> => {
+    const r = await getFtsLegs().search(getDefaultDbPath(), q, POOL, scopeCols, budget!.remainingMs());
+    if (r.status === "ok") return r.results;
+    if (r.status === "failed") {
+      // A worker that died or could not open the vault: the answer is the one the main thread
+      // gives, but only while the budget has time for it.
+      const spent = budget!.expired();
+      console.error(`[clawmem] fts worker failed (${r.error.message})${spent ? "; budget spent, FTS skipped" : "; falling back to the main thread"}`);
+      timer.count("fts_worker_failed", 1);
+      if (!spent) return s.searchFTS(q, POOL, undefined, scopeCols);
+    } else if (r.status === "shed") {
+      console.error(`[clawmem] fts shed: ${getFtsLegs().abandonedCount()} abandoned FTS workers still running`);
+      timer.count("fts_shed", 1);
+      ftsShed = true;
+      return [];
+    } else {
+      timer.count("fts_cut", 1);
+    }
+    ftsCut = true;
+    return [];
+  };
+  if (budget) {
+    // Always present with a budget, so a timing row tells a cut or shed FTS from a fast one.
+    timer.count("fts_cut", 0);
+    timer.count("fts_shed", 0);
+  }
   const endFts = timer.start("fts");
-  const ftsResults = s.searchFTS(query, POOL, undefined, scopeCols);
+  const ftsResults = budget ? await budgetedFts(query) : s.searchFTS(query, POOL, undefined, scopeCols);
   endFts();
   const strongSignal = ftsBypassEnabled() && hasStrongFtsSignal(ftsResults);
-  // FTS is synchronous and cannot be cut short: when it (or the queue before it) spent the budget,
-  // skip expansion and the vector stage and carry on with the FTS results alone.
-  const budgetSpentAtFts = !!budget && budget.expired();
-  let budgetExpired = budgetSpentAtFts;
+  // When FTS (or the queue before it) spent the budget, or was shed, skip expansion and the vector
+  // stage and carry on with what FTS gave (nothing, if it was cut). A shed with budget left only
+  // marks the reply degraded: the vector stage still gets its turn.
+  const budgetSpentAtFts = !!budget && (ftsCut || budget.expired());
+  let budgetExpired = budgetSpentAtFts || ftsShed;
 
   // Step 2: Query expansion (skip if strong BM25 signal). expandQuery now returns
   // typed ExpandedQuery[] (lex/vec/hyde) — no more brittle string re-parsing, and
@@ -1859,8 +1904,9 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   for (const eq of expandedQueries) {
     if (eq.type === "lex") {
       const endLex = timer.start("lex_legs");
-      const r = s.searchFTS(eq.query, POOL, undefined, scopeCols);
+      const r = budget ? await budgetedFts(eq.query) : s.searchFTS(eq.query, POOL, undefined, scopeCols);
       endLex();
+      if (budget && (ftsCut || ftsShed)) budgetExpired = true;
       allRanked.push({ results: r.map(toRanked), weight: 1 });
       candidateResults.push(...r);
     } else {
@@ -2313,6 +2359,7 @@ async function cmdServe(args: string[]) {
   const host = args.find((_, i, a) => a[i - 1] === "--host") || "127.0.0.1";
   const s = getStore();
   const { startServer, QueryRequestError } = await import("./server.ts");
+  if (queryBudgetMs() > 0) getFtsLegs().keepWarm(getDefaultDbPath()); // vn4rz.135: FTS worker up before the first request
   if (vecDeadlineMs() > 0 || queryBudgetMs() > 0) {
     // vn4rz.131: this process owns the deadline's worker pool, so the first query finds it warm.
     vecDeadlineLegsServed = true;

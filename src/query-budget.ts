@@ -7,13 +7,36 @@
  * POSTs at a 2000 ms deadline returned at 2055, 4073, 4084 and 4092 ms. Unset or 0 is off, and
  * every code path then runs exactly as it did before.
  *
- * What it does not bound: FTS and every other main-thread step. They are synchronous, so neither
- * this budget's timer nor the next request's arrival clock can run while one is going. A request
- * whose FTS runs past the budget answers only when FTS returns (degraded, FTS hits, vector stage
- * skipped). A request that arrives during such a stall is stamped when the server gets to it,
- * after the stall, so its budget starts late. That overrun is not in its own counts and so not in
- * the degraded rate that clawmem-recall-health reads. Moving FTS off the main thread is separate
- * work.
+ * FTS (vn4rz.135): with the budget on, the original query's FTS and any expansion lex leg run in a
+ * read-only worker (src/fts-legs.ts) and are awaited against the budget left, so a slow FTS is cut
+ * at the budget and the main thread keeps stamping arrivals meanwhile. A cut FTS yields no hits
+ * (the query is then flagged degraded, later stages skipped), and the cut worker keeps its thread
+ * until its SQLite call returns: terminate() does not free it. Those workers are capped: live plus
+ * abandoned (up to 3 abandoned, with none live) stay under the cap, and past it a request is shed
+ * without starting FTS. A shed with budget left is degraded but still runs the vector stage; only a
+ * cut or a spent budget skips it.
+ *
+ * A worker is never terminated while it is still loading (src/worker-load-guard.ts). On Bun
+ * 1.3.13 that panics the whole process (SIGILL, exit 132, in the worker's module transpile), so a
+ * cut worker that is still booting is terminated only once it has posted its loaded signal.
+ *
+ * What it still does not bound: every other synchronous main-thread step. Named: opening the store
+ * and resolving the collection scope, the expansion and rerank cache lookups, RRF fusion, result
+ * enrichment (one SQLite read per row on the main handle), composite scoring and JSON building,
+ * disposing the local models, the HTTP body parse, reply deserialization from the FTS worker, and
+ * a main-thread FTS fallback after a worker failure. Neither this budget's timer nor the next
+ * request's arrival clock can run while one is going, so a request stuck in one answers only when
+ * it returns. The other REST routes, which do their own FTS on the main thread, are outside this
+ * budget altogether.
+ *
+ * The unbounded case is the cache WRITES on the main handle: the rerank cache flush
+ * (store.ts flushCacheWrites) and the expansion cache write. A write that waits on a write lock
+ * held by another connection blocks the main thread for up to busy_timeout (5 s). A measured run
+ * answered at 6233 ms and 10965 ms under a 2000 ms budget, with the budget count at 0. Moving
+ * those writes off the main thread is not part of this change. The other main-thread stages, over
+ * the 533 live timing rows (95.5 h), peaked at 415 ms; the "50 of 200 rows at 1000 ms or more"
+ * figure sometimes quoted for this change is the FTS rows that this change moved to the worker,
+ * not a remainder.
  *
  * Expiry is never an error: the response carries the best results so far, flagged degraded with
  * reason `query_budget_expired`. The pipeline checks the budget around the synchronous stages and
@@ -72,6 +95,11 @@ export class QueryBudget {
     return ms > 0 ? new QueryBudget(ms, arrivedAt) : null;
   }
 
+  /** Milliseconds since arrival, unclamped: how much of the budget the queue wait already took. */
+  elapsedMs(): number {
+    return this.now() - (this.deadline - this.totalMs);
+  }
+
   remainingMs(): number {
     return Math.max(0, this.deadline - this.now());
   }
@@ -112,11 +140,12 @@ export async function withinBudget<T>(
 /**
  * Test seam, a no-op unless set; nothing in production sets it.
  *
- *   CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MS     block the main thread this long just before FTS
+ *   CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MS     block this long just before FTS, inside the FTS worker
  *   CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MATCH  only when the query text contains this string
  *
- * Bun.sleepSync on purpose: FTS is a synchronous SQLite call, and a native sleep stalls the event
- * loop the same way, so neither the budget's timers nor a request's arrival clock can run.
+ * Bun.sleepSync on purpose: FTS is a synchronous SQLite call, and a native sleep blocks its thread
+ * the same way. Only the FTS worker calls this, and only when a budget is set; the main thread
+ * never does, so a test that passes with it set proves the stall is off the main thread.
  */
 export function queryBudgetTestStall(
   query: string,
@@ -127,6 +156,18 @@ export function queryBudgetTestStall(
   const match = env.CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MATCH;
   if (match && !query.includes(match)) return;
   Bun.sleepSync(ms);
+}
+
+/**
+ * Test seam, a no-op unless CLAWMEM_QUERY_BUDGET_TEST_FTS_FAIL_MATCH is set: the FTS worker throws
+ * for a query containing that string, as a worker that cannot open the vault or crashes would.
+ */
+export function queryBudgetTestFtsFail(
+  query: string,
+  env: Record<string, string | undefined> = process.env,
+): void {
+  const match = env.CLAWMEM_QUERY_BUDGET_TEST_FTS_FAIL_MATCH;
+  if (match && query.includes(match)) throw new Error("test: FTS worker failure");
 }
 
 export interface BudgetedSubmission<T> {
