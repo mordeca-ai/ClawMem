@@ -30,6 +30,7 @@ export function isWorkerLoadedMessage(data: unknown): boolean {
 
 export interface TerminableWorker {
   terminate(): void;
+  unref?(): void;
   addEventListener(type: "close", fn: () => void): void;
 }
 
@@ -87,6 +88,12 @@ export class WorkerLoadGuard {
   private forward(): void {
     if (this.forwarded) return;
     this.forwarded = true;
+    // Terminate does not stop a thread inside a blocking call, and a leg queued during load can
+    // start before this runs: that thread must not hold a CLI process open after its answer. Not
+    // unreffed earlier, so the process cannot exit while the worker is still loading.
+    try {
+      this.worker.unref?.();
+    } catch {}
     try {
       this.worker.terminate();
     } catch {}

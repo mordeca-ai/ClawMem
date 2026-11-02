@@ -313,9 +313,10 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
   };
 
   const closeTracked = (): Promise<void>[] => {
-    // A worker still loading has not started its scan (it only does so after the loaded signal), so
-    // it is not counted: its terminate is held until the load ends (src/worker-load-guard.ts), and
-    // counting it would shed the next query's vector stage for the length of a cold start.
+    // A worker still loading is not counted: it starts no scan before the loaded signal, and counting
+    // it would shed the next query's vector stage for the length of a cold start. Its terminate is
+    // held until then and unrefs it (src/worker-load-guard.ts). A leg queued on it can still start in
+    // the gap before that terminate lands, so this count can be low by one per slot cut during load.
     const busy = [...slots].filter(slot => slot.pending && slot.guard.isSettled);
     // A thread still inside a native scan must not hold a CLI process open after its answer.
     for (const slot of busy) slot.worker.unref();

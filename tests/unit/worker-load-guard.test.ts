@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   isWorkerLoadedMessage,
   WORKER_LOADED_MESSAGE,
@@ -95,4 +98,45 @@ describe("WorkerLoadGuard", () => {
     // Replies carry an id; the signal has none, so no pending request can match it.
     expect("id" in WORKER_LOADED_MESSAGE).toBe(false);
   });
+});
+
+describe("a worker cut during load, on a real Worker", () => {
+  // The terminate is held until the loaded signal. The leg already queued on the worker can start
+  // first, and terminate does not stop a thread inside a blocking call: that thread must not hold
+  // the process open. The busy main thread forces the order.
+  it("does not hold the process open for the scan the worker started first", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "load-guard-"));
+    const guardPath = resolve(import.meta.dir, "../../src/worker-load-guard.ts");
+    const started = join(dir, "scan-started");
+    try {
+      writeFileSync(
+        join(dir, "w.ts"),
+        `import { postWorkerLoaded } from ${JSON.stringify(guardPath)};
+         self.onmessage = () => {
+           Bun.write(${JSON.stringify(started)}, "1");
+           Bun.sleepSync(30_000);
+         };
+         postWorkerLoaded();`,
+      );
+      writeFileSync(
+        join(dir, "host.ts"),
+        `import { WorkerLoadGuard } from ${JSON.stringify(guardPath)};
+         const w = new Worker(${JSON.stringify(join(dir, "w.ts"))});
+         const g = new WorkerLoadGuard(w);
+         w.onmessage = (ev) => { g.observe(ev.data); };
+         w.postMessage("leg");
+         g.terminate();
+         setTimeout(() => Bun.sleepSync(2_000), 0);`,
+      );
+      const t0 = performance.now();
+      const proc = Bun.spawn([process.execPath, join(dir, "host.ts")], { stdout: "ignore", stderr: "pipe" });
+      const stderr = new Response(proc.stderr).text();
+      const code = await proc.exited;
+      expect(code, await stderr).toBe(0);
+      expect(existsSync(started)).toBe(true); // the control: the scan did start before the terminate
+      expect(performance.now() - t0).toBeLessThan(20_000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

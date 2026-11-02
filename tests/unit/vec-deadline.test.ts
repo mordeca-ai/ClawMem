@@ -730,4 +730,29 @@ describe("clawmem query (CLI) under the deadline", () => {
     expect(stderr).toContain("vec_deadline_expired");
     expect(scanThreads()).toEqual(["worker"]);
   }, 90_000);
+
+  // vn4rz.135: a cut during worker load holds the terminate until the load ends, and the leg already
+  // queued on that worker can start its scan first. That scan must not hold the CLI open either.
+  it("exits without waiting for a scan when the deadline cuts during worker load", async () => {
+    writeFileSync(SCAN_LOG, "");
+    const t0 = performance.now();
+    const proc = Bun.spawn([process.execPath, "src/clawmem.ts", "query", Q_BLOCK, "--json"], {
+      cwd: REPO_ROOT,
+      env: serveEnv({
+        CLAWMEM_QUERY_VEC_DEADLINE_MS: "1",
+        CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "60000",
+      }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    expect(code, stderr).toBe(0);
+    expect(performance.now() - t0).toBeLessThan(45_000);
+    expect((JSON.parse(stdout) as Hit[]).map((h) => h.file)).toContain("alpha/ferry.md");
+    expect(stderr).toContain("vec_deadline_expired");
+  }, 90_000);
 });
