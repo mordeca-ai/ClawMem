@@ -4,6 +4,24 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.75 — Recall deadline bounds only the vector stage; health is blind to a permanent degraded run
+
+Whole-request budget for POST /query (CLAWMEM_QUERY_BUDGET_MS, off when unset): from arrival it bounds the queue, vector stage and rerank, keeps a finished leg, and answers degraded rather than error. FTS and other main-thread work are not bounded. Do not set the env before vn4rz.131 lands.
+
+---
+
+## v0.36.74 — Whole-request budget for POST /query
+
+CLAWMEM_QUERY_BUDGET_MS sets one budget for `clawmem serve` POST /query, counted from the request's arrival, before the queue wait. It is off unless set, and nothing changes when off. A value of 2^31 ms or more is ignored like any invalid value.
+
+The budget bounds the queue wait, the vector stage and rerank. When it runs out the request returns the best results so far with {degraded, degraded_reason: "query_budget_expired", hits}, never an error: a request still queued answers at once with no hits, the vector stage ends at the smaller of its own deadline and what is left, and rerank's fetch is aborted at the remaining budget and falls back to the fused order. If a vector leg failed and the budget also cut the request, the reply keeps `vec_leg_failed` and the timing row counts both.
+
+What it does not bound: FTS and every other main-thread step. They are synchronous, so neither the budget's timer nor the next request's arrival clock can run while one is going. A request whose FTS outlasts the budget answers only when FTS returns, with the FTS hits and without the vector stage. A request that arrives during such a stall is stamped after it, so its budget starts late, and that overrun is not counted in its timing row. Moving FTS off the main thread is separate work.
+
+The timing row gains a `query_budget_expired` count. Also fixed: with CLAWMEM_QUERY_VEC_DEADLINE_MS, a vector leg that had finished was dropped when the query expansion was still in flight at the deadline.
+
+---
+
 ## v0.36.73 — Query vector stage gets an opt-in deadline
 
 CLAWMEM_QUERY_VEC_DEADLINE_MS bounds the vector stage of `clawmem query` and POST /query. It is off unless set, and nothing changes when off. When a query runs past the deadline, it drops its vector results and answers from FTS and rerank, and POST /query returns {degraded, degraded_reason, hits} in place of the bare array. Worker.terminate() cannot stop a scan already inside SQLite, so at most 2 abandoned scans run before later queries skip the vector stage.

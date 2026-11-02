@@ -175,12 +175,32 @@ export async function runVecStageWithDeadline<E, R>(
     landed = e;
     return e;
   });
+  // The original query's leg does not wait for the expansion (vn4rz.97), so it can finish while the
+  // expansion is still in flight at the deadline. Keep that result: dropping it threw away a scan
+  // that had completed (vn4rz.134, finding 4).
+  let firstLeg: R | undefined;
+  let firstLegDone = false;
   const outcome = await opts.legs.run(opts.deadlineMs, async (pool) => {
+    const leg = opts.legOn(pool);
+    let started = false;
     const out = await runVecLegsOverlapped({
       original: opts.original,
       expansion,
       legsOf: opts.legsOf,
-      runLeg: opts.legOn(pool),
+      runLeg: (q) => {
+        const p = leg(q);
+        if (!started) {
+          started = true;
+          p.then(
+            (r) => {
+              firstLeg = r;
+              firstLegDone = true;
+            },
+            () => {},
+          );
+        }
+        return p;
+      },
       pool,
       warm: opts.warm,
     });
@@ -191,7 +211,11 @@ export async function runVecStageWithDeadline<E, R>(
     case "ok":
       return { expansion: outcome.value.expansion, results: outcome.value.results };
     case "expired":
-      return { expansion: landed, results: [], degraded: "vec_deadline_expired" };
+      return {
+        expansion: landed,
+        results: firstLegDone ? [firstLeg as R] : [],
+        degraded: "vec_deadline_expired",
+      };
     case "shed":
       return { expansion: landed, results: [], degraded: "vec_deadline_shed" };
     case "failed":
