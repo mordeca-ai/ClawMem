@@ -5,6 +5,10 @@
  * (ollama on the GPU host), not invented noise.
  */
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   anchorExpansions,
   contentTokens,
@@ -14,6 +18,7 @@ import {
   type Queryable,
 } from "../../src/llm.ts";
 import {
+  createCacheWriteGuard,
   createStore,
   expandQueryCacheKey,
   getCacheKey,
@@ -199,5 +204,57 @@ describe("store.expandQuery with the anchor gate", () => {
     next = JARGON_LIVE;
     expect(await store.expandQuery(JARGON_QUERY)).toEqual([]);
     expect(calls).toBe(1);
+  });
+});
+
+// vn4rz.140: the serve tests in query-budget.test.ts pre-cache every expansion so no test waits on a
+// live LLM call, which leaves this write undriven there. Here it runs for real under a held lock.
+describe("store.expandQuery with a cache-write guard (vn4rz.140)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clawmem-expansion-guard-"));
+  let errSpy: ReturnType<typeof spyOn>;
+  let calls = 0;
+
+  beforeEach(() => {
+    calls = 0;
+    setDefaultLlamaCpp({
+      expandQuery: async () => {
+        calls++;
+        return GOOD_SET;
+      },
+    } as never);
+    errSpy = spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    errSpy.mockRestore();
+    setDefaultLlamaCpp(null);
+  });
+
+  it("drops and counts the write under a held lock, keeps the answer, and the next call writes it", async () => {
+    const path = join(dir, "held.sqlite");
+    const store = createStore(path);
+    const holder = new Database(path);
+    const want = GOOD_SET.map((g) => ({ type: g.type, query: g.text }));
+    holder.exec("BEGIN IMMEDIATE");
+    try {
+      const guard = createCacheWriteGuard(50);
+      const t0 = performance.now();
+      expect(await store.expandQuery(GOOD_QUERY, undefined, undefined, guard)).toEqual(want);
+      // The handle's 5000 ms busy_timeout is what this replaces.
+      expect(performance.now() - t0).toBeLessThan(2000);
+      expect(guard.dropped).toBe(1);
+    } finally {
+      holder.exec("ROLLBACK");
+      holder.close();
+    }
+    // The dropped row was not cached, so this regenerates; with the lock gone it lands.
+    const guard = createCacheWriteGuard(50);
+    expect(await store.expandQuery(GOOD_QUERY, undefined, undefined, guard)).toEqual(want);
+    expect(calls).toBe(2);
+    expect(guard.dropped).toBe(0);
+    expect(await store.expandQuery(GOOD_QUERY, undefined, undefined, guard)).toEqual(want);
+    expect(calls).toBe(2);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   });
 });
