@@ -226,6 +226,17 @@ describe("runVecStageWithDeadline", () => {
     expect(res).toEqual({ expansion: ["a"], results: [], degraded: "vec_deadline_expired" });
   });
 
+  it("keeps the original leg when it finished but the expansion is still in flight at the deadline", async () => {
+    // vn4rz.134 finding 4: the original leg does not wait for the expansion, so it can be done by
+    // the deadline; its scan used to be thrown away with the unfinished ones.
+    const pool = fakePool(async (q) => [q]);
+    const expansion = new Promise<string[]>(() => {});
+    const res = await stage(new VecDeadlineLegs({ createPool: () => pool }), 30, expansion);
+    expect(res.degraded).toBe("vec_deadline_expired");
+    expect(res.expansion).toBeUndefined();
+    expect(res.results as unknown).toEqual([["orig"]]);
+  });
+
   it("does not wait for an expansion still in flight, nor start its legs when it lands", async () => {
     const pools: FakePool[] = [];
     let land!: (e: string[]) => void;

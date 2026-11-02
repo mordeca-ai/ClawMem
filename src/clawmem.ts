@@ -71,6 +71,7 @@ import { vecLegParallelism, runVecLegs, createWorkerLegPool, runVecLegsOverlappe
 import { scopedScanEnabled, vecScopeScanStats } from "./vec-scope-scan.ts";
 import { QueryTimer, queryTimingEnabled } from "./query-timing.ts";
 import { runVecStageWithDeadline, VecDeadlineLegs, vecDeadlineMs, type VecDegradedReason } from "./vec-deadline.ts";
+import { QUERY_BUDGET_GRACE_MS, QUERY_BUDGET_REASON, QueryBudget, QueryBudgetExpired, queryBudgetMs, withinBudget } from "./query-budget.ts";
 import type { ScopedLegResult } from "./vec-legs.ts";
 import { splitDocument } from "./splitter.ts";
 import { buildEmbedFrontmatter } from "./embed-input.ts";
@@ -1614,9 +1615,13 @@ function getVecDeadlineLegs(): VecDeadlineLegs {
 }
 
 /** What cmdQuery reports beside its hits; `clawmem serve` turns it into the /query response. */
-type QueryOutcome = { degraded?: VecDegradedReason };
+type QueryOutcome = { degraded?: VecDegradedReason | typeof QUERY_BUDGET_REASON };
 
-async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOutcome): Promise<QueryJsonHit[]> {
+/**
+ * `budget` is the whole-request budget (vn4rz.134), set only by `clawmem serve` when
+ * CLAWMEM_QUERY_BUDGET_MS is on; without it every branch below is the one that ran before.
+ */
+async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOutcome, budget?: QueryBudget): Promise<QueryJsonHit[]> {
   const { values, positionals } = parseArgs({
     args,
     options: {
@@ -1659,13 +1664,17 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   const ftsResults = s.searchFTS(query, POOL, undefined, scopeCols);
   endFts();
   const strongSignal = ftsBypassEnabled() && hasStrongFtsSignal(ftsResults);
+  // FTS is synchronous and cannot be cut short: when it (or the queue before it) spent the budget,
+  // skip expansion and the vector stage and carry on with the FTS results alone.
+  const budgetSpentAtFts = !!budget && budget.expired();
+  let budgetExpired = budgetSpentAtFts;
 
   // Step 2: Query expansion (skip if strong BM25 signal). expandQuery now returns
   // typed ExpandedQuery[] (lex/vec/hyde) — no more brittle string re-parsing, and
   // the original query is no longer echoed back as a phantom "vec" expansion.
   // A failed expansion means "no expansion"; the cap (vn4rz.92) applies to whatever lands.
   let expansion: Promise<ExpandedQuery[]> | undefined;
-  if (!strongSignal) {
+  if (!strongSignal && !budgetSpentAtFts) {
     const endExpand = timer.start("expand");
     expansion = s.expandQuery(query, DEFAULT_QUERY_MODEL)
       .catch(() => [] as ExpandedQuery[])
@@ -1685,8 +1694,16 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   let expandedQueries: ExpandedQuery[];
   let vecLegResults: SearchResult[][];
   const endVec = timer.start("vec_legs");
-  const vecDeadline = vecDeadlineMs();
-  if (vecDeadline > 0) {
+  const vecDeadlineOwn = vecDeadlineMs();
+  // The vector stage's deadline is the smaller of its own and what the request budget has left.
+  const budgetRemaining = budget ? Math.max(1, Math.floor(budget.remainingMs())) : Infinity;
+  const budgetBindsVec = !!budget && (vecDeadlineOwn <= 0 || budgetRemaining <= vecDeadlineOwn);
+  const vecDeadline = Math.min(vecDeadlineOwn > 0 ? vecDeadlineOwn : Infinity, budgetRemaining);
+  if (budgetSpentAtFts) {
+    expandedQueries = [];
+    vecLegResults = [];
+    console.error(`[clawmem] query degraded (${QUERY_BUDGET_REASON}): vector stage skipped, budget ${budget!.totalMs} ms spent before it`);
+  } else if (Number.isFinite(vecDeadline) && vecDeadline > 0) {
     // vn4rz.131: the deadline owns the whole stage. Every leg runs in a worker, scoped ones too,
     // and nothing here falls back to the in-process leg. See src/vec-deadline.ts.
     const scopeId = scopeCols && scopedScanEnabled() ? crypto.randomUUID() : undefined;
@@ -1719,11 +1736,14 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
     });
     expandedQueries = stage.expansion ?? [];
     vecLegResults = stage.results;
+    // An expiry the request budget set is the budget's, not the vector deadline's own.
+    const budgetCutVec = stage.degraded === "vec_deadline_expired" && budgetBindsVec;
+    if (budgetCutVec) budgetExpired = true;
     if (stage.degraded) {
-      if (outcome) outcome.degraded = stage.degraded;
-      console.error(`[clawmem] query degraded (${stage.degraded}): vector results dropped, deadline ${vecDeadline} ms`);
+      if (outcome) outcome.degraded = budgetCutVec ? QUERY_BUDGET_REASON : stage.degraded;
+      console.error(`[clawmem] query degraded (${budgetCutVec ? QUERY_BUDGET_REASON : stage.degraded}): vector results dropped, deadline ${vecDeadline} ms`);
     }
-    timer.count("vec_deadline_expired", stage.degraded === "vec_deadline_expired" ? 1 : 0);
+    timer.count("vec_deadline_expired", stage.degraded === "vec_deadline_expired" && !budgetCutVec ? 1 : 0);
     timer.count("vec_deadline_shed", stage.degraded === "vec_deadline_shed" ? 1 : 0);
     timer.count("vec_leg_failed", stage.degraded === "vec_leg_failed" ? 1 : 0);
     if (scopeStats) {
@@ -1821,6 +1841,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
       }
     }
   }
+  if (budgetSpentAtFts && outcome) outcome.degraded = QUERY_BUDGET_REASON;
   timer.count("vec_legs", vecLegResults.length);
   timer.count("lex_legs", expandedQueries.filter(e => e.type === "lex").length);
   endVec();
@@ -1855,10 +1876,25 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   const { blended } = await fuseAndRerank(
     query,
     allRanked,
-    (q, docs) => timer.time("rerank", () => s.rerank(q, docs, DEFAULT_RERANK_MODEL)),
+    (q, docs) => timer.time("rerank", async () => {
+      if (!budget) return s.rerank(q, docs, DEFAULT_RERANK_MODEL);
+      // The budget replaces rerank's 60 s fetch bound; a cut leaves the fused order (fuseAndRerank).
+      try {
+        return await withinBudget(budget, "rerank", signal =>
+          s.rerank(q, docs, DEFAULT_RERANK_MODEL, undefined, { signal, failOnAbort: true }));
+      } catch (e) {
+        if (e instanceof QueryBudgetExpired) budgetExpired = true;
+        throw e;
+      }
+    }),
     { rerankCap: RERANK_CAP }
   );
   endFuse();
+  if (budget) {
+    if (budgetExpired && outcome) outcome.degraded = QUERY_BUDGET_REASON;
+    if (budgetExpired) console.error(`[clawmem] query degraded (${QUERY_BUDGET_REASON}): budget ${budget.totalMs} ms, best results so far returned`);
+    timer.count(QUERY_BUDGET_REASON, budgetExpired ? 1 : 0);
+  }
 
   // Step 8: Map back to full results and apply composite scoring. Build the map from
   // ALL legs (incl. typed expansions) so expansion-only candidates aren't dropped.
@@ -2274,7 +2310,7 @@ async function cmdServe(args: string[]) {
   const host = args.find((_, i, a) => a[i - 1] === "--host") || "127.0.0.1";
   const s = getStore();
   const { startServer, QueryRequestError } = await import("./server.ts");
-  if (vecDeadlineMs() > 0) {
+  if (vecDeadlineMs() > 0 || queryBudgetMs() > 0) {
     // vn4rz.131: this process owns the deadline's worker pool, so the first query finds it warm.
     vecDeadlineLegsServed = true;
     getVecDeadlineLegs().keepWarm(getDefaultDbPath());
@@ -2288,6 +2324,7 @@ async function cmdServe(args: string[]) {
   let queryQueue: Promise<unknown> = Promise.resolve();
   const runQuery = async (
     query: string, collection: string | undefined, limit: number, sessionId: string | undefined,
+    budget?: QueryBudget,
   ) => {
     // master-harness-vn4rz.123: validate the scope HERE. cmdQuery reports an unknown
     // collection through die() -> process.exit(1), which is right for the CLI and fatal for
@@ -2314,7 +2351,7 @@ async function cmdServe(args: string[]) {
       const args = ["-n", String(limit), "--json"];
       if (collection !== undefined) args.push("-c", collection);
       const outcome: QueryOutcome = {};
-      const hits = await cmdQuery([...args, "--", query], false, outcome);
+      const hits = await cmdQuery([...args, "--", query], false, outcome, budget);
       return outcome.degraded ? { degraded: true as const, degraded_reason: outcome.degraded, hits } : hits;
     } finally {
       for (const [k, v] of saved) {
@@ -2323,10 +2360,54 @@ async function cmdServe(args: string[]) {
       }
     }
   };
-  const queryHandler = (query: string, collection: string | undefined, limit: number, sessionId?: string) => {
-    const run = queryQueue.then(() => runQuery(query, collection, limit, sessionId));
+  const queryHandler = (query: string, collection: string | undefined, limit: number, sessionId?: string, arrivedAt?: number) => {
+    // vn4rz.134: the budget starts at arrival, before the queue wait below.
+    const budget = QueryBudget.fromEnv(arrivedAt);
+    if (!budget) {
+      const run = queryQueue.then(() => runQuery(query, collection, limit, sessionId));
+      queryQueue = run.then(() => undefined, () => undefined);
+      return run;
+    }
+    type Budgeted = Awaited<ReturnType<typeof runQuery>>;
+    const answerSpent = async (): Promise<Budgeted> => {
+      // Nothing ran for this request: say so in the timing row, so a stuck queue is countable.
+      const timer = new QueryTimer(queryTimingEnabled());
+      timer.count(QUERY_BUDGET_REASON, 1);
+      timer.count("query_budget_unstarted", 1);
+      timer.emit();
+      console.error(`[clawmem] query degraded (${QUERY_BUDGET_REASON}): budget ${budget.totalMs} ms spent before the query started`);
+      return { degraded: true as const, degraded_reason: QUERY_BUDGET_REASON, hits: [] };
+    };
+    let started = false;
+    let answered = false;
+    const run = queryQueue.then(async (): Promise<Budgeted> => {
+      // The budget ran out while this request waited its turn: its answer has gone already.
+      if (answered) return { degraded: true as const, degraded_reason: QUERY_BUDGET_REASON, hits: [] };
+      if (budget.expired()) {
+        answered = true;
+        return answerSpent();
+      }
+      started = true;
+      return runQuery(query, collection, limit, sessionId, budget);
+    });
     queryQueue = run.then(() => undefined, () => undefined);
-    return run;
+    // A queued request is answered at its budget, without waiting for the requests ahead of it. A
+    // started one ends on its own at the budget; the grace timer is the backstop for a stage that
+    // cannot be cut.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const early = new Promise<Budgeted>((resolve) => {
+      const fire = () => {
+        if (answered) return;
+        answered = true;
+        void answerSpent().then(resolve);
+      };
+      timer = setTimeout(() => {
+        if (!started) fire();
+        else timer = setTimeout(fire, QUERY_BUDGET_GRACE_MS);
+      }, budget.remainingMs());
+    });
+    const settle = <T,>(v: T): T => { clearTimeout(timer); return v; };
+    return Promise.race([run.then(settle, (e) => { clearTimeout(timer); throw e; }), early]);
   };
   const server = startServer(s, port, host, queryHandler);
   // server.port, not the flag: `--port 0` binds an ephemeral port and this line names it.

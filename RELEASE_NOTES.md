@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.74 — Whole-request budget for POST /query
+
+CLAWMEM_QUERY_BUDGET_MS sets one budget for `clawmem serve` POST /query, counted from the request's arrival, before the queue wait. It covers the queue, FTS, the vector stage and rerank. It is off unless set, and nothing changes when off. When the budget runs out the request returns the best results so far with {degraded, degraded_reason: "query_budget_expired", hits}, never an error: a request still queued answers at once with no hits, the vector stage ends at the smaller of its own deadline and what is left, and rerank's fetch is aborted at the remaining budget and falls back to the fused order. The timing row gains a `query_budget_expired` count. Also fixed: with CLAWMEM_QUERY_VEC_DEADLINE_MS, a vector leg that had finished was dropped when the query expansion was still in flight at the deadline.
+
+---
+
 ## v0.36.73 — Query vector stage gets an opt-in deadline
 
 CLAWMEM_QUERY_VEC_DEADLINE_MS bounds the vector stage of `clawmem query` and POST /query. It is off unless set, and nothing changes when off. When a query runs past the deadline, it drops its vector results and answers from FTS and rerank, and POST /query returns {degraded, degraded_reason, hits} in place of the bare array. Worker.terminate() cannot stop a scan already inside SQLite, so at most 2 abandoned scans run before later queries skip the vector stage.

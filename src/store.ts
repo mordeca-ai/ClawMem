@@ -5888,6 +5888,11 @@ export type RerankProbeOptions = {
   signal?: AbortSignal;
   /** Convenience: derive AbortSignal.timeout(timeoutMs) for the remote fetch when no signal is given. */
   timeoutMs?: number;
+  /**
+   * When `signal` aborts the remote fetch, rethrow instead of falling through to the local
+   * reranker (vn4rz.134: the request budget is spent; a model load would only run past it).
+   */
+  failOnAbort?: boolean;
 };
 
 /** Thrown by rerank() when requireLiveCoverage is set and the reranker did not score every input doc. */
@@ -6009,7 +6014,9 @@ export async function rerank(query: string, documents: { file: string; text: str
             let data: { results: { index: number; relevance_score: number }[] };
             try {
               data = await resp.json() as { results: { index: number; relevance_score: number }[] };
-            } catch {
+            } catch (jsonErr) {
+              // The budget aborted the body read: not a malformed remote (vn4rz.134).
+              if (options?.failOnAbort && options.signal?.aborted) throw jsonErr;
               // Invalid JSON from a 200 response. For a probe this is a malformed remote → surface it;
               // for production treat it like a transport failure and fall through to local.
               if (options?.requireLiveCoverage) throw new RerankMalformedResponseError(["response body is not valid JSON"]);
@@ -6064,6 +6071,7 @@ export async function rerank(query: string, documents: { file: string; text: str
         // Keep the scores of the batches that did arrive before the transport failure, as the
         // per-row writes did. A failing cache write must not mask the local fallback.
         try { flushCacheWrites(); } catch { pendingCacheWrites.length = 0; }
+        if (options?.failOnAbort && options.signal?.aborted) throw e;
       }
     }
 

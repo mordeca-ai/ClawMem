@@ -52,6 +52,8 @@ export type QueryHandler = (
   collection: string | undefined,
   limit: number,
   sessionId?: string,
+  /** `performance.now()` when the request arrived: the origin of CLAWMEM_QUERY_BUDGET_MS (vn4rz.134). */
+  arrivedAt?: number,
 ) => Promise<QueryJsonHit[] | DegradedQueryResponse>;
 
 /**
@@ -891,6 +893,7 @@ export function startServer(store: Store, port: number = 7438, host: string = "1
     port,
     hostname: host,
     async fetch(req) {
+      const arrivedAt = performance.now();
       const url = new URL(req.url);
 
       // CORS preflight
@@ -931,6 +934,7 @@ export function startServer(store: Store, port: number = 7438, host: string = "1
             body.collection as string | undefined,
             body.limit as number | undefined ?? 3,
             body.session_id as string | undefined,
+            arrivedAt,
           ));
         } catch (err: any) {
           if (err instanceof QueryRequestError) {
