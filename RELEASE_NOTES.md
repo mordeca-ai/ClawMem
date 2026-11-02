@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.75 — Recall deadline bounds only the vector stage; health is blind to a permanent degraded run
+
+Whole-request budget for POST /query (CLAWMEM_QUERY_BUDGET_MS, off when unset): from arrival it bounds the queue, vector stage and rerank, keeps a finished leg, and answers degraded rather than error. FTS and other main-thread work are not bounded. Do not set the env before vn4rz.131 lands.
+
+---
+
 ## v0.36.74 — Whole-request budget for POST /query
 
 CLAWMEM_QUERY_BUDGET_MS sets one budget for `clawmem serve` POST /query, counted from the request's arrival, before the queue wait. It is off unless set, and nothing changes when off. A value of 2^31 ms or more is ignored like any invalid value.
