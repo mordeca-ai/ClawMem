@@ -10,6 +10,8 @@ import {
 } from "./store.ts";
 import { resetVecScopeScanStats, vecScopeScanStats, type VecScopeScanStats } from "./vec-scope-scan.ts";
 
+import { postWorkerLoaded } from "./worker-load-guard.ts";
+
 declare var self: Worker;
 
 // One read-only connection per database path. A long-lived pool (MCP server) can serve
@@ -111,3 +113,6 @@ self.onmessage = async (ev: MessageEvent) => {
     });
   }
 };
+
+// Last statement of module evaluation: from here a terminate is safe (src/worker-load-guard.ts).
+postWorkerLoaded();

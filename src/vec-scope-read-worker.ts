@@ -4,6 +4,8 @@
 import { Database } from "bun:sqlite";
 import { readChunkTasks, type ChunkReadRequest, type ChunkReadResponse } from "./vec-scope-scan.ts";
 
+import { postWorkerLoaded } from "./worker-load-guard.ts";
+
 declare var self: Worker;
 
 self.onmessage = (ev: MessageEvent) => {
@@ -40,3 +42,6 @@ self.onmessage = (ev: MessageEvent) => {
     self.postMessage(reply);
   }
 };
+
+// Last statement of module evaluation: from here a terminate is safe (src/worker-load-guard.ts).
+postWorkerLoaded();

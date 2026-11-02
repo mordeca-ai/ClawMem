@@ -1,6 +1,8 @@
 import { createStore, type Store } from "./store.ts";
 import { queryBudgetTestFtsFail, queryBudgetTestStall } from "./query-budget.ts";
 
+import { postWorkerLoaded } from "./worker-load-guard.ts";
+
 declare var self: Worker;
 
 // One read-only connection per database path, opened on the first message that names it and kept
@@ -37,3 +39,6 @@ self.onmessage = (ev: MessageEvent) => {
     self.postMessage({ id, ok: false, error: e instanceof Error ? e.message : String(e) });
   }
 };
+
+// Last statement of module evaluation: from here a terminate is safe (src/worker-load-guard.ts).
+postWorkerLoaded();

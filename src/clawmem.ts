@@ -1650,6 +1650,8 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
 
   // CLAWMEM_QUERY_TIMING=1 prints a per-stage breakdown to stderr (vn4rz.97); off by default.
   const timer = new QueryTimer(queryTimingEnabled());
+  // Arrival to pipeline start (the stamp plus the queue wait), so a test can see a late arrival stamp.
+  if (budget) timer.count("budget_elapsed_at_start_ms", Math.round(budget.elapsedMs()));
   const endStore = timer.start("store_open");
   const s = getStore();
   endStore();
@@ -1674,6 +1676,9 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   // cut at the budget and the main thread stays free to stamp the next request (vn4rz.135). Without
   // one it is the synchronous main-thread call it always was.
   let ftsCut = false;
+  // A shed started no FTS but spent no budget either: the reply is degraded and the vector stage
+  // still runs (vn4rz.135 F6). Only a cut, or a budget that is spent, skips later stages.
+  let ftsShed = false;
   const budgetedFts = async (q: string): Promise<SearchResult[]> => {
     const r = await getFtsLegs().search(getDefaultDbPath(), q, POOL, scopeCols, budget!.remainingMs());
     if (r.status === "ok") return r.results;
@@ -1687,6 +1692,8 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
     } else if (r.status === "shed") {
       console.error(`[clawmem] fts shed: ${getFtsLegs().abandonedCount()} abandoned FTS workers still running`);
       timer.count("fts_shed", 1);
+      ftsShed = true;
+      return [];
     } else {
       timer.count("fts_cut", 1);
     }
@@ -1703,9 +1710,10 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   endFts();
   const strongSignal = ftsBypassEnabled() && hasStrongFtsSignal(ftsResults);
   // When FTS (or the queue before it) spent the budget, or was shed, skip expansion and the vector
-  // stage and carry on with what FTS gave (nothing, if it was cut).
+  // stage and carry on with what FTS gave (nothing, if it was cut). A shed with budget left only
+  // marks the reply degraded: the vector stage still gets its turn.
   const budgetSpentAtFts = !!budget && (ftsCut || budget.expired());
-  let budgetExpired = budgetSpentAtFts;
+  let budgetExpired = budgetSpentAtFts || ftsShed;
 
   // Step 2: Query expansion (skip if strong BM25 signal). expandQuery now returns
   // typed ExpandedQuery[] (lex/vec/hyde) — no more brittle string re-parsing, and
@@ -1898,7 +1906,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
       const endLex = timer.start("lex_legs");
       const r = budget ? await budgetedFts(eq.query) : s.searchFTS(eq.query, POOL, undefined, scopeCols);
       endLex();
-      if (budget && ftsCut) budgetExpired = true;
+      if (budget && (ftsCut || ftsShed)) budgetExpired = true;
       allRanked.push({ results: r.map(toRanked), weight: 1 });
       candidateResults.push(...r);
     } else {

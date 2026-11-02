@@ -13,11 +13,17 @@
  * class counts such workers from terminate to `close` and keeps live + abandoned workers under a
  * hard cap; at the cap a request is shed (no FTS started) instead of adding another.
  *
+ * A worker is never terminated while it is still loading: on Bun 1.3.13 that panics the whole
+ * process. `WorkerLoadGuard` (src/worker-load-guard.ts) holds an early terminate until the worker
+ * posts its loaded signal, so a cut worker that was still booting stays in the abandoned count
+ * until the signal arrives, is terminated, and its `close` fires. There is no timed force.
+ *
  * FTS has its own workers, not a message on the vector-leg pool: the pool's workers may be inside
  * an abandoned scan for minutes, and an FTS queued behind one would be cut by the budget without
  * ever having run.
  */
 import type { SearchResult } from "./store.ts";
+import { WorkerLoadGuard } from "./worker-load-guard.ts";
 
 /** Live plus abandoned FTS workers allowed at once. */
 export const FTS_MAX_WORKERS = 3;
@@ -51,6 +57,7 @@ export interface FtsLegsOpts {
 interface Slot {
   worker: FtsWorkerHandle;
   pending?: { id: number; resolve: (o: FtsOutcome) => void };
+  guard: WorkerLoadGuard;
   dead: boolean;
 }
 
@@ -113,7 +120,13 @@ export class FtsLegs {
     if (this.closed || this.warmDbPath === undefined) return;
     if (this.slots.size > 0 || this.totalCount() >= this.max) return;
     const slot = this.spawn();
-    if (slot) slot.worker.postMessage({ id: 0, warm: true, dbPath: this.warmDbPath });
+    if (slot) {
+      try {
+        slot.worker.postMessage({ id: 0, warm: true, dbPath: this.warmDbPath });
+      } catch {
+        this.drop(slot);
+      }
+    }
   }
 
   private spawn(): Slot | undefined {
@@ -125,9 +138,10 @@ export class FtsLegs {
     }
     this.spawned++;
     this.onSpawn?.();
-    const slot: Slot = { worker, dead: false };
+    const slot: Slot = { worker, guard: new WorkerLoadGuard(worker), dead: false };
     worker.onmessage = (ev) => {
       const msg = ev.data;
+      if (slot.guard.observe(msg)) return; // the loaded signal is never a reply
       const pending = slot.pending;
       // A reply for anything but the request this worker is on (a warm-up, or a request that was
       // already cut) is dropped: a late answer can never land on a later request.
@@ -137,6 +151,7 @@ export class FtsLegs {
       else pending.resolve({ status: "failed", error: new Error(String(msg.error)) });
     };
     worker.onerror = (ev) => {
+      slot.guard.failed();
       const pending = slot.pending;
       slot.pending = undefined;
       this.drop(slot);
@@ -145,6 +160,15 @@ export class FtsLegs {
         error: ev.error instanceof Error ? ev.error : new Error(ev.message || "FTS worker error"),
       });
     };
+    // A thread that exits without an error event (a silent exit) must not wedge its slot: drop it
+    // and fail whatever it was running, so the caller falls back instead of waiting out a budget.
+    worker.addEventListener("close", () => {
+      slot.dead = true;
+      this.slots.delete(slot);
+      const pending = slot.pending;
+      slot.pending = undefined;
+      pending?.resolve({ status: "failed", error: new Error("FTS worker exited") });
+    });
     this.slots.add(slot);
     return slot;
   }
@@ -152,9 +176,7 @@ export class FtsLegs {
   private drop(slot: Slot): void {
     slot.dead = true;
     this.slots.delete(slot);
-    try {
-      slot.worker.terminate();
-    } catch {}
+    slot.guard.terminate(); // held until the worker has loaded
   }
 
   /** Terminate a busy worker and count it until its thread really exits. */
@@ -194,7 +216,13 @@ export class FtsLegs {
       mine.pending = { id, resolve };
       timer = setTimeout(() => resolve({ status: "expired" }), budgetMs);
     });
-    mine.worker.postMessage({ id, dbPath, query, limit, collections });
+    try {
+      mine.worker.postMessage({ id, dbPath, query, limit, collections });
+    } catch (e) {
+      const p = mine.pending;
+      mine.pending = undefined;
+      p?.resolve({ status: "failed", error: e instanceof Error ? e : new Error(String(e)) });
+    }
     const outcome = await answer;
     clearTimeout(timer);
     if (outcome.status === "expired") this.abandon(mine);

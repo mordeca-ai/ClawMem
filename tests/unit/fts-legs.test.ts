@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FtsLegs, type FtsWorkerHandle } from "../../src/fts-legs.ts";
 import { createStore } from "../../src/store.ts";
+import { WORKER_LOADED_MESSAGE } from "../../src/worker-load-guard.ts";
 import { hashContent } from "../../src/indexer.ts";
 
 /**
@@ -41,7 +42,8 @@ class FakeWorker implements FtsWorkerHandle {
   }
 }
 
-function fakePool(max: number) {
+/** `loadSignal: false` leaves the workers loading forever, for the terminate-during-load rules. */
+function fakePool(max: number, loadSignal = true) {
   const made: FakeWorker[] = [];
   let peakLive = 0;
   const legs = new FtsLegs({
@@ -49,6 +51,8 @@ function fakePool(max: number) {
     spawn: () => {
       const w = new FakeWorker();
       made.push(w);
+      // A real worker posts this as the last statement of its module; a microtask stands in.
+      if (loadSignal) queueMicrotask(() => w.reply(WORKER_LOADED_MESSAGE));
       return w;
     },
   });
@@ -340,4 +344,67 @@ describe("FtsLegs with a real worker", () => {
       legs.close();
     }
   }, 60_000);
+});
+
+describe("FtsLegs and the terminate-during-load rule (vn4rz.135)", () => {
+  it("a cut worker that is still loading is not terminated until it has loaded, and stays counted", async () => {
+    const { legs, made } = fakePool(3, false);
+    const p = legs.search("db", "q", 10, undefined, 20);
+    expect(await p).toEqual({ status: "expired" });
+    expect(made[0]!.terminated).toBe(false);
+    expect(legs.abandonedCount()).toBe(1);
+    expect(legs.totalCount()).toBe(1);
+    made[0]!.reply(WORKER_LOADED_MESSAGE);
+    expect(made[0]!.terminated).toBe(true);
+    made[0]!.exit();
+    expect(legs.abandonedCount()).toBe(0);
+  });
+
+  it("the loaded signal is not a reply: it cannot resolve a pending request", async () => {
+    const { legs, made } = fakePool(3, false);
+    let done = false;
+    const p = legs.search("db", "q", 10, undefined, 5000).then((o) => {
+      done = true;
+      return o;
+    });
+    made[0]!.reply(WORKER_LOADED_MESSAGE);
+    await sleep(10);
+    expect(done).toBe(false);
+    made[0]!.reply({ id: made[0]!.searches[0].id, ok: true, results: [row("x")] });
+    expect(await p).toEqual({ status: "ok", results: [row("x")] });
+  });
+
+  it("a silent exit (close, no error) drops the slot and fails the pending request", async () => {
+    const { legs, made } = fakePool(1);
+    const p = legs.search("db", "q", 10, undefined, 5000);
+    made[0]!.exit();
+    const out = await p;
+    expect(out.status).toBe("failed");
+    expect(legs.liveCount()).toBe(0);
+    expect(legs.totalCount()).toBe(0);
+    // The next request gets a fresh worker instead of a wedged slot.
+    const next = legs.search("db", "q2", 10, undefined, 5000);
+    expect(made.length).toBe(2);
+    made[1]!.reply({ id: made[1]!.searches[0].id, ok: true, results: [] });
+    expect((await next).status).toBe("ok");
+  });
+
+  it("a synchronous postMessage throw resolves as failed and leaves no timer or pending", async () => {
+    // Throws on the first search post only.
+    const w = new FakeWorker();
+    let first = true;
+    w.postMessage = () => {
+      if (first) {
+        first = false;
+        throw new Error("post failed");
+      }
+    };
+    const l2 = new FtsLegs({ maxWorkers: 2, spawn: () => w });
+    const t0 = Date.now();
+    const out = await l2.search("db", "q", 10, undefined, 5000);
+    expect(out.status).toBe("failed");
+    expect(Date.now() - t0).toBeLessThan(1000); // not the 5 s budget: the timer was cleared and unused
+    expect(w.terminated).toBe(false); // still loading: held, not terminated
+    expect(l2.liveCount()).toBe(0); // failed: the worker was dropped, not kept
+  });
 });

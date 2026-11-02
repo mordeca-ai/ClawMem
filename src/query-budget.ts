@@ -11,17 +11,32 @@
  * read-only worker (src/fts-legs.ts) and are awaited against the budget left, so a slow FTS is cut
  * at the budget and the main thread keeps stamping arrivals meanwhile. A cut FTS yields no hits
  * (the query is then flagged degraded, later stages skipped), and the cut worker keeps its thread
- * until its SQLite call returns: terminate() does not free it. Those workers are capped, and past
- * the cap a request is shed without starting FTS.
+ * until its SQLite call returns: terminate() does not free it. Those workers are capped: live plus
+ * abandoned (up to 3 abandoned, with none live) stay under the cap, and past it a request is shed
+ * without starting FTS. A shed with budget left is degraded but still runs the vector stage; only a
+ * cut or a spent budget skips it.
+ *
+ * A worker is never terminated while it is still loading (src/worker-load-guard.ts). On Bun
+ * 1.3.13 that panics the whole process (SIGILL, exit 132, in the worker's module transpile), so a
+ * cut worker that is still booting is terminated only once it has posted its loaded signal.
  *
  * What it still does not bound: every other synchronous main-thread step. Named: opening the store
  * and resolving the collection scope, the expansion and rerank cache lookups, RRF fusion, result
  * enrichment (one SQLite read per row on the main handle), composite scoring and JSON building,
- * disposing the local models, the HTTP body parse, and a main-thread FTS fallback after a worker
- * failure. Neither this budget's timer nor the next request's arrival clock can run while one is
- * going, so a request stuck in one answers only when it returns. The other REST routes, which do
- * their own FTS on the main thread, are outside this budget altogether. The newest 200 live timing
- * rows (taken before this change) showed main-thread stages of 1000 ms or more on 50 of them.
+ * disposing the local models, the HTTP body parse, reply deserialization from the FTS worker, and
+ * a main-thread FTS fallback after a worker failure. Neither this budget's timer nor the next
+ * request's arrival clock can run while one is going, so a request stuck in one answers only when
+ * it returns. The other REST routes, which do their own FTS on the main thread, are outside this
+ * budget altogether.
+ *
+ * The unbounded case is the cache WRITES on the main handle: the rerank cache flush
+ * (store.ts flushCacheWrites) and the expansion cache write. A write that waits on a write lock
+ * held by another connection blocks the main thread for up to busy_timeout (5 s). A measured run
+ * answered at 6233 ms and 10965 ms under a 2000 ms budget, with the budget count at 0. Moving
+ * those writes off the main thread is not part of this change. The other main-thread stages, over
+ * the 533 live timing rows (95.5 h), peaked at 415 ms; the "50 of 200 rows at 1000 ms or more"
+ * figure sometimes quoted for this change is the FTS rows that this change moved to the worker,
+ * not a remainder.
  *
  * Expiry is never an error: the response carries the best results so far, flagged degraded with
  * reason `query_budget_expired`. The pipeline checks the budget around the synchronous stages and
@@ -78,6 +93,11 @@ export class QueryBudget {
   ): QueryBudget | null {
     const ms = queryBudgetMs(env);
     return ms > 0 ? new QueryBudget(ms, arrivedAt) : null;
+  }
+
+  /** Milliseconds since arrival, unclamped: how much of the budget the queue wait already took. */
+  elapsedMs(): number {
+    return this.now() - (this.deadline - this.totalMs);
   }
 
   remainingMs(): number {
