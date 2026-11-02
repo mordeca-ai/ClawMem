@@ -17,15 +17,23 @@
  */
 
 /** Distinct from every reply shape: replies carry `id` and `ok`, this carries neither. */
-export const WORKER_LOADED_MESSAGE = Object.freeze({ __clawmemWorkerLoaded: true });
+export const WORKER_LOADED_MESSAGE = Object.freeze({
+  __clawmemWorkerLoaded: true,
+});
 
 /** Worker side: the last statement of the script. */
 export function postWorkerLoaded(): void {
-  (globalThis as unknown as { postMessage(m: unknown): void }).postMessage(WORKER_LOADED_MESSAGE);
+  (globalThis as unknown as { postMessage(m: unknown): void }).postMessage(
+    WORKER_LOADED_MESSAGE,
+  );
 }
 
 export function isWorkerLoadedMessage(data: unknown): boolean {
-  return typeof data === "object" && data !== null && (data as Record<string, unknown>).__clawmemWorkerLoaded === true;
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    (data as Record<string, unknown>).__clawmemWorkerLoaded === true
+  );
 }
 
 export interface TerminableWorker {

@@ -106,7 +106,10 @@ describe("a worker cut during load, on a real Worker", () => {
   // the process open. The busy main thread forces the order.
   it("does not hold the process open for the scan the worker started first", async () => {
     const dir = mkdtempSync(join(tmpdir(), "load-guard-"));
-    const guardPath = resolve(import.meta.dir, "../../src/worker-load-guard.ts");
+    const guardPath = resolve(
+      import.meta.dir,
+      "../../src/worker-load-guard.ts",
+    );
     const started = join(dir, "scan-started");
     try {
       writeFileSync(
@@ -129,7 +132,10 @@ describe("a worker cut during load, on a real Worker", () => {
          setTimeout(() => Bun.sleepSync(2_000), 0);`,
       );
       const t0 = performance.now();
-      const proc = Bun.spawn([process.execPath, join(dir, "host.ts")], { stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn([process.execPath, join(dir, "host.ts")], {
+        stdout: "ignore",
+        stderr: "pipe",
+      });
       const stderr = new Response(proc.stderr).text();
       const code = await proc.exited;
       expect(code, await stderr).toBe(0);
