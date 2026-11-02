@@ -4,7 +4,7 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
-## v0.36.75 — FTS runs in a worker under the query budget
+## v0.36.76 — FTS runs in a worker under the query budget
 
 With CLAWMEM_QUERY_BUDGET_MS set, POST /query runs its FTS (the original query and any expansion lex leg) in a read-only worker and waits for it against the budget left. A slow FTS is now cut at the budget instead of holding the whole server: the request goes on at once with no FTS hits, is flagged `query_budget_expired`, and skips the vector stage and rerank. A request that arrives meanwhile is stamped on arrival. Measured on a 5000 ms FTS stall at a 2000 ms budget: the first request answered at 5045 ms and the second, sent at t=1000, started its clock at about t=5000 and was not counted; both now answer within budget + 1000 ms and are counted. With the budget unset nothing changes: FTS is the same synchronous main-thread call and no worker is started.
 
@@ -20,13 +20,19 @@ The timing row also gains `budget_elapsed_at_start_ms`: arrival to pipeline star
 
 ---
 
+## v0.36.75 — Recall deadline bounds only the vector stage; health is blind to a permanent degraded run
+
+Whole-request budget for POST /query (CLAWMEM_QUERY_BUDGET_MS, off when unset): from arrival it bounds the queue, vector stage and rerank, keeps a finished leg, and answers degraded rather than error. FTS and other main-thread work are not bounded. Do not set the env before vn4rz.131 lands.
+
+---
+
 ## v0.36.74 — Whole-request budget for POST /query
 
 CLAWMEM_QUERY_BUDGET_MS sets one budget for `clawmem serve` POST /query, counted from the request's arrival, before the queue wait. It is off unless set, and nothing changes when off. A value of 2^31 ms or more is ignored like any invalid value.
 
 The budget bounds the queue wait, the vector stage and rerank. When it runs out the request returns the best results so far with {degraded, degraded_reason: "query_budget_expired", hits}, never an error: a request still queued answers at once with no hits, the vector stage ends at the smaller of its own deadline and what is left, and rerank's fetch is aborted at the remaining budget and falls back to the fused order. If a vector leg failed and the budget also cut the request, the reply keeps `vec_leg_failed` and the timing row counts both.
 
-v0.36.75 moves FTS off the main thread; see below for what is bounded now. (v0.36.74 itself left FTS synchronous, so a slow FTS outlasted the budget.)
+v0.36.76 moves FTS off the main thread; see above for what is bounded now. (v0.36.74 itself left FTS synchronous, so a slow FTS outlasted the budget.)
 
 The timing row gains a `query_budget_expired` count. Also fixed: with CLAWMEM_QUERY_VEC_DEADLINE_MS, a vector leg that had finished was dropped when the query expansion was still in flight at the deadline.
 
