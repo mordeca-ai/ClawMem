@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.73 — Query vector stage gets an opt-in deadline
+
+CLAWMEM_QUERY_VEC_DEADLINE_MS bounds the vector stage of `clawmem query` and POST /query. It is off unless set, and nothing changes when off. When a query runs past the deadline, it drops its vector results and answers from FTS and rerank, and POST /query returns {degraded, degraded_reason, hits} in place of the bare array. Worker.terminate() cannot stop a scan already inside SQLite, so at most 2 abandoned scans run before later queries skip the vector stage.
+
+---
+
 ## v0.36.72 — llm_cache keeps a day of writes, not 38 minutes
 
 Fixed: rerank scores could evict every other llm_cache row within about 38 minutes, so a repeating query lost its cached expansion. The cap is now 50,000 rows and a purge fires on 0.1% of writes. (master-harness-uvnhf.17)
