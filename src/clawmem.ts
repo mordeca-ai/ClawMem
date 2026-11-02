@@ -71,7 +71,7 @@ import { vecLegParallelism, runVecLegs, createWorkerLegPool, runVecLegsOverlappe
 import { scopedScanEnabled, vecScopeScanStats } from "./vec-scope-scan.ts";
 import { QueryTimer, queryTimingEnabled } from "./query-timing.ts";
 import { runVecStageWithDeadline, VecDeadlineLegs, vecDeadlineMs, type VecDegradedReason } from "./vec-deadline.ts";
-import { QUERY_BUDGET_GRACE_MS, QUERY_BUDGET_REASON, QueryBudget, QueryBudgetExpired, queryBudgetMs, withinBudget } from "./query-budget.ts";
+import { QUERY_BUDGET_REASON, QueryBudget, QueryBudgetExpired, queryBudgetMs, queryBudgetTestStall, submitWithBudget, withinBudget } from "./query-budget.ts";
 import type { ScopedLegResult } from "./vec-legs.ts";
 import { splitDocument } from "./splitter.ts";
 import { buildEmbedFrontmatter } from "./embed-input.ts";
@@ -1660,6 +1660,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   const POOL = RERANK_CAP * 2;
 
   // Step 1: BM25 for strong signal check
+  if (budget) queryBudgetTestStall(query);
   const endFts = timer.start("fts");
   const ftsResults = s.searchFTS(query, POOL, undefined, scopeCols);
   endFts();
@@ -1891,7 +1892,9 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   );
   endFuse();
   if (budget) {
-    if (budgetExpired && outcome) outcome.degraded = QUERY_BUDGET_REASON;
+    // A failed vector leg stays the reply's reason: the recall hook counts it toward its DOWN streak,
+    // and a budget cut on top of it must not hide it. The timing row still counts both.
+    if (budgetExpired && outcome && outcome.degraded !== "vec_leg_failed") outcome.degraded = QUERY_BUDGET_REASON;
     if (budgetExpired) console.error(`[clawmem] query degraded (${QUERY_BUDGET_REASON}): budget ${budget.totalMs} ms, best results so far returned`);
     timer.count(QUERY_BUDGET_REASON, budgetExpired ? 1 : 0);
   }
@@ -2369,45 +2372,24 @@ async function cmdServe(args: string[]) {
       return run;
     }
     type Budgeted = Awaited<ReturnType<typeof runQuery>>;
-    const answerSpent = async (): Promise<Budgeted> => {
-      // Nothing ran for this request: say so in the timing row, so a stuck queue is countable.
-      const timer = new QueryTimer(queryTimingEnabled());
-      timer.count(QUERY_BUDGET_REASON, 1);
-      timer.count("query_budget_unstarted", 1);
-      timer.emit();
-      console.error(`[clawmem] query degraded (${QUERY_BUDGET_REASON}): budget ${budget.totalMs} ms spent before the query started`);
-      return { degraded: true as const, degraded_reason: QUERY_BUDGET_REASON, hits: [] };
-    };
-    let started = false;
-    let answered = false;
-    const run = queryQueue.then(async (): Promise<Budgeted> => {
-      // The budget ran out while this request waited its turn: its answer has gone already.
-      if (answered) return { degraded: true as const, degraded_reason: QUERY_BUDGET_REASON, hits: [] };
-      if (budget.expired()) {
-        answered = true;
-        return answerSpent();
-      }
-      started = true;
-      return runQuery(query, collection, limit, sessionId, budget);
+    const empty = (): Budgeted => ({ degraded: true as const, degraded_reason: QUERY_BUDGET_REASON, hits: [] });
+    const { result, tail } = submitWithBudget<Budgeted>({
+      budget,
+      queue: queryQueue,
+      run: () => runQuery(query, collection, limit, sessionId, budget),
+      unstarted: async () => {
+        // Nothing ran for this request: say so in the timing row, so a stuck queue is countable.
+        const timer = new QueryTimer(queryTimingEnabled());
+        timer.count(QUERY_BUDGET_REASON, 1);
+        timer.count("query_budget_unstarted", 1);
+        timer.emit();
+        console.error(`[clawmem] query degraded (${QUERY_BUDGET_REASON}): budget ${budget.totalMs} ms spent before the query started`);
+        return empty();
+      },
+      empty,
     });
-    queryQueue = run.then(() => undefined, () => undefined);
-    // A queued request is answered at its budget, without waiting for the requests ahead of it. A
-    // started one ends on its own at the budget; the grace timer is the backstop for a stage that
-    // cannot be cut.
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const early = new Promise<Budgeted>((resolve) => {
-      const fire = () => {
-        if (answered) return;
-        answered = true;
-        void answerSpent().then(resolve);
-      };
-      timer = setTimeout(() => {
-        if (!started) fire();
-        else timer = setTimeout(fire, QUERY_BUDGET_GRACE_MS);
-      }, budget.remainingMs());
-    });
-    const settle = <T,>(v: T): T => { clearTimeout(timer); return v; };
-    return Promise.race([run.then(settle, (e) => { clearTimeout(timer); throw e; }), early]);
+    queryQueue = tail;
+    return result;
   };
   const server = startServer(s, port, host, queryHandler);
   // server.port, not the flag: `--port 0` binds an ephemeral port and this line names it.

@@ -7,7 +7,9 @@ import { hashContent } from "../../src/indexer.ts";
 import {
   QueryBudget,
   QueryBudgetExpired,
+  QUERY_BUDGET_MAX_MS,
   queryBudgetMs,
+  submitWithBudget,
   withinBudget,
 } from "../../src/query-budget.ts";
 import { fakeEmbedVector, goldenRerankScore } from "../helpers/fake-embed-server.ts";
@@ -32,6 +34,15 @@ describe("queryBudgetMs", () => {
   });
   it("parses a positive integer", () => {
     expect(queryBudgetMs({ CLAWMEM_QUERY_BUDGET_MS: " 6500 " })).toBe(6500);
+  });
+  it("is off for a value setTimeout cannot hold (2^31 ms and up), like any invalid value", () => {
+    // setTimeout with 2^31 or more fires at once, so such a budget would cut every request.
+    expect(QUERY_BUDGET_MAX_MS).toBe(2147483647);
+    expect(queryBudgetMs({ CLAWMEM_QUERY_BUDGET_MS: "2147483647" })).toBe(2147483647);
+    for (const v of ["2147483648", "3000000000", "99999999999999999999"]) {
+      expect(queryBudgetMs({ CLAWMEM_QUERY_BUDGET_MS: v })).toBe(0);
+    }
+    expect(QueryBudget.fromEnv(0, { CLAWMEM_QUERY_BUDGET_MS: "3000000000" })).toBeNull();
   });
   it("fromEnv is null when off", () => {
     expect(QueryBudget.fromEnv(0, {})).toBeNull();
@@ -77,6 +88,99 @@ describe("withinBudget", () => {
   });
 });
 
+describe("submitWithBudget", () => {
+  // Real timers at tens of milliseconds against pipelines that settle seconds later: a loaded host
+  // can slip a timer by a few hundred ms, never by the gap these tests leave.
+  const LATE_MS = 2000;
+  const mk = (
+    budgetMs: number,
+    queue: Promise<unknown>,
+    run: () => Promise<string>,
+    graceMs = 60,
+  ) => {
+    let unstarted = 0;
+    const sub = submitWithBudget<string>({
+      budget: new QueryBudget(budgetMs),
+      queue,
+      run,
+      unstarted: async () => {
+        unstarted++;
+        return "spent";
+      },
+      empty: () => "empty",
+      graceMs,
+    });
+    return { ...sub, unstartedCalls: () => unstarted };
+  };
+
+  it("returns the pipeline's answer when it finishes within the budget, and never answers twice", async () => {
+    const sub = mk(200, Promise.resolve(), async () => {
+      await sleep(20);
+      return "ran";
+    });
+    expect(await sub.result).toBe("ran");
+    await sleep(500); // past budget and grace: no timer may fire an answer after the fact
+    expect(sub.unstartedCalls()).toBe(0);
+  });
+
+  it("answers a started request at budget + grace when its pipeline cannot be cut", async () => {
+    // The backstop: this pipeline ignores the budget and settles long after it.
+    const sub = mk(40, Promise.resolve(), async () => {
+      await sleep(LATE_MS);
+      return "late";
+    });
+    expect(await sub.result).toBe("spent");
+    expect(sub.unstartedCalls()).toBe(1);
+    expect(await sub.tail).toBeUndefined(); // the queue still waits for the pipeline itself
+  });
+
+  it("answers a queued request at its budget, without waiting for the ones ahead", async () => {
+    let ran = false;
+    const ahead = new Promise<void>((resolve) => setTimeout(resolve, LATE_MS));
+    const sub = mk(40, ahead, async () => {
+      ran = true;
+      return "ran";
+    });
+    expect(await sub.result).toBe("spent");
+    expect(ran).toBe(false);
+    expect(sub.unstartedCalls()).toBe(1);
+    // Its turn comes later and finds the answer gone: nothing runs and nothing is counted again.
+    expect(await sub.tail).toBeUndefined();
+    expect(ran).toBe(false);
+    expect(sub.unstartedCalls()).toBe(1);
+  });
+
+  it("does not start a pipeline whose budget ran out before its turn", async () => {
+    let ran = false;
+    const b = new QueryBudget(5, 0, () => 100); // already spent when the turn comes
+    let unstarted = 0;
+    const sub = submitWithBudget<string>({
+      budget: b,
+      queue: Promise.resolve(),
+      run: async () => {
+        ran = true;
+        return "ran";
+      },
+      unstarted: async () => {
+        unstarted++;
+        return "spent";
+      },
+      empty: () => "empty",
+    });
+    expect(await sub.result).toBe("spent");
+    expect(ran).toBe(false);
+    expect(unstarted).toBe(1);
+  });
+
+  it("passes a pipeline's own failure through and still frees the queue", async () => {
+    const sub = mk(500, Promise.resolve(), async () => {
+      throw new Error("boom");
+    });
+    expect((await sub.result.catch((e) => e)).message).toBe("boom");
+    expect(await sub.tail).toBeUndefined();
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------------------------
@@ -90,10 +194,12 @@ const BLOCKED = "zzblock";
 const Q_OK = "orbital ferry schedule";
 const Q_BLOCK = `orbital ferry schedule ${BLOCKED}`;
 const Q_RERANK = "orbital ferry cutoffprobe";
+const Q_LEG = "orbital ferry zzlegfail";
 
 let fake: ReturnType<typeof Bun.serve>;
 let rerankDelayMs = 0;
 let rerankCalls = 0;
+let rerankAborts = 0; // rerank requests the client closed before the fake answered
 
 function seedVault(): void {
   mkdirSync(join(ROOT, "alpha"), { recursive: true });
@@ -112,7 +218,7 @@ function seedVault(): void {
   store.ensureVecTable(DIM);
   store.db.transaction(() => {
     const docs: Record<string, string> = {
-      "ferry.md": `# Orbital ferry schedule ${BLOCKED}\n\nThe orbital ferry cutoffprobe departs every six hours.\n`,
+      "ferry.md": `# Orbital ferry schedule ${BLOCKED}\n\nThe orbital ferry cutoffprobe departs every six hours zzlegfail.\n`,
       "dock.md": `# Docking bay rota\n\nFerry crews rotate through the docking bays weekly.\n`,
       "cargo.md": `# Cargo manifest\n\nCargo on the orbital ferry is weighed before departure.\n`,
     };
@@ -133,7 +239,7 @@ function seedVault(): void {
       );
     }
     // Known at once (llm_cache hit, no expansion), so no test waits on a live LLM call.
-    for (const q of [Q_OK, Q_BLOCK, Q_RERANK]) {
+    for (const q of [Q_OK, Q_BLOCK, Q_RERANK, Q_LEG]) {
       store.db
         .prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`)
         .run(expandQueryCacheKey(q), "[]", now);
@@ -176,6 +282,8 @@ type Reply = { status: number; body: any; ms: number };
 
 type Serve = {
   post: (query: string) => Promise<Reply>;
+  /** Headers go out now and the body `bodyDelayMs` later: the request has arrived but is unread. */
+  postSlowBody: (query: string, bodyDelayMs: number) => Promise<Reply>;
   timings: () => Promise<Timing[]>;
 };
 
@@ -215,6 +323,25 @@ async function withServe(
         const body = await res.json();
         return { status: res.status, body, ms: performance.now() - t0 };
       },
+      postSlowBody: async (query, bodyDelayMs) => {
+        const t0 = performance.now();
+        const payload = new TextEncoder().encode(JSON.stringify({ query, limit: 5 }));
+        const res = await fetch(`${base}/query`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: new ReadableStream({
+            async start(ctrl) {
+              await sleep(bodyDelayMs);
+              ctrl.enqueue(payload);
+              ctrl.close();
+            },
+          }),
+          // A streamed request body needs duplex; Bun's types do not list it.
+          ...({ duplex: "half" } as object),
+        });
+        const body = await res.json();
+        return { status: res.status, body, ms: performance.now() - t0 };
+      },
       timings: async () => {
         proc.kill(9);
         await proc.exited;
@@ -241,6 +368,7 @@ beforeAll(() => {
       const path = new URL(req.url).pathname;
       if (path.endsWith("/v1/rerank")) {
         rerankCalls++;
+        req.signal.addEventListener("abort", () => rerankAborts++);
         const rr = (await req.json()) as { documents: string[] };
         if (rerankDelayMs > 0) await sleep(rerankDelayMs);
         return Response.json({
@@ -271,7 +399,51 @@ afterAll(() => {
 
 // Positive control: QUERY_BUDGET_TEST_CONTROL=off leaves the budget unset, and B1 and B2 go RED.
 const BUDGET = (ms: number) => (process.env.QUERY_BUDGET_TEST_CONTROL === "off" ? "0" : String(ms));
-const TOLERANCE_MS = 1000;
+// Host load of 20-40 lags timers by hundreds of ms; the RED controls miss the bound by seconds.
+const TOLERANCE_MS = 1500;
+
+describe("store.rerank with failOnAbort (the budget's abort must not fall through to the local reranker)", () => {
+  const docs = Array.from({ length: 3 }, (_, i) => ({ file: `f${i}`, text: `doc ${i}` }));
+  const saved: Record<string, string | undefined> = {};
+  const ENV = ["CLAWMEM_RERANK_URL", "CLAWMEM_NO_LOCAL_MODELS"];
+  beforeAll(() => {
+    for (const k of ENV) saved[k] = process.env[k];
+    process.env.CLAWMEM_RERANK_URL = `http://127.0.0.1:${fake.port}`;
+    process.env.CLAWMEM_NO_LOCAL_MODELS = "true";
+  });
+  afterAll(() => {
+    for (const k of ENV) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  test("S1: an aborted remote rerank rejects, and the fetch ends at the abort", async () => {
+    rerankDelayMs = 4500;
+    const st = createStore(DB);
+    try {
+      const ctrl = new AbortController();
+      setTimeout(() => ctrl.abort(), 200);
+      const t0 = performance.now();
+      const outcome = await st
+        .rerank("abort probe", docs, undefined, undefined, {
+          signal: ctrl.signal,
+          failOnAbort: true,
+        })
+        .then(
+          () => "resolved" as const,
+          (e: Error) => e,
+        );
+      expect(outcome).not.toBe("resolved");
+      expect((outcome as Error).name).toMatch(/Abort|Timeout/);
+      // Far under the fake's 4500 ms: the reply never waited for the endpoint.
+      expect(performance.now() - t0).toBeLessThan(3000);
+    } finally {
+      rerankDelayMs = 0;
+      st.close();
+    }
+  }, 30_000);
+});
 
 describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
   test("B1: 4 concurrent POSTs with a blocked scan all return within budget + tolerance", async () => {
@@ -306,8 +478,15 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
     const budget = 2000;
     rerankDelayMs = 4500; // far past budget + tolerance, far under the 60 s fetch bound
     rerankCalls = 0;
+    rerankAborts = 0;
     try {
       await withServe({ CLAWMEM_QUERY_BUDGET_MS: BUDGET(budget) }, async (s) => {
+        // Cold start (store, workers) is not what this test times: warm with a fast rerank.
+        rerankDelayMs = 0;
+        await s.post(Q_OK);
+        rerankDelayMs = 4500;
+        rerankCalls = 0;
+        rerankAborts = 0;
         const r = await s.post(Q_RERANK);
         expect(r.status).toBe(200);
         expect(r.ms).toBeLessThan(budget + TOLERANCE_MS);
@@ -315,10 +494,16 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
         expect(r.body.degraded_reason).toBe("query_budget_expired");
         expect(hitsOf(r.body).length).toBeGreaterThan(0);
         expect(rerankCalls).toBeGreaterThan(0);
-        const [t] = await s.timings();
-        expect(t!.counts.query_budget_expired).toBe(1);
-        expect(t!.counts.vec_deadline_expired).toBe(0);
-        expect(t!.stages.rerank!.ms).toBeLessThan(budget + TOLERANCE_MS);
+        // The fetch is cancelled, not just abandoned: the fake sees the client close while it is
+        // still sleeping on its 4500 ms delay. Without the signal it would sleep that out. Checked
+        // before timings(), which kills the serve and would close the connection itself.
+        const until = Date.now() + 1500;
+        while (rerankAborts === 0 && Date.now() < until) await sleep(50);
+        expect(rerankAborts).toBeGreaterThan(0);
+        const t = (await s.timings()).at(-1)!;
+        expect(t.counts.query_budget_expired).toBe(1);
+        expect(t.counts.vec_deadline_expired).toBe(0);
+        expect(t.stages.rerank!.ms).toBeLessThan(budget + TOLERANCE_MS);
       });
     } finally {
       rerankDelayMs = 0;
@@ -343,6 +528,121 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
     expect((on.out[0] as unknown[]).length).toBeGreaterThan(0);
     expect(on.out).toEqual(off.out);
     expect(on.counts.query_budget_expired).toBe(0);
+  }, 90_000);
+
+  test("B4: the budget's own cut is counted as query_budget_expired, not vec_deadline_expired", async () => {
+    // No vector deadline of its own: the budget is what ends the blocked scan.
+    await withServe(
+      { CLAWMEM_QUERY_BUDGET_MS: "1500", CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "6000" },
+      async (s) => {
+        const r = await s.post(Q_BLOCK);
+        expect(r.status).toBe(200);
+        expect(r.body.degraded_reason).toBe("query_budget_expired");
+        const [t] = await s.timings();
+        expect(t!.counts.query_budget_expired).toBe(1);
+        expect(t!.counts.vec_deadline_expired).toBe(0);
+      },
+    );
+  }, 90_000);
+
+  test("B5: a vector deadline tighter than the budget keeps its own reason and count", async () => {
+    await withServe(
+      {
+        CLAWMEM_QUERY_BUDGET_MS: "20000",
+        CLAWMEM_QUERY_VEC_DEADLINE_MS: "1000",
+        CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "3000",
+      },
+      async (s) => {
+        const r = await s.post(Q_BLOCK);
+        expect(r.status).toBe(200);
+        expect(r.body.degraded_reason).toBe("vec_deadline_expired");
+        const [t] = await s.timings();
+        expect(t!.counts.vec_deadline_expired).toBe(1);
+        expect(t!.counts.query_budget_expired).toBe(0);
+      },
+    );
+  }, 90_000);
+
+  test("B6: the budget counts from arrival: a request read late is answered without running", async () => {
+    // Headers at t=0, body at t=3000, budget 1500. Measured from the handler call (the body read)
+    // the budget would be whole and the pipeline would run; from arrival it is already spent.
+    rerankCalls = 0;
+    await withServe({ CLAWMEM_QUERY_BUDGET_MS: "1500" }, async (s) => {
+      const r = await s.postSlowBody(Q_RERANK, 3000);
+      expect(r.status).toBe(200);
+      expect(r.body.degraded).toBe(true);
+      expect(r.body.degraded_reason).toBe("query_budget_expired");
+      expect(hitsOf(r.body)).toEqual([]);
+      expect(rerankCalls).toBe(0);
+      const [t] = await s.timings();
+      expect(t!.counts.query_budget_unstarted).toBe(1);
+      expect(t!.counts.vec_legs).toBeUndefined();
+    });
+  }, 90_000);
+
+  test("B7: a budget spent during FTS skips the vector stage and rerank, and still answers with the FTS hits", async () => {
+    // FTS cannot be cut, so the stall runs its course; what the budget decides is what happens next.
+    rerankCalls = 0;
+    await withServe(
+      {
+        CLAWMEM_QUERY_BUDGET_MS: "600",
+        CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MS: "1500",
+        CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MATCH: "cutoffprobe",
+      },
+      async (s) => {
+        const r = await s.post(Q_RERANK);
+        expect(r.status).toBe(200);
+        expect(r.body.degraded).toBe(true);
+        expect(r.body.degraded_reason).toBe("query_budget_expired");
+        expect(hitsOf(r.body).map((h) => h.file)).toContain("alpha/ferry.md");
+        expect(rerankCalls).toBe(0);
+        const [t] = await s.timings();
+        expect(t!.counts.query_budget_expired).toBe(1);
+        expect(t!.counts.vec_legs).toBe(0);
+        expect(t!.counts.query_budget_unstarted).toBeUndefined();
+      },
+    );
+  }, 90_000);
+
+  test("B8: a failed vector leg stays the reply's reason when the budget also cuts the request", async () => {
+    // A directory as the seam's log path makes every worker leg throw a plain (non-fatal) error.
+    // Rerank then outlasts the budget. The hook counts vec_leg_failed toward its DOWN streak, so
+    // the reply must keep it; the timing row counts both reasons.
+    rerankDelayMs = 4500;
+    try {
+      await withServe(
+        { CLAWMEM_QUERY_BUDGET_MS: "2000", CLAWMEM_VEC_SCAN_TEST_LOG: ROOT },
+        async (s) => {
+          // Cold start must not eat the budget before the vector stage runs: warm with a fast rerank.
+          rerankDelayMs = 0;
+          await s.post(Q_OK);
+          rerankDelayMs = 4500;
+          const r = await s.post(Q_LEG);
+          expect(r.status).toBe(200);
+          expect(r.body.degraded).toBe(true);
+          expect(r.body.degraded_reason).toBe("vec_leg_failed");
+          expect(hitsOf(r.body).length).toBeGreaterThan(0);
+          const t = (await s.timings()).at(-1)!;
+          expect(t.counts.vec_leg_failed).toBe(1);
+          expect(t.counts.query_budget_expired).toBe(1);
+        },
+      );
+    } finally {
+      rerankDelayMs = 0;
+    }
+  }, 90_000);
+
+  test("B9: a failed vector leg alone is vec_leg_failed with no budget cut counted", async () => {
+    await withServe(
+      { CLAWMEM_QUERY_BUDGET_MS: "20000", CLAWMEM_VEC_SCAN_TEST_LOG: ROOT },
+      async (s) => {
+        const r = await s.post(Q_LEG);
+        expect(r.body.degraded_reason).toBe("vec_leg_failed");
+        const [t] = await s.timings();
+        expect(t!.counts.vec_leg_failed).toBe(1);
+        expect(t!.counts.query_budget_expired).toBe(0);
+      },
+    );
   }, 90_000);
 
   test("C: env unset is today's behaviour: bare array, no budget count, requests serialize", async () => {
