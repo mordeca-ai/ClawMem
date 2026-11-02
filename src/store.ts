@@ -2872,11 +2872,20 @@ export function getCachedResult(db: Database, cacheKey: string): string | null {
   return row?.result || null;
 }
 
+/**
+ * Rerank scores are written per document and per query, up to about 2200 rows an hour, and share
+ * this table with query expansions. The cap has to hold about a day of writes, or a repeating
+ * query loses its cached expansion before it runs again (master-harness-uvnhf.17).
+ */
+export const LLM_CACHE_MAX_ROWS = 50_000;
+/** A purge at the cap takes about 200 ms on the caller's thread, so it stays rare. */
+const LLM_CACHE_PURGE_PROBABILITY = 0.001;
+
 export function setCachedResult(db: Database, cacheKey: string, result: string): void {
   const now = new Date().toISOString();
   db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`).run(cacheKey, result, now);
-  if (Math.random() < 0.01) {
-    db.exec(`DELETE FROM llm_cache WHERE hash NOT IN (SELECT hash FROM llm_cache ORDER BY created_at DESC LIMIT 1000)`);
+  if (Math.random() < LLM_CACHE_PURGE_PROBABILITY) {
+    db.exec(`DELETE FROM llm_cache WHERE hash NOT IN (SELECT hash FROM llm_cache ORDER BY created_at DESC LIMIT ${LLM_CACHE_MAX_ROWS})`);
   }
 }
 
