@@ -40,7 +40,10 @@ function fatalFromWorker(err: unknown): FatalVectorError | null {
   return fatal;
 }
 
-export type VecDeadlinePool = Pick<WorkerLegPool, "size" | "warm" | "close" | "closeTracked" | "runLegOn" | "runLegScoped" | "releaseScoped">;
+export type VecDeadlinePool = Pick<
+  WorkerLegPool,
+  "size" | "warm" | "close" | "closeTracked" | "runLegOn" | "runLegScoped" | "releaseScoped"
+>;
 
 export type VecDeadlineOutcome<T> =
   | { status: "ok"; value: T }
@@ -105,11 +108,14 @@ export class VecDeadlineLegs {
    * Run `work` on the pool, bounded by `deadlineMs`. Expiry and a non-fatal leg failure both retire
    * the pool, so no leg of this query can outlive it; a fatal vector error is rethrown.
    */
-  async run<T>(deadlineMs: number, work: (pool: VecDeadlinePool) => Promise<T>): Promise<VecDeadlineOutcome<T>> {
+  async run<T>(
+    deadlineMs: number,
+    work: (pool: VecDeadlinePool) => Promise<T>,
+  ): Promise<VecDeadlineOutcome<T>> {
     if (this.abandonedScans() >= this.maxAbandoned) return { status: "shed" };
     const pool = (this.pool ??= this.opts.createPool());
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const expired = new Promise<"expired">(resolve => {
+    const expired = new Promise<"expired">((resolve) => {
       timer = setTimeout(() => resolve("expired"), deadlineMs);
     });
     try {
@@ -161,13 +167,15 @@ export interface VecDeadlineStageResult<E, R> {
 }
 
 /** The vector stage under a deadline: the same legs in the same order as the unbounded path. */
-export async function runVecStageWithDeadline<E, R>(opts: VecDeadlineStageOpts<E, R>): Promise<VecDeadlineStageResult<E, R>> {
+export async function runVecStageWithDeadline<E, R>(
+  opts: VecDeadlineStageOpts<E, R>,
+): Promise<VecDeadlineStageResult<E, R>> {
   let landed: E | undefined;
-  const expansion = opts.expansion.then(e => {
+  const expansion = opts.expansion.then((e) => {
     landed = e;
     return e;
   });
-  const outcome = await opts.legs.run(opts.deadlineMs, async pool => {
+  const outcome = await opts.legs.run(opts.deadlineMs, async (pool) => {
     const out = await runVecLegsOverlapped({
       original: opts.original,
       expansion,
@@ -187,7 +195,9 @@ export async function runVecStageWithDeadline<E, R>(opts: VecDeadlineStageOpts<E
     case "shed":
       return { expansion: landed, results: [], degraded: "vec_deadline_shed" };
     case "failed":
-      console.error(`[clawmem] vector leg worker failed, dropping vector results: ${outcome.error.message}`);
+      console.error(
+        `[clawmem] vector leg worker failed, dropping vector results: ${outcome.error.message}`,
+      );
       return { expansion: landed, results: [], degraded: "vec_leg_failed" };
   }
 }

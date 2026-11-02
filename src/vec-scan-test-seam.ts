@@ -11,7 +11,10 @@
  */
 import { appendFileSync } from "node:fs";
 
-export function vecScanTestSeam(query: string, env: Record<string, string | undefined> = process.env): void {
+export function vecScanTestSeam(
+  query: string,
+  env: Record<string, string | undefined> = process.env,
+): void {
   const log = env.CLAWMEM_VEC_SCAN_TEST_LOG;
   if (log) appendFileSync(log, `${Bun.isMainThread ? "main" : "worker"}\n`);
   const ms = Number(env.CLAWMEM_VEC_SCAN_TEST_BLOCK_MS);

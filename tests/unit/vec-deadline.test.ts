@@ -23,7 +23,7 @@ import { fakeEmbedVector, goldenRerankScore } from "../helpers/fake-embed-server
  * that log, and no test here depends on how loaded the host is.
  */
 
-const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 type FakePool = VecDeadlinePool & { closes: number; exits: Array<() => void>; legs: string[] };
 
@@ -34,13 +34,21 @@ function fakePool(run: (q: string) => Promise<unknown> = async () => []): FakePo
     exits: [],
     legs: [],
     warm: async () => {},
-    close: () => { pool.closes++; },
+    close: () => {
+      pool.closes++;
+    },
     closeTracked: () => {
       pool.closes++;
-      return [new Promise<void>(resolve => pool.exits.push(resolve))];
+      return [new Promise<void>((resolve) => pool.exits.push(resolve))];
     },
-    runLegOn: async q => { pool.legs.push(q); return (await run(q)) as never; },
-    runLegScoped: async q => { pool.legs.push(q); return (await run(q)) as never; },
+    runLegOn: async (q) => {
+      pool.legs.push(q);
+      return (await run(q)) as never;
+    },
+    runLegScoped: async (q) => {
+      pool.legs.push(q);
+      return (await run(q)) as never;
+    },
     releaseScoped: () => {},
   };
   return pool;
@@ -62,7 +70,13 @@ describe("vecDeadlineMs", () => {
 describe("VecDeadlineLegs", () => {
   it("returns the value in time and keeps the same pool for the next query", async () => {
     const pools: FakePool[] = [];
-    const legs = new VecDeadlineLegs({ createPool: () => { const p = fakePool(); pools.push(p); return p; } });
+    const legs = new VecDeadlineLegs({
+      createPool: () => {
+        const p = fakePool();
+        pools.push(p);
+        return p;
+      },
+    });
     expect(await legs.run(1000, async () => "fine")).toEqual({ status: "ok", value: "fine" });
     expect(await legs.run(1000, async () => "again")).toEqual({ status: "ok", value: "again" });
     expect(pools).toHaveLength(1);
@@ -71,22 +85,41 @@ describe("VecDeadlineLegs", () => {
 
   it("on expiry retires the pool, and the next query gets a new one", async () => {
     const pools: FakePool[] = [];
-    const legs = new VecDeadlineLegs({ createPool: () => { const p = fakePool(); pools.push(p); return p; } });
+    const legs = new VecDeadlineLegs({
+      createPool: () => {
+        const p = fakePool();
+        pools.push(p);
+        return p;
+      },
+    });
     expect(await legs.run(5, never)).toEqual({ status: "expired" });
     expect(pools[0]!.closes).toBe(1);
-    expect(await legs.run(1000, async () => "recovered")).toEqual({ status: "ok", value: "recovered" });
+    expect(await legs.run(1000, async () => "recovered")).toEqual({
+      status: "ok",
+      value: "recovered",
+    });
     expect(pools).toHaveLength(2);
     expect(pools[1]!.closes).toBe(0);
   });
 
   it("sheds once too many abandoned scans are running, and resumes as they exit", async () => {
     const pools: FakePool[] = [];
-    const legs = new VecDeadlineLegs({ createPool: () => { const p = fakePool(); pools.push(p); return p; } });
-    for (let i = 0; i < VEC_DEADLINE_MAX_ABANDONED; i++) expect((await legs.run(5, never)).status).toBe("expired");
+    const legs = new VecDeadlineLegs({
+      createPool: () => {
+        const p = fakePool();
+        pools.push(p);
+        return p;
+      },
+    });
+    for (let i = 0; i < VEC_DEADLINE_MAX_ABANDONED; i++)
+      expect((await legs.run(5, never)).status).toBe("expired");
     expect(legs.abandonedScans()).toBe(VEC_DEADLINE_MAX_ABANDONED);
 
     let started = false;
-    const shed = await legs.run(1000, async () => { started = true; return "no"; });
+    const shed = await legs.run(1000, async () => {
+      started = true;
+      return "no";
+    });
     expect(shed).toEqual({ status: "shed" });
     expect(started).toBe(false);
     const poolsWhenShed = pools.length;
@@ -100,7 +133,12 @@ describe("VecDeadlineLegs", () => {
 
   it("stops counting an abandoned worker whose close never arrives", async () => {
     let now = 1000;
-    const legs = new VecDeadlineLegs({ createPool: () => fakePool(), now: () => now, abandonedStaleMs: 500, maxAbandoned: 1 });
+    const legs = new VecDeadlineLegs({
+      createPool: () => fakePool(),
+      now: () => now,
+      abandonedStaleMs: 500,
+      maxAbandoned: 1,
+    });
     await legs.run(5, never);
     expect((await legs.run(1000, async () => "x")).status).toBe("shed");
     now += 501;
@@ -109,8 +147,14 @@ describe("VecDeadlineLegs", () => {
 
   it("restores a fatal vector error from a worker, with its class and message", async () => {
     const legs = new VecDeadlineLegs({ createPool: () => fakePool() });
-    const fromWorker = Object.assign(new Error("Embedding model changed"), { fatalName: "VecReadModelMismatchError" });
-    const caught = await legs.run(1000, async () => { throw fromWorker; }).catch(e => e);
+    const fromWorker = Object.assign(new Error("Embedding model changed"), {
+      fatalName: "VecReadModelMismatchError",
+    });
+    const caught = await legs
+      .run(1000, async () => {
+        throw fromWorker;
+      })
+      .catch((e) => e);
     expect(caught).toBeInstanceOf(FatalVectorError);
     expect(caught.name).toBe("VecReadModelMismatchError");
     expect(caught.message).toBe("Embedding model changed");
@@ -118,8 +162,16 @@ describe("VecDeadlineLegs", () => {
 
   it("a non-fatal leg failure retires the pool and reports failed", async () => {
     const pools: FakePool[] = [];
-    const legs = new VecDeadlineLegs({ createPool: () => { const p = fakePool(); pools.push(p); return p; } });
-    const res = await legs.run(1000, async () => { throw new Error("Worker spawn failed"); });
+    const legs = new VecDeadlineLegs({
+      createPool: () => {
+        const p = fakePool();
+        pools.push(p);
+        return p;
+      },
+    });
+    const res = await legs.run(1000, async () => {
+      throw new Error("Worker spawn failed");
+    });
     expect(res.status).toBe("failed");
     expect(pools[0]!.closes).toBe(1);
   });
@@ -127,7 +179,12 @@ describe("VecDeadlineLegs", () => {
   it("keepWarm warms a worker at once and a fresh one after an expiry", async () => {
     const warmed: Array<string | undefined> = [];
     const legs = new VecDeadlineLegs({
-      createPool: () => ({ ...fakePool(), warm: async (_n: number, path?: string) => { warmed.push(path); } }),
+      createPool: () => ({
+        ...fakePool(),
+        warm: async (_n: number, path?: string) => {
+          warmed.push(path);
+        },
+      }),
     });
     legs.keepWarm("/vault.sqlite");
     expect(warmed).toEqual(["/vault.sqlite"]);
@@ -144,28 +201,44 @@ describe("runVecStageWithDeadline", () => {
       original: "orig",
       expansion,
       legsOf: (e: string[]) => e,
-      legOn: pool => q => pool.runLegOn(q, { dbPath: "", model: "m", limit: 1 }),
+      legOn: (pool) => (q) => pool.runLegOn(q, { dbPath: "", model: "m", limit: 1 }),
       warm: 0,
     });
 
   it("keeps leg order when nothing expires", async () => {
-    const pool = fakePool(async q => [q]);
-    const res = await stage(new VecDeadlineLegs({ createPool: () => pool }), 1000, Promise.resolve(["a", "b"]));
+    const pool = fakePool(async (q) => [q]);
+    const res = await stage(
+      new VecDeadlineLegs({ createPool: () => pool }),
+      1000,
+      Promise.resolve(["a", "b"]),
+    );
     expect(res.degraded).toBeUndefined();
     expect(res.results as unknown).toEqual([["orig"], ["a"], ["b"]]);
   });
 
   it("drops the vector results but keeps an expansion that landed in time", async () => {
     const pool = fakePool(() => never());
-    const res = await stage(new VecDeadlineLegs({ createPool: () => pool }), 20, Promise.resolve(["a"]));
+    const res = await stage(
+      new VecDeadlineLegs({ createPool: () => pool }),
+      20,
+      Promise.resolve(["a"]),
+    );
     expect(res).toEqual({ expansion: ["a"], results: [], degraded: "vec_deadline_expired" });
   });
 
   it("does not wait for an expansion still in flight, nor start its legs when it lands", async () => {
     const pools: FakePool[] = [];
     let land!: (e: string[]) => void;
-    const expansion = new Promise<string[]>(resolve => { land = resolve; });
-    const legs = new VecDeadlineLegs({ createPool: () => { const p = fakePool(() => never()); pools.push(p); return p; } });
+    const expansion = new Promise<string[]>((resolve) => {
+      land = resolve;
+    });
+    const legs = new VecDeadlineLegs({
+      createPool: () => {
+        const p = fakePool(() => never());
+        pools.push(p);
+        return p;
+      },
+    });
     const res = await stage(legs, 20, expansion);
     expect(res).toEqual({ expansion: undefined, results: [], degraded: "vec_deadline_expired" });
     expect(pools[0]!.legs).toEqual(["orig"]);
@@ -209,16 +282,19 @@ function mulberry(seed: number): () => number {
 function seedVault(): void {
   mkdirSync(join(ROOT, "alpha"), { recursive: true });
   mkdirSync(join(ROOT, "beta"), { recursive: true });
-  writeFileSync(join(ROOT, "config.yaml"), [
-    "collections:",
-    "  alpha:",
-    `    path: ${join(ROOT, "alpha")}`,
-    '    pattern: "**/*.md"',
-    "  beta:",
-    `    path: ${join(ROOT, "beta")}`,
-    '    pattern: "**/*.md"',
-    "",
-  ].join("\n"));
+  writeFileSync(
+    join(ROOT, "config.yaml"),
+    [
+      "collections:",
+      "  alpha:",
+      `    path: ${join(ROOT, "alpha")}`,
+      '    pattern: "**/*.md"',
+      "  beta:",
+      `    path: ${join(ROOT, "beta")}`,
+      '    pattern: "**/*.md"',
+      "",
+    ].join("\n"),
+  );
   const store = createStore(DB);
   const now = new Date().toISOString();
   store.ensureVecTable(DIM);
@@ -233,7 +309,17 @@ function seedVault(): void {
     const v = new Float32Array(DIM);
     for (let seq = 0; seq < 3100; seq++) {
       for (let i = 0; i < DIM; i++) v[i] = r() * 2 - 1;
-      store.insertEmbedding(fillerHash, seq, seq, v, MODEL, now, "full", undefined, "beta/filler.md");
+      store.insertEmbedding(
+        fillerHash,
+        seq,
+        seq,
+        v,
+        MODEL,
+        now,
+        "full",
+        undefined,
+        "beta/filler.md",
+      );
     }
     const docs: Record<string, string> = {
       "ferry.md": `# Orbital ferry schedule ${BLOCKED}\n\nThe orbital ferry liveone livetwo departs every six hours.\n`,
@@ -244,11 +330,22 @@ function seedVault(): void {
       const hash = hashContent(body + path);
       store.insertContent(hash, body, now);
       store.insertDocument("alpha", path, path, hash, now, now);
-      store.insertEmbedding(hash, 0, 1, new Float32Array(fakeEmbedVector(body, DIM)), MODEL, now, "full", undefined, `alpha/${path}`);
+      store.insertEmbedding(
+        hash,
+        0,
+        1,
+        new Float32Array(fakeEmbedVector(body, DIM)),
+        MODEL,
+        now,
+        "full",
+        undefined,
+        `alpha/${path}`,
+      );
     }
     // Known at once (llm_cache hit, no expansion): the path that used to run one leg in process.
     for (const q of [Q_OK, Q_BLOCK]) {
-      store.db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`)
+      store.db
+        .prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`)
         .run(expandQueryCacheKey(q), "[]", now);
     }
   })();
@@ -258,7 +355,13 @@ function seedVault(): void {
 function serveEnv(extra: Record<string, string>): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined && !k.startsWith("CLAWMEM_") && k !== "INDEX_PATH" && !k.endsWith("SESSION_ID")) env[k] = v;
+    if (
+      v !== undefined &&
+      !k.startsWith("CLAWMEM_") &&
+      k !== "INDEX_PATH" &&
+      !k.endsWith("SESSION_ID")
+    )
+      env[k] = v;
   }
   const url = `http://127.0.0.1:${fake.port}`;
   return {
@@ -295,7 +398,10 @@ type Serve = {
   timings: () => Promise<Timing[]>;
 };
 
-async function withServe(extra: Record<string, string>, fn: (s: Serve) => Promise<void>): Promise<void> {
+async function withServe(
+  extra: Record<string, string>,
+  fn: (s: Serve) => Promise<void>,
+): Promise<void> {
   writeFileSync(SCAN_LOG, "");
   const probe = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
   const port = probe.port as number;
@@ -311,7 +417,9 @@ async function withServe(extra: Record<string, string>, fn: (s: Serve) => Promis
     for (;;) {
       try {
         if ((await fetch(`${base}/health`)).ok) break;
-      } catch { /* not listening yet */ }
+      } catch {
+        /* not listening yet */
+      }
       if (Date.now() > up) throw new Error("serve never became healthy");
       await sleep(100);
     }
@@ -331,8 +439,10 @@ async function withServe(extra: Record<string, string>, fn: (s: Serve) => Promis
         proc.kill(9);
         await proc.exited;
         finished ??= await stderr;
-        return finished.split("\n").filter(l => l.includes("[query-timing]"))
-          .map(l => JSON.parse(l.slice(l.indexOf("{"))) as Timing);
+        return finished
+          .split("\n")
+          .filter((l) => l.includes("[query-timing]"))
+          .map((l) => JSON.parse(l.slice(l.indexOf("{"))) as Timing);
       },
     });
   } finally {
@@ -342,7 +452,7 @@ async function withServe(extra: Record<string, string>, fn: (s: Serve) => Promis
 }
 
 const hitsOf = (body: QueryBody): Hit[] => (Array.isArray(body) ? body : body.hits);
-const ranking = (body: QueryBody) => hitsOf(body).map(h => [h.file, h.searchScore]);
+const ranking = (body: QueryBody) => hitsOf(body).map((h) => [h.file, h.searchScore]);
 
 beforeAll(() => {
   fake = Bun.serve({
@@ -352,12 +462,21 @@ beforeAll(() => {
       const path = new URL(req.url).pathname;
       if (path.endsWith("/v1/rerank")) {
         const rr = (await req.json()) as { documents: string[] };
-        return Response.json({ results: rr.documents.map((t, index) => ({ index, relevance_score: goldenRerankScore(t) })) });
+        return Response.json({
+          results: rr.documents.map((t, index) => ({
+            index,
+            relevance_score: goldenRerankScore(t),
+          })),
+        });
       }
       if (path.endsWith("/chat/completions")) {
         // A live LLM call: slow enough that the expansion is still in flight when the leg starts.
         await sleep(150);
-        return Response.json({ choices: [{ message: { content: "lex: orbital ferry\nvec: orbital ferry departure times" } }] });
+        return Response.json({
+          choices: [
+            { message: { content: "lex: orbital ferry\nvec: orbital ferry departure times" } },
+          ],
+        });
       }
       if (path.endsWith("/v1/embeddings")) {
         const body = (await req.json()) as { input: string | string[] };
@@ -371,7 +490,7 @@ beforeAll(() => {
     },
   });
   seedVault();
-});
+}, 120_000);
 
 afterAll(() => {
   fake.stop(true);
@@ -384,21 +503,27 @@ const A1_BLOCK_MS = "6000";
 
 describe("clawmem serve POST /query under CLAWMEM_QUERY_VEC_DEADLINE_MS", () => {
   test("A1: a blocked scan returns FTS hits, flagged degraded, within deadline + 1000 ms", async () => {
-    await withServe({ CLAWMEM_QUERY_VEC_DEADLINE_MS: A1_DEADLINE_MS, CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: A1_BLOCK_MS }, async s => {
-      const { status, body, ms } = await s.post(Q_BLOCK);
-      expect(status).toBe(200);
-      expect(ms).toBeLessThan(500 + 1000);
-      expect(body.degraded).toBe(true);
-      expect(body.degraded_reason).toBe("vec_deadline_expired");
-      expect(body.hits.map((h: Hit) => h.file)).toContain("alpha/ferry.md");
-      const [timing] = await s.timings();
-      expect(timing!.counts.vec_deadline_expired).toBe(1);
-      expect(timing!.counts.vec_legs).toBe(0);
-    });
+    await withServe(
+      {
+        CLAWMEM_QUERY_VEC_DEADLINE_MS: A1_DEADLINE_MS,
+        CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: A1_BLOCK_MS,
+      },
+      async (s) => {
+        const { status, body, ms } = await s.post(Q_BLOCK);
+        expect(status).toBe(200);
+        expect(ms).toBeLessThan(500 + 1000);
+        expect(body.degraded).toBe(true);
+        expect(body.degraded_reason).toBe("vec_deadline_expired");
+        expect(body.hits.map((h: Hit) => h.file)).toContain("alpha/ferry.md");
+        const [timing] = await s.timings();
+        expect(timing!.counts.vec_deadline_expired).toBe(1);
+        expect(timing!.counts.vec_legs).toBe(0);
+      },
+    );
   }, 60_000);
 
   test("A2: env unset keeps the single leg in process, blocking, in the bare array shape", async () => {
-    await withServe({ CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "1500" }, async s => {
+    await withServe({ CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "1500" }, async (s) => {
       const { status, body, ms } = await s.post(Q_BLOCK);
       expect(status).toBe(200);
       expect(Array.isArray(body)).toBe(true);
@@ -410,7 +535,7 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_VEC_DEADLINE_MS", () => 
   }, 60_000);
 
   test("A2: deadline 0 is the same as unset", async () => {
-    await withServe({ CLAWMEM_QUERY_VEC_DEADLINE_MS: "0" }, async s => {
+    await withServe({ CLAWMEM_QUERY_VEC_DEADLINE_MS: "0" }, async (s) => {
       const { body } = await s.post(Q_OK);
       expect(Array.isArray(body)).toBe(true);
       expect(scanThreads()).toEqual(["main"]);
@@ -421,7 +546,7 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_VEC_DEADLINE_MS", () => 
     const shapes: Array<[string, string?]> = [[Q_OK], [Q_OK, "alpha"], [Q_LIVE_OK]];
     const run = async (extra: Record<string, string>) => {
       const out: unknown[] = [];
-      await withServe(extra, async s => {
+      await withServe(extra, async (s) => {
         for (const [q, c] of shapes) {
           const { status, body } = await s.post(q, c);
           expect(status).toBe(200);
@@ -440,10 +565,14 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_VEC_DEADLINE_MS", () => 
   }, 120_000);
 
   describe("A3: expiry never reruns the scan on the main thread", () => {
-    const deadline = { CLAWMEM_QUERY_VEC_DEADLINE_MS: "300", CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "3000" };
+    // Long enough that the leg has embedded and reached the seam, far short of the block.
+    const deadline = {
+      CLAWMEM_QUERY_VEC_DEADLINE_MS: "1500",
+      CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "10000",
+    };
 
     test("the single-leg shape", async () => {
-      await withServe(deadline, async s => {
+      await withServe(deadline, async (s) => {
         const { body } = await s.post(Q_BLOCK);
         expect(body.degraded).toBe(true);
         await sleep(600); // Long enough for a fallback leg to have embedded and reached the seam.
@@ -453,19 +582,19 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_VEC_DEADLINE_MS", () => 
 
     test("the scoped shape, which the chunk-targeted scan serves when nothing expires", async () => {
       // The fixture really does select the scoped path, off and on.
-      await withServe({}, async s => {
+      await withServe({}, async (s) => {
         await s.post(Q_OK, "alpha");
         expect(scanThreads()).toEqual(["main"]);
         const [timing] = await s.timings();
         expect(timing!.counts.scope_scans).toBeGreaterThan(0);
       });
-      await withServe({ CLAWMEM_QUERY_VEC_DEADLINE_MS: "60000" }, async s => {
+      await withServe({ CLAWMEM_QUERY_VEC_DEADLINE_MS: "60000" }, async (s) => {
         await s.post(Q_OK, "alpha");
         expect(scanThreads()).toEqual(["worker"]);
         const [timing] = await s.timings();
         expect(timing!.counts.scope_scans).toBeGreaterThan(0);
       });
-      await withServe(deadline, async s => {
+      await withServe(deadline, async (s) => {
         const { body } = await s.post(Q_BLOCK, "alpha");
         expect(body.degraded).toBe(true);
         expect(body.hits.map((h: Hit) => h.file)).toContain("alpha/ferry.md");
@@ -475,7 +604,7 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_VEC_DEADLINE_MS", () => 
     }, 90_000);
 
     test("the live-expansion shape", async () => {
-      await withServe(deadline, async s => {
+      await withServe(deadline, async (s) => {
         const { status, body } = await s.post(Q_LIVE_BLOCK);
         expect(status).toBe(200);
         expect(body.degraded).toBe(true);
@@ -487,42 +616,61 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_VEC_DEADLINE_MS", () => 
   });
 
   test("A4: the next request after an expiry succeeds, with vector legs, on a working pool", async () => {
-    await withServe({ CLAWMEM_QUERY_VEC_DEADLINE_MS: "2000", CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "20000" }, async s => {
-      expect((await s.post(Q_BLOCK)).body.degraded).toBe(true);
-      const next = await s.post(Q_OK);
-      expect(next.status).toBe(200);
-      expect(Array.isArray(next.body)).toBe(true);
-      expect(hitsOf(next.body).length).toBeGreaterThan(0);
-      const timings = await s.timings();
-      expect(timings[1]!.counts.vec_deadline_expired).toBe(0);
-      expect(timings[1]!.counts.vec_legs).toBe(1);
-    });
+    await withServe(
+      { CLAWMEM_QUERY_VEC_DEADLINE_MS: "5000", CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "30000" },
+      async (s) => {
+        expect((await s.post(Q_BLOCK)).body.degraded).toBe(true);
+        const next = await s.post(Q_OK);
+        expect(next.status).toBe(200);
+        expect(Array.isArray(next.body)).toBe(true);
+        expect(hitsOf(next.body).length).toBeGreaterThan(0);
+        const timings = await s.timings();
+        expect(timings[1]!.counts.vec_deadline_expired).toBe(0);
+        expect(timings[1]!.counts.vec_legs).toBe(1);
+      },
+    );
     expect(scanThreads()).toEqual(["worker", "worker"]);
   }, 60_000);
 
   test("abandoned scans are bounded: past the cap a query sheds without starting a scan", async () => {
-    await withServe({ CLAWMEM_QUERY_VEC_DEADLINE_MS: "200", CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "30000" }, async s => {
-      for (let i = 0; i < VEC_DEADLINE_MAX_ABANDONED; i++) {
-        expect((await s.post(Q_BLOCK)).body.degraded_reason).toBe("vec_deadline_expired");
-      }
-      const scansBefore = scanThreads().length;
-      const shed = await s.post(Q_BLOCK);
-      expect(shed.status).toBe(200);
-      expect(shed.body.degraded_reason).toBe("vec_deadline_shed");
-      expect(shed.body.hits.map((h: Hit) => h.file)).toContain("alpha/ferry.md");
-      expect(scanThreads().length).toBe(scansBefore);
-      const timings = await s.timings();
-      expect(timings.at(-1)!.counts.vec_deadline_shed).toBe(1);
-    });
-  }, 60_000);
+    await withServe(
+      { CLAWMEM_QUERY_VEC_DEADLINE_MS: "1500", CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "120000" },
+      async (s) => {
+        // A leg still embedding at the deadline dies at once and leaves nothing behind, so count
+        // what reached the scan rather than assume each expiry did.
+        let shed: Awaited<ReturnType<Serve["post"]>> | undefined;
+        for (let i = 0; i < VEC_DEADLINE_MAX_ABANDONED + 4 && !shed; i++) {
+          const res = await s.post(Q_BLOCK);
+          if (res.body.degraded_reason === "vec_deadline_shed") shed = res;
+          else expect(res.body.degraded_reason).toBe("vec_deadline_expired");
+        }
+        expect(shed).toBeDefined();
+        expect(shed!.status).toBe(200);
+        expect(shed!.body.hits.map((h: Hit) => h.file)).toContain("alpha/ferry.md");
+        expect(scanThreads().length).toBe(VEC_DEADLINE_MAX_ABANDONED);
+        const timings = await s.timings();
+        expect(timings.at(-1)!.counts.vec_deadline_shed).toBe(1);
+      },
+    );
+  }, 90_000);
 
-  test("the abandoned worker frees its slot when the scan really ends", async () => {
-    await withServe({ CLAWMEM_QUERY_VEC_DEADLINE_MS: "200", CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "2500" }, async s => {
-      for (let i = 0; i < VEC_DEADLINE_MAX_ABANDONED; i++) await s.post(Q_BLOCK);
-      await sleep(3500);
-      const back = await s.post(Q_OK);
-      expect(Array.isArray(back.body)).toBe(true);
-    });
+  test("an abandoned worker stops counting when its scan really ends", async () => {
+    const blockMs = 4000;
+    await withServe(
+      {
+        CLAWMEM_QUERY_VEC_DEADLINE_MS: "1500",
+        CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: String(blockMs),
+      },
+      async (s) => {
+        for (let i = 0; i < VEC_DEADLINE_MAX_ABANDONED; i++) await s.post(Q_BLOCK);
+        await sleep(blockMs + 2000);
+        // Whether this query itself beats the deadline does not matter here; it must get to try.
+        const back = await s.post(Q_OK);
+        expect(back.status).toBe(200);
+        expect(back.body.degraded_reason).not.toBe("vec_deadline_shed");
+        expect(scanThreads().length).toBeGreaterThan(VEC_DEADLINE_MAX_ABANDONED - 1);
+      },
+    );
   }, 60_000);
 
   test("a fatal vector error surfaces exactly as it does with the deadline off", async () => {
@@ -530,7 +678,7 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_VEC_DEADLINE_MS", () => 
     try {
       const run = async (extra: Record<string, string>) => {
         let out: { status: number; body: unknown } | undefined;
-        await withServe(extra, async s => {
+        await withServe(extra, async (s) => {
           out = await s.post(Q_OK);
         });
         return out!;
@@ -553,7 +701,10 @@ describe("clawmem query (CLI) under the deadline", () => {
     const t0 = performance.now();
     const proc = Bun.spawn([process.execPath, "src/clawmem.ts", "query", Q_BLOCK, "--json"], {
       cwd: REPO_ROOT,
-      env: serveEnv({ CLAWMEM_QUERY_VEC_DEADLINE_MS: "300", CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "15000" }),
+      env: serveEnv({
+        CLAWMEM_QUERY_VEC_DEADLINE_MS: "5000",
+        CLAWMEM_VEC_SCAN_TEST_BLOCK_MS: "60000",
+      }),
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -563,9 +714,9 @@ describe("clawmem query (CLI) under the deadline", () => {
       proc.exited,
     ]);
     expect(code, stderr).toBe(0);
-    expect(performance.now() - t0).toBeLessThan(15_000);
-    expect((JSON.parse(stdout) as Hit[]).map(h => h.file)).toContain("alpha/ferry.md");
+    expect(performance.now() - t0).toBeLessThan(60_000);
+    expect((JSON.parse(stdout) as Hit[]).map((h) => h.file)).toContain("alpha/ferry.md");
     expect(stderr).toContain("vec_deadline_expired");
     expect(scanThreads()).toEqual(["worker"]);
-  }, 60_000);
+  }, 90_000);
 });
