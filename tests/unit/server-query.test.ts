@@ -21,6 +21,7 @@ describe("POST /query", () => {
       calls.push([query, collection, limit, sessionId]);
       if (collection === "unknown-collection") throw new QueryRequestError("Unknown collection 'unknown-collection'.");
       if (query === "explode") throw new Error("pipeline fault");
+      if (query === "degraded") return { degraded: true as const, degraded_reason: "vec_deadline_expired", hits: [hit] };
       return [hit];
     });
     base = `http://127.0.0.1:${server.port}`;
@@ -38,6 +39,13 @@ describe("POST /query", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual([hit]);
     expect(calls.at(-1)).toEqual(["relay policy", "openclaw-workspace", 3, undefined]);
+  });
+
+  // master-harness-vn4rz.131: a degraded answer is the one shape that is not the bare array.
+  test("a degraded handler answer reaches the caller with its flag and its hits", async () => {
+    const response = await post({ query: "degraded" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ degraded: true, degraded_reason: "vec_deadline_expired", hits: [hit] });
   });
 
   // master-harness-vn4rz.123: collection is optional (absent => unscoped) and session_id is

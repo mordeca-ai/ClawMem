@@ -52,7 +52,18 @@ export type QueryHandler = (
   collection: string | undefined,
   limit: number,
   sessionId?: string,
-) => Promise<QueryJsonHit[]>;
+) => Promise<QueryJsonHit[] | DegradedQueryResponse>;
+
+/**
+ * POST /query when the vector legs were dropped (master-harness-vn4rz.131). A healthy answer stays
+ * the bare hit array `clawmem query --json` prints; this object appears only when the deadline in
+ * CLAWMEM_QUERY_VEC_DEADLINE_MS actually cost the query its vector results.
+ */
+export type DegradedQueryResponse = {
+  degraded: true;
+  degraded_reason: string;
+  hits: QueryJsonHit[];
+};
 
 /**
  * A request the query pipeline refuses as the CALLER's fault (unknown collection, ...). A

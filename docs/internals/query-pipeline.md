@@ -112,6 +112,18 @@ The original query's vector leg does not depend on the expansion. When the expan
 
 The old path still runs in three cases: a strong BM25 signal (no expansion), an `llm_cache` hit (the leg list is known at once), and `CLAWMEM_QUERY_VEC_PARALLEL=1`.
 
+### Deadline on the vector legs
+
+`CLAWMEM_QUERY_VEC_DEADLINE_MS=<n>` bounds the vector stage of the CLI `query` and of `POST /query` on `clawmem serve` (vn4rz.131). Unset, `0` or anything other than a positive integer leaves it off, and the paths described here run unchanged. The MCP `query` tool has its own pipeline and ignores it.
+
+When it is on, every leg runs on a worker, including the single-leg and scoped paths that otherwise run in process. A scan on the main thread would block the timer meant to end it. `clawmem serve` keeps one worker warm across requests. Legs and their order are unchanged, so a query that finishes in time ranks exactly as it does with the deadline off. Scoped legs read the scope's vectors on their worker's own thread rather than on `CLAWMEM_QUERY_VEC_PARALLEL` threads, so a large scope loads more slowly under the deadline.
+
+On expiry the workers are terminated, the vector results are dropped, and the query continues with FTS, fusion and rerank. It never falls back to an in-process leg. `POST /query` then answers `{"degraded": true, "degraded_reason": "vec_deadline_expired", "hits": [...]}` instead of the bare array. The CLI prints the usual array and notes the drop on stderr. With `CLAWMEM_QUERY_TIMING=1`, `counts` carries `vec_deadline_expired`, `vec_deadline_shed` and `vec_leg_failed`.
+
+`Worker.terminate()` does not stop a scan already inside SQLite. Measured on Bun 1.3.13, it returns in under 10 ms, but the thread keeps scanning until `sqlite3_step` returns, and only then does its `close` event fire. So an abandoned scan still uses CPU for its full length. Once 2 abandoned scans are still running, later queries skip the vector stage and answer degraded with `vec_deadline_shed`, so they cannot stack up.
+
+A worker failure other than expiry also drops the vector results, as `vec_leg_failed`. A fatal vector error, such as a model mismatch, still fails the query as it does with the deadline off.
+
 ## Scoped vector scan (collection-scoped legs)
 
 sqlite-vec reads every vector chunk before it applies a `hash_seq IN (...)` filter, so a scoped vector leg cost a scan of the whole vault (1.4 GB for 350k x 768 vectors) whatever the collection. For an include scope (`-c`, `collections`, `dateRange`) small enough to pre-filter, the leg now reads only the vec0 chunks that hold the scope's fragments, straight from the shadow tables, and computes cosine distances in JS with sqlite-vec's float32 operation order (vn4rz.100). The distances are bit-identical to vec0's and cover every in-scope fragment, so the results equal the vec0 path's. On the live vault, `docs` (15.7k fragments) sits in 172 of 459 chunks: about 0.54 GB is read once, and each further leg is a ~25 ms scan.

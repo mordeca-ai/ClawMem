@@ -1,4 +1,5 @@
 import type { SearchResult, VecSearchDetailedResult } from "./store.ts";
+import type { VecScopeScanStats } from "./vec-scope-scan.ts";
 
 export function vecLegParallelism(env: Record<string, string | undefined> = process.env): number {
   const raw = env.CLAWMEM_QUERY_VEC_PARALLEL?.trim();
@@ -71,6 +72,26 @@ export interface WorkerLegPoolOpts {
   collections?: string[];
 }
 
+/** Per-call configuration for a plain leg (the deadline path's long-lived pool, vn4rz.131). */
+export interface PlainLegOpts {
+  dbPath: string;
+  model: string;
+  limit: number;
+  collections?: string[];
+}
+
+/** A chunk-targeted scoped leg (vn4rz.100) run in a worker: legs sharing `scopeId` share one store. */
+export interface ScopedLegOpts extends PlainLegOpts {
+  collections: string[];
+  scopeId: string;
+  mmapBytes: number;
+}
+
+export interface ScopedLegResult {
+  results: SearchResult[];
+  scopeStats: VecScopeScanStats;
+}
+
 /** Full per-call configuration for a detailed leg (the MCP `query` path). */
 export interface DetailedLegOpts {
   dbPath: string;
@@ -92,7 +113,18 @@ export interface WorkerLegPool {
    * worker start and store open (vn4rz.97). Resolves when they are ready; never rejects.
    */
   warm(n: number, dbPath?: string): Promise<void>;
+  /** Plain `searchVec` leg with per-call options. A rejection may carry `fatalName`. */
+  runLegOn(query: string, opts: PlainLegOpts): Promise<SearchResult[]>;
+  /** Scoped leg in the worker. A rejection may carry `fatalName`. */
+  runLegScoped(query: string, opts: ScopedLegOpts): Promise<ScopedLegResult>;
+  /** Idle workers drop the store and vectors their scoped legs were holding. */
+  releaseScoped(): void;
   close(): void;
+  /**
+   * close(), returning one promise per worker that was busy: each resolves when that thread has
+   * really exited. A worker inside a native scan exits only when the scan returns.
+   */
+  closeTracked(): Promise<void>[];
 }
 
 interface Pending {
@@ -104,6 +136,7 @@ interface Pending {
 interface WorkerSlot {
   worker: Worker;
   pending?: Pending;
+  exited: Promise<void>;
 }
 
 interface QueuedRequest {
@@ -140,7 +173,10 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
     } catch {
       return undefined;
     }
-    const slot: WorkerSlot = { worker };
+    const exited = new Promise<void>(resolve => {
+      worker.addEventListener("close", () => resolve());
+    });
+    const slot: WorkerSlot = { worker, exited };
 
     worker.onmessage = (ev: MessageEvent) => {
       const msg = ev.data;
@@ -150,7 +186,11 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
       if (closed) return;
       idleSlots.push(slot);
       if (msg.ok) pending.resolve(msg.results);
-      else pending.reject(new Error(msg.error));
+      else {
+        const err = new Error(msg.error);
+        if (msg.fatalName) (err as Error & { fatalName?: string }).fatalName = msg.fatalName;
+        pending.reject(err);
+      }
       dispatch();
     };
 
@@ -220,6 +260,30 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
       excludeCollections: o.excludeCollections,
     });
 
+  const runLegOn = (query: string, o: PlainLegOpts): Promise<SearchResult[]> =>
+    submit<SearchResult[]>({
+      dbPath: o.dbPath,
+      model: o.model,
+      query,
+      limit: o.limit,
+      collections: o.collections,
+    });
+
+  const runLegScoped = (query: string, o: ScopedLegOpts): Promise<ScopedLegResult> =>
+    submit<ScopedLegResult>({
+      scopeId: o.scopeId,
+      mmapBytes: o.mmapBytes,
+      dbPath: o.dbPath,
+      model: o.model,
+      query,
+      limit: o.limit,
+      collections: o.collections,
+    });
+
+  const releaseScoped = () => {
+    for (const slot of idleSlots) slot.worker.postMessage({ releaseScoped: true });
+  };
+
   const warm = async (n: number, dbPath?: string): Promise<void> => {
     const count = Math.max(0, Math.min(Math.floor(n), poolSize));
     const targetDbPath = dbPath ?? opts.dbPath;
@@ -243,12 +307,25 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
     idleSlots.length = 0;
   };
 
+  const closeTracked = (): Promise<void>[] => {
+    const busy = [...slots].filter(slot => slot.pending);
+    // A thread still inside a native scan must not hold a CLI process open after its answer.
+    for (const slot of busy) slot.worker.unref();
+    const exits = busy.map(slot => slot.exited);
+    close();
+    return exits;
+  };
+
   return {
     size: poolSize,
     runLeg,
     runLegDetailed,
+    runLegOn,
+    runLegScoped,
+    releaseScoped,
     warm,
     close,
+    closeTracked,
   };
 }
 
