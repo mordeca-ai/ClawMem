@@ -60,6 +60,7 @@ import {
 } from "./amem.ts";
 import { parseLegacyEdgeWitness } from "./causal-reader.ts";
 import { uniquePhysicalResults } from "./search-utils.ts";
+import { vecScanTestSeam } from "./vec-scan-test-seam.ts";
 import {
   canonicalVecTableDim,
   loadScopedVectors,
@@ -4627,6 +4628,7 @@ export async function searchVecMatch(db: Database, query: string, model: string,
   assertQueryVectorCompatible(db, embedResult.model, embedResult.embedding.length);
 
   const embedding = embedResult.embedding;
+  vecScanTestSeam(query);
 
   // Guard-defect fix: the caller's Promise.race(vectorTimeout) cannot interrupt the SYNCHRONOUS
   // sqlite-vec MATCH below (bun:sqlite blocks the event loop) and does NOT cancel this promise.
@@ -5362,6 +5364,7 @@ export async function searchVecDetailed(
   const pendingLoad = pendingScopeLoads.get(db);
   if (pendingLoad) await pendingLoad;
   if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
+  vecScanTestSeam(query);
 
   return searchVecDetailedWithVector(
     db,
