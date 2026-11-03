@@ -23,6 +23,8 @@ import { setPgSchema } from "../../src/pg/config.ts";
 import { resetVaultCache } from "../../src/pg/vaults.ts";
 import { hashContent } from "../../src/indexer.ts";
 import { loadOriginCollection, OriginWriteReadBackError } from "../../src/pg/origin.ts";
+import { syncOriginLifecycle } from "../../src/pg/origin-lifecycle.ts";
+import { createStore } from "../../src/store.ts";
 
 const REPO = "/home/bj/claude/master-harness";
 const DIM = 768;
@@ -192,6 +194,43 @@ d("PG origin write read-back guard", () => {
         expect(row.hash).toBe(expectedHash);
       }
     } finally {
+      await pool.end();
+    }
+  });
+
+  it("archive survives origin reload and restore reactivates the PG row", async () => {
+    const collection = "origin-lifecycle-test";
+    const sqlitePath = join(fixtureDir, "lifecycle.sqlite");
+    const store = createStore(sqlitePath);
+    const now = new Date().toISOString();
+    for (const path of ["session_001.md", "session_002.md", "session_003.md"]) {
+      const hash = hashContent(path);
+      store.db.query("INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)").run(hash, path, now);
+      store.db.query(
+        "INSERT INTO documents (collection, path, title, hash, created_at, modified_at) VALUES (?, ?, ?, ?, ?, ?)",
+      ).run(collection, path, path, hash, now, now);
+    }
+    await loadOriginCollection({ collection, root: fixtureDir, pattern: "session_*.md", skipEmbed: true });
+    const pool = new pg.Pool({ connectionString: dbUrl(SCRATCH_DB) });
+    const row = async () => (await pool.query<{ active: boolean; archived_at: Date | null }>(
+      "SELECT active, archived_at FROM origin_documents WHERE collection = $1 AND path = $2",
+      [collection, "session_001.md"],
+    )).rows[0]!;
+    try {
+      const id = (store.db.query("SELECT id FROM documents WHERE collection = ? AND path = ?")
+        .get(collection, "session_001.md") as { id: number }).id;
+      expect(store.archiveDocuments([id])).toBe(1);
+      expect((await syncOriginLifecycle(collection, sqlitePath)).changedRows).toBe(1);
+      expect((await row()).active).toBe(false);
+      expect((await row()).archived_at).not.toBeNull();
+      await loadOriginCollection({ collection, root: fixtureDir, pattern: "session_*.md", skipEmbed: true });
+      expect((await row()).active).toBe(false);
+      expect((await syncOriginLifecycle(collection, sqlitePath)).changedRows).toBe(0);
+      expect(store.restoreArchivedDocuments({ ids: [id] })).toBe(1);
+      expect((await syncOriginLifecycle(collection, sqlitePath)).changedRows).toBe(1);
+      expect(await row()).toMatchObject({ active: true, archived_at: null });
+    } finally {
+      store.close();
       await pool.end();
     }
   });

@@ -24,6 +24,7 @@ import {
   loadOriginCollection,
 } from "./origin.ts";
 import { resolvePgCollectionScope } from "./focus-scope.ts";
+import { defaultSqlitePath, syncOriginLifecycle } from "./origin-lifecycle.ts";
 import { listCollections } from "../collections.ts";
 import { formatFrontmatterVocab } from "../indexer.ts";
 
@@ -134,6 +135,13 @@ async function main() {
   const cfg = resolvePgConfig(vault);
 
   switch (cmd) {
+    case "origin-lifecycle-sync": {
+      const name = flagValue(argv, "--collection");
+      if (!name) throw new Error("origin-lifecycle-sync requires --collection <name>");
+      const result = await syncOriginLifecycle(name, flagValue(argv, "--sqlite-db") ?? defaultSqlitePath(), vault);
+      console.log(`${name}: lifecycle sync ${result.sourceRows} source rows, ${result.changedRows} PG rows changed (${vault})`);
+      break;
+    }
     case "migrate": {
       const r = await applyMigrations(undefined, vault);
       console.log(`vault:   ${vault}`);
@@ -373,7 +381,7 @@ async function main() {
     }
     default:
       console.error(
-        "usage: bun src/pg/cli.ts <migrate|status|reindex|search|retrieve|origin-load|origin-classify|origin-partitions|" +
+        "usage: bun src/pg/cli.ts <migrate|status|reindex|search|retrieve|origin-load|origin-lifecycle-sync|origin-classify|origin-partitions|" +
         "origin-drop-legacy|origin-retention|gc> [--vault sfw|nsfw] " +
         "[--collection a,b] [--limit N] [--no-embed] [--reembed] [--no-sweep] [--month YYYY-MM] " +
         "[--before DATE] [--apply] [--query TEXT] [--timeout-ms N] [--no-gc] [origin-classify: --json] " +
