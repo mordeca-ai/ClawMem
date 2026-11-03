@@ -641,25 +641,29 @@ describe("the parallel prewarm (A9)", () => {
 
     const ro = readOnly(dbPath);
     const loading = prewarmScopedVecScan(ro.db, dbPath, scopeOpts("c"), 3);
-    // Synchronously after the enumeration: same fragment list, new bytes, before any worker reply.
-    clearAllEmbeddings(writer.db);
-    writer.ensureVecTable(DIM);
-    const r = rng(100);
-    for (let i = 0; i < 6; i++) {
-      const original = randomVec(r, DIM);
-      writer.insertEmbedding(
-        hashOf("c", i),
-        0,
-        0,
-        i === 3 ? QUERY : original,
-        MODEL,
-        NOW,
-        "section",
-      );
-    }
+    // Right after the enumeration: same fragment list, new bytes. One commit, so a worker sees the
+    // old table or the new one whole and its load succeeds either way; only the re-read stops it.
+    writer.db.transaction(() => {
+      clearAllEmbeddings(writer.db);
+      writer.ensureVecTable(DIM);
+      const r = rng(100);
+      for (let i = 0; i < 6; i++) {
+        const original = randomVec(r, DIM);
+        writer.insertEmbedding(
+          hashOf("c", i),
+          0,
+          0,
+          i === 3 ? QUERY : original,
+          MODEL,
+          NOW,
+          "section",
+        );
+      }
+    })();
     expect(schemaVersion(writer.db)).toBeGreaterThan(versionBefore);
     await loading;
     ro.close();
+    expect(vecScopeScanStats().parallelLoads).toBe(1); // the load itself succeeded
     expect(residentScopeUsage().entries).toBe(0);
 
     const after = query(dbPath, "c");
