@@ -981,11 +981,12 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
   }, 90_000);
 
   test("W3: a cache write that carries the request past its budget flags query_budget_expired and counts the stalled write", async () => {
-    // The seam blocks inside the guarded write alone, so only that write can end the budget.
+    // The seam blocks inside the guarded write alone, so only that write can end the budget. The budget
+    // is wide because at load 27 a 1500 ms one ran out in FTS first: degraded, correctly, with no hits.
     await withServe(
       {
-        CLAWMEM_QUERY_BUDGET_MS: BUDGET(1500),
-        CLAWMEM_QUERY_BUDGET_TEST_CACHE_WRITE_STALL_MS: "2500",
+        CLAWMEM_QUERY_BUDGET_MS: BUDGET(6000),
+        CLAWMEM_QUERY_BUDGET_TEST_CACHE_WRITE_STALL_MS: "7000",
       },
       async (s) => {
         await s.post(Q_WARM);
@@ -998,7 +999,7 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
         expect(t.counts.query_budget_expired).toBe(1);
         expect(t.counts.cache_write_stalled).toBe(1);
         expect(t.counts.cache_write_dropped).toBe(0);
-        expect(t.counts.cache_write_ms).toBeGreaterThanOrEqual(2400);
+        expect(t.counts.cache_write_ms).toBeGreaterThanOrEqual(6900);
         expect(await s.log()).toContain("cache write stalled");
       },
     );
