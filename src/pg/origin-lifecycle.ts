@@ -35,11 +35,24 @@ export async function syncOriginLifecycle(
     const batch = rows.slice(i, i + 1000);
     changedRows += await withTransaction(vault, async c => {
       const r = await c.query(
-        `UPDATE origin_documents AS o
-         SET active = s.active, archived_at = s.archived_at
-         FROM jsonb_to_recordset($2::jsonb) AS s(path text, active boolean, archived_at timestamptz)
-         WHERE o.collection = $1 AND o.path = s.path
-           AND (o.active, o.archived_at) IS DISTINCT FROM (s.active, s.archived_at)`,
+        `WITH source AS (
+           SELECT * FROM jsonb_to_recordset($2::jsonb)
+             AS s(path text, active boolean, archived_at timestamptz)
+         ), ranked AS (
+           SELECT o.id, s.active, s.archived_at,
+                  row_number() OVER (
+                    PARTITION BY o.path ORDER BY o.ingested_at DESC, o.id DESC
+                  ) AS revision
+           FROM origin_documents AS o
+           JOIN source AS s ON s.path = o.path
+           WHERE o.collection = $1
+         )
+         UPDATE origin_documents AS o
+         SET active = (r.active AND r.revision = 1), archived_at = r.archived_at
+         FROM ranked AS r
+         WHERE o.id = r.id
+           AND (o.active, o.archived_at)
+             IS DISTINCT FROM ((r.active AND r.revision = 1), r.archived_at)`,
         [collection, JSON.stringify(batch)],
       );
       return r.rowCount ?? 0;

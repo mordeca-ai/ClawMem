@@ -235,6 +235,55 @@ d("PG origin write read-back guard", () => {
     }
   });
 
+  it("lifecycle sync retires superseded timestamp revisions and restore keeps them retired", async () => {
+    const collection = "origin-revision-test";
+    const sqlitePath = join(fixtureDir, "revision.sqlite");
+    const store = createStore(sqlitePath);
+    const path = "session_001.md";
+    const now = new Date().toISOString();
+    const hash = hashContent(path);
+    store.db.query("INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)").run(hash, path, now);
+    store.db.query(
+      "INSERT INTO documents (collection, path, title, hash, created_at, modified_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(collection, path, path, hash, now, now);
+    const pool = new pg.Pool({ connectionString: dbUrl(SCRATCH_DB) });
+    try {
+      await loadOriginCollection({ collection, root: fixtureDir, pattern: "session_001.md", skipEmbed: true });
+      await pool.query(
+        `INSERT INTO origin_documents (collection, path, title, hash, authored_at, ingested_at, active)
+         SELECT collection, path, title, hash, authored_at + interval '1 second',
+                ingested_at - interval '1 day', true
+         FROM origin_documents WHERE collection = $1 AND path = $2`,
+        [collection, path],
+      );
+      await pool.query(
+        `UPDATE origin_documents SET ingested_at = now() - interval '2 days'
+         WHERE collection = $1 AND path = $2 AND authored_at = '2026-03-01T10:00:00Z'`,
+        [collection, path],
+      );
+      await loadOriginCollection({ collection, root: fixtureDir, pattern: "session_001.md", skipEmbed: true });
+      const activeCount = async () => Number((await pool.query<{ n: string }>(
+        "SELECT count(*) AS n FROM origin_documents WHERE collection = $1 AND path = $2 AND active",
+        [collection, path],
+      )).rows[0]!.n);
+      expect(await activeCount()).toBe(2);
+      expect((await syncOriginLifecycle(collection, sqlitePath)).changedRows).toBe(1);
+      expect(await activeCount()).toBe(1);
+      expect((await syncOriginLifecycle(collection, sqlitePath)).changedRows).toBe(0);
+      const id = (store.db.query("SELECT id FROM documents WHERE collection = ? AND path = ?")
+        .get(collection, path) as { id: number }).id;
+      expect(store.archiveDocuments([id])).toBe(1);
+      expect((await syncOriginLifecycle(collection, sqlitePath)).changedRows).toBe(2);
+      expect(await activeCount()).toBe(0);
+      expect(store.restoreArchivedDocuments({ ids: [id] })).toBe(1);
+      expect((await syncOriginLifecycle(collection, sqlitePath)).changedRows).toBe(2);
+      expect(await activeCount()).toBe(1);
+    } finally {
+      store.close();
+      await pool.end();
+    }
+  });
+
   it("REGRESSION (vn4rz.114, live 2026-10-18T08:53Z): raw carrying ANOTHER file's text is caught by the source re-read; the bad write rolls back", async () => {
     // Every expected value AND the server's sha256(doc) derive from `raw`, so
     // before vn4rz.114 this shape passed the read-back guard and committed

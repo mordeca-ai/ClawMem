@@ -1239,6 +1239,7 @@ export async function loadOriginCollection(
            git_branch         = EXCLUDED.git_branch,
            agent_version      = EXCLUDED.agent_version,
            provenance         = EXCLUDED.provenance,
+           ingested_at        = now(),
            active             = origin_documents.active
          RETURNING path, title, hash, authored_at, session_id`,
         [
