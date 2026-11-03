@@ -4,6 +4,16 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.77 — Cache writes under the query budget wait 50 ms and are dropped, counted
+
+Under CLAWMEM_QUERY_BUDGET_MS, the rerank cache flush and the expansion cache write wait 50 ms for the vault's write lock and are dropped past it, instead of freezing the main thread for the handle's 5 s busy_timeout per write. This replaces the v0.36.76 note that these writes were unbounded. Measured with another connection holding BEGIN IMMEDIATE, budget 2000 ms: before, A and B answered at 5040 ms and 9093 ms with query_budget_expired 0; after, under 200 ms.
+
+The timing row gains `cache_write_dropped`, `cache_write_stalled` and `cache_write_ms`, and stderr logs "cache write dropped" or "cache write stalled". A dropped write on an on-time answer does not degrade the reply: the result is identical and only a later recompute is lost. A write that carries the request past its budget flags `query_budget_expired`.
+
+Off when the budget is unset: requests without a budget keep the 5 s timeout and the unguarded write. A cache purge at the row cap, about 200 ms and one write in a thousand, still runs inside the guarded write and is not bounded by the 50 ms wait.
+
+---
+
 ## v0.36.76 — FTS runs in a worker under the query budget
 
 With CLAWMEM_QUERY_BUDGET_MS set, POST /query runs its FTS (the original query and any expansion lex leg) in a read-only worker and waits for it against the budget left. A slow FTS is now cut at the budget instead of holding the whole server: the request goes on at once with no FTS hits, is flagged `query_budget_expired`, and skips the vector stage and rerank. A request that arrives meanwhile is stamped on arrival. Measured on a 5000 ms FTS stall at a 2000 ms budget: the first request answered at 5045 ms and the second, sent at t=1000, started its clock at about t=5000 and was not counted; both now answer within budget + 1000 ms and are counted. With the budget unset nothing changes: FTS is the same synchronous main-thread call and no worker is started.

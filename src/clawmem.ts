@@ -11,6 +11,7 @@ import type { CanaryCheckResult } from "./canary.ts";
 import { retryOnBusyAsync, isSqliteBusyError } from "./busy-retry.ts";
 import {
   createStore,
+  createCacheWriteGuard,
   prewarmVectors,
   startPeriodicPrewarm,
   resolvePrewarmIntervalMs,
@@ -71,7 +72,7 @@ import { vecLegParallelism, runVecLegs, createWorkerLegPool, runVecLegsOverlappe
 import { scopedScanEnabled, vecScopeScanStats } from "./vec-scope-scan.ts";
 import { QueryTimer, queryTimingEnabled } from "./query-timing.ts";
 import { runVecStageWithDeadline, VecDeadlineLegs, vecDeadlineMs, type VecDegradedReason } from "./vec-deadline.ts";
-import { QUERY_BUDGET_REASON, QueryBudget, QueryBudgetExpired, queryBudgetMs, submitWithBudget, withinBudget } from "./query-budget.ts";
+import { QUERY_BUDGET_CACHE_WRITE_BUSY_MS, QUERY_BUDGET_REASON, QueryBudget, QueryBudgetExpired, queryBudgetMs, queryBudgetTestCacheWriteStall, submitWithBudget, withinBudget } from "./query-budget.ts";
 import { FtsLegs } from "./fts-legs.ts";
 import type { ScopedLegResult } from "./vec-legs.ts";
 import { splitDocument } from "./splitter.ts";
@@ -1676,6 +1677,9 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   // cut at the budget and the main thread stays free to stamp the next request (vn4rz.135). Without
   // one it is the synchronous main-thread call it always was.
   let ftsCut = false;
+  // The two cache writes on this path (expansion, rerank scores) wait only a short window for the
+  // write lock under a budget and are dropped past it (vn4rz.140); without one they are as before.
+  const cacheWrites = budget ? createCacheWriteGuard(QUERY_BUDGET_CACHE_WRITE_BUSY_MS, () => budget.expired(), queryBudgetTestCacheWriteStall) : undefined;
   // A shed started no FTS but spent no budget either: the reply is degraded and the vector stage
   // still runs (vn4rz.135 F6). Only a cut, or a budget that is spent, skips later stages.
   let ftsShed = false;
@@ -1722,7 +1726,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   let expansion: Promise<ExpandedQuery[]> | undefined;
   if (!strongSignal && !budgetSpentAtFts) {
     const endExpand = timer.start("expand");
-    expansion = s.expandQuery(query, DEFAULT_QUERY_MODEL)
+    expansion = s.expandQuery(query, DEFAULT_QUERY_MODEL, undefined, cacheWrites)
       .catch(() => [] as ExpandedQuery[])
       .then(eqs => { endExpand(); return applyQueryVecLegCap(eqs); });
   }
@@ -1928,7 +1932,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
       // The budget replaces rerank's 60 s fetch bound; a cut leaves the fused order (fuseAndRerank).
       try {
         return await withinBudget(budget, "rerank", signal =>
-          s.rerank(q, docs, DEFAULT_RERANK_MODEL, undefined, { signal, failOnAbort: true }));
+          s.rerank(q, docs, DEFAULT_RERANK_MODEL, undefined, { signal, failOnAbort: true, cacheWrites }));
       } catch (e) {
         if (e instanceof QueryBudgetExpired) budgetExpired = true;
         throw e;
@@ -1940,9 +1944,17 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   if (budget) {
     // A failed vector leg stays the reply's reason: the recall hook counts it toward its DOWN streak,
     // and a budget cut on top of it must not hide it. The timing row still counts both.
+    // A cache write that carried the request past its budget is a miss like any other stage's. A write
+    // that was only dropped, with the answer on time, is counted below and is not a degraded reply.
+    if (cacheWrites?.crossedBudget) budgetExpired = true;
     if (budgetExpired && outcome && outcome.degraded !== "vec_leg_failed") outcome.degraded = QUERY_BUDGET_REASON;
     if (budgetExpired) console.error(`[clawmem] query degraded (${QUERY_BUDGET_REASON}): budget ${budget.totalMs} ms, best results so far returned`);
     timer.count(QUERY_BUDGET_REASON, budgetExpired ? 1 : 0);
+    if (cacheWrites) {
+      timer.count("cache_write_dropped", cacheWrites.dropped);
+      timer.count("cache_write_stalled", cacheWrites.stalled);
+      timer.count("cache_write_ms", Math.round(cacheWrites.ms));
+    }
   }
 
   // Step 8: Map back to full results and apply composite scoring. Build the map from
