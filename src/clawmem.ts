@@ -69,7 +69,7 @@ import { detectBeadsProject } from "./beads.ts";
 import { applyCompositeScoring, hasRecencyIntent, HALF_LIVES, type EnrichedResult } from "./memory.ts";
 import { enrichResults, toRanked, fuseAndRerank, hasStrongFtsSignal, ftsBypassEnabled, applyQueryVecLegCap, queryVecExpansionLegCap, type RankedResult } from "./search-utils.ts";
 import { vecLegParallelism, runVecLegs, createWorkerLegPool, runVecLegsOverlapped, settlesImmediately } from "./vec-legs.ts";
-import { scopedScanEnabled, vecScopeScanStats } from "./vec-scope-scan.ts";
+import { residentScopeCapBytes, scopedScanEnabled, vecScopeScanStats } from "./vec-scope-scan.ts";
 import { QueryTimer, queryTimingEnabled } from "./query-timing.ts";
 import { runVecStageWithDeadline, VecDeadlineLegs, vecDeadlineMs, type VecDegradedReason } from "./vec-deadline.ts";
 import { QUERY_BUDGET_CACHE_WRITE_BUSY_MS, QUERY_BUDGET_REASON, QueryBudget, QueryBudgetExpired, queryBudgetMs, queryBudgetTestCacheWriteStall, submitWithBudget, withinBudget } from "./query-budget.ts";
@@ -1810,6 +1810,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
     // vn4rz.100: a collection scope the chunk-targeted scan serves runs every leg in this process
     // on one read-only store, so the scope's vectors are read once per query (~0.5 GB for docs)
     // instead of a full 1.4 GB vec0 scan per leg per worker. Embeds still overlap.
+    const residentBefore = vecScopeScanStats();
     const endPlan = timer.start("scope_plan");
     const scoped = scopeCols && scopedScanEnabled() ? openScopedLegStore(scopeCols) : null;
     endPlan();
@@ -1850,10 +1851,16 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
       } finally {
         scoped.close();
       }
+      // These three are process totals, so in `clawmem serve` they accumulate across requests.
+      // The resident counters are per-query deltas; a request overlapping this one can add to them.
       const st = vecScopeScanStats();
       timer.count("scope_scans", st.scans);
       timer.count("scope_chunks_read", st.chunksRead);
       timer.count("scope_load_fallbacks", st.verifyFailures);
+      if (residentScopeCapBytes() > 0) {
+        timer.count("scope_resident_hits", st.residentHits - residentBefore.residentHits);
+        timer.count("scope_resident_misses", st.residentMisses - residentBefore.residentMisses);
+      }
     } else if (liveExpansion && par > 1) {
       // Live expansion in flight (vn4rz.97): start the original query's vector leg now and warm
       // the workers for the expansion legs, instead of waiting ~1.5-2s for the LLM first. Same

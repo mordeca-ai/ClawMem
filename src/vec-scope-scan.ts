@@ -16,6 +16,8 @@
  * future sqlite-vec degrades to the old speed, never to a wrong answer.
  */
 import type { Database } from "bun:sqlite";
+import { statSync } from "node:fs";
+import { isMainThread } from "node:worker_threads";
 import { WorkerLoadGuard } from "./worker-load-guard.ts";
 
 /** One in-scope fragment and where vec0 stores its vector. */
@@ -51,6 +53,10 @@ export interface VecScopeScanStats {
   scans: number;
   chunksRead: number;
   bytesRead: number;
+  /** Loads the resident cache served without reading a chunk (uvnhf.17). */
+  residentHits: number;
+  /** Lookups in the resident cache that found nothing valid, so the caller went to the chunks. */
+  residentMisses: number;
 }
 
 const stats: VecScopeScanStats = {
@@ -61,6 +67,8 @@ const stats: VecScopeScanStats = {
   scans: 0,
   chunksRead: 0,
   bytesRead: 0,
+  residentHits: 0,
+  residentMisses: 0,
 };
 
 export function vecScopeScanStats(): VecScopeScanStats {
@@ -194,9 +202,10 @@ export interface ChunkReadTask {
 /**
  * Copy the tasks' vectors into `vectors` (row-major, `dim` wide) and their float32 magnitudes
  * into `mags`. Every slot is verified first: blob sizes consistent with one chunk_size, the
- * validity bit set, and the chunk's rowid at that slot equal to the enumerated rowid (vec0 rowids
- * are AUTOINCREMENT and clawmem never UPDATEs a vector in place, so a matching rowid means the
- * same vector). Returns the bytes read, or -1 on any mismatch.
+ * validity bit set, and the chunk's rowid at that slot equal to the enumerated rowid. A matching
+ * rowid proves the layout, NOT the content: rowids are AUTOINCREMENT only while the table lives,
+ * and dropping it (vec-compact, clearAllEmbeddings) clears its sqlite_sequence row, so a refill
+ * reuses the same rowids and slots for new bytes. Returns the bytes read, or -1 on any mismatch.
  */
 export function readChunkTasks(
   db: Database,
@@ -311,7 +320,10 @@ export type ChunkReadResponse =
  * loadScopedVectors split over `workers` threads, each with its own read-only connection.
  * One thread copies ~0.5 GB of chunk blobs in ~0.6 s on the live vault; the copy is the cost,
  * so it is spread. Each worker reads its chunks in one read transaction and verifies every slot
- * against the enumerated rowid, which is what makes reading from separate snapshots safe.
+ * against the enumerated rowid. That catches a slot rewritten after the enumeration, but not a
+ * table dropped and refilled in between (see readChunkTasks), so these vectors can be newer than
+ * the enumerated snapshot. The current query tolerates that, as it would a write a moment earlier;
+ * the resident cache does not (store.ts re-reads schema_version before retaining a parallel load).
  * Resolves null on any worker failure (the caller then loads in-thread or uses vec0 MATCH).
  */
 export async function loadScopedVectorsParallel(
@@ -394,6 +406,146 @@ export async function loadScopedVectorsParallel(
     // A reader still loading is terminated when it has loaded, never before (src/worker-load-guard.ts).
     for (const g of spawned) g.terminate();
   }
+}
+
+// uvnhf.17 — resident scoped vectors: loaded scopes that outlive the per-query connection, so a
+// long-lived `clawmem serve` stops re-reading the same chunks on every query. Off unless
+// CLAWMEM_QUERY_RESIDENT_SCOPE_MB is set, and never used off the main thread. The validity rule
+// lives here and in the caller's key (see the comment above VecScopeRow in store.ts).
+
+/** Upper bound on how long a resident entry may serve, whatever else matched. Staleness from a
+ * writer nobody thought of is bounded by this: two earlier premises about when vectors change
+ * were false. */
+export const RESIDENT_SCOPE_MAX_AGE_S = 6 * 60 * 60;
+
+interface ResidentScope {
+  schemaVersion: number;
+  frags: VecScopeFragment[];
+  sv: ScopedVectors;
+  bytes: number;
+  loadedAtMs: number;
+}
+
+// Map iteration order is the LRU order: a hit re-inserts, the first key is the coldest.
+const residentScopes = new Map<string, ResidentScope>();
+let residentBytes = 0;
+
+/** The byte cap from CLAWMEM_QUERY_RESIDENT_SCOPE_MB; 0 (off) when unset, empty, 0, not a whole
+ * number, or off the main thread. */
+export function residentScopeCapBytes(
+  env: Record<string, string | undefined> = process.env,
+  mainThread: boolean = isMainThread,
+): number {
+  if (!mainThread) return 0;
+  const raw = env.CLAWMEM_QUERY_RESIDENT_SCOPE_MB?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return 0;
+  const bytes = Number(raw) * 1024 * 1024;
+  return Number.isSafeInteger(bytes) ? bytes : 0;
+}
+
+/** RESIDENT_SCOPE_MAX_AGE_S, overridable by CLAWMEM_QUERY_RESIDENT_SCOPE_MAX_AGE_S (tests). */
+export function residentScopeMaxAgeMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env.CLAWMEM_QUERY_RESIDENT_SCOPE_MAX_AGE_S?.trim();
+  const seconds = raw && /^\d+(\.\d+)?$/.test(raw) ? Number(raw) : RESIDENT_SCOPE_MAX_AGE_S;
+  return seconds * 1000;
+}
+
+/** What identifies the file behind a path: a database rebuilt at the same path repeats the
+ * path, the schema_version and the fragment list, with new vectors. Birth time is here because
+ * a deleted file's inode number is commonly reused. Null when the file cannot be read. */
+export function residentScopeFileIdentity(path: string): string | null {
+  try {
+    const st = statSync(path, { bigint: true });
+    return `${path}|${st.dev}:${st.ino}:${st.birthtimeNs}`;
+  } catch {
+    return null;
+  }
+}
+
+function dropResidentScope(key: string, entry: ResidentScope): void {
+  residentScopes.delete(key);
+  residentBytes -= entry.bytes;
+}
+
+export function clearResidentScopes(): void {
+  residentScopes.clear();
+  residentBytes = 0;
+}
+
+/** What is currently retained (tests and diagnostics). */
+export function residentScopeUsage(): { entries: number; bytes: number } {
+  return { entries: residentScopes.size, bytes: residentBytes };
+}
+
+function sameFragments(a: VecScopeFragment[], b: VecScopeFragment[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]!;
+    const y = b[i]!;
+    if (
+      x.rowid !== y.rowid ||
+      x.chunkId !== y.chunkId ||
+      x.offset !== y.offset ||
+      x.hashSeq !== y.hashSeq
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The retained vectors for `key` when ALL of these hold: same schema_version, the whole fragment
+ * list element-wise equal, and the entry younger than the max age (a hit does not refresh it).
+ * A schema_version or age mismatch drops the entry. A fragment mismatch leaves it for the load
+ * that follows to replace. The returned arrays are shared across queries and must never be written.
+ */
+export function residentScopeGet(
+  key: string,
+  schemaVersion: number,
+  frags: VecScopeFragment[],
+): ScopedVectors | null {
+  const entry = residentScopes.get(key);
+  if (entry) {
+    const age = Date.now() - entry.loadedAtMs;
+    if (entry.schemaVersion !== schemaVersion || age < 0 || age >= residentScopeMaxAgeMs()) {
+      dropResidentScope(key, entry);
+    } else if (sameFragments(entry.frags, frags)) {
+      residentScopes.delete(key);
+      residentScopes.set(key, entry);
+      stats.residentHits++;
+      return entry.sv;
+    }
+  }
+  stats.residentMisses++;
+  return null;
+}
+
+/**
+ * Retain a successful load. `schemaVersion` and `frags` must come from the snapshot the load was
+ * enumerated in. An entry larger than the cap is not retained, and an empty scope never is: it
+ * saves no read, and only vector bytes count towards the cap.
+ */
+export function residentScopePut(
+  key: string,
+  schemaVersion: number,
+  frags: VecScopeFragment[],
+  sv: ScopedVectors,
+): void {
+  const previous = residentScopes.get(key);
+  if (previous) dropResidentScope(key, previous);
+  const cap = residentScopeCapBytes();
+  const bytes = sv.vectors.byteLength + sv.mags.byteLength;
+  if (frags.length === 0 || bytes > cap) return;
+  while (residentBytes + bytes > cap) {
+    const coldest = residentScopes.entries().next().value;
+    if (!coldest) break;
+    dropResidentScope(coldest[0], coldest[1]);
+  }
+  residentScopes.set(key, { schemaVersion, frags, sv, bytes, loadedAtMs: Date.now() });
+  residentBytes += bytes;
 }
 
 /**

@@ -4,6 +4,16 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.79 — A serve process can keep scope vectors between queries
+
+Added, off by default: `CLAWMEM_QUERY_RESIDENT_SCOPE_MB` keeps a scope's loaded vectors in memory between queries, on the main thread. It is meant for `clawmem serve`, which opened a new store and re-read the same chunks on every query. In a paired run over 50 live scoped queries, `scope_load` p50 fell from 904 ms to 10.5 ms and request p50 from 2040 ms to 641 ms.
+
+A cached scope is reused only when the file, scope, dim and `schema_version` all match, every fragment's id, rowid, chunk and offset match, and the entry is under 6 hours old. Scope enumeration still runs on every query, so document changes apply at once. Each vec-compact run causes one reload per scope.
+
+With the variable unset, nothing is kept. Worker threads never use the cache. The timing row gains `scope_resident_hits` and `scope_resident_misses` when it is on.
+
+---
+
 ## v0.36.78 — Lifecycle policy reads the collection file; session-start archive is opt-in
 
 **Fixed: a lifecycle policy in `index.yml` is now read.** `loadVaultConfig` opened `config.yaml` only, while the collection list falls back to `index.yml`, so on a host using `index.yml` the policy was invisible and `clawmem lifecycle status` printed `Policy: none configured`. Both now read the same file.
