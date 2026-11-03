@@ -77,6 +77,7 @@ export interface LifecyclePolicy {
   purge_after_days: number | null;
   exempt_collections: string[];
   dry_run: boolean;
+  session_start_archive?: boolean;  // see src/config.ts
 }
 
 export interface CollectionConfig {
@@ -304,6 +305,7 @@ function parseConfigFile(configPath: string): CollectionConfig {
             : null,
         exempt_collections: Array.isArray(lc.exempt_collections) ? lc.exempt_collections as string[] : [],
         dry_run: lc.dry_run !== false,
+        session_start_archive: lc.session_start_archive === true,
       };
     }
 

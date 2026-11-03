@@ -224,6 +224,7 @@ describe("the SessionStart staleness-check hook", () => {
         "  purge_after_days: 1",
         "  exempt_collections: []",
         "  dry_run: false",
+        "  session_start_archive: true",
       ].join("\n")
     );
 
