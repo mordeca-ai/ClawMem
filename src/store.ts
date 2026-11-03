@@ -63,9 +63,14 @@ import { uniquePhysicalResults } from "./search-utils.ts";
 import { vecScanTestSeam } from "./vec-scan-test-seam.ts";
 import {
   canonicalVecTableDim,
+  clearResidentScopes,
   loadScopedVectors,
   loadScopedVectorsParallel,
   planScopedScan,
+  residentScopeCapBytes,
+  residentScopeFileIdentity,
+  residentScopeGet,
+  residentScopePut,
   scanScopedVectors,
   scopedScanEnabled,
   type ScopedVectors,
@@ -5083,6 +5088,20 @@ const VEC_KNN_K_MAX = 4096;
 // own commits do not move its data_version. Other connections (the long-lived MCP vector-leg
 // workers included) load per call and keep nothing, so no process retains up to ~150 MB of
 // scope vectors per worker.
+//
+// uvnhf.17 — the one exception, opt-in: with CLAWMEM_QUERY_RESIDENT_SCOPE_MB set, the MAIN THREAD
+// also keeps loaded vectors in a byte-capped LRU that outlives the connection, because `clawmem
+// serve` opens a new leg store per query. Unset, 0 or invalid retains nothing, and worker threads
+// (the MCP and deadline legs) never read or fill it. Only opted-in (query_only) connections take
+// part, so a load can never contain a writer's uncommitted vectors. Enumeration still runs every
+// query; the cache replaces only the chunk read. A hit needs ALL of:
+//   - the same file (path, device, inode, birth time), scope key and dim: a database rebuilt at
+//     the same path repeats the schema_version and fragment list with new bytes;
+//   - the same PRAGMA schema_version, read in the enumeration's snapshot: dropping vectors_vec
+//     (vec-compact, clearAllEmbeddings) restarts its rowids, so the same list can hold new bytes;
+//   - the whole fragment list equal element-wise: a re-embed (DELETE + INSERT) gets a new rowid;
+//   - an entry younger than the max age, which bounds staleness from any writer not listed here.
+// A stale or failed load is never retained. The rule itself is in vec-scope-scan.ts.
 interface VecScopeRow {
   hash_seq: string;
   collection: string;
@@ -5099,6 +5118,14 @@ interface VecScopeEntry {
   overflow: boolean;
   /** undefined = not loaded yet; null = the scoped scan declined this scope (use vec0 MATCH). */
   vectors?: ScopedVectors | null;
+  /** Null unless this load can use the resident cache (uvnhf.17). */
+  resident: ResidentSlot | null;
+}
+
+/** Where a scope lives in the resident cache, as seen by the enumeration's snapshot. */
+interface ResidentSlot {
+  key: string;
+  schemaVersion: number;
 }
 
 const vecScopeCache = new WeakMap<Database, VecScopeEntry>();
@@ -5118,6 +5145,44 @@ export function enableVecScopeCache(db: Database): boolean {
 
 function vecScopeCacheable(db: Database): boolean {
   return vecScopeCacheOptIn.has(db) && isQueryOnly(db);
+}
+
+function readSchemaVersion(db: Database): number {
+  return (db.prepare("PRAGMA schema_version").get() as { schema_version: number }).schema_version;
+}
+
+/** Call inside the enumeration's read snapshot. Null when the resident cache does not apply. */
+function residentSlotFor(db: Database, scopeKey: string, schemaVersion: number): ResidentSlot | null {
+  if (residentScopeCapBytes() <= 0) {
+    clearResidentScopes();
+    return null;
+  }
+  const dim = canonicalVecTableDim(db);
+  const main = (db.prepare("PRAGMA database_list").all() as { name: string; file: string }[])
+    .find(d => d.name === "main");
+  const file = main?.file ? residentScopeFileIdentity(main.file) : null;
+  if (dim === null || !file) return null;
+  return { key: JSON.stringify([file, scopeKey, dim]), schemaVersion };
+}
+
+function residentLookup(entry: VecScopeEntry, frags: VecScopeFragment[]): ScopedVectors | null {
+  return entry.resident ? residentScopeGet(entry.resident.key, entry.resident.schemaVersion, frags) : null;
+}
+
+/**
+ * Retain a parallel load. Its workers read in their own snapshots, after the enumeration, and a
+ * table dropped and refilled in between passes their rowid check with new bytes. So retain it
+ * only if schema_version has not moved since the enumeration, read in a fresh snapshot now.
+ */
+function retainParallelLoad(db: Database, entry: VecScopeEntry, frags: VecScopeFragment[], sv: ScopedVectors): void {
+  if (!entry.resident) return;
+  try {
+    if (!db.inTransaction && readSchemaVersion(db) === entry.resident.schemaVersion) {
+      residentScopePut(entry.resident.key, entry.resident.schemaVersion, frags, sv);
+    }
+  } catch {
+    // The connection closed under the load. Retaining is optional, so nothing is lost.
+  }
 }
 
 function withReadSnapshot<T>(db: Database, fn: () => T): T {
@@ -5151,10 +5216,9 @@ function readVecScope(db: Database, opts: VecSearchDetailedOpts, maxScope: numbe
   const key = JSON.stringify([filter.sql, filter.params, maxScope, scanOn, fraction ?? null]);
   const cacheable = vecScopeCacheable(db);
   return withReadSnapshot(db, () => {
-    const token = cacheable
-      ? `${(db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version}:` +
-        `${(db.prepare("PRAGMA schema_version").get() as { schema_version: number }).schema_version}`
-      : "";
+    const dataVersion = cacheable ? (db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version : 0;
+    const schemaVersion = cacheable ? readSchemaVersion(db) : 0;
+    const token = cacheable ? `${dataVersion}:${schemaVersion}` : "";
     let entry = cacheable ? vecScopeCache.get(db) : undefined;
     if (!entry || entry.key !== key || entry.token !== token) {
       // Enumerate the in-scope fragments (bounded: one row past the threshold is enough to
@@ -5170,11 +5234,27 @@ function readVecScope(db: Database, opts: VecSearchDetailedOpts, maxScope: numbe
         WHERE d.active = 1 AND d.invalidated_at IS NULL${filter.sql}
         LIMIT ?
       `).all(...filter.params, maxScope + 1) as VecScopeRow[];
-      entry = { key, token, rows, overflow: rows.length > maxScope, vectors: scanOn ? undefined : null };
+      entry = {
+        key,
+        token,
+        rows,
+        overflow: rows.length > maxScope,
+        vectors: scanOn ? undefined : null,
+        resident: cacheable && scanOn ? residentSlotFor(db, key, schemaVersion) : null,
+      };
       if (cacheable) vecScopeCache.set(db, entry);
     }
     if (withVectors && entry.vectors === undefined && !entry.overflow) {
-      entry.vectors = loadScopedVectors(db, scopeFragments(entry.rows), { maxChunkFraction: fraction });
+      const frags = scopeFragments(entry.rows);
+      let vectors = residentLookup(entry, frags);
+      if (!vectors) {
+        vectors = loadScopedVectors(db, frags, { maxChunkFraction: fraction });
+        // Same snapshot as the enumeration, so the slot's schema_version describes these bytes.
+        if (vectors && entry.resident) {
+          residentScopePut(entry.resident.key, entry.resident.schemaVersion, frags, vectors);
+        }
+      }
+      entry.vectors = vectors;
     }
     return entry;
   });
@@ -5205,11 +5285,17 @@ export async function prewarmScopedVecScan(
     if (entry.overflow || entry.vectors === null) return false;
     if (entry.vectors) return true;
     const frags = scopeFragments(entry.rows);
+    const resident = residentLookup(entry, frags);
+    if (resident) {
+      entry.vectors = resident;
+      return true;
+    }
     const plan = planScopedScan(db, frags, { maxChunkFraction: opts.scopedScanMaxChunkFraction });
     if (!plan) return false;
     const pending: Promise<void> = loadScopedVectorsParallel(dbPath, frags, plan, workers, readScopedMmapBytes())
       .then(sv => {
         if (sv && entry.vectors === undefined && vecScopeCache.get(db) === entry) entry.vectors = sv;
+        if (sv) retainParallelLoad(db, entry, frags, sv);
       })
       .catch(() => {})
       .finally(() => {
