@@ -51,11 +51,13 @@ export async function stalenessCheck(
     }
   }
 
-  // Auto-archive if lifecycle policy is configured (runs regardless of stale report results)
+  // Auto-archive only if the policy opts in (runs regardless of stale report results)
   try {
     const { loadVaultConfig } = await import("../config.ts");
     const config = loadVaultConfig();
-    if (config.lifecycle) {
+    // Opt-in: an unattended SessionStart archive has no cap and no canary, so a policy written
+    // for a guarded explicit sweep must not also fire here.
+    if (config.lifecycle?.session_start_archive === true) {
       const candidates = store.getArchiveCandidates(config.lifecycle);
       if (candidates.length > 0 && !config.lifecycle.dry_run) {
         const archived = store.archiveDocuments(candidates.map(c => c.id));

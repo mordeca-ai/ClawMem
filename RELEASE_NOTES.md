@@ -4,6 +4,14 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.78 — Lifecycle policy reads the collection file; session-start archive is opt-in
+
+**Fixed: a lifecycle policy in `index.yml` is now read.** `loadVaultConfig` opened `config.yaml` only, while the collection list falls back to `index.yml`, so on a host using `index.yml` the policy was invisible and `clawmem lifecycle status` printed `Policy: none configured`. Both now read the same file.
+
+**Changed (fork delta): the SessionStart staleness hook no longer archives unless asked.** It archived on any live policy, with no cap and no canary. It now needs `session_start_archive: true` in the policy. Upstream still archives here. Explicit `clawmem lifecycle sweep` and MCP `lifecycle_sweep` are unchanged.
+
+---
+
 ## v0.36.77 — Cache writes under the query budget wait 50 ms and are dropped, counted
 
 Under CLAWMEM_QUERY_BUDGET_MS, the rerank cache flush and the expansion cache write wait 50 ms for the vault's write lock and are dropped past it, instead of freezing the main thread for the handle's 5 s busy_timeout per write. This replaces the v0.36.76 note that these writes were unbounded. Measured with another connection holding BEGIN IMMEDIATE, budget 2000 ms: before, A and B answered at 5040 ms and 9093 ms with query_budget_expired 0; after, under 200 ms.

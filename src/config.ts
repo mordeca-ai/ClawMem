@@ -10,7 +10,8 @@
  *
  * Configuration sources (highest priority first):
  *   1. Environment variables (CLAWMEM_VAULTS JSON map)
- *   2. Config file (~/.config/clawmem/config.yaml, vaults section)
+ *   2. Config file: ~/.config/clawmem/config.yaml if present, otherwise index.yml.
+ *      The same file `collections.ts` reads, so one file holds a host's whole config.
  *
  * Example config.yaml with multiple vaults:
  *   vaults:
@@ -50,6 +51,11 @@ export interface LifecyclePolicy {
   purge_after_days: number | null;
   exempt_collections: string[];
   dry_run: boolean;
+  /**
+   * Let the staleness-check SessionStart hook archive with no canary or cap. Opt-in on this
+   * fork: a policy means an explicit `lifecycle sweep` may archive, not every session start.
+   */
+  session_start_archive?: boolean;
 }
 
 export interface RetrievalConfig {
@@ -176,9 +182,11 @@ export function loadVaultConfig(): ClawMemConfig {
 
   const vaults: VaultConfig = {};
 
-  // 1. Load from config.yaml (vaults section)
+  // 1. Load the config file (vaults section). Same choice as collections.ts getConfigFilePath:
+  // reading config.yaml alone left a host on index.yml with a policy clawmem could not see.
   const configDir = process.env.CLAWMEM_CONFIG_DIR || join(homedir(), ".config", "clawmem");
-  const configPath = join(configDir, "config.yaml");
+  const preferredPath = join(configDir, "config.yaml");
+  const configPath = existsSync(preferredPath) ? preferredPath : join(configDir, "index.yml");
 
   let parsedYaml: any = null;
   if (existsSync(configPath)) {
@@ -232,6 +240,7 @@ export function loadVaultConfig(): ClawMemConfig {
           : null,
       exempt_collections: Array.isArray(lc.exempt_collections) ? lc.exempt_collections : [],
       dry_run: lc.dry_run !== false,
+      session_start_archive: lc.session_start_archive === true,
     };
   }
 

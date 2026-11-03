@@ -4636,7 +4636,7 @@ async function cmdLifecycle(args: string[]) {
       const config = loadVaultConfig();
       const policy = config.lifecycle;
       if (!policy) {
-        die("No lifecycle policy configured in config.yaml");
+        die("No lifecycle policy configured (config.yaml, otherwise index.yml)");
         return;
       }
 

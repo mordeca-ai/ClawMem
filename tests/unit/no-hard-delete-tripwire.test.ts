@@ -84,6 +84,7 @@ function writeLivePolicy(dir: string): void {
       "  purge_after_days: 1", // set on purpose: the surfaces must ignore it
       "  exempt_collections: []",
       "  dry_run: false",
+      "  session_start_archive: true", // the hook surface below archives only on this opt-in
     ].join("\n")
   );
   clearConfigCache();

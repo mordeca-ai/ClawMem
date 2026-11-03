@@ -2785,7 +2785,7 @@ This is the recommended entry point for ALL memory queries.`,
       const config = loadConfig();
       const policy = config.lifecycle;
       if (!policy) {
-        return { content: [{ type: "text", text: "No lifecycle policy configured in config.yaml" }] };
+        return { content: [{ type: "text", text: "No lifecycle policy configured (config.yaml, otherwise index.yml)" }] };
       }
 
       const candidates = store.getArchiveCandidates(policy);
