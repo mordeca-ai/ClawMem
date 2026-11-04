@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.82 — Budget grace answer writes one row and keeps its hits
+
+An answer served during the budget grace period now writes one labelled row and keeps its hits.
+
+---
+
 ## v0.36.81 — clawmem-lander land gate fails on load-only flakes: LIVE A4 wall-clock overrun and bun runtime crash
 
 Wall-clock test assertions now scale with host load, so a busy host no longer fails a land when the code is fine.
