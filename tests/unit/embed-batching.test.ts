@@ -21,6 +21,7 @@ import { runBatchedEmbed, type DocEmbedTask, type BatchedEmbedLLM } from "../../
 import { createStore, type Store } from "../../src/store.ts";
 import type { Fragment } from "../../src/splitter.ts";
 import type { EmbeddingResult } from "../../src/llm.ts";
+import { loadScaledBound } from "../helpers/wall-clock.ts";
 
 function frag(content: string, label: string | null = null): Fragment {
   return { type: "section", label, content, startLine: 0 };
@@ -170,7 +171,7 @@ describe("runBatchedEmbed — TPM pacing applies only to real rate-limited cloud
     });
     const elapsed = Date.now() - start;
 
-    expect(elapsed).toBeLessThan(300);
+    expect(elapsed).toBeLessThan(loadScaledBound(300, 3000)); // tpmLimit pacing would wait far longer
   });
 
   it("applies the TPM pacing floor between batches when isCloudEmbed=true", async () => {

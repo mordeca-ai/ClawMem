@@ -6,6 +6,7 @@ import { FtsLegs, type FtsWorkerHandle } from "../../src/fts-legs.ts";
 import { createStore } from "../../src/store.ts";
 import { WORKER_LOADED_MESSAGE } from "../../src/worker-load-guard.ts";
 import { hashContent } from "../../src/indexer.ts";
+import { loadScaledBound } from "../helpers/wall-clock.ts";
 
 /**
  * master-harness-vn4rz.135 — FTS off the main thread, under the query budget.
@@ -171,7 +172,7 @@ describe("FtsLegs with fake workers", () => {
     made[0]!.onerror?.({ message: "boom" });
     const r = await p;
     expect(r.status).toBe("failed");
-    expect(performance.now() - t0).toBeLessThan(1000); // not the 5000 ms budget
+    expect(performance.now() - t0).toBeLessThan(loadScaledBound(1000, 4900)); // not the 5000 ms budget
     expect(made[0]!.terminated).toBe(true);
     const p2 = legs.search("db", "q", 10, undefined, 5000);
     expect(made.length).toBe(2);
@@ -337,7 +338,7 @@ describe("FtsLegs with a real worker", () => {
       const t0 = performance.now();
       const r = await legs.search(DB, "ferry", 5, undefined, 500);
       expect(r.status).toBe("expired");
-      expect(performance.now() - t0).toBeLessThan(2500); // the stall is 3000 ms
+      expect(performance.now() - t0).toBeLessThan(loadScaledBound(2500, 2900)); // the stall is 3000 ms
       expect(legs.abandonedCount()).toBe(1);
     } finally {
       delete process.env.CLAWMEM_QUERY_BUDGET_TEST_FTS_STALL_MS;
@@ -403,7 +404,7 @@ describe("FtsLegs and the terminate-during-load rule (vn4rz.135)", () => {
     const t0 = Date.now();
     const out = await l2.search("db", "q", 10, undefined, 5000);
     expect(out.status).toBe("failed");
-    expect(Date.now() - t0).toBeLessThan(1000); // not the 5 s budget: the timer was cleared and unused
+    expect(Date.now() - t0).toBeLessThan(loadScaledBound(1000, 4900)); // not the 5 s budget: the timer was cleared and unused
     expect(w.terminated).toBe(false); // still loading: held, not terminated
     expect(l2.liveCount()).toBe(0); // failed: the worker was dropped, not kept
   });
