@@ -15,6 +15,7 @@ import {
   withinBudget,
 } from "../../src/query-budget.ts";
 import { fakeEmbedVector, goldenRerankScore } from "../helpers/fake-embed-server.ts";
+import { loadScaledBound } from "../helpers/wall-clock.ts";
 
 /**
  * master-harness-vn4rz.134 — one whole-request budget for POST /query.
@@ -514,7 +515,9 @@ describe("guardedCacheWrite (vn4rz.140)", () => {
       holder.close();
     }
     // Lock gone: the write lands, nothing is counted as dropped, and a fast one is not "stalled".
-    const guard = createCacheWriteGuard(50);
+    // The window is wide here because stalled means "took half the window": at 50 ms a loaded host
+    // read a free write as stalled (29 ms, vn4rz.148 land). A write taking 2.5 s is still a real stall.
+    const guard = createCacheWriteGuard(5000);
     expect(guardedCacheWrite(db, guard, "unit", insert(db))).toBe(true);
     expect(guard.dropped).toBe(0);
     expect(guard.stalled).toBe(0);
@@ -736,7 +739,7 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
         expect(bTiming!.counts.budget_elapsed_at_start_ms).toBeGreaterThanOrEqual(expectedElapsed - 450);
         expect(bSentAt).toBeGreaterThanOrEqual(900); // B really was sent while A's stall was on
         // The bug: A answers at ~5045 ms, and B, read only after the stall, starts its clock at ~5000 ms.
-        const bound = D + QUERY_BUDGET_GRACE_MS + 500;
+        const bound = D + QUERY_BUDGET_GRACE_MS + loadScaledBound(500, 4900 - D - QUERY_BUDGET_GRACE_MS); // the bug answers at ~5045 ms
         expect(ra.status).toBe(200);
         expect(ra.ms).toBeLessThan(bound);
         expect(b.status).toBe(200);
@@ -914,7 +917,7 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
         const ra = await a;
         release();
         console.error(`[W] A ${Math.round(ra.ms)} ms, B ${Math.round(b.ms)} ms (sent at ${Math.round(bSentAt)} ms); A body ${Array.isArray(ra.body) ? "array" : JSON.stringify(ra.body.degraded_reason)}, B body ${Array.isArray(b.body) ? "array" : JSON.stringify(b.body.degraded_reason)}`);
-        const bound = D + QUERY_BUDGET_GRACE_MS + 500;
+        const bound = D + QUERY_BUDGET_GRACE_MS + loadScaledBound(500, 4900 - D - QUERY_BUDGET_GRACE_MS); // the bug answers at ~5045 ms
         expect(bSentAt).toBeGreaterThanOrEqual(900);
         expect(ra.status).toBe(200);
         expect(ra.ms).toBeLessThan(bound);
