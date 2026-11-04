@@ -284,6 +284,43 @@ d("PG origin write read-back guard", () => {
     }
   });
 
+  it("REGRESSION (vn4rz.148): lifecycle sync keeps the row matching SQLite over a newer stale-raw row", async () => {
+    const collection = "origin-stray-test";
+    const sqlitePath = join(fixtureDir, "stray.sqlite");
+    const store = createStore(sqlitePath);
+    const path = "session_001.md";
+    const now = new Date().toISOString();
+    const hash = hashContent(path);
+    const pool = new pg.Pool({ connectionString: dbUrl(SCRATCH_DB) });
+    try {
+      await loadOriginCollection({ collection, root: fixtureDir, pattern: "session_001.md", skipEmbed: true });
+      const title = (await pool.query<{ title: string }>(
+        "SELECT title FROM origin_documents WHERE collection = $1 AND path = $2",
+        [collection, path],
+      )).rows[0]!.title;
+      store.db.query("INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)").run(hash, path, now);
+      store.db.query(
+        "INSERT INTO documents (collection, path, title, hash, created_at, modified_at) VALUES (?, ?, ?, ?, ?, ?)",
+      ).run(collection, path, title, hash, now, now);
+      await pool.query(
+        `INSERT INTO origin_documents (collection, path, title, hash, authored_at, ingested_at, active)
+         SELECT collection, path, 'another file title', hash, authored_at + interval '1 second',
+                ingested_at + interval '1 day', true
+         FROM origin_documents WHERE collection = $1 AND path = $2`,
+        [collection, path],
+      );
+      await syncOriginLifecycle(collection, sqlitePath);
+      const active = await pool.query<{ title: string }>(
+        "SELECT title FROM origin_documents WHERE collection = $1 AND path = $2 AND active",
+        [collection, path],
+      );
+      expect(active.rows.map(r => r.title)).toEqual([title]);
+    } finally {
+      store.close();
+      await pool.end();
+    }
+  });
+
   it("REGRESSION (vn4rz.114, live 2026-10-18T08:53Z): raw carrying ANOTHER file's text is caught by the source re-read; the bad write rolls back", async () => {
     // Every expected value AND the server's sha256(doc) derive from `raw`, so
     // before vn4rz.114 this shape passed the read-back guard and committed
