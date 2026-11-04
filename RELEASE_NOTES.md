@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.81 — clawmem-lander land gate fails on load-only flakes: LIVE A4 wall-clock overrun and bun runtime crash
+
+Wall-clock test assertions now scale with host load, so a busy host no longer fails a land when the code is fine.
+
+---
+
 ## v0.36.80 — Lifecycle sync keeps the row matching SQLite
 
 Origin lifecycle sync now keeps the revision whose title matches SQLite, then the newest ingested. Ranking by newest alone kept stale-raw rows active over the correct row at the same path (master-harness-vn4rz.148).
