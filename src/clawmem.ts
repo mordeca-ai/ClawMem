@@ -72,7 +72,7 @@ import { vecLegParallelism, runVecLegs, createWorkerLegPool, runVecLegsOverlappe
 import { residentScopeCapBytes, scopedScanEnabled, vecScopeScanStats } from "./vec-scope-scan.ts";
 import { QueryTimer, queryTimingEnabled } from "./query-timing.ts";
 import { runVecStageWithDeadline, VecDeadlineLegs, vecDeadlineMs, type VecDegradedReason } from "./vec-deadline.ts";
-import { QUERY_BUDGET_CACHE_WRITE_BUSY_MS, QUERY_BUDGET_REASON, QueryBudget, QueryBudgetExpired, queryBudgetMs, queryBudgetTestCacheWriteStall, submitWithBudget, withinBudget } from "./query-budget.ts";
+import { QUERY_BUDGET_CACHE_WRITE_BUSY_MS, QUERY_BUDGET_REASON, QueryBudget, QueryBudgetExpired, queryBudgetMs, queryBudgetTestDisposeStall, queryBudgetTestCacheWriteStall, submitWithBudget, withinBudget } from "./query-budget.ts";
 import { FtsLegs } from "./fts-legs.ts";
 import type { ScopedLegResult } from "./vec-legs.ts";
 import { splitDocument } from "./splitter.ts";
@@ -1626,7 +1626,20 @@ function getFtsLegs(): FtsLegs {
 }
 
 /** What cmdQuery reports beside its hits; `clawmem serve` turns it into the /query response. */
-type QueryOutcome = { degraded?: VecDegradedReason | typeof QUERY_BUDGET_REASON };
+type QueryHit = {
+  file: string;
+  title: string;
+  score: number;
+  searchScore: number;
+  recencyScore: number;
+  contentType: string;
+};
+type QueryOutcome = {
+  degraded?: VecDegradedReason | typeof QUERY_BUDGET_REASON;
+  /** The request's timer and finished hits, for a grace answer sent while the pipeline still runs. */
+  timer?: QueryTimer;
+  hits?: QueryHit[];
+};
 
 /**
  * `budget` is the whole-request budget (vn4rz.134), set only by `clawmem serve` when
@@ -1651,6 +1664,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
 
   // CLAWMEM_QUERY_TIMING=1 prints a per-stage breakdown to stderr (vn4rz.97); off by default.
   const timer = new QueryTimer(queryTimingEnabled());
+  if (outcome) outcome.timer = timer;
   // Arrival to pipeline start (the stamp plus the queue wait), so a test can see a late arrival stamp.
   if (budget) timer.count("budget_elapsed_at_start_ms", Math.round(budget.elapsedMs()));
   const endStore = timer.start("store_open");
@@ -1991,6 +2005,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
       recencyScore: r.recencyScore,
       contentType: r.contentType,
     }));
+  if (outcome) outcome.hits = jsonHits;
   if (emit && values.json) {
     console.log(JSON.stringify(jsonHits, null, 2));
   } else if (emit) {
@@ -1998,7 +2013,10 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   }
 
   signalEmptyResults(scored.length, !!values["fail-on-empty"]);
-  await timer.time("dispose", () => disposeDefaultLlamaCpp());
+  await timer.time("dispose", async () => {
+    if (budget) await queryBudgetTestDisposeStall();
+    await disposeDefaultLlamaCpp();
+  });
   timer.emit();
   return jsonHits;
 }
@@ -2394,6 +2412,7 @@ async function cmdServe(args: string[]) {
   const runQuery = async (
     query: string, collection: string | undefined, limit: number, sessionId: string | undefined,
     budget?: QueryBudget,
+    outcome: QueryOutcome = {},
   ) => {
     // master-harness-vn4rz.123: validate the scope HERE. cmdQuery reports an unknown
     // collection through die() -> process.exit(1), which is right for the CLI and fatal for
@@ -2419,7 +2438,6 @@ async function cmdServe(args: string[]) {
       // never a cmdQuery option.
       const args = ["-n", String(limit), "--json"];
       if (collection !== undefined) args.push("-c", collection);
-      const outcome: QueryOutcome = {};
       const hits = await cmdQuery([...args, "--", query], false, outcome, budget);
       return outcome.degraded ? { degraded: true as const, degraded_reason: outcome.degraded, hits } : hits;
     } finally {
@@ -2439,10 +2457,24 @@ async function cmdServe(args: string[]) {
     }
     type Budgeted = Awaited<ReturnType<typeof runQuery>>;
     const empty = (): Budgeted => ({ degraded: true as const, degraded_reason: QUERY_BUDGET_REASON, hits: [] });
+    const outcome: QueryOutcome = {};
     const { result, tail } = submitWithBudget<Budgeted>({
       budget,
       queue: queryQueue,
-      run: () => runQuery(query, collection, limit, sessionId, budget),
+      run: () => runQuery(query, collection, limit, sessionId, budget, outcome),
+      grace: async () => {
+        // The pipeline ran but a stage that cannot be cut holds it. This is the request's one
+        // timing row: the pipeline's own emit is a no-op once this timer has emitted.
+        const timer = outcome.timer ?? new QueryTimer(queryTimingEnabled());
+        timer.count(QUERY_BUDGET_REASON, 1);
+        timer.count("query_budget_grace", 1);
+        timer.emit();
+        const hits = outcome.hits ?? [];
+        console.error(`[clawmem] query degraded (${QUERY_BUDGET_REASON}): answered at budget ${budget.totalMs} ms + grace with ${hits.length} hit(s)`);
+        // A failed vector leg stays the reply's reason when the budget also cuts the request.
+        const reason = outcome.degraded === "vec_leg_failed" ? outcome.degraded : QUERY_BUDGET_REASON;
+        return { degraded: true as const, degraded_reason: reason, hits };
+      },
       unstarted: async () => {
         // Nothing ran for this request: say so in the timing row, so a stuck queue is countable.
         const timer = new QueryTimer(queryTimingEnabled());

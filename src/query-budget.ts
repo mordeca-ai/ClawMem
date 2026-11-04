@@ -185,6 +185,18 @@ export function queryBudgetTestCacheWriteStall(
 }
 
 /**
+ * Test seam, a no-op unless CLAWMEM_QUERY_BUDGET_TEST_DISPOSE_STALL_MS is set: hold the request in
+ * its dispose stage this long, the one stage the budget cannot cut. Carries a started request
+ * past budget + grace with its hits already built.
+ */
+export async function queryBudgetTestDisposeStall(
+  env: Record<string, string | undefined> = process.env,
+): Promise<void> {
+  const ms = Number(env.CLAWMEM_QUERY_BUDGET_TEST_DISPOSE_STALL_MS);
+  if (ms > 0) await Bun.sleep(ms);
+}
+
+/**
  * Test seam, a no-op unless CLAWMEM_QUERY_BUDGET_TEST_FTS_FAIL_MATCH is set: the FTS worker throws
  * for a query containing that string, as a worker that cannot open the vault or crashes would.
  */
@@ -212,7 +224,8 @@ export interface BudgetedSubmission<T> {
  * the next one starts.
  *
  *   run        the pipeline, called at this request's turn when budget remains
- *   unstarted  answers a request the pipeline did not answer in time (emits its timing row)
+ *   unstarted  answers a request whose pipeline never started (emits its timing row)
+ *   grace      answers a started request held past budget + grace (emits its timing row)
  *   empty      the same answer without side effects, for a queued turn that was answered early
  */
 export function submitWithBudget<T>(o: {
@@ -220,6 +233,7 @@ export function submitWithBudget<T>(o: {
   queue: Promise<unknown>;
   run: () => Promise<T>;
   unstarted: () => Promise<T>;
+  grace: () => Promise<T>;
   empty: () => T;
   graceMs?: number;
 }): BudgetedSubmission<T> {
@@ -242,14 +256,14 @@ export function submitWithBudget<T>(o: {
   );
   let timer: ReturnType<typeof setTimeout> | undefined;
   const early = new Promise<T>((resolve) => {
-    const fire = () => {
+    const fire = (answer: () => Promise<T>) => {
       if (answered) return;
       answered = true;
-      void o.unstarted().then(resolve);
+      void answer().then(resolve);
     };
     timer = setTimeout(() => {
-      if (!started) fire();
-      else timer = setTimeout(fire, graceMs);
+      if (!started) fire(o.unstarted);
+      else timer = setTimeout(() => fire(o.grace), graceMs);
     }, o.budget.remainingMs());
   });
   const settle = (v: T): T => {

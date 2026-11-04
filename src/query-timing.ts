@@ -32,6 +32,7 @@ export class QueryTimer {
   private readonly stages: Record<string, StageTiming> = {};
   private readonly counts: Record<string, number> = {};
   private readonly now: () => number;
+  private emitted = false;
 
   constructor(enabled: boolean, now: () => number = () => performance.now()) {
     this.enabled = enabled;
@@ -75,9 +76,13 @@ export class QueryTimer {
     return { startup_ms: round(this.startupMs), total_ms: round(this.now()), stages, counts: { ...this.counts } };
   }
 
-  /** Print the report to stderr when enabled; a no-op otherwise. */
+  /**
+   * Print the report to stderr when enabled; a no-op otherwise. Prints once: a grace answer emits
+   * the request's row, and the pipeline that finishes after it must not add a second one.
+   */
   emit(write: (line: string) => void = line => console.error(line)): void {
-    if (!this.enabled) return;
+    if (!this.enabled || this.emitted) return;
+    this.emitted = true;
     write(`[query-timing] ${JSON.stringify(this.report())}`);
   }
 }

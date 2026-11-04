@@ -101,6 +101,7 @@ describe("submitWithBudget", () => {
     graceMs = 60,
   ) => {
     let unstarted = 0;
+    let grace = 0;
     const sub = submitWithBudget<string>({
       budget: new QueryBudget(budgetMs),
       queue,
@@ -109,10 +110,14 @@ describe("submitWithBudget", () => {
         unstarted++;
         return "spent";
       },
+      grace: async () => {
+        grace++;
+        return "grace";
+      },
       empty: () => "empty",
       graceMs,
     });
-    return { ...sub, unstartedCalls: () => unstarted };
+    return { ...sub, unstartedCalls: () => unstarted, graceCalls: () => grace };
   };
 
   it("returns the pipeline's answer when it finishes within the budget, and never answers twice", async () => {
@@ -131,8 +136,9 @@ describe("submitWithBudget", () => {
       await sleep(LATE_MS);
       return "late";
     });
-    expect(await sub.result).toBe("spent");
-    expect(sub.unstartedCalls()).toBe(1);
+    expect(await sub.result).toBe("grace");
+    expect(sub.graceCalls()).toBe(1);
+    expect(sub.unstartedCalls()).toBe(0); // it started, so it must not be counted as unstarted
     expect(await sub.tail).toBeUndefined(); // the queue still waits for the pipeline itself
   });
 
@@ -167,6 +173,7 @@ describe("submitWithBudget", () => {
         unstarted++;
         return "spent";
       },
+      grace: async () => "grace",
       empty: () => "empty",
     });
     expect(await sub.result).toBe("spent");
@@ -1001,6 +1008,33 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
         expect(t.counts.cache_write_dropped).toBe(0);
         expect(t.counts.cache_write_ms).toBeGreaterThanOrEqual(6900);
         expect(await s.log()).toContain("cache write stalled");
+      },
+    );
+  }, 90_000);
+
+  test("G: a request held past budget + grace by dispose answers once, with its hits and one labelled row", async () => {
+    // vn4rz.136: this answered hits: [] and wrote two rows, one falsely unstarted and one healthy.
+    // The wait outlasts the stall, because a pipeline row can only appear after dispose ends.
+    const budgetMs = 3000;
+    const stallMs = 8000;
+    await withServe(
+      {
+        CLAWMEM_QUERY_BUDGET_MS: String(budgetMs),
+        CLAWMEM_QUERY_BUDGET_TEST_DISPOSE_STALL_MS: String(stallMs),
+      },
+      async (s) => {
+        const r = await s.post(Q_OK);
+        expect(r.status).toBe(200);
+        expect(r.ms).toBeLessThan(budgetMs + QUERY_BUDGET_GRACE_MS + TOLERANCE_MS);
+        expect(r.body.degraded).toBe(true);
+        expect(r.body.degraded_reason).toBe("query_budget_expired");
+        expect(hitsOf(r.body).length).toBeGreaterThan(0);
+        await sleep(stallMs);
+        const rows = await s.timings();
+        expect(rows.length).toBe(1);
+        expect(rows[0]!.counts.query_budget_grace).toBe(1);
+        expect(rows[0]!.counts.query_budget_expired).toBe(1);
+        expect(rows[0]!.counts.query_budget_unstarted).toBeUndefined();
       },
     );
   }, 90_000);
