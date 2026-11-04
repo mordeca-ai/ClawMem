@@ -231,7 +231,8 @@ beforeAll(async () => {
   await client.connect(clientTransport);
 
   restServer = startServer(seedStore, 0);
-});
+  // Importing and connecting the MCP server outlasts bun's 5 s hook default at load 20+, on 1.3.13 and 1.4.4 alike.
+}, 60_000);
 
 afterAll(() => {
   try { restServer?.stop(true); } catch { /* stopped */ }

@@ -9,9 +9,14 @@
  *
  * These tests EXPLAIN QUERY PLAN the exact statement searchFTS runs (via the exported
  * buildSearchFTSSql) on a fixture built through the store's own schema path, and assert the
- * FTS virtual-table scan is the outer loop without the per-row `=` constraint. A sensitivity
- * guard proves the fixture still provokes the bad plan for the un-pinned SQL, so the plan
- * assertion is not vacuous.
+ * FTS virtual-table scan is the outer loop without the per-row `=` constraint.
+ *
+ * master-harness-xbgy1.66: SQLite 3.53 (Bun 1.4) plans even the un-pinned JOIN FTS-outer, on
+ * this fixture and on a copy of the live vault, so removing the pin no longer turns a plan
+ * assertion red there. Three checks keep this file honest on every version:
+ *   - the pin's text must be present in the SQL;
+ *   - a forced documents-outer statement proves the plan check rejects the bad plan;
+ *   - on SQLite older than 3.53, the un-pinned JOIN must still get the bad plan on this fixture.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
@@ -25,6 +30,22 @@ import {
   type SearchFTSFilters,
   type Store,
 } from "../../src/store.ts";
+
+/** The SQLite the store really opens, read while the suite is defined so `skipIf` can use it. */
+function storeSqliteVersion(): [number, number] {
+  const probe = createStore(":memory:");
+  try {
+    const { v } = probe.db.prepare("SELECT sqlite_version() AS v").get() as { v: string };
+    const [major = 0, minor = 0] = v.split(".").map(Number);
+    return [major, minor];
+  } finally {
+    probe.close();
+  }
+}
+
+const [SQLITE_MAJOR, SQLITE_MINOR] = storeSqliteVersion();
+/** From SQLite 3.53 the planner no longer chooses documents-outer for the un-pinned JOIN here. */
+const UNPINNED_PLANS_FTS_OUTER = SQLITE_MAJOR > 3 || (SQLITE_MAJOR === 3 && SQLITE_MINOR >= 53);
 
 const BIG = "bigcoll";
 const SMALL = "smallcoll";
@@ -74,10 +95,29 @@ for (const analyzed of [false, true]) {
     });
     afterAll(() => store.close());
 
+    it("the pin is in the SQL, whatever the planner would choose without it", () => {
+      for (const { filters } of SCOPES) {
+        const { sql } = buildSearchFTSSql(ftsQuery, 20, filters);
+        expect(sql).toMatch(/FROM documents_fts f\s+CROSS JOIN documents d ON d\.id = f\.rowid/);
+      }
+    });
+
+    it("control: the plan check rejects a forced documents-outer plan on this SQLite", () => {
+      for (const { filters } of SCOPES) {
+        const { sql, params } = buildSearchFTSSql(ftsQuery, 20, filters);
+        const forced = sql.replace(
+          /FROM documents_fts f\s+CROSS JOIN documents d ON d\.id = f\.rowid/,
+          "FROM documents d CROSS JOIN documents_fts f ON f.rowid = d.id",
+        );
+        expect(forced).not.toBe(sql);
+        expect(ftsIsOuter(planRows(store, forced, params))).toBe(false);
+      }
+    });
+
     // The live vault carries no sqlite_stat1 (never ANALYZEd), so the no-stats fixture is the
     // faithful reproduction; post-ANALYZE the un-pinned plan depends on the stats, so the guard
     // only runs without them. The pinned-plan assertions run in both modes.
-    it.skipIf(analyzed)("sensitivity guard: the un-pinned JOIN gets the documents-outer plan on this fixture", () => {
+    it.skipIf(analyzed || UNPINNED_PLANS_FTS_OUTER)("sensitivity guard: below SQLite 3.53 the un-pinned JOIN gets the documents-outer plan on this fixture", () => {
       const { sql, params } = buildSearchFTSSql(ftsQuery, 20, { collections: [BIG] });
       const unpinned = sql.replace(/CROSS JOIN documents d/, "JOIN documents d");
       const plan = planRows(store, unpinned, params);
