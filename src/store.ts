@@ -4540,6 +4540,8 @@ export function buildSearchFTSSql(ftsQuery: string, limit: number, filters: Sear
   // the FTS MATCH once per document row (`SCAN f VIRTUAL TABLE INDEX 0:=M3`) — 38s+ on a
   // 21k-doc collection. CROSS JOIN is SQLite's documented join-order pin: the FTS scan stays
   // the outer loop and each hit is a rowid (INTEGER PRIMARY KEY) lookup into documents (~40ms).
+  // SQLite 3.53 (Bun 1.4) plans the plain JOIN FTS-outer by itself (master-harness-xbgy1.66), but
+  // that is a planner default that has already moved once, so the pin stays.
   // Do not "simplify" this back to a plain JOIN.
   let sql = `
     SELECT
