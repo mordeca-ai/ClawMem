@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.83 — Bun 1.4 readiness: searchFTS pin guard holds on SQLite 3.51 and 3.53
+
+Bun 1.4 readiness. The searchFTS join-order guard now holds on SQLite 3.51 and 3.53: SQLite 3.53.4 plans the un-pinned JOIN FTS-outer, so the suite asserts the pin's text, proves the plan check rejects a forced documents-outer plan, and runs the old sensitivity guard only below 3.53. The pin stays. causal-boundary setup gets a 60 s hook budget because it hit the 5 s default at load 20+ on both Bun versions. No runtime behaviour changes.
+
+---
+
 ## v0.36.82 — Budget grace answer writes one row and keeps its hits
 
 An answer served during the budget grace period now writes one labelled row and keeps its hits.
