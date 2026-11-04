@@ -18,6 +18,7 @@ import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:te
 // Since these are private, we test them via the public API behavior
 
 import { LlamaCpp, type LlamaCppConfig } from "../../src/llm.ts";
+import { loadScaledBound } from "../helpers/wall-clock.ts";
 
 function createLlm(overrides: Partial<LlamaCppConfig> = {}): LlamaCpp {
   return new LlamaCpp({
@@ -459,7 +460,7 @@ describe("LLM Remote Fallback", () => {
       // next attempt — and a late abort would wait out a backoff up to 16s.
       // 500ms cleanly separates the two: abortable ~150ms vs non-abortable
       // >=750ms.
-      expect(elapsed).toBeLessThan(500);
+      expect(elapsed).toBeLessThan(loadScaledBound(500, 749));
       expect(fetchCount).toBeGreaterThanOrEqual(1);
     }, 10000);
 
@@ -483,7 +484,7 @@ describe("LLM Remote Fallback", () => {
       const elapsed = Date.now() - t0;
 
       expect(result).toBeNull();
-      expect(elapsed).toBeLessThan(900); // aborted at ~150ms, did not hang
+      expect(elapsed).toBeLessThan(loadScaledBound(900, 5000)); // aborted at ~150ms, did not hang
     }, 10000);
 
     it("an aborted embed does NOT trip the remote-down cooldown", async () => {

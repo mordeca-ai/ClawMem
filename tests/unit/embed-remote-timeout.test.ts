@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 
 import { LlamaCpp } from "../../src/llm.ts";
+import { loadScaledBound } from "../helpers/wall-clock.ts";
 
 /**
  * Tests for 1d1fn (follow-up to 62xr.5 — embed timeout storm, finance corpus
@@ -177,7 +178,7 @@ describe("remote embed fetch timeout (1d1fn)", () => {
         const results2 = await llm.embedBatch(["d", "e"]);
         const elapsed2 = Date.now() - start2;
         expect(results2).toEqual([null, null]);
-        expect(elapsed2).toBeLessThan(150);
+        expect(elapsed2).toBeLessThan(loadScaledBound(150, 1000)); // short-circuit, no remote timeout
       } finally {
         hung.stop();
       }

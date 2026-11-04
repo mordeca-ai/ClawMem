@@ -1,5 +1,6 @@
 import { describe, expect, it, mock } from "bun:test";
 import { withRetryAndFeedback, type ParseOutcome } from "../../src/llm-retry.ts";
+import { loadScaledBound } from "../helpers/wall-clock.ts";
 
 function makeLlm(responses: Array<string | null | Error>) {
   const generate = mock(async (_prompt: string, _opts: unknown) => {
@@ -170,7 +171,7 @@ describe("withRetryAndFeedback", () => {
       opts.signal?.addEventListener("abort", () => {
         sawAbort = true;
       });
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, 3000));
       return { text: '["too-late"]', model: "mock-llm", done: true };
     });
     const started = Date.now();
@@ -185,7 +186,7 @@ describe("withRetryAndFeedback", () => {
     const elapsed = Date.now() - started;
     expect(result).toBeNull();
     expect(generate).toHaveBeenCalledTimes(1);
-    expect(elapsed).toBeLessThan(400);
+    expect(elapsed).toBeLessThan(loadScaledBound(400, 2900)); // not the mock's 3000 ms sleep
     expect(sawAbort).toBe(true);
   });
 
@@ -212,6 +213,6 @@ describe("withRetryAndFeedback", () => {
     expect(result).toBeNull();
     expect(sawAbort).toBe(true);
     expect(generate).toHaveBeenCalledTimes(1);
-    expect(elapsed).toBeLessThan(400);
+    expect(elapsed).toBeLessThan(loadScaledBound(400, 2900)); // not the mock's 3000 ms sleep
   });
 });

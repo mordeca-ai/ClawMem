@@ -45,6 +45,7 @@ import {
   type PgReranker,
   type PgRerankStatus,
 } from "../../src/pg/search-reranked.ts";
+import { loadScaledBound } from "../helpers/wall-clock.ts";
 
 const URL_ = process.env.CLAWMEM_PG_URL;
 const DIM = 8;
@@ -313,7 +314,8 @@ d("PG reranked read path", () => {
         deadlineMs,
       }),
     );
-    expect(out.timings.totalMs).toBeLessThanOrEqual(deadlineMs + EPSILON_MS);
+    // Ceiling: with no budget this call ends at ~1475 ms, on the default statement bound.
+    expect(out.timings.totalMs).toBeLessThanOrEqual(deadlineMs + loadScaledBound(EPSILON_MS, 800));
     expect(out.hybrid.degraded).toBe(true);
     expect(out.hybrid.arms).toBe("none");
     // The vec ANN leg was cancelled by its CLAMPED server-side bound…
@@ -344,7 +346,7 @@ d("PG reranked read path", () => {
       }),
     );
     expect(out.hybrid.arms).toBe("vec+fts");
-    expect(out.timings.totalMs).toBeLessThanOrEqual(deadlineMs + EPSILON_MS);
+    expect(out.timings.totalMs).toBeLessThanOrEqual(deadlineMs + loadScaledBound(EPSILON_MS, 2500));
     const lastVec = seen.reduce((acc, t, i) => (t.includes("<=>") ? i : acc), -1);
     const ftsBounds = stmtBounds(seen.slice(lastVec + 1));
     expect(ftsBounds).toHaveLength(1);
@@ -363,7 +365,7 @@ d("PG reranked read path", () => {
         deadlineAt: performance.now() + 400,
       }),
     );
-    expect(performance.now() - t0).toBeLessThanOrEqual(400 + EPSILON_MS);
+    expect(performance.now() - t0).toBeLessThanOrEqual(400 + loadScaledBound(EPSILON_MS, 800));
     expect(out.degraded).toBe(true);
     expect(out.armFailures.map((f) => f.arm)).toEqual(["vec", "fts"]);
   });

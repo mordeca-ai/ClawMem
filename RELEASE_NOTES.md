@@ -4,6 +4,18 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.81 — clawmem-lander land gate fails on load-only flakes: LIVE A4 wall-clock overrun and bun runtime crash
+
+Wall-clock test assertions now scale with host load, so a busy host no longer fails a land when the code is fine.
+
+---
+
+## v0.36.80 — Lifecycle sync keeps the row matching SQLite
+
+Origin lifecycle sync now keeps the revision whose title matches SQLite, then the newest ingested. Ranking by newest alone kept stale-raw rows active over the correct row at the same path (master-harness-vn4rz.148).
+
+---
+
 ## v0.36.79 — A serve process can keep scope vectors between queries
 
 Added, off by default: `CLAWMEM_QUERY_RESIDENT_SCOPE_MB` keeps a scope's loaded vectors in memory between queries, on the main thread. It is meant for `clawmem serve`, which opened a new store and re-read the same chunks on every query. In a paired run over 50 live scoped queries, `scope_load` p50 fell from 904 ms to 10.5 ms and request p50 from 2040 ms to 641 ms.

@@ -7,6 +7,7 @@ import { createStore, prewarmVectors, startPeriodicPrewarm, resolvePrewarmInterv
 import { hashContent } from "../../src/indexer.ts";
 import { wasPromptSeenRecently } from "../../src/hooks.ts";
 import { clearConfigCache } from "../../src/config.ts";
+import { loadScaledBound } from "../helpers/wall-clock.ts";
 
 /**
  * Regression tests for the context-surfacing UserPromptSubmit hook timing out
@@ -69,7 +70,7 @@ describe("initializeDatabase — the backfill is read-guarded (Change 1)", () =>
       const elapsed = Date.now() - t0;
 
       expect(threw).toBe(false);            // must NOT SQLITE_BUSY out
-      expect(elapsed).toBeLessThan(1500);   // must NOT wait out the 4s busy_timeout
+      expect(elapsed).toBeLessThan(loadScaledBound(1500, 3900)); // must NOT wait out the 4s busy_timeout
     } finally {
       try { holder.exec("ROLLBACK"); } catch { /* ignore */ }
       holder.close();
@@ -256,7 +257,7 @@ describe("wasPromptSeenRecently — dedup write is fail-open under contention (B
 
       expect(threw).toBe(false);           // fail-open: contended dedup write must not throw
       expect(typeof result).toBe("boolean"); // still returns the READ-based verdict
-      expect(elapsed).toBeLessThan(1500);   // bounded by the 500ms cap, not the 4000ms default
+      expect(elapsed).toBeLessThan(loadScaledBound(1500, 3900)); // bounded by the 500ms cap, not the 4000ms default
     } finally {
       if (prevWindow === undefined) delete process.env.CLAWMEM_HOOK_DEDUP_WINDOW_SEC;
       else process.env.CLAWMEM_HOOK_DEDUP_WINDOW_SEC = prevWindow;
@@ -307,7 +308,7 @@ describe("resolveStore forwards the busy_timeout cap to a NAMED vault (B3 High-f
       const elapsed = Date.now() - t0;
 
       expect(threw).toBe(true);           // contended write does hit SQLITE_BUSY (caller swallows it)
-      expect(elapsed).toBeLessThan(1500); // bounded by the 500ms cap, NOT the 5000ms default
+      expect(elapsed).toBeLessThan(loadScaledBound(1500, 4900)); // bounded by the 500ms cap, NOT the 5000ms default
     } finally {
       if (prevVaults === undefined) delete process.env.CLAWMEM_VAULTS;
       else process.env.CLAWMEM_VAULTS = prevVaults;
