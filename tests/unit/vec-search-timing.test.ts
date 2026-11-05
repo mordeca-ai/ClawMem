@@ -33,3 +33,21 @@ test("worker timing observer clears after a failed embedding", async () => {
   expect(phases).toEqual(["embed_ms"]);
   store.close();
 });
+
+test("overlapping in-process legs keep their timing observers separate", async () => {
+  const store = createStore(":memory:");
+  store.ensureVecTable(4);
+  setDefaultLlamaCpp({ embed: async () => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return { embedding: [1, 0, 0, 0], model: "model-A" };
+  } } as any);
+  const first: VecSearchTimingPhase[] = [];
+  const second: VecSearchTimingPhase[] = [];
+  await Promise.all([
+    withVecSearchTiming((phase) => first.push(phase), () => searchVec(store.db, "first", "model-A")),
+    withVecSearchTiming((phase) => second.push(phase), () => searchVec(store.db, "second", "model-A")),
+  ]);
+  expect(first).toEqual(["embed_ms", "scan_ms"]);
+  expect(second).toEqual(["embed_ms", "scan_ms"]);
+  store.close();
+});

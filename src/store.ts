@@ -15,6 +15,7 @@
 import { Database } from "bun:sqlite";
 import { Glob } from "bun";
 import { realpathSync, existsSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as sqliteVec from "sqlite-vec";
 import {
   LlamaCpp,
@@ -4694,24 +4695,22 @@ function assertQueryEmbedModelConsistent(db: Database, endpointModel: string): v
 // event loop — while the hook hydrates locally via hydrateVecResults(). In-process searchVec() below
 // composes the two, so its public contract is unchanged.
 export type VecSearchTimingPhase = "embed_ms" | "scope_wait_ms" | "scan_ms";
-let vecSearchTimingObserver: ((phase: VecSearchTimingPhase, ms: number) => void) | undefined;
+const vecSearchTimingContext = new AsyncLocalStorage<(phase: VecSearchTimingPhase, ms: number) => void>();
 
-/** The vec-leg worker runs one request at a time; keep timing scoped to that request. */
+/** Keep each leg's timings separate even when embeddings overlap in the in-process path. */
 export async function withVecSearchTiming<T>(
   observer: (phase: VecSearchTimingPhase, ms: number) => void,
   run: () => Promise<T>,
 ): Promise<T> {
-  const previous = vecSearchTimingObserver;
-  vecSearchTimingObserver = observer;
-  try { return await run(); }
-  finally { vecSearchTimingObserver = previous; }
+  return vecSearchTimingContext.run(observer, run);
 }
 
 async function timeVecSearch<T>(phase: VecSearchTimingPhase, run: () => Promise<T> | T): Promise<T> {
-  if (!vecSearchTimingObserver) return await run();
+  const observer = vecSearchTimingContext.getStore();
+  if (!observer) return await run();
   const started = performance.now();
   try { return await run(); }
-  finally { vecSearchTimingObserver(phase, performance.now() - started); }
+  finally { observer(phase, performance.now() - started); }
 }
 
 export async function searchVecMatch(db: Database, query: string, model: string, limit: number = 20, deadlineMs?: number): Promise<{ hash_seq: string; distance: number }[]> {

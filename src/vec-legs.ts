@@ -71,6 +71,7 @@ export interface WorkerLegPoolOpts {
   model: string;
   limit: number;
   collections?: string[];
+  requestId?: string;
 }
 
 /** Per-call configuration for a plain leg (the deadline path's long-lived pool, vn4rz.131). */
@@ -246,6 +247,7 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
       dispatch();
     });
 
+  let legIndex = 0;
   const runLeg = (query: string): Promise<SearchResult[]> =>
     submit<SearchResult[]>({
       dbPath: opts.dbPath,
@@ -253,6 +255,9 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
       query,
       limit: opts.limit,
       collections: opts.collections,
+      requestId: opts.requestId,
+      legIndex: legIndex++,
+      queuedAt: opts.requestId ? Date.now() : undefined,
     });
 
   const runLegDetailed = (query: string, o: DetailedLegOpts): Promise<VecSearchDetailedResult> =>

@@ -586,6 +586,23 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
     });
   }, 90_000);
 
+  test("T2: live serve path without a vector deadline emits correlated leg timing", async () => {
+    await withServe({}, async (s) => {
+      expect((await s.post(Q_OK)).status).toBe(200);
+      const rows = (await s.log()).split("\n");
+      const query = JSON.parse(rows.find((line) => line.startsWith("[query-timing] "))!.split("[query-timing] ")[1]!);
+      const legs = rows.filter((line) => line.startsWith("[vec-leg-timing] "))
+        .map((line) => JSON.parse(line.split("[vec-leg-timing] ")[1]!));
+      expect(query.counts.query_queue_wait_ms).toBeGreaterThanOrEqual(0);
+      expect(legs.length).toBeGreaterThanOrEqual(1);
+      for (const leg of legs) {
+        expect(leg.request_id).toBe(query.request_id);
+        expect(leg.embed_ms).toBeGreaterThanOrEqual(0);
+        expect(leg.scan_ms).toBeGreaterThanOrEqual(0);
+      }
+    });
+  }, 90_000);
+
   test("B1: 4 concurrent POSTs with a blocked scan all return within budget + tolerance", async () => {
     const D = 2000;
     await withServe(
@@ -1079,7 +1096,7 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
       expect(performance.now() - t0).toBeGreaterThanOrEqual(3000);
       const timings = await s.timings();
       for (const t of timings)
-        expect(Object.keys(t.counts).sort()).toEqual(["lex_legs", "vec_legs"]);
+        expect(Object.keys(t.counts).sort()).toEqual(["lex_legs", "query_queue_wait_ms", "vec_legs"]);
       // No budget: FTS stayed on the main thread and no FTS worker was ever started (vn4rz.135).
       expect(await s.log()).not.toContain("fts worker started");
     });
