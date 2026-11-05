@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.85 — Measure what inside clawmem vec_legs takes the time beyond scope_load, the tail that still fails openclaw turns open
+
+Complete opt-in vector timing on the live no-deadline ClawMem serve path: correlate in-process and worker legs, isolate concurrent leg observations, and record request serialization wait.
+
+---
+
 ## v0.36.84 — Measure what inside clawmem vec_legs takes the time beyond scope_load, the tail that still fails openclaw turns open
 
 Opt-in per-leg vector timing: correlate query and worker rows and split queue wait, embedding, scope load/wait, and scan under CLAWMEM_QUERY_TIMING. No retrieval behavior change.

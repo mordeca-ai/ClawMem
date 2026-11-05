@@ -20,6 +20,7 @@ import {
   canonicalDocId,
   prepareScopedVecScan,
   prewarmScopedVecScan,
+  withVecSearchTiming,
   enableVecScopeCache,
   readScopedMmapBytes,
   type Store,
@@ -1645,7 +1646,7 @@ type QueryOutcome = {
  * `budget` is the whole-request budget (vn4rz.134), set only by `clawmem serve` when
  * CLAWMEM_QUERY_BUDGET_MS is on; without it every branch below is the one that ran before.
  */
-async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOutcome, budget?: QueryBudget): Promise<QueryJsonHit[]> {
+async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOutcome, budget?: QueryBudget, arrivedAt?: number): Promise<QueryJsonHit[]> {
   const { values, positionals } = parseArgs({
     args,
     options: {
@@ -1666,6 +1667,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   const timer = new QueryTimer(queryTimingEnabled());
   if (timer.enabled) timer.requestId = crypto.randomUUID();
   if (outcome) outcome.timer = timer;
+  if (arrivedAt !== undefined) timer.count("query_queue_wait_ms", Math.max(0, Math.round(performance.now() - arrivedAt)));
   // Arrival to pipeline start (the stamp plus the queue wait), so a test can see a late arrival stamp.
   if (budget) timer.count("budget_elapsed_at_start_ms", Math.round(budget.elapsedMs()));
   const endStore = timer.start("store_open");
@@ -1753,8 +1755,23 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   const candidateResults: SearchResult[] = [];
 
   const vecLegsOf = (eqs: ExpandedQuery[]) => eqs.filter(e => e.type !== "lex").map(e => e.query);
-  const inProcessLeg = (q: string) => s.searchVec(q, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols);
-  const poolOpts = { dbPath: getDefaultDbPath(), model: DEFAULT_EMBED_MODEL, limit: POOL, collections: scopeCols };
+  let localLegIndex = 0;
+  const tracedLocalLeg = (run: () => Promise<SearchResult[]>, path: string): Promise<SearchResult[]> => {
+    if (!timer.enabled) return run();
+    const index = localLegIndex++;
+    const started = performance.now();
+    const phases: Record<string, number> = {};
+    return withVecSearchTiming((phase, ms) => { phases[phase] = (phases[phase] ?? 0) + ms; }, run)
+      .finally(() => console.error(`[vec-leg-timing] ${JSON.stringify({
+        request_id: timer.requestId, leg_index: index, path,
+        leg_total_ms: Math.round(performance.now() - started),
+        ...Object.fromEntries(Object.entries(phases).map(([key, ms]) => [key, Math.round(ms)])),
+      })}`));
+  };
+  const rawInProcessLeg = (q: string) => s.searchVec(q, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols);
+  const inProcessLeg = (q: string) => tracedLocalLeg(() => rawInProcessLeg(q), "in_process");
+  const poolOpts = { dbPath: getDefaultDbPath(), model: DEFAULT_EMBED_MODEL, limit: POOL, collections: scopeCols,
+    requestId: timer.requestId };
   const par = vecLegParallelism();
   let expandedQueries: ExpandedQuery[];
   let vecLegResults: SearchResult[][];
@@ -1832,8 +1849,10 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
     const scoped = scopeCols && scopedScanEnabled() ? openScopedLegStore(scopeCols) : null;
     endPlan();
     if (scoped) {
-      const scopedLeg = (q: string) =>
-        scoped.searchVec(q, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols).catch(() => inProcessLeg(q));
+      const scopedLeg = (q: string) => tracedLocalLeg(
+        () => scoped.searchVec(q, DEFAULT_EMBED_MODEL, POOL, undefined, scopeCols).catch(() => rawInProcessLeg(q)),
+        "scoped_in_process",
+      );
       // Concurrency bounds the embeds in flight; the scans themselves are short and synchronous.
       // CLAWMEM_QUERY_VEC_PARALLEL=1 keeps the sequential order here too.
       const legConcurrency = par;
@@ -2416,6 +2435,7 @@ async function cmdServe(args: string[]) {
     query: string, collection: string | undefined, limit: number, sessionId: string | undefined,
     budget?: QueryBudget,
     outcome: QueryOutcome = {},
+    arrivedAt?: number,
   ) => {
     // master-harness-vn4rz.123: validate the scope HERE. cmdQuery reports an unknown
     // collection through die() -> process.exit(1), which is right for the CLI and fatal for
@@ -2441,7 +2461,7 @@ async function cmdServe(args: string[]) {
       // never a cmdQuery option.
       const args = ["-n", String(limit), "--json"];
       if (collection !== undefined) args.push("-c", collection);
-      const hits = await cmdQuery([...args, "--", query], false, outcome, budget);
+      const hits = await cmdQuery([...args, "--", query], false, outcome, budget, arrivedAt);
       return outcome.degraded ? { degraded: true as const, degraded_reason: outcome.degraded, hits } : hits;
     } finally {
       for (const [k, v] of saved) {
@@ -2454,7 +2474,7 @@ async function cmdServe(args: string[]) {
     // vn4rz.134: the budget starts at arrival, before the queue wait below.
     const budget = QueryBudget.fromEnv(arrivedAt);
     if (!budget) {
-      const run = queryQueue.then(() => runQuery(query, collection, limit, sessionId));
+      const run = queryQueue.then(() => runQuery(query, collection, limit, sessionId, undefined, {}, arrivedAt));
       queryQueue = run.then(() => undefined, () => undefined);
       return run;
     }
@@ -2464,7 +2484,7 @@ async function cmdServe(args: string[]) {
     const { result, tail } = submitWithBudget<Budgeted>({
       budget,
       queue: queryQueue,
-      run: () => runQuery(query, collection, limit, sessionId, budget, outcome),
+      run: () => runQuery(query, collection, limit, sessionId, budget, outcome, arrivedAt),
       grace: async () => {
         // The pipeline ran but a stage that cannot be cut holds it. This is the request's one
         // timing row: the pipeline's own emit is a no-op once this timer has emitted.
