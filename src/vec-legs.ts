@@ -79,6 +79,8 @@ export interface PlainLegOpts {
   model: string;
   limit: number;
   collections?: string[];
+  requestId?: string;
+  legIndex?: number;
 }
 
 /** A chunk-targeted scoped leg (vn4rz.100) run in a worker: legs sharing `scopeId` share one store. */
@@ -272,6 +274,9 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
       query,
       limit: o.limit,
       collections: o.collections,
+      requestId: o.requestId,
+      legIndex: o.legIndex,
+      queuedAt: o.requestId ? Date.now() : undefined,
     });
 
   const runLegScoped = (query: string, o: ScopedLegOpts): Promise<ScopedLegResult> =>
@@ -283,6 +288,9 @@ export function createWorkerLegPool(size: number, opts: WorkerLegPoolOpts): Work
       query,
       limit: o.limit,
       collections: o.collections,
+      requestId: o.requestId,
+      legIndex: o.legIndex,
+      queuedAt: o.requestId ? Date.now() : undefined,
     });
 
   const releaseScoped = () => {

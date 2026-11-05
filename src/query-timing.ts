@@ -15,6 +15,7 @@
 export type StageTiming = { start_ms: number; ms: number };
 
 export type QueryTimingReport = {
+  request_id?: string;
   startup_ms: number;
   total_ms: number;
   stages: Record<string, StageTiming>;
@@ -33,6 +34,7 @@ export class QueryTimer {
   private readonly counts: Record<string, number> = {};
   private readonly now: () => number;
   private emitted = false;
+  requestId?: string;
 
   constructor(enabled: boolean, now: () => number = () => performance.now()) {
     this.enabled = enabled;
@@ -73,7 +75,7 @@ export class QueryTimer {
     for (const [name, s] of Object.entries(this.stages)) {
       stages[name] = { start_ms: round(s.start_ms), ms: round(s.ms) };
     }
-    return { startup_ms: round(this.startupMs), total_ms: round(this.now()), stages, counts: { ...this.counts } };
+    return { request_id: this.requestId, startup_ms: round(this.startupMs), total_ms: round(this.now()), stages, counts: { ...this.counts } };
   }
 
   /**

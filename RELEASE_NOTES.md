@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.84 — Measure what inside clawmem vec_legs takes the time beyond scope_load, the tail that still fails openclaw turns open
+
+Opt-in per-leg vector timing: correlate query and worker rows and split queue wait, embedding, scope load/wait, and scan under CLAWMEM_QUERY_TIMING. No retrieval behavior change.
+
+---
+
 ## v0.36.83 — Bun 1.4 readiness: searchFTS pin guard holds on SQLite 3.51 and 3.53
 
 Bun 1.4 readiness. The searchFTS join-order guard now holds on SQLite 3.51 and 3.53: SQLite 3.53.4 plans the un-pinned JOIN FTS-outer, so the suite asserts the pin's text, proves the plan check rejects a forced documents-outer plan, and runs the old sensitivity guard only below 3.53. The pin stays. causal-boundary setup gets a 60 s hook budget because it hit the 5 s default at load 20+ on both Bun versions. No runtime behaviour changes.

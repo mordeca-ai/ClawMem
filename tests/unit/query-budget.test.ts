@@ -561,6 +561,31 @@ describe("guardedCacheWrite (vn4rz.140)", () => {
 });
 
 describe("clawmem serve POST /query under CLAWMEM_QUERY_BUDGET_MS", () => {
+  test("T: traced deadline legs share a request id with the query row and expose the timing split", async () => {
+    await withServe({ CLAWMEM_QUERY_BUDGET_MS: "20000" }, async (s) => {
+      const reply = await s.post(Q_OK);
+      expect(reply.status).toBe(200);
+      const rows = (await s.log()).split("\n");
+      const queryRows = rows.filter((line) => line.startsWith("[query-timing] "));
+      const legRows = rows.filter((line) => line.startsWith("[vec-leg-timing] "));
+      expect(queryRows).toHaveLength(1);
+      expect(legRows.length).toBeGreaterThanOrEqual(1);
+      const query = JSON.parse(queryRows[0]!.slice("[query-timing] ".length));
+      const leg = JSON.parse(legRows[0]!.slice("[vec-leg-timing] ".length));
+      expect(leg.request_id).toBe(query.request_id);
+      expect(leg.leg_index).toBe(0);
+      expect(leg.worker_queue_wait_ms).toBeGreaterThanOrEqual(0);
+      expect(leg.embed_ms).toBeGreaterThanOrEqual(0);
+      expect(leg.scan_ms).toBeGreaterThanOrEqual(0);
+    });
+    await withServe({ CLAWMEM_QUERY_BUDGET_MS: "20000", CLAWMEM_QUERY_TIMING: "0" }, async (s) => {
+      expect((await s.post(Q_OK)).status).toBe(200);
+      const log = await s.log();
+      expect(log).not.toContain("[query-timing]");
+      expect(log).not.toContain("[vec-leg-timing]");
+    });
+  }, 90_000);
+
   test("B1: 4 concurrent POSTs with a blocked scan all return within budget + tolerance", async () => {
     const D = 2000;
     await withServe(

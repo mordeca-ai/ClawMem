@@ -5,12 +5,14 @@ import {
   prepareScopedVecScan,
   prewarmScopedVecScan,
   rethrowIfFatalVectorError,
+  withVecSearchTiming,
   type SearchResult,
   type Store,
 } from "./store.ts";
 import { resetVecScopeScanStats, vecScopeScanStats, type VecScopeScanStats } from "./vec-scope-scan.ts";
 
 import { postWorkerLoaded } from "./worker-load-guard.ts";
+import { queryTimingEnabled } from "./query-timing.ts";
 
 declare var self: Worker;
 
@@ -62,6 +64,7 @@ function scopedStoreFor(scopeId: string, dbPath: string, collections: string[], 
  */
 async function runScopedLeg(
   scopeId: string, dbPath: string, model: string, query: string, limit: number, collections: string[], mmapBytes: number,
+  timing?: Record<string, number>,
 ): Promise<{ results: SearchResult[]; scopeStats: VecScopeScanStats }> {
   const ro = scopedStoreFor(scopeId, dbPath, collections, mmapBytes);
   let results: SearchResult[];
@@ -70,7 +73,9 @@ async function runScopedLeg(
       const leg = ro.searchVec(query, model, limit, undefined, collections);
       leg.catch(() => {}); // Observed below; stops an early rejection reading as unhandled.
       await new Promise(resolve => setTimeout(resolve, 0));
-      await prewarmScopedVecScan(ro.db, ro.dbPath, { collections }, 1);
+      const loadStarted = performance.now();
+      try { await prewarmScopedVecScan(ro.db, ro.dbPath, { collections }, 1); }
+      finally { if (timing) timing.scope_load_ms = performance.now() - loadStarted; }
       results = await leg;
     } catch (e) {
       rethrowIfFatalVectorError(e);
@@ -83,14 +88,21 @@ async function runScopedLeg(
 }
 
 self.onmessage = async (ev: MessageEvent) => {
-  const { id, dbPath, model, query, limit, collections, detailed, dateRange, excludeCollections, warm, scopeId, mmapBytes } = ev.data;
+  const { id, dbPath, model, query, limit, collections, detailed, dateRange, excludeCollections, warm, scopeId, mmapBytes,
+    requestId, legIndex, queuedAt } = ev.data;
   if (ev.data.releaseScoped) {
     releaseScoped();
     return;
   }
+  const trace = typeof requestId === "string" && queryTimingEnabled();
+  const timing: Record<string, number> = {};
+  const started = performance.now();
+  const measure = <T>(run: () => Promise<T>): Promise<T> => trace
+    ? withVecSearchTiming((phase, ms) => { timing[phase] = (timing[phase] ?? 0) + ms; }, run)
+    : run();
   try {
     if (scopeId) {
-      const results = await runScopedLeg(scopeId, dbPath, model, query, limit, collections, mmapBytes);
+      const results = await measure(() => runScopedLeg(scopeId, dbPath, model, query, limit, collections, mmapBytes, timing));
       self.postMessage({ id, ok: true, results });
       return;
     }
@@ -101,8 +113,8 @@ self.onmessage = async (ev: MessageEvent) => {
       return;
     }
     const results = detailed
-      ? await st.searchVecDetailed(query, model, limit, { collections, dateRange, excludeCollections })
-      : await st.searchVec(query, model, limit, undefined, collections);
+      ? await measure(() => st.searchVecDetailed(query, model, limit, { collections, dateRange, excludeCollections }))
+      : await measure(() => st.searchVec(query, model, limit, undefined, collections));
     self.postMessage({ id, ok: true, results });
   } catch (e) {
     self.postMessage({
@@ -111,6 +123,13 @@ self.onmessage = async (ev: MessageEvent) => {
       error: e instanceof Error ? e.message : String(e),
       fatalName: e instanceof FatalVectorError ? e.name : undefined,
     });
+  } finally {
+    if (trace) console.error(`[vec-leg-timing] ${JSON.stringify({
+      request_id: requestId, leg_index: legIndex,
+      worker_queue_wait_ms: typeof queuedAt === "number" ? Math.max(0, Date.now() - queuedAt - (performance.now() - started)) : null,
+      leg_total_ms: Math.round(performance.now() - started),
+      ...Object.fromEntries(Object.entries(timing).map(([k, v]) => [k, Math.round(v)])),
+    })}`);
   }
 };
 
