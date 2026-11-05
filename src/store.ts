@@ -4693,11 +4693,32 @@ function assertQueryEmbedModelConsistent(db: Database, endpointModel: string): v
 // daemon can run JUST this half on the long-lived watcher — keeping the blocking MATCH off the hook's
 // event loop — while the hook hydrates locally via hydrateVecResults(). In-process searchVec() below
 // composes the two, so its public contract is unchanged.
+export type VecSearchTimingPhase = "embed_ms" | "scope_wait_ms" | "scan_ms";
+let vecSearchTimingObserver: ((phase: VecSearchTimingPhase, ms: number) => void) | undefined;
+
+/** The vec-leg worker runs one request at a time; keep timing scoped to that request. */
+export async function withVecSearchTiming<T>(
+  observer: (phase: VecSearchTimingPhase, ms: number) => void,
+  run: () => Promise<T>,
+): Promise<T> {
+  const previous = vecSearchTimingObserver;
+  vecSearchTimingObserver = observer;
+  try { return await run(); }
+  finally { vecSearchTimingObserver = previous; }
+}
+
+async function timeVecSearch<T>(phase: VecSearchTimingPhase, run: () => Promise<T> | T): Promise<T> {
+  if (!vecSearchTimingObserver) return await run();
+  const started = performance.now();
+  try { return await run(); }
+  finally { vecSearchTimingObserver(phase, performance.now() - started); }
+}
+
 export async function searchVecMatch(db: Database, query: string, model: string, limit: number = 20, deadlineMs?: number): Promise<{ hash_seq: string; distance: number }[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedResult = await getEmbedding(query, model, true, deadlineMs);
+  const embedResult = await timeVecSearch("embed_ms", () => getEmbedding(query, model, true, deadlineMs));
   if (!embedResult) return [];
 
   // W1: read-path embedding-model consistency gate + dimension check via the SHARED guard
@@ -4722,11 +4743,11 @@ export async function searchVecMatch(db: Database, query: string, model: string,
   // See: https://github.com/tobi/qmd/pull/23
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
-  return db.prepare(`
+  return timeVecSearch("scan_ms", () => db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[]);
 }
 
 // Step 2 of vector search — the cheap, local half: hydrate raw {hash_seq, distance} hits into
@@ -5519,20 +5540,20 @@ export async function searchVecDetailed(
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return empty;
 
-  const embedResult = await getEmbedding(query, model, true, opts.deadlineMs);
+  const embedResult = await timeVecSearch("embed_ms", () => getEmbedding(query, model, true, opts.deadlineMs));
   if (!embedResult) return empty;
   if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
   const pendingLoad = pendingScopeLoads.get(db);
-  if (pendingLoad) await pendingLoad;
+  if (pendingLoad) await timeVecSearch("scope_wait_ms", () => pendingLoad);
   if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) return empty;
   vecScanTestSeam(query);
 
-  return searchVecDetailedWithVector(
+  return timeVecSearch("scan_ms", () => searchVecDetailedWithVector(
     db,
     { embedding: new Float32Array(embedResult.embedding), endpointModel: embedResult.model },
     limit,
     opts
-  );
+  ));
 }
 
 // =============================================================================

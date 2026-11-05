@@ -1664,6 +1664,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
 
   // CLAWMEM_QUERY_TIMING=1 prints a per-stage breakdown to stderr (vn4rz.97); off by default.
   const timer = new QueryTimer(queryTimingEnabled());
+  if (timer.enabled) timer.requestId = crypto.randomUUID();
   if (outcome) outcome.timer = timer;
   // Arrival to pipeline start (the stamp plus the queue wait), so a test can see a late arrival stamp.
   if (budget) timer.count("budget_elapsed_at_start_ms", Math.round(budget.elapsedMs()));
@@ -1774,6 +1775,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
     const dbPath = getDefaultDbPath();
     let scopeStats: ScopedLegResult["scopeStats"] | undefined;
     let scopedChain: Promise<unknown> = Promise.resolve();
+    let legIndex = 0;
     const stage = await runVecStageWithDeadline({
       legs: getVecDeadlineLegs(),
       deadlineMs: vecDeadline,
@@ -1781,7 +1783,8 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
       expansion: expansion ?? Promise.resolve([] as ExpandedQuery[]),
       legsOf: vecLegsOf,
       legOn: pool => q => {
-        const legOpts = { dbPath, model: DEFAULT_EMBED_MODEL, limit: POOL, collections: scopeCols };
+        const legOpts = { dbPath, model: DEFAULT_EMBED_MODEL, limit: POOL, collections: scopeCols,
+          requestId: timer.requestId, legIndex: legIndex++ };
         if (!scopeId) return pool.runLegOn(q, legOpts);
         // One at a time, so the query's legs land on one worker and read the scope once.
         const leg = scopedChain
