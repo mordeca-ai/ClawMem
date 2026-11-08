@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.88 — clawmem bin/clawmem re-defaults an unset CLAWMEM_LLM_URL to localhost:8089: recall 'expansion off' POSTs every query prompt there (404) and runs fallback expansion
+
+Add CLAWMEM_QUERY_EXPAND=off: query expansion makes no LLM call and reads no cache, and bin/clawmem leaves an unset CLAWMEM_LLM_URL unset.
+
+---
+
 ## v0.36.87 — clawmem worker-load-guard real-Worker test races an unawaited Bun.write under load and red-gates the lander
 
 Test-only: the real-Worker case in worker-load-guard.test.ts now writes its control marker synchronously, so a loaded host can no longer terminate the worker before the marker exists. No runtime change.
