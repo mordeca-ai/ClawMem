@@ -541,7 +541,12 @@ describe("clawmem serve POST /query under CLAWMEM_QUERY_VEC_DEADLINE_MS", () => 
       expect(ms).toBeGreaterThanOrEqual(1500);
       expect(scanThreads()).toEqual(["main"]);
       const [timing] = await s.timings();
-      expect(Object.keys(timing!.counts).sort()).toEqual(["lex_legs", "vec_legs"]);
+      // No budget and no deadline: no budget or deadline counts, only the queue wait serve always stamps.
+      expect(Object.keys(timing!.counts).sort()).toEqual([
+        "lex_legs",
+        "query_queue_wait_ms",
+        "vec_legs",
+      ]);
     });
   }, 60_000);
 

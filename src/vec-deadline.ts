@@ -31,6 +31,19 @@ export function vecDeadlineMs(env: Record<string, string | undefined> = process.
   return Number.parseInt(raw, 10);
 }
 
+/**
+ * CLAWMEM_QUERY_FTS_VEC_OVERLAP (vn4rz.150): on by default. Under a request budget with the vector
+ * deadline on, the original query's vector leg starts beside FTS instead of after it. `0`, `false`,
+ * `off` or `no` restores the serial order.
+ */
+export function ftsVecOverlapEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const raw = env.CLAWMEM_QUERY_FTS_VEC_OVERLAP?.trim().toLowerCase();
+  if (!raw) return true;
+  return !["0", "false", "off", "no"].includes(raw);
+}
+
 /** A worker's error crossed the thread boundary as text: restore the fatal class it had there. */
 function fatalFromWorker(err: unknown): FatalVectorError | null {
   const name = (err as { fatalName?: string } | null)?.fatalName;
