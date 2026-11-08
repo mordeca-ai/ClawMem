@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.87 — clawmem worker-load-guard real-Worker test races an unawaited Bun.write under load and red-gates the lander
+
+Test-only: the real-Worker case in worker-load-guard.test.ts now writes its control marker synchronously, so a loaded host can no longer terminate the worker before the marker exists. No runtime change.
+
+---
+
 ## v0.36.86 — Run FTS and the original vector leg side by side under a request budget
 
 Under a request budget (CLAWMEM_QUERY_BUDGET_MS) with the vector deadline on, the original query's vector leg now starts beside FTS instead of after it, so a budgeted answer costs about the longer of the two stages rather than their sum. Expansion legs still wait for FTS's strong-signal decision. Vector results that arrived within the deadline are kept when FTS is cut. Timing rows carry `fts_vec_overlap`. Set `CLAWMEM_QUERY_FTS_VEC_OVERLAP=0` to restore the serial order. No change without a budget.
