@@ -60,7 +60,7 @@ import {
   postIndexEnrich,
 } from "./amem.ts";
 import { parseLegacyEdgeWitness } from "./causal-reader.ts";
-import { uniquePhysicalResults } from "./search-utils.ts";
+import { queryExpansionDisabled, uniquePhysicalResults } from "./search-utils.ts";
 import { vecScanTestSeam } from "./vec-scan-test-seam.ts";
 import {
   canonicalVecTableDim,
@@ -5987,6 +5987,9 @@ export function expandQueryCacheKey(query: string, model: string = DEFAULT_QUERY
 }
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, cacheWrites?: CacheWriteGuard): Promise<ExpandedQuery[]> {
+  // Checked before the cache: "off" must not serve legs cached while expansion was on.
+  if (queryExpansionDisabled()) return [];
+
   // Typed-JSON cache. Versioned key (include intent + provider fingerprint).
   const cacheKey = expandQueryCacheKey(query, model, intent);
   const cached = getCachedResult(db, cacheKey);
