@@ -124,6 +124,16 @@ On expiry the workers are terminated, the vector results are dropped, and the qu
 
 A worker failure other than expiry also drops the vector results, as `vec_leg_failed`. A fatal vector error, such as a model mismatch, still fails the query as it does with the deadline off.
 
+### FTS beside the vector stage (`clawmem serve` with a request budget)
+
+The original query's vector leg does not depend on FTS: FTS only decides whether expansion runs. When `CLAWMEM_QUERY_BUDGET_MS` and `CLAWMEM_QUERY_VEC_DEADLINE_MS` are both on, `POST /query` starts the vector stage (vn4rz.150) before it awaits FTS, so the two run side by side and a request costs about the longer of the two instead of their sum. `CLAWMEM_QUERY_FTS_VEC_OVERLAP=0` (or `false`/`off`/`no`) restores the serial order; the default is on.
+
+- The vector deadline is `min(CLAWMEM_QUERY_VEC_DEADLINE_MS, what the budget has left)` read when the stage starts, which is now before FTS, so the deadline also covers the wait for FTS and the expansion that follows it.
+- Expansion still waits for FTS. `expandQuery` starts only when FTS reports no strong signal and the budget is not spent, so the strong-signal bypass still saves the LLM call. The expansion vector legs join the stage once the expansion lands (the lex legs still run after it, as before); a strong or spent FTS gives the stage no expansion. Workers for the expansion legs are not pre-warmed on this path, since FTS has not yet said whether there will be any.
+- When FTS is cut by the budget, the vector results that arrived within the deadline stay in the answer. The reply is still marked `query_budget_expired`. The "vector stage skipped" log line now appears only when the stage never started (budget already spent on arrival, or the overlap is off).
+- Without a budget, with the vector deadline off, or with the knob at `0`, the stages run in the old order. The CLI `query` never overlaps.
+- With `CLAWMEM_QUERY_TIMING=1`, a budgeted row carries `fts_vec_overlap` (1 when the vector stage started beside FTS, 0 otherwise). The `fts` and `vec_legs` stage windows then overlap; `vec_legs` ends when the vector stage ends, not when FTS lets the request reach it.
+
 ## Scoped vector scan (collection-scoped legs)
 
 sqlite-vec reads every vector chunk before it applies a `hash_seq IN (...)` filter, so a scoped vector leg cost a scan of the whole vault (1.4 GB for 350k x 768 vectors) whatever the collection. For an include scope (`-c`, `collections`, `dateRange`) small enough to pre-filter, the leg now reads only the vec0 chunks that hold the scope's fragments, straight from the shadow tables, and computes cosine distances in JS with sqlite-vec's float32 operation order (vn4rz.100). The distances are bit-identical to vec0's and cover every in-scope fragment, so the results equal the vec0 path's. On the live vault, `docs` (15.7k fragments) sits in 172 of 459 chunks: about 0.54 GB is read once, and each further leg is a ~25 ms scan.
