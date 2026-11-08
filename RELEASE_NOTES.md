@@ -4,6 +4,12 @@ For upgrade instructions (migration steps, opt-in features, verification command
 
 ---
 
+## v0.36.86 — Run FTS and the original vector leg side by side under a request budget
+
+Under a request budget (CLAWMEM_QUERY_BUDGET_MS) with the vector deadline on, the original query's vector leg now starts beside FTS instead of after it, so a budgeted answer costs about the longer of the two stages rather than their sum. Expansion legs still wait for FTS's strong-signal decision. Vector results that arrived within the deadline are kept when FTS is cut. Timing rows carry `fts_vec_overlap`. Set `CLAWMEM_QUERY_FTS_VEC_OVERLAP=0` to restore the serial order. No change without a budget.
+
+---
+
 ## v0.36.85 — Measure what inside clawmem vec_legs takes the time beyond scope_load, the tail that still fails openclaw turns open
 
 Complete opt-in vector timing on the live no-deadline ClawMem serve path: correlate in-process and worker legs, isolate concurrent leg observations, and record request serialization wait.
