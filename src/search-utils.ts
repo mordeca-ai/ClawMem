@@ -330,6 +330,18 @@ export function ftsBypassEnabled(): boolean {
 }
 
 // =============================================================================
+// Query expansion off switch (master-harness-vn4rz.125)
+// =============================================================================
+
+/**
+ * True when CLAWMEM_QUERY_EXPAND is exactly `off`: query expansion makes no LLM call and adds
+ * no legs, so a query runs only as written. Read at call time, like ftsBypassEnabled.
+ */
+export function queryExpansionDisabled(): boolean {
+  return process.env.CLAWMEM_QUERY_EXPAND === "off";
+}
+
+// =============================================================================
 // Vector-leg cap for hybrid query (master-harness-vn4rz.92)
 // =============================================================================
 

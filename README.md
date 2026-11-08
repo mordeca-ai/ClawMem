@@ -794,6 +794,7 @@ Notes referenced by the agent during a session get boosted (`access_count++`). U
 | `CLAWMEM_EMBED_TPM_LIMIT` | `100000` | Tokens-per-minute limit for cloud embedding pacing. Match to your provider tier. |
 | `CLAWMEM_EMBED_DIMENSIONS` | (none) | Output dimensions for OpenAI `text-embedding-3-*` Matryoshka models (e.g. `512`, `1024`). |
 | `CLAWMEM_LLM_URL` | `http://localhost:8089` | LLM server URL for intent/query/A-MEM. Without it, falls to `node-llama-cpp` (if allowed). |
+| `CLAWMEM_QUERY_EXPAND` | (on) | Set to exactly `off` to skip query expansion: no LLM call, no cached expansions, no added legs. With no `CLAWMEM_LLM_URL` set, the wrapper then leaves the URL unset instead of applying its default. |
 | `CLAWMEM_LLM_API_KEY` | (none) | Bearer token for an authenticated remote LLM endpoint. Independent of the embed and rerank keys. |
 | `CLAWMEM_LLM_MODEL` | `qwen3` | Model name sent to the configured LLM endpoint. Override this for OpenAI-compatible proxies such as `gpt-5.4-mini`. |
 | `CLAWMEM_LLM_REASONING_EFFORT` | (none) | Optional top-level `reasoning_effort` field for Chat Completions endpoints that support it (for example OpenAI reasoning models). Leave unset for llama-server/vLLM unless your serving stack explicitly accepts that field. |

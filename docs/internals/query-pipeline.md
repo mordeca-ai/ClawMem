@@ -99,6 +99,8 @@ The cap keeps hyde legs first, then vec legs, each in generation order. A vec le
 
 When the cap drops legs, stderr shows `[query] vec-leg cap <n>: running <kept>/<total> expansion vector legs`.
 
+`CLAWMEM_QUERY_EXPAND=off` turns expansion off for the process. `expandQuery` returns no legs without calling the LLM or reading the cache, so the query runs only as written. Unsetting `CLAWMEM_LLM_URL` does not do this, because `bin/clawmem` applies its default URL unless this switch is `off`.
+
 ## Parallel vector legs (CLI `query` and MCP `query`)
 
 Both consumers run their vector legs (the original query plus each vec/hyde expansion that survives the cap) in parallel read-only Bun Workers, each with its own connection to the vault. `CLAWMEM_QUERY_VEC_PARALLEL=<n>` sets the pool size: default 4, clamped to 1-8, and `1` restores the old sequential in-process loop. Results are merged back in the original leg order, so the fused ranking is identical to the sequential run. A leg whose worker fails reruns in-process, so a fatal vector error still surfaces as before. The cap above applies first; the pool only sees the legs that survive it.
