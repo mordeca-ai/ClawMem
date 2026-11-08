@@ -114,9 +114,10 @@ describe("a worker cut during load, on a real Worker", () => {
     try {
       writeFileSync(
         join(dir, "w.ts"),
-        `import { postWorkerLoaded } from ${JSON.stringify(guardPath)};
+        `import { writeFileSync } from "node:fs";
+         import { postWorkerLoaded } from ${JSON.stringify(guardPath)};
          self.onmessage = () => {
-           Bun.write(${JSON.stringify(started)}, "1");
+           writeFileSync(${JSON.stringify(started)}, "1");
            Bun.sleepSync(30_000);
          };
          postWorkerLoaded();`,
