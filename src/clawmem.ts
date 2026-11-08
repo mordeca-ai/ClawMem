@@ -72,7 +72,7 @@ import { enrichResults, toRanked, fuseAndRerank, hasStrongFtsSignal, ftsBypassEn
 import { vecLegParallelism, runVecLegs, createWorkerLegPool, runVecLegsOverlapped, settlesImmediately } from "./vec-legs.ts";
 import { residentScopeCapBytes, scopedScanEnabled, vecScopeScanStats } from "./vec-scope-scan.ts";
 import { QueryTimer, queryTimingEnabled } from "./query-timing.ts";
-import { runVecStageWithDeadline, VecDeadlineLegs, vecDeadlineMs, type VecDegradedReason } from "./vec-deadline.ts";
+import { ftsVecOverlapEnabled, runVecStageWithDeadline, VecDeadlineLegs, vecDeadlineMs, type VecDegradedReason } from "./vec-deadline.ts";
 import { QUERY_BUDGET_CACHE_WRITE_BUSY_MS, QUERY_BUDGET_REASON, QueryBudget, QueryBudgetExpired, queryBudgetMs, queryBudgetTestDisposeStall, queryBudgetTestCacheWriteStall, submitWithBudget, withinBudget } from "./query-budget.ts";
 import { FtsLegs } from "./fts-legs.ts";
 import type { ScopedLegResult } from "./vec-legs.ts";
@@ -1721,13 +1721,99 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
     ftsCut = true;
     return [];
   };
+  // The vector stage's pieces that FTS does not decide, defined here so the stage can start beside
+  // FTS (vn4rz.150) as well as after it.
+  const vecLegsOf = (eqs: ExpandedQuery[]) => eqs.filter(e => e.type !== "lex").map(e => e.query);
+  const par = vecLegParallelism();
+  const vecDeadlineOwn = vecDeadlineMs();
+  // The vector stage's deadline is the smaller of its own and what the request budget has left,
+  // read when the stage starts.
+  const vecDeadlineNow = () => {
+    const budgetRemaining = budget ? Math.max(1, Math.floor(budget.remainingMs())) : Infinity;
+    return {
+      budgetBinds: !!budget && (vecDeadlineOwn <= 0 || budgetRemaining <= vecDeadlineOwn),
+      deadline: Math.min(vecDeadlineOwn > 0 ? vecDeadlineOwn : Infinity, budgetRemaining),
+    };
+  };
+  const startDeadlineVecStage = (
+    { deadline, budgetBinds }: ReturnType<typeof vecDeadlineNow>,
+    expansionP: Promise<ExpandedQuery[]>,
+    warmExpansionLegs: boolean,
+  ) => (async () => {
+    // vn4rz.131: the deadline owns the whole stage. Every leg runs in a worker, scoped ones too,
+    // and nothing here falls back to the in-process leg. See src/vec-deadline.ts.
+    const scopeId = scopeCols && scopedScanEnabled() ? crypto.randomUUID() : undefined;
+    const dbPath = getDefaultDbPath();
+    let scopeStats: ScopedLegResult["scopeStats"] | undefined;
+    let scopedChain: Promise<unknown> = Promise.resolve();
+    let legIndex = 0;
+    const stage = await runVecStageWithDeadline({
+      legs: getVecDeadlineLegs(),
+      deadlineMs: deadline,
+      original: query,
+      expansion: expansionP,
+      legsOf: vecLegsOf,
+      legOn: pool => q => {
+        const legOpts = { dbPath, model: DEFAULT_EMBED_MODEL, limit: POOL, collections: scopeCols,
+          requestId: timer.requestId, legIndex: legIndex++ };
+        if (!scopeId) return pool.runLegOn(q, legOpts);
+        // One at a time, so the query's legs land on one worker and read the scope once.
+        const leg = scopedChain
+          .then(() => pool.runLegScoped(q, { ...legOpts, collections: scopeCols!, scopeId, mmapBytes: readScopedMmapBytes() }))
+          .then(res => {
+            scopeStats = res.scopeStats;
+            return res.results;
+          });
+        scopedChain = leg.catch(() => {});
+        return leg;
+      },
+      warm: scopeId || !warmExpansionLegs ? 0 : Math.min(par - 1, queryVecExpansionLegCap() ?? par - 1),
+      after: pool => {
+        if (scopeId) pool.releaseScoped();
+      },
+    });
+    if (!vecDeadlineLegsServed) {
+      vecDeadlineLegs?.close();
+      vecDeadlineLegs = undefined;
+    }
+    return { stage, deadline, budgetBinds, scopeStats };
+  })();
+  let endVecOnce: (() => void) | undefined;
+  const endVecStage = () => {
+    const end = endVecOnce;
+    endVecOnce = undefined;
+    end?.();
+  };
+
+  // FTS and the original query's vector leg do not depend on each other: FTS only decides whether
+  // expansion runs. Under a budget with the vector deadline on, start the vector stage now and let
+  // FTS run beside it (vn4rz.150). The expansion legs still wait for FTS, through `expansionGate`.
+  const overlapFtsVec = !!budget && vecDeadlineOwn > 0 && ftsVecOverlapEnabled() && !budget.expired();
+  let earlyVec: ReturnType<typeof startDeadlineVecStage> | undefined;
+  let openExpansionGate: ((legs: ExpandedQuery[] | Promise<ExpandedQuery[]>) => void) | undefined;
   if (budget) {
     // Always present with a budget, so a timing row tells a cut or shed FTS from a fast one.
     timer.count("fts_cut", 0);
     timer.count("fts_shed", 0);
+    timer.count("fts_vec_overlap", overlapFtsVec ? 1 : 0);
   }
   const endFts = timer.start("fts");
-  const ftsResults = budget ? await budgetedFts(query) : s.searchFTS(query, POOL, undefined, scopeCols);
+  if (overlapFtsVec) {
+    const expansionGate = new Promise<ExpandedQuery[]>(resolve => { openExpansionGate = resolve; });
+    endVecOnce = timer.start("vec_legs");
+    earlyVec = startDeadlineVecStage(vecDeadlineNow(), expansionGate, false);
+    // Observed here so a throw from FTS below cannot leave this promise unhandled, and so the
+    // vec_legs stamp ends when the stage does, not when FTS lets the main flow reach it.
+    earlyVec.then(endVecStage, endVecStage);
+  }
+  let ftsResults: SearchResult[];
+  try {
+    ftsResults = budget ? await budgetedFts(query) : s.searchFTS(query, POOL, undefined, scopeCols);
+  } catch (e) {
+    // The stage must not wait for an expansion that will never start; its own deadline ends it.
+    openExpansionGate?.([]);
+    throw e;
+  }
   endFts();
   const strongSignal = ftsBypassEnabled() && hasStrongFtsSignal(ftsResults);
   // When FTS (or the queue before it) spent the budget, or was shed, skip expansion and the vector
@@ -1747,6 +1833,8 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
       .catch(() => [] as ExpandedQuery[])
       .then(eqs => { endExpand(); return applyQueryVecLegCap(eqs); });
   }
+  // FTS has settled: the vector stage that started beside it may now take the expansion legs, or none.
+  openExpansionGate?.(expansion ?? []);
 
   // Step 3: Parallel searches
   const allRanked: { results: RankedResult[]; weight: number }[] = [];
@@ -1754,7 +1842,6 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   // candidate found ONLY via an expansion leg survives Step 8's resultMap lookup.
   const candidateResults: SearchResult[] = [];
 
-  const vecLegsOf = (eqs: ExpandedQuery[]) => eqs.filter(e => e.type !== "lex").map(e => e.query);
   let localLegIndex = 0;
   const tracedLocalLeg = (run: () => Promise<SearchResult[]>, path: string): Promise<SearchResult[]> => {
     if (!timer.enabled) return run();
@@ -1772,60 +1859,19 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   const inProcessLeg = (q: string) => tracedLocalLeg(() => rawInProcessLeg(q), "in_process");
   const poolOpts = { dbPath: getDefaultDbPath(), model: DEFAULT_EMBED_MODEL, limit: POOL, collections: scopeCols,
     requestId: timer.requestId };
-  const par = vecLegParallelism();
   let expandedQueries: ExpandedQuery[];
   let vecLegResults: SearchResult[][];
-  const endVec = timer.start("vec_legs");
-  const vecDeadlineOwn = vecDeadlineMs();
-  // The vector stage's deadline is the smaller of its own and what the request budget has left.
-  const budgetRemaining = budget ? Math.max(1, Math.floor(budget.remainingMs())) : Infinity;
-  const budgetBindsVec = !!budget && (vecDeadlineOwn <= 0 || budgetRemaining <= vecDeadlineOwn);
-  const vecDeadline = Math.min(vecDeadlineOwn > 0 ? vecDeadlineOwn : Infinity, budgetRemaining);
-  if (budgetSpentAtFts) {
-    expandedQueries = [];
-    vecLegResults = [];
-    console.error(`[clawmem] query degraded (${QUERY_BUDGET_REASON}): vector stage skipped, budget ${budget!.totalMs} ms spent before it`);
-  } else if (Number.isFinite(vecDeadline) && vecDeadline > 0) {
-    // vn4rz.131: the deadline owns the whole stage. Every leg runs in a worker, scoped ones too,
-    // and nothing here falls back to the in-process leg. See src/vec-deadline.ts.
-    const scopeId = scopeCols && scopedScanEnabled() ? crypto.randomUUID() : undefined;
-    const dbPath = getDefaultDbPath();
-    let scopeStats: ScopedLegResult["scopeStats"] | undefined;
-    let scopedChain: Promise<unknown> = Promise.resolve();
-    let legIndex = 0;
-    const stage = await runVecStageWithDeadline({
-      legs: getVecDeadlineLegs(),
-      deadlineMs: vecDeadline,
-      original: query,
-      expansion: expansion ?? Promise.resolve([] as ExpandedQuery[]),
-      legsOf: vecLegsOf,
-      legOn: pool => q => {
-        const legOpts = { dbPath, model: DEFAULT_EMBED_MODEL, limit: POOL, collections: scopeCols,
-          requestId: timer.requestId, legIndex: legIndex++ };
-        if (!scopeId) return pool.runLegOn(q, legOpts);
-        // One at a time, so the query's legs land on one worker and read the scope once.
-        const leg = scopedChain
-          .then(() => pool.runLegScoped(q, { ...legOpts, collections: scopeCols!, scopeId, mmapBytes: readScopedMmapBytes() }))
-          .then(res => {
-            scopeStats = res.scopeStats;
-            return res.results;
-          });
-        scopedChain = leg.catch(() => {});
-        return leg;
-      },
-      warm: scopeId || !expansion ? 0 : Math.min(par - 1, queryVecExpansionLegCap() ?? par - 1),
-      after: pool => {
-        if (scopeId) pool.releaseScoped();
-      },
-    });
-    expandedQueries = stage.expansion ?? [];
-    vecLegResults = stage.results;
+  // The overlapped stage stamped its own start, beside FTS; every other path starts it here.
+  if (!earlyVec) endVecOnce = timer.start("vec_legs");
+  // What a finished deadline stage means for the reply; the same for the stage that ran beside FTS
+  // and the one that ran after it.
+  const settleDeadlineVec = ({ stage, deadline, budgetBinds, scopeStats }: Awaited<ReturnType<typeof startDeadlineVecStage>>) => {
     // An expiry the request budget set is the budget's, not the vector deadline's own.
-    const budgetCutVec = stage.degraded === "vec_deadline_expired" && budgetBindsVec;
+    const budgetCutVec = stage.degraded === "vec_deadline_expired" && budgetBinds;
     if (budgetCutVec) budgetExpired = true;
     if (stage.degraded) {
       if (outcome) outcome.degraded = budgetCutVec ? QUERY_BUDGET_REASON : stage.degraded;
-      console.error(`[clawmem] query degraded (${budgetCutVec ? QUERY_BUDGET_REASON : stage.degraded}): vector results dropped, deadline ${vecDeadline} ms`);
+      console.error(`[clawmem] query degraded (${budgetCutVec ? QUERY_BUDGET_REASON : stage.degraded}): vector results dropped, deadline ${deadline} ms`);
     }
     timer.count("vec_deadline_expired", stage.degraded === "vec_deadline_expired" && !budgetCutVec ? 1 : 0);
     timer.count("vec_deadline_shed", stage.degraded === "vec_deadline_shed" ? 1 : 0);
@@ -1835,10 +1881,20 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
       timer.count("scope_chunks_read", scopeStats.chunksRead);
       timer.count("scope_load_fallbacks", scopeStats.verifyFailures);
     }
-    if (!vecDeadlineLegsServed) {
-      vecDeadlineLegs?.close();
-      vecDeadlineLegs = undefined;
-    }
+    return { expandedQueries: stage.expansion ?? [], vecLegResults: stage.results };
+  };
+  const vecDeadlineAfterFts = vecDeadlineNow();
+  if (earlyVec) {
+    // Started beside FTS. Vector results that arrived within the deadline stay even when FTS was
+    // cut or the budget is spent: the stage ran, so there is something to keep.
+    ({ expandedQueries, vecLegResults } = settleDeadlineVec(await earlyVec));
+  } else if (budgetSpentAtFts) {
+    expandedQueries = [];
+    vecLegResults = [];
+    console.error(`[clawmem] query degraded (${QUERY_BUDGET_REASON}): vector stage skipped, budget ${budget!.totalMs} ms spent before it`);
+  } else if (Number.isFinite(vecDeadlineAfterFts.deadline) && vecDeadlineAfterFts.deadline > 0) {
+    ({ expandedQueries, vecLegResults } = settleDeadlineVec(await startDeadlineVecStage(
+      vecDeadlineAfterFts, expansion ?? Promise.resolve([] as ExpandedQuery[]), !!expansion)));
   } else {
     const liveExpansion = !!expansion && !(await settlesImmediately(expansion));
     // vn4rz.100: a collection scope the chunk-targeted scan serves runs every leg in this process
@@ -1937,7 +1993,7 @@ async function cmdQuery(args: string[], emit: boolean = true, outcome?: QueryOut
   if (budgetSpentAtFts && outcome) outcome.degraded = QUERY_BUDGET_REASON;
   timer.count("vec_legs", vecLegResults.length);
   timer.count("lex_legs", expandedQueries.filter(e => e.type === "lex").length);
-  endVec();
+  endVecStage();
 
   // Original query BM25 + vec (weight 2x)
   allRanked.push({ results: ftsResults.map(toRanked), weight: 2 });
